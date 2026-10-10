@@ -37,7 +37,7 @@ export const DEFAULT_REQUIRED_CHECKS = Object.freeze({
 const PR_FRAGMENT = [
   "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision createdAt updatedAt mergedAt closedAt",
   " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:100){nodes{__typename",
-  " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state}}}}}}}",
+  " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state createdAt}}}}}}}",
   " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
   " comments(last:30){pageInfo{hasPreviousPage} nodes{author{login} body createdAt}}",
   " files(first:100){pageInfo{hasNextPage} nodes{path}} }"
@@ -57,7 +57,7 @@ function gateRunSelection(required) {
 
 function gateSelection(required) {
   if (!required.length) return "";
-  const statuses = required.map(({ name }, i) => `g${i}: context(name:${JSON.stringify(name)}){__typename context state}`).join(" ");
+  const statuses = required.map(({ name }, i) => `g${i}: context(name:${JSON.stringify(name)}){__typename context state createdAt}`).join(" ");
   return ` gateCommit: commits(last:1){nodes{commit{oid status{${statuses}} checkSuites(first:${FIRST_GATE_SUITES}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}}}}}`;
 }
 
@@ -68,7 +68,8 @@ export function buildGateSuitesQuery(repo, oid, after, required) {
 
 // Pages the head's remaining check suites while a required check is still
 // missing, so a check run past the first page is not read as never run.
-// Bounded to MAX_GATE_SUITES suites; a failed page leaves the gate missing.
+// Bounded to MAX_GATE_SUITES suites. A failed page marks the lookup unread,
+// so a gate still not found is unknown rather than confirmed absent.
 async function gateSuitePages(repo, node, config, run) {
   const required = requiredChecksFor(repo, config);
   const gateCommit = node.gateCommit?.nodes?.[0]?.commit;
@@ -77,6 +78,7 @@ async function gateSuitePages(repo, node, config, run) {
   const gates = () => gatesFor(node.commits?.nodes?.[0]?.commit ?? null, node.headRefOid ?? "", required, gateCommit);
   let page = suites.pageInfo;
   let read = suites.nodes?.length ?? 0;
+  gateCommit.suitesUnread = true;
   while (page?.hasNextPage && page.endCursor && read < MAX_GATE_SUITES && gates().some((gate) => gate.state === null)) {
     let result;
     try {
@@ -90,6 +92,7 @@ async function gateSuitePages(repo, node, config, run) {
     read += more.nodes.length;
     page = more.pageInfo;
   }
+  gateCommit.suitesUnread = false;
 }
 
 // refs: [{repo, number}] already validated by parsePrRef, so owner and name
@@ -123,7 +126,17 @@ function parseJson(text) {
 }
 
 function checkStamp(node) {
-  return Date.parse(node?.startedAt ?? node?.completedAt ?? "") || 0;
+  return Date.parse(node?.startedAt ?? node?.completedAt ?? node?.createdAt ?? "") || 0;
+}
+
+// The newer of two results for one check name. Without both times, the
+// result that does not pass wins, so a stale green never masks a red.
+function newerCheck(best, next) {
+  if (!best) return next;
+  const [a, b] = [checkStamp(best), checkStamp(next)];
+  if (a && b) return b >= a ? next : best;
+  const passes = (node) => checkState(node) === "SUCCESS";
+  return passes(next) && !passes(best) ? best : next;
 }
 
 // The newest run of each check on the head, or null when the head's CI is
@@ -137,8 +150,7 @@ function latestChecks(commit, headOid) {
   for (const node of rollup.contexts?.nodes ?? []) {
     const name = node?.name ?? node?.context;
     if (!name) continue;
-    const previous = latest.get(name);
-    if (!previous || checkStamp(node) >= checkStamp(previous)) latest.set(name, node);
+    latest.set(name, newerCheck(latest.get(name), node));
   }
   return latest;
 }
@@ -194,8 +206,11 @@ function gatesFor(commit, headOid, required, gateCommit) {
     const found = [latest?.get(name), direct?.status?.[`g${i}`],
       ...(direct?.checkSuites?.nodes ?? []).flatMap((suite) => suite?.[`g${i}`]?.nodes ?? [])]
       .filter((node) => node && (node.name ?? node.context) === name);
-    const node = found.reduce((best, next) => !best || checkStamp(next) >= checkStamp(best) ? next : best, null);
-    return { name, label, ...(typeof how === "string" && how ? { how } : {}), state: checkState(node) };
+    const node = found.reduce(newerCheck, null);
+    const state = checkState(node);
+    // A suite page that failed to load: not found is unknown, not missing.
+    const unread = state === null && direct?.suitesUnread === true;
+    return { name, label, ...(typeof how === "string" && how ? { how } : {}), state, ...(unread ? { unread: true } : {}) };
   });
 }
 

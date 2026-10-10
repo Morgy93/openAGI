@@ -102,6 +102,8 @@ test("prReadiness gates on the repo's required check, not on hosted CI", () => {
   const blockersOf = (prOver) => prReadiness(makePr(prOver), cleanGit).blockers;
   // Unrelated green checks are no proof the full run passed.
   assert.deepEqual(blockersOf({ gates: gate(null) }), ["BuildBot3 full run missing"]);
+  // A lookup that failed to load is unread, not missing.
+  assert.deepEqual(blockersOf({ gates: [{ ...gate(null)[0], unread: true }] }), ["BuildBot3 full run unread"]);
   assert.deepEqual(blockersOf({ gates: gate("FAILURE"), ci: { state: "FAILURE", failing: ["BuildBot3 full verification"], pending: [] } }), ["BuildBot3 full run failed"]);
   assert.deepEqual(blockersOf({ gates: gate("PENDING"), ci: { state: "PENDING", failing: [], pending: ["BuildBot3 full verification"] } }), ["BuildBot3 full run pending"]);
   assert.deepEqual(blockersOf({ gates: gate("SKIPPED") }), ["BuildBot3 full run skipped"]);

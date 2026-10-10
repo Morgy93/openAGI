@@ -230,11 +230,12 @@ export function prReadiness(pr, localGit) {
   return { ready: blockers.length === 0 && !onlyHumanLeft, blockers, onlyHumanLeft, progressMark };
 }
 
-// "BuildBot3 full run missing" / "... failed" / "... pending" / "... skipped".
+// "BuildBot3 full run missing" / "... unread" / "... failed" / "... pending" / "... skipped".
 function gateBlocker(gate) {
   const label = gate.label || gate.name;
   if (gate.state === "SUCCESS") return null;
-  if (!gate.state) return `${label} missing`;
+  // A lookup that failed to load is unknown, not proof it never ran.
+  if (!gate.state) return gate.unread ? `${label} unread` : `${label} missing`;
   if (gate.state === "FAILURE") return `${label} failed`;
   return `${label} ${String(gate.state).toLowerCase()}`;
 }

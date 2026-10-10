@@ -28,7 +28,8 @@ const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
 // "CI running", or a required check still running ("BuildBot3 full run pending").
-const ciRunning = (blocker) => blocker === "CI running" || / pending$/.test(blocker);
+// A gate GitHub did not finish reading waits for the next read like a running one.
+const ciRunning = (blocker) => blocker === "CI running" || / (?:pending|unread)$/.test(blocker);
 const passive = (blocker) => PASSIVE_BLOCKERS.has(blocker) || ciRunning(blocker);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
@@ -305,6 +306,8 @@ function waitingIntent(ctx) {
     // manager, never a nudge to drop it. Elsewhere hosted CI is the gate: a
     // full run only reproduces a hosted CI failure.
     if (!fullRunGated(pr, thread, ctx.config) && !ciFailing(pr)) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
+    // The full-run gate already passed on the head: the run is over, whatever the task says.
+    if (ciDone && gates.length) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
     if (silent) return statusCheck("bb-verify --full", quietMs);
     return escalateIntent(ctx, "bb-verify --full", age);
   }
@@ -332,7 +335,7 @@ function waitingIntent(ctx) {
   if (pr?.state === "OPEN" && settled && !hostedRunning) {
     return nudge("merge-ready", `${settled.label || settled.name} ${String(settled.state).toLowerCase()}`);
   }
-  const missing = gates.find((gate) => !gate.state);
+  const missing = gates.find((gate) => !gate.state && !gate.unread);
   if (pr?.state === "OPEN" && (missing || (!gates.length && !ci.state)) && age >= limits.waitingTaskMaxMs) {
     return nudge("merge-ready", `${missing ? `${missing.label || missing.name} missing` : "no CI on head"} after waiting`);
   }

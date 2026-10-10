@@ -844,6 +844,34 @@ test("the BuildBot3 full run gates the merge ask and the CI-finished nudge", () 
   assert.equal(run(waiting, { pr: makePr({ gates: gate("SUCCESS") }) }).decision.playbook, "ci-finished");
 });
 
+test("an unread full-run gate is never called missing", () => {
+  const gate = [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: null, unread: true }];
+  // Idle on a PR whose gate lookup failed: wait for the next read, no merge-ready nudge.
+  const idle = run(makeThread(), { pr: makePr({ gates: gate }) }).decision;
+  assert.equal(idle.action, "wait");
+  assert.doesNotMatch(String(idle.message ?? idle.reason), /missing/);
+  const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(60 * MIN), lastAgentAt: ago(60 * MIN), lastUserAt: ago(120 * MIN) });
+  const waited = run(waiting, { pr: makePr({ gates: gate }) }).decision;
+  assert.notEqual(waited.playbook, "merge-ready");
+  assert.doesNotMatch(String(waited.message ?? waited.reason), /missing/);
+  // A long background task with only the unread gate blocking is not nudged.
+  const task = makeThread({ agentStatus: "waiting", openTasks: [{ id: "t1", kind: "local_bash", description: "tail -f build.log", startedAt: ago(60 * MIN) }] });
+  assert.notEqual(run(task, { pr: makePr({ gates: gate }) }).decision.playbook, "merge-ready");
+});
+
+test("a slow full verify whose gate already passed gets ci-finished, not the manager", () => {
+  const full = { id: "t1", kind: "local_bash", description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [full] });
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state }];
+  const decide = (state) => {
+    const pr = makePr({ gates: gate(state) });
+    const classified = classifyThread(thread, { pr, localGit: cleanGit, now: NOW, config });
+    return decideThread(classified, thread, { playbooks, config, now: NOW, pr, mode: "auto", manager });
+  };
+  assert.equal(decide("SUCCESS").playbook, "ci-finished");
+  assert.equal(decide("PENDING").action, "escalate-manager");
+});
+
 test("merge-ready names the repo's gate, or hosted CI when it has none", () => {
   const bb3 = [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state: null }];
   const gated = run(makeThread(), { pr: makePr({ gates: bb3 }) }).decision;
