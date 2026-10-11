@@ -47,3 +47,21 @@ The prototype does not mirror fleet questions onto physical G2 glasses or the
 Distiller main. Delivery adapters are verified with isolated tests; this QA does
 not send messages to real coding sessions. Desktop-held Codex writer locks and
 non-live Conductor sessions still require opening the original thread.
+
+
+## PR #113 update on 2026-10-10
+
+The branch now includes `main` at `fcd6a92`. Fleet dismissal keeps the owner action,
+actor, and note when a refresh overlaps the response. A failed dismissal keeps
+the outreach question open. A successful refresh closes questions from a computer
+that is no longer selected. The update keeps main's five-minute delivery budget
+and offline glasses dismissal replay. Android allows 340 seconds for a response.
+
+The iOS retry checks now use the shared conversation model. An interrupted turn
+cannot be sent again through the retry button. This check is saved in the chat
+cache and remains after an app restart. A reply received before a stream error
+remains visible. Cancelled tasks have no completion button in the row or detail.
+
+The focused Fleet and outreach tests passed: 33 tests on Node 22.21.1. The changed
+Swift files passed parsing. Hosted backend/G2 and iOS CI must pass on the new PR
+head before merge. No release, installation, or device test is part of this merge.

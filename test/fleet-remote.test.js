@@ -64,6 +64,43 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   assert.match(remote.getState().lastError, /unavailable/);
 });
 
+test('an outreach dismissal preserves the owner decision until its route records it', async t => {
+  const { remote, runtime } = fixture(t);
+  await remote.refresh();
+  const item = runtime.outreach.list()[0];
+  const dispatch = runtime.nodeCapabilities.dispatch;
+  let dismissalReached, releaseDismissal;
+  const reached = new Promise(resolve => { dismissalReached = resolve; });
+  const held = new Promise(resolve => { releaseDismissal = resolve; });
+  runtime.nodeCapabilities.dispatch = async (...args) => {
+    const result = await dispatch(...args);
+    if (args[3].path === '/fleet/api/questions/fq_one') {
+      dismissalReached();
+      await held;
+    }
+    return result;
+  };
+  remote.beginOutreachDecision('fq_one');
+  const dismissal = remote.dismissQuestion('fq_one');
+  await reached; // The computer has dismissed it, but main has not received that reply.
+  await remote.refresh(); // A concurrent refresh sees the now-empty question list.
+  releaseDismissal();
+  await dismissal;
+  assert.equal(runtime.outreach.get(item.id).status, 'unseen');
+  runtime.outreach.resolve(item.id, { action: 'dismiss', by: 'user', note: 'Use main' }, { status: 'dismissed' });
+  remote.finishOutreachDecision('fq_one');
+  assert.deepEqual(runtime.outreach.get(item.id).decision, { action: 'dismiss', by: 'user', note: 'Use main' });
+});
+
+test('successful refresh retires open questions from the previously selected node', async t => {
+  const { remote, runtime } = fixture(t);
+  const old = runtime.outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: 'fq_old', nodeId: 'old-mac' },
+    title: 'Old Mac question', needsDecision: true, actions: ['dismiss'] });
+  await remote.refresh();
+  assert.equal(runtime.outreach.get(old.id).status, 'dismissed');
+  assert.deepEqual(runtime.outreach.list({ status: 'unseen' }).map(item => item.sourceRef.id), ['fq_one']);
+});
+
 test('requests that type into an app outlast a whole UI delivery; reads keep the short timeout', async t => {
   const { remote, calls } = fixture(t);
   await remote.refresh();

@@ -194,8 +194,45 @@ final class SharedConversationClientTests: XCTestCase {
         let conversation = ChatConversation(thread: .agent, client: makeClient(),
                                             store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
         await conversation.send("hello")
-        XCTAssertEqual(conversation.messages.last?.text, "Reply stopped early. Try again.")
+        XCTAssertEqual(conversation.messages.last?.text, "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
         XCTAssertTrue(conversation.messages.last?.isFailed ?? false)
+        let failed = try XCTUnwrap(conversation.messages.last)
+        await conversation.retry(failed)
+        XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 1)
+        let relaunched = ChatConversation(thread: .agent, client: makeClient(),
+                                         store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
+        await relaunched.retry(try XCTUnwrap(relaunched.messages.last))
+        XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 1)
+    }
+
+    @MainActor
+    func testFailureFrameDoesNotPermitBlindResend() async throws {
+        stub(["/message": (200, "event: failure\ndata: {\"error\":\"Stopped\"}\n\n"),
+              "/conversations/agent/messages": (404, "{}")])
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+                                            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
+        await conversation.send("hello")
+        let failed = try XCTUnwrap(conversation.messages.last)
+        XCTAssertTrue(failed.isFailed)
+        XCTAssertFalse(failed.retrySafe)
+        await conversation.retry(failed)
+        XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 1)
+    }
+
+    @MainActor
+    func testDefiniteHostRejectionCanBeRetried() async throws {
+        stub(["/message": (503, #"{"error":"agent-host-disabled"}"#),
+              "/conversations/agent/messages": (404, "{}")])
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+                                            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
+        await conversation.send("hello")
+        let failed = try XCTUnwrap(conversation.messages.last)
+        XCTAssertTrue(failed.isFailed)
+        XCTAssertTrue(failed.retrySafe)
+        stub(["/message": (200, replyStream), "/conversations/agent/messages": (404, "{}")])
+        await conversation.retry(failed)
+        XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 2)
+        XCTAssertEqual(conversation.messages.last?.text, "Hi there")
     }
 
     @MainActor
