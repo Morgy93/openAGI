@@ -14,6 +14,7 @@ const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
 const REOPEN_MS = 60 * 60 * 1000;
 const PUSH_KEEP_MS = 24 * 60 * 60 * 1000;
 const NUDGES_KEPT = 20;
+const FACTS_KEPT = 8;
 const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
@@ -227,7 +228,10 @@ export class FleetStore {
       playbook: entry.playbook ?? null,
       route: entry.route ?? null,
       status,
-      messageHash: entry.messageHash ?? null
+      messageHash: entry.messageHash ?? null,
+      // When the send started, and the facts the nudge was about.
+      ...(entry.sentAt ? { sentAt: iso(toMs(entry.sentAt, toMs(at, this.now()))) } : {}),
+      ...(entry.factsKey ? { factsKey: String(entry.factsKey), facts: (Array.isArray(entry.facts) ? entry.facts : []).slice(0, FACTS_KEPT).map((item) => clampText(item, 80)) } : {})
     });
     if (ledger.nudges.length > NUDGES_KEPT) ledger.nudges.splice(0, ledger.nudges.length - NUDGES_KEPT);
     if (progressMark !== undefined && markKey(progressMark) !== markKey(ledger.lastProgressMark)) {

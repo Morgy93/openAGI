@@ -2,7 +2,7 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, liveCardItems, msSince } from "./contracts.js";
+import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -110,9 +110,10 @@ export const PROMISED_WORK_PATTERNS = Object.freeze([
 const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b/i;
 const CHOICE_WORDS = /\bwhich\b|\bpick\b|\bchoose\b|\boption\b|\bor\b/i;
 
+// A tool named for the box ("bb3-watch", "bb3-doctor") is not the box.
 const BB3_DOWN_PATTERNS = [
-  /\b(?:buildbot ?3|bb3|100\.99\.3\.113)\b[^.?!\n]{0,60}\b(?:down|unreachable|not reachable|unavailable|frozen|rebooting|jammed)\b/i,
-  /\bblocked on (?:buildbot ?3|bb3)\b/i
+  /\b(?:buildbot ?3|bb3|100\.99\.3\.113)\b(?!-\w)[^.?!\n]{0,60}\b(?:down|unreachable|not reachable|unavailable|frozen|rebooting|jammed)\b/i,
+  /\bblocked on (?:buildbot ?3|bb3)\b(?!-\w)/i
 ];
 
 const BLOCKED_ON_OWNER_ASK = Object.freeze({ topic: "approval", text: "Blocked on a permission prompt or dialog.", options: Object.freeze(["opened", "later"]) });
@@ -161,6 +162,8 @@ function foldClaudeInto(target, claude) {
   if (!target.lastAgentText) {
     target.lastAgentText = claude.lastAgentText ?? "";
     target.lastAgentTail = claude.lastAgentTail ?? "";
+    target.lastAgentFull = claude.lastAgentFull ?? "";
+    target.lastAgentFullAt = claude.lastAgentFullAt ?? null;
     target.lastAgentAt = claude.lastAgentAt ?? target.lastAgentAt ?? null;
   }
   target.cwd = target.cwd || claude.cwd || null;
@@ -291,9 +294,13 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // violation, not a CI wait, so it must not be swallowed by waiting-ci.
   const localVerify = matchLocalVerify(thread, infra);
   let wait = localVerify ? null : waitSignal(thread, text, now);
+  const settled = prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? ""));
+  // The whole report, not the tail: its "Blocked on:" list is often above
+  // the last 600 characters.
+  const blocked = text && !settled ? blockedOnSection(thread.lastAgentFull || text) : null;
   // "CI is pending. Blocked on your approval.": an explicit owner ask beats
   // a wait the agent only wrote down.
-  if (wait?.source === "text" && detectAsk(text)?.kind === "needs-human" && !prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? ""))) wait = null;
+  if (wait?.source === "text" && (detectAsk(text)?.kind === "needs-human" || blocked?.owner.length) && !settled) wait = null;
   if (wait) return result("waiting-ci", wait.reason, { wait, infraKind: wait.taskKind ? "bb3" : null });
   if (localVerify) {
     return result("local-verify", "heavy verification on the laptop", {
@@ -301,7 +308,13 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     });
   }
 
-  const ask = prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? "")) ? null : detectAsk(text);
+  const ask = settled ? null : detectAsk(text);
+  // "Blocked on: your decision": the owner's, whatever else the list holds.
+  // Its own answers beat a plain "your call" read from the same words; a
+  // named topic (a merge, prod, creds) keeps the ask it came with.
+  if (blocked?.owner.length && (ask?.kind !== "needs-human" || ask.topic === "decision")) {
+    return result("needs-human", "agent asks: blocked on the owner", { ask: blockedAsk(blocked) });
+  }
   if (ask?.kind === "needs-human") return result("needs-human", `agent asks: ${ask.topic}`, { ask });
   if (ask?.kind === "in-scope") return result("asked-in-scope", "agent asked to do an in-scope step", { ask });
 
@@ -480,8 +493,10 @@ function verifyKind(task) {
   return null;
 }
 
-function detectAsk(text) {
-  if (!text) return null;
+function detectAsk(raw) {
+  if (!raw) return null;
+  // "**Blocked on:** your call" reads as "Blocked on: your call".
+  const text = stripMarkdown(raw);
   const sentences = splitSentences(text);
   const askIndexes = sentences.map((sentence, index) => (isAsk(sentence) ? index : -1)).filter((index) => index >= 0);
   if (!askIndexes.length) return null;
@@ -515,6 +530,66 @@ function detectAsk(text) {
   // Every permission ask must name a routine PR step; the default is the owner.
   if (permission.every((index) => isRoutineStep(stepText(sentences, index)))) return { kind: "in-scope", topic: "in-scope", options, text: askText };
   return { kind: "needs-human", topic: "permission", options, text: askText };
+}
+
+function stripMarkdown(text) {
+  return String(text ?? "").replace(/\*\*|__|`/g, "");
+}
+
+// A "Blocked on:" item only the owner can clear: their decision, call,
+// approval, merge, review, pick or go-ahead. "Approval from Adam" names
+// someone else, so only an approval from the owner counts.
+const OWNER_BLOCKER = /\b(?:your|you|owner)\b[^.\n]{0,40}\b(?:decision|call|approv\w*|merge|review|sign-?off|pick|choice|go-?ahead)\b|\bmerge decision\b|\b(?:approval|review|sign-?off|decision|go-?ahead) from (?:you|the owner|spencer)\b|\bsudo\b/i;
+// Items GitHub or time clears: checks running, a review not in yet.
+const PASSIVE_BLOCKER = /\b(?:running|pending|queued|in progress|not (?:yet )?(?:reviewed|started|finished)|has(?:n't| not) reviewed|waiting (?:on|for))\b|^(?:CI|checks?|tests?|builds?)\W*$/i;
+const NO_BLOCKER = /^(?:nothing|none|n\/a|nope|no(?:thing)? (?:blockers?|else))\b/i;
+const BLOCKED_HEADER = /^[\s>#*_\-•]*blocked on\b[\s*_]*:?[\s*_]*(.*)$/i;
+const BULLET = /^(\s*)(?:[-*•+]|\d+[.)]|[a-c][.)])\s+(.*)$/i;
+
+// The agent's "Blocked on:" section: the header (any markdown) with what
+// follows it on its line, then its bullets up to a blank line or the next
+// header. Each item is tagged owner, passive or other; sub-bullets under an
+// item are its options. "Blocked on: nothing" holds no items.
+export function blockedOnSection(text) {
+  const lines = stripMarkdown(text).replace(/[\u2018\u2019]/g, "'").split("\n");
+  const start = lines.findIndex((line) => BLOCKED_HEADER.test(line));
+  if (start < 0) return null;
+  const items = [];
+  const inline = BLOCKED_HEADER.exec(lines[start])[1].trim();
+  if (inline) items.push({ text: inline, options: [] });
+  let indent = null;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line.trim()) {
+      // A blank line between the header and its first bullet is allowed.
+      if (items.length || indent !== null) break;
+      continue;
+    }
+    const bullet = BULLET.exec(line);
+    if (!bullet) {
+      // An indented line goes on with the item above it; anything else is the next block.
+      if (/^\s{2,}\S/.test(line) && items.length) { items.at(-1).text += ` ${line.trim()}`; continue; }
+      break;
+    }
+    const depth = bullet[1].replace(/\t/g, "  ").length;
+    if (indent === null) indent = depth;
+    if (depth > indent && items.length) items.at(-1).options.push(bullet[2].trim());
+    else items.push({ text: bullet[2].trim(), options: [] });
+  }
+  const tagged = items.filter((item) => item.text && !NO_BLOCKER.test(item.text))
+    .map((item) => ({ ...item, tag: OWNER_BLOCKER.test(item.text) ? "owner" : PASSIVE_BLOCKER.test(item.text) ? "passive" : "other" }));
+  const of = (tag) => tagged.filter((item) => item.tag === tag);
+  return { items: tagged, owner: of("owner"), passive: of("passive"), other: of("other") };
+}
+
+// The owner items as one question. The agent's own sub-bullets are the
+// answers when there is one item; "open thread" always stays, and never a
+// "later" that would be relayed to the agent as an answer.
+function blockedAsk(blocked) {
+  const owner = blocked.owner;
+  const labels = owner.length === 1 ? [...new Set(owner[0].options.map((option) => clampText(option, 40)).filter(Boolean))].slice(0, 3) : [];
+  const text = owner.map((item) => item.text.replace(/[.;,\s]+$/, "")).join(" / ");
+  return { topic: "decision", blocked: true, text, options: [...labels, "open thread"], key: shortHash(text) };
 }
 
 function isRoutineStep(text) {

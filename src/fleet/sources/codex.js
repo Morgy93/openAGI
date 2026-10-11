@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
   CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
 import { asksOwner } from "../classify.js";
@@ -488,6 +488,8 @@ function applyRollout(thread, row, context) {
   if (summary.lastAgent) {
     thread.lastAgentText = clampTail(redactSecrets(summary.lastAgent.text), limits.excerptMax);
     thread.lastAgentTail = clampTail(redactSecrets(summary.lastAgent.text), limits.reviewTailMax);
+    thread.lastAgentFull = clampTailLines(redactSecrets(summary.lastAgent.text), limits.fullTextMax);
+    thread.lastAgentFullAt = summary.lastAgent.at;
     thread.lastAgentAt = summary.lastAgent.at;
   }
   if (summary.lastUser) {
@@ -624,6 +626,8 @@ function buildThread(row, context) {
     lastActivityAt: toIso(updatedMs),
     lastAgentText: "",
     lastAgentTail: "",
+    lastAgentFull: "",
+    lastAgentFullAt: null,
     lastAgentAt: null,
     lastUserText: "",
     lastUserAt: null,

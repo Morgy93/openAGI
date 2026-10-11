@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, classifyThread, mergeThreads, prReadiness, threadHealth
+  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, blockedOnSection, classifyThread, mergeThreads, prReadiness, threadHealth
 } from "../src/fleet/classify.js";
-import { DEFAULTS, STATES } from "../src/fleet/contracts.js";
+import { DEFAULTS, STATES, clampTail, clampTailLines } from "../src/fleet/contracts.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -502,4 +502,76 @@ test("a turn that stopped mid-work is stopped, whatever its PR or last words say
   // Still running, or asking the owner: not stopped.
   assert.equal(classify(makeThread({ agentStatus: "running" })).state, "running");
   assert.equal(classify({ ...dead, meta: { pendingQuestion: { text: "Pick a price?", options: ["$1", "$2"], at: ago(20 * MIN) } } }).state, "needs-human");
+});
+
+// The real 18:17 report from Conductor session d1dbe71a (2,198 chars).
+const D1DBE71A_REPORT = [
+  "**Not ready to merge.**",
+  "",
+  "- **PR:** https://github.com/buildbetter-app/remote-dev-setup/pull/1",
+  "- **Head:** `1bfd2c83`",
+  "- **BuildBot3 run:** none. This repo has no BuildBot3 verification.",
+  "",
+  "**Correction:** my earlier \"0 open, ready\" was wrong. I had only counted the first 100 of 402 threads. There were 50 unresolved, including 12 P1 and 1 Cursor MEDIUM security finding.",
+  "",
+  "**Open ≥6/10: 2.** Both need your call.",
+  "- **CPU lanes:** `bb-verify` fixes the lane count when a run starts, but the sweep can shrink its CPU share later. Fixing it means pinning lanes to a per-slot share, or having the sweep resize lanes.",
+  "- **Cache write default:** PR runs write to the shared cache by default, which is a documented trade-off. Making cross-repository (fork) PRs read-only needs a fork check in `pr_head_and_base`.",
+  "",
+  "38 threads remain unresolved, 36 of them P2. I replied on both open P1s.",
+  "",
+  "**Resolved: 12 of 13 P1s plus the security one.**",
+  "- **Fixed in code:**",
+  "  - `bb-ci-remote` now runs the full lane.",
+  "  - `lb-usage-shim` now returns 403 to anyone but loopback and the allow list, and it won't start without one.",
+  "- **Already fixed in code:** five (ticket start ticks, pool lock, base-branch check, `bb-edge` exclusion, SSH login errors).",
+  "- **Deliberate:** two `bb3-watch` \"go down\" fallbacks, because falling back would bill the ChatGPT login.",
+  "- **Bounded:** one memory-reservation race, three 32 GiB slots on about 249 GiB.",
+  "",
+  "**Blocked on:**",
+  "- **Your decision** on the two P1s above.",
+  "- **Checks on the new head:** the Cursor router and Security checks are still running. Codex has not reviewed `1bfd2c83`.",
+  "- **Another session editing this worktree:** about 20 files have uncommitted edits that aren't mine, including `bb3-doctor`, `bb3-heal`, `bb-quick` and `server.py`. That session needs to push or hand off, or we'll conflict.",
+  "- **Deploying the shim:** the shim fix takes effect after `ci-local/install.sh --box` on BuildBot3."
+].join("\n");
+
+// The supervisor's own read gaps on that PR.
+const gappyPr = () => makePr({ unresolvedThreads: 0, threadsTruncated: true, codexReview: { reviewedHead: false, sha: "bbbbbbb" } });
+
+test("a markdown Blocked-on list naming the owner's decision asks the owner, read from the whole report", () => {
+  const thread = makeThread({ lastAgentText: clampTail(D1DBE71A_REPORT, DEFAULTS.excerptMax), lastAgentFull: clampTailLines(D1DBE71A_REPORT, DEFAULTS.fullTextMax) });
+  const result = classify(thread, { pr: gappyPr() });
+  assert.equal(result.state, "needs-human");
+  assert.equal(result.infraKind, null);
+  assert.equal(result.ask.blocked, true);
+  assert.equal(result.ask.text, "Your decision on the two P1s above");
+  // Never a "later" that would be relayed to the agent as the answer.
+  assert.deepEqual(result.ask.options, ["open thread"]);
+  // The whole report as the short text too: "bb3-watch" names a tool, not a down box.
+  assert.equal(classify(makeThread({ lastAgentText: D1DBE71A_REPORT }), { pr: gappyPr() }).state, "needs-human");
+  const section = blockedOnSection(D1DBE71A_REPORT);
+  assert.deepEqual(section.items.map((item) => item.tag), ["owner", "passive", "other", "other"]);
+});
+
+test("the short Blocked-on form asks; nothing, CI, or a third party's approval does not", () => {
+  const ask = classify(makeThread({ lastAgentText: "**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head are running" }));
+  assert.equal(ask.state, "needs-human");
+  assert.equal(classify(makeThread({ lastAgentText: "Pushed. **Blocked on:** your merge decision." })).state, "needs-human");
+  assert.equal(classify(makeThread({ lastAgentText: "Blocked on: approval from you." })).state, "needs-human");
+  for (const text of ["Done.\n\nBlocked on: nothing", "**Blocked on:** none.", "**Blocked on:** CI", "Blocked on: required reviewer approval from Adam/Nikhil"]) {
+    const result = classify(makeThread({ lastAgentText: text }), { pr: makePr({ reviewDecision: "REVIEW_REQUIRED", mergeState: "BLOCKED" }) });
+    assert.notEqual(result.state, "needs-human", text);
+  }
+  assert.equal(blockedOnSection("Blocked on: nothing").items.length, 0);
+  assert.equal(blockedOnSection("Blocked on: required reviewer approval from Adam/Nikhil").items[0].tag, "other");
+  assert.equal(blockedOnSection("Not blocked."), null);
+});
+
+test("an owner Blocked-on item offers the agent's own sub-bullets, then open thread", () => {
+  const text = "Ready except one thing.\n\n### Blocked on\n\n- **Your call** on cache writes:\n  - keep shared writes\n  - make fork PRs read-only\n- CI running\n\nI'll wait.";
+  const result = classify(makeThread({ lastAgentText: text }));
+  assert.equal(result.state, "needs-human");
+  assert.deepEqual(result.ask.options, ["keep shared writes", "make fork PRs read-only", "open thread"]);
+  // Once the owner replied, the old report asks nothing.
+  assert.notEqual(classify(makeThread({ lastAgentText: text, lastUserText: "keep them", lastUserAt: ago(5 * MIN) })).state, "needs-human");
 });

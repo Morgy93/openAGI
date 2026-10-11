@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, parseJsonLines, parsePrRef, prRefKey, readTail,
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, isPidAlive as defaultIsPidAlive, parseJsonLines, parsePrRef, prRefKey, readTail,
   redactSecrets, threadKey, toIso
 } from "../contracts.js";
 
@@ -330,6 +330,9 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     lastActivityAt: summary.lastTurnAt ?? toIso(mtimeMs),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
+    // API error rows never reach lastAgentText, so this is a real reply.
+    lastAgentFull: clampTailLines(redactSecrets(summary.lastAgentText), limits.fullTextMax),
+    lastAgentFullAt: summary.lastAgentAt,
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,

@@ -1275,3 +1275,98 @@ test("automation threads surface their cards; the supervisor's own and archived 
   assert.equal(run(cardThread({ excluded: "automation", archived: true })).classified.state, "excluded");
   assert.equal(run(cardThread({ excluded: "no-repo" })).classified.state, "excluded");
 });
+
+// --- Context-aware nudges ----------------------------------------------------
+
+const redPr = (overrides = {}) => makePr({ ci: { state: "FAILURE", failing: ["lint"], pending: [] }, ...overrides });
+// The ledger after `decision` went out at `sentAgo`.
+function sentLedger(decision, sentAgo, extra = {}) {
+  const at = ago(sentAgo);
+  return {
+    nudges: [{ at, sentAt: at, playbook: decision.playbook, route: decision.route, status: "sent", messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null }],
+    lastNudgeAt: at, attemptsWithoutProgress: 1, lastProgressMark: decision.progressMark, undelivered: null, ...extra
+  };
+}
+
+test("the d1dbe71a report asks the owner about their decision, not another merge-ready nudge", () => {
+  const report = "Not ready.\n\n**Open \u22656/10: 2.** Both need your call.\n\n**Blocked on:**\n- **Your decision** on the two P1s above.\n- checks on new head are still running. Codex has not reviewed it.\n- Another session editing this worktree.";
+  const thread = makeThread({ lastAgentText: report, lastAgentFull: report });
+  const pr = makePr({ threadsTruncated: true, codexReview: { reviewedHead: false, sha: "bbbbbbb" } });
+  const { classified, decision } = run(thread, { pr });
+  assert.equal(classified.state, "needs-human");
+  assert.equal(decision.action, "ask-user");
+  assert.notEqual(decision.playbook, "merge-ready");
+  assert.equal(decision.question.kind, "agent-ask");
+  assert.deepEqual(decision.question.options, ["open thread"]);
+  assert.match(decision.question.body, /Your decision on the two P1s/);
+});
+
+test("only the supervisor's own read gaps never nudge", () => {
+  const pr = makePr({ threadsTruncated: true, codexReview: { reviewedHead: false, sha: "bbbbbbb" } });
+  const { classified, decision } = run(makeThread(), { pr });
+  assert.deepEqual(classified.blockers, ["100+ threads, not all read", "Codex review not on head"]);
+  assert.equal(decision.action, "wait");
+  assert.equal(decision.message, null);
+});
+
+test("an agent that answered the last merge-ready nudge is left alone until a fact changes", () => {
+  const thread = makeThread();
+  const first = run(thread, { pr: redPr() }).decision;
+  assert.equal(first.action, "nudge");
+  assert.equal(first.playbook, "merge-ready");
+  assert.deepEqual(first.facts, [`head ${HEAD.slice(0, 10)}`, "lint failing"]);
+  assert.match(first.messageHash, /^[0-9a-f]{16}$/);
+  // It replied (30 min ago) after the nudge (40 min ago); nothing changed.
+  const ledger = sentLedger(first, 40 * MIN);
+  const same = run(thread, { pr: redPr(), ledger }).decision;
+  assert.equal(same.action, "wait");
+  assert.match(same.reason, /^agent answered the \d\d:\d\d nudge; nothing new$/);
+  // New head, another failing check: the nudge leads with what changed.
+  const newHead = "b".repeat(40);
+  const changed = run(thread, { pr: redPr({ headOid: newHead, ci: { state: "FAILURE", failing: ["lint", "types"], pending: [] } }), localGit: { ...cleanGit, head: newHead }, ledger }).decision;
+  assert.equal(changed.action, "nudge");
+  assert.match(changed.message, /^Since your \d\d:\d\d reply: new: head bbbbbbbbbb, types failing; cleared: head aaaaaaaaaa\. /);
+  assert.notEqual(changed.factsKey, first.factsKey);
+});
+
+test("a third party's approval is not an owner ask; the agent's repeat answer is respected", () => {
+  const thread = makeThread({ lastAgentText: "Supervisor warnings are stale. Blocked on: required reviewer approval from Adam/Nikhil." });
+  const pr = makePr({ reviewDecision: "REVIEW_REQUIRED", headOid: "c".repeat(40) });
+  const { classified, decision } = run(thread, { pr });
+  assert.notEqual(classified.state, "needs-human");
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.playbook, "merge-ready");
+  assert.equal(run(thread, { pr, ledger: sentLedger(decision, 40 * MIN) }).decision.action, "wait");
+});
+
+test("the same nudge is never sent twice in a row without a reply between", () => {
+  const first = run(makeThread(), { pr: redPr() }).decision;
+  // Sent 20 min ago; the agent last spoke 30 min ago.
+  const ledger = sentLedger(first, 20 * MIN);
+  const again = run(makeThread(), { pr: redPr(), ledger }).decision;
+  assert.equal(again.action, "wait");
+  assert.match(again.reason, /^same message sent at \d\d:\d\d; no reply since$/);
+  // A synthetic limit notice after the send is not a reply.
+  const notice = makeThread({ lastAgentText: "You've hit your session limit", lastAgentAt: ago(16 * MIN), lastAgentFullAt: ago(30 * MIN) });
+  assert.match(run(notice, { pr: redPr(), ledger }).decision.reason, /^same message sent at/);
+  // A reply that lands before delivery returns still counts: sentAt is the send's start.
+  const quick = run(makeThread({ lastAgentAt: ago(19.5 * MIN), lastActivityAt: ago(19.5 * MIN) }), { pr: redPr(), ledger: { ...ledger, nudges: [{ ...ledger.nudges[0], sentAt: ago(20 * MIN), at: ago(19 * MIN) }] } }).decision;
+  assert.match(quick.reason, /^agent answered the/);
+});
+
+test("a resume after a limit reset is never held back by an earlier nudge or reply", () => {
+  const thread = makeThread({
+    agentStatus: "error", error: { kind: "session-limit", text: "You've hit your session limit", resetAt: ago(10 * MIN) },
+    lastAgentText: "You've hit your session limit", lastAgentAt: ago(20 * MIN), lastAgentFullAt: ago(60 * MIN)
+  });
+  const first = run(thread).decision;
+  assert.equal(first.action, "nudge");
+  assert.equal(first.playbook, "resume");
+  // The identical resume went out 25 min ago and only the limit notice followed.
+  assert.equal(run(thread, { ledger: sentLedger(first, 25 * MIN) }).decision.action, "nudge");
+  // A real reply after it changes nothing for a resume either.
+  const replied = { ...thread, lastAgentFullAt: ago(21 * MIN) };
+  const again = run(replied, { ledger: sentLedger(first, 25 * MIN) }).decision;
+  assert.equal(again.action, "nudge");
+  assert.equal(again.playbook, "resume");
+});

@@ -1215,13 +1215,15 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
+    const sentAt = new Date(this.now()).toISOString();
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
     if ((delivery.route ?? action.route) === "computer-use") this.noteUiResult(thread, delivery);
-    this.recordSend(action, delivery);
+    this.recordSend(action, delivery, sentAt);
     return { action: this.store.action(actionId), delivery };
   }
 
-  recordSend(action, delivery) {
+  // sentAt: when the send started. A reply can land before delivery returns.
+  recordSend(action, delivery, sentAt = null) {
     const at = new Date(this.now()).toISOString();
     const incident = incidentKey(action);
     if (incident && ESCALATION_STATUSES.has(delivery.status)) this.store.recordEscalation(incident, at);
@@ -1233,7 +1235,9 @@ export class FleetSupervisor {
     const threadActivityAt = thread ? (thread.lastAgentAt && Date.parse(thread.lastAgentAt) > Date.parse(thread.lastActivityAt ?? "") ? thread.lastAgentAt : thread.lastActivityAt) : null;
     // The route that actually ran: a presence-blocked app send may have gone
     // by a background route instead.
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
+    // The policy's hash and facts, so the next decision can tell a repeat.
+    const said = { sentAt, messageHash: action.messageHash ?? null, factsKey: action.factsKey ?? null, facts: action.facts ?? null };
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt, ...said }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
     // back that one attempt. Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
@@ -1631,7 +1635,8 @@ export class FleetSupervisor {
       const target = targetKey ? byKey.get(targetKey) : null;
       const record = {
         threadKey: decision.threadKey, targetKey, playbook: decision.playbook, route: decision.route,
-        message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action
+        message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
+        ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
       if (existing) seenActions.add(existing.id);
@@ -1661,13 +1666,14 @@ export class FleetSupervisor {
       if (uiKey) typedInto.add(uiKey);
       tries += 1;
       attempted.add(decision.threadKey);
+      const sentAt = new Date(this.now()).toISOString();
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
       if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
       if (delivery.status !== "blocked") sends += 1;
       if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
       else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
-      this.recordSend(record, delivery);
+      this.recordSend(record, delivery, sentAt);
     }
 
     // A planned/proposed action the policy no longer wants is stale.

@@ -79,6 +79,8 @@ export const DEFAULTS = Object.freeze({
   // A question card item's full question and its numbered choices.
   cardBodyMax: 900,
   excerptMax: 600,
+  // The agent's whole final message, lines kept, for reading its report.
+  fullTextMax: 8000,
   // The self-review reads this much of each thread's last agent message.
   reviewTailMax: 1500,
   maxThreads: 150,
@@ -519,6 +521,15 @@ export function clampTail(value, max) {
   return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
 }
 
+// clampTail with the lines kept: spaces collapse, newlines (and one blank
+// line between blocks) stay, so lists and sections can still be read.
+export function clampTailLines(value, max) {
+  const text = String(value ?? "").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ")
+    .replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!max || text.length <= max) return text;
+  return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
+}
+
 export function isPidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -646,6 +657,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {string|null} lastActivityAt ISO
  * @property {string} lastAgentText       untrusted, redacted, <= excerptMax
  * @property {string} lastAgentTail       the same message, <= reviewTailMax (self-review only)
+ * @property {string} [lastAgentFull]     the last real (not synthetic) agent message, lines kept, <= fullTextMax
+ * @property {string|null} [lastAgentFullAt] when that message was written
  * @property {string|null} lastAgentAt
  * @property {string} lastUserText
  * @property {string|null} lastUserAt

@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
   threadKey, toIso
 } from "../contracts.js";
 import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
@@ -79,7 +79,7 @@ function eventText(event) {
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    pendingAsk: null
+    pendingAsk: null, fullText: "", fullAt: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
@@ -113,6 +113,11 @@ function summarizeTail(rowsNewestFirst) {
       if (text) {
         summary.lastAgentText = text;
         summary.lastAgentAt = at;
+        // A "<synthetic>" row (a session limit notice) is not the agent's reply.
+        if (event.message?.model !== "<synthetic>") {
+          summary.fullText = text;
+          summary.fullAt = at;
+        }
       }
     } else if (event.type === "result") {
       const errors = Array.isArray(event.errors) ? event.errors.join("; ") : "";
@@ -122,6 +127,8 @@ function summarizeTail(rowsNewestFirst) {
       if (!isError && !summary.lastAgentText && event.result) {
         summary.lastAgentText = String(event.result);
         summary.lastAgentAt = at;
+        summary.fullText = summary.lastAgentText;
+        summary.fullAt = at;
       }
     } else if (event.type === "error") {
       summary.lastEnd = { isError: true, text: String(event.content ?? ""), at };
@@ -303,6 +310,8 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
     lastActivityAt: summary.lastAt ?? dbTimeToIso(row.updated_at),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
+    lastAgentFull: clampTailLines(redactSecrets(summary.fullText), limits.fullTextMax),
+    lastAgentFullAt: summary.fullAt,
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,

@@ -3072,3 +3072,26 @@ test("the review never sees or closes a card question", async (t) => {
   assert.equal(model.calls.length, 0);
   assert.equal(cardQuestions(supervisor).length, 2);
 });
+
+test("a sent nudge keeps its hash, facts and start time, and an answered one is not resent", async (t) => {
+  let clock = NOW;
+  const thread = makeThread();
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].playbook, "merge-ready");
+  const entry = supervisor.store.ledgerFor("codex:t1").nudges[0];
+  assert.equal(entry.status, "sent");
+  assert.equal(entry.sentAt, new Date(NOW).toISOString());
+  assert.match(entry.messageHash, /^[0-9a-f]{16}$/);
+  assert.match(entry.factsKey, /^[0-9a-f]{16}$/);
+  assert.deepEqual(entry.facts, ["2 open threads", `head ${HEAD.slice(0, 10)}`, "verification failing"]);
+  // The agent answered at +5 min; at +40 nothing has changed.
+  thread.lastAgentAt = new Date(NOW + 5 * MIN).toISOString();
+  thread.lastActivityAt = thread.lastAgentAt;
+  clock = NOW + 40 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  const decision = supervisor.getState().snapshot.threads.find((item) => item.key === "codex:t1").decision;
+  assert.match(decision.reason, /^agent answered the \d\d:\d\d nudge; nothing new$/);
+});

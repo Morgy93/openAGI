@@ -654,3 +654,20 @@ test("a card item keeps its raw labels, a long body, and a dismissal holds its l
   assert.equal(other.suppressed, undefined);
   assert.equal(other.status, "open");
 });
+
+test("a nudge keeps when its send started, its message hash and the facts it was about", (t) => {
+  const store = new FleetStore({ dir: tempDir(t), now: clock() });
+  store.recordNudge("codex:a", {
+    at: "2026-09-26T12:00:02.000Z", sentAt: "2026-09-26T12:00:00.000Z", playbook: "merge-ready", route: "codex-exec", status: "sent",
+    messageHash: "abc", factsKey: "k1", facts: ["head 1234567890", "lint failing", ...Array.from({ length: 10 }, (_, i) => `f${i}`)]
+  });
+  store.recordNudge("codex:a", { at: "2026-09-26T12:20:00.000Z", playbook: "resume", status: "sent" });
+  const [first, second] = store.ledgerFor("codex:a").nudges;
+  assert.equal(first.sentAt, "2026-09-26T12:00:00.000Z");
+  assert.equal(first.messageHash, "abc");
+  assert.equal(first.factsKey, "k1");
+  assert.equal(first.facts.length, 8);
+  assert.deepEqual(first.facts.slice(0, 2), ["head 1234567890", "lint failing"]);
+  assert.equal(second.sentAt, undefined);
+  assert.equal(second.factsKey, undefined);
+});

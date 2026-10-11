@@ -521,3 +521,22 @@ test("a card pushed out of the tail by subagent rows is still read, until its an
   thread = byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"];
   assert.equal(thread.meta.pendingCard, null);
 });
+
+test("the agent's whole last message is kept with its lines; a synthetic limit row is not its reply", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  const report = `${"Earlier notes. ".repeat(60)}\n\n**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head`;
+  addMessage(db, "s-idle", "assistant", sdk.text("s-idle", report), iso(15 * MIN));
+  const limit = sdk.text("s-idle", "You've hit your session limit · resets 2:30pm");
+  limit.message.model = "<synthetic>";
+  addMessage(db, "s-idle", "assistant", limit, iso(14 * MIN));
+  db.close();
+  const thread = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
+  assert.match(thread.lastAgentText, /session limit/);
+  assert.ok(thread.lastAgentText.length <= DEFAULTS.excerptMax);
+  assert.ok(thread.lastAgentFull.length > DEFAULTS.excerptMax);
+  assert.ok(thread.lastAgentFull.endsWith("Earlier notes.\n\n**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head"));
+  assert.equal(thread.lastAgentFullAt, iso(15 * MIN));
+  assert.equal(thread.lastAgentAt, iso(14 * MIN));
+});

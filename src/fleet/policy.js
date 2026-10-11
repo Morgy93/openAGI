@@ -28,8 +28,8 @@ const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
 const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
-// does nothing for them.
-const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
+// does nothing for them. "Not all read" is the supervisor's own read gap.
+const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown", "100+ threads, not all read"]);
 // "CI running", or a required check still running ("BuildBot3 full run pending").
 // A gate GitHub did not finish reading waits for the next read like a running one.
 const ciRunning = (blocker) => blocker === "CI running" || / (?:pending|unread)$/.test(blocker);
@@ -343,7 +343,7 @@ function waitingIntent(ctx) {
     if (wait.taskKind || age < limits.waitingTaskMaxMs) return { type: "wait", reason: wait.reason ?? "waiting on a background task" };
     if (ciDone) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
     const blockers = classified.readiness?.blockers ?? [];
-    if (pr?.state === "OPEN" && blockers.length && !blockers.some(ciRunning)) {
+    if (pr?.state === "OPEN" && blockers.length && !blockers.some(ciRunning) && !blockers.every(passive)) {
       return nudge("merge-ready", `waiting ${minutes(age)}m; not ready: ${blockers.join("; ")}`, { immediate: true });
     }
     if (silent) return statusCheck("a background task", quietMs);
@@ -466,7 +466,8 @@ function agentAskIntent(ctx) {
     };
   }
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
-  const options = ask.structured ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
+  // A "Blocked on:" ask brings its own answers ("open thread" at least).
+  const options = ask.structured || ask.blocked ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
   // A sealed Codex ask brings its own key: its shown text is a stand-in.
   return {
@@ -528,6 +529,8 @@ function resolveNudge(ctx, intent, base) {
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   if (deliberateStop(thread)) return { ...decision, reason: "owner stopped this turn" };
+  const reply = replyCheck(ctx, intent.playbook);
+  if (reply.wait) return { ...decision, action: "wait", reason: reply.wait };
   if (!intent.immediate) {
     const idleUntil = addMs(latest(thread.lastAgentAt, thread.lastActivityAt), limits.idleBeforeNudgeMs);
     if (idleUntil && Date.parse(idleUntil) > now) return { ...decision, action: "wait", reason: "recently active", notBefore: idleUntil };
@@ -560,7 +563,85 @@ function resolveNudge(ctx, intent, base) {
     if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
     return { ...unreachableDecision(ctx, decision), uiBlocked };
   }
-  return { ...decision, action: "nudge", route, message: renderTemplate(playbook.body, vars) };
+  const message = `${reply.prefix}${renderTemplate(playbook.body, vars)}`;
+  const messageHash = shortHash(message);
+  // The same words twice in a row, with no reply between, is noise.
+  const repeat = REPEAT_GUARDED(intent.playbook) ? lastReached(ledger) : null;
+  if (repeat?.messageHash === messageHash && !repliedAfter(thread, repeat)) {
+    return { ...decision, action: "wait", reason: `same message sent at ${clock(sentAtOf(repeat))}; no reply since` };
+  }
+  return { ...decision, action: "nudge", route, message, messageHash, factsKey: reply.factsKey, facts: reply.facts };
+}
+
+// Nudges that report on the PR. Resume, status checks and limit retries
+// are never held back by an earlier answer.
+const REPLY_AWARE = new Set(["merge-ready", "ci-finished"]);
+const REPEAT_GUARDED = (playbook) => playbook !== "resume" && playbook !== "status-check";
+const FACTS_KEPT = 8;
+
+// The agent ended a real turn after the last nudge of this playbook. Same
+// facts: its answer stands, so wait. New facts: lead with what changed.
+function replyCheck(ctx, playbookId) {
+  const none = { wait: null, prefix: "", factsKey: null, facts: null };
+  if (!REPLY_AWARE.has(playbookId)) return none;
+  const facts = nudgeFacts(ctx);
+  const factsKey = shortHash(facts.join("\n"));
+  const out = { ...none, factsKey, facts };
+  const last = lastSent(ctx.ledger, playbookId);
+  if (!last || !repliedAfter(ctx.thread, last)) return out;
+  if (last.factsKey === factsKey) return { ...out, wait: `agent answered the ${clock(sentAtOf(last))} nudge; nothing new` };
+  // A nudge from before facts were kept: nothing to compare, so no prefix.
+  if (!Array.isArray(last.facts)) return out;
+  const added = facts.filter((item) => !last.facts.includes(item));
+  const cleared = last.facts.filter((item) => !facts.includes(item));
+  const parts = [added.length ? `new: ${added.join(", ")}` : "", cleared.length ? `cleared: ${cleared.join(", ")}` : ""].filter(Boolean);
+  return { ...out, prefix: `Since your ${clock(replyAt(ctx.thread))} reply: ${parts.join("; ") || "facts changed"}. ` };
+}
+
+// What the agent can act on: blockers it can clear, failing checks, the head.
+function nudgeFacts(ctx) {
+  const { classified, pr } = ctx;
+  const blockers = (classified.blockers?.length ? classified.blockers : classified.readiness?.blockers) ?? [];
+  const failing = (pr?.ci?.failing ?? []).map((name) => fact(name, 60)).filter(Boolean);
+  const out = blockers.filter((blocker) => !passive(blocker) && !(failing.length && /^CI red:/.test(blocker))).map((blocker) => fact(blocker, 80));
+  for (const name of failing) out.push(`${name} failing`);
+  const head = shortSha(pr?.headOid);
+  if (head) out.push(`head ${head}`);
+  return [...new Set(out)].sort().slice(0, FACTS_KEPT);
+}
+
+function lastSent(ledger, playbookId) {
+  return (ledger?.nudges ?? []).filter((entry) => entry?.playbook === playbookId && entry.status === "sent").at(-1) ?? null;
+}
+
+// The newest nudge or owner answer that reached the thread.
+function lastReached(ledger) {
+  return (ledger?.nudges ?? []).filter((entry) => entry?.status === "sent" || entry?.status === "owner-answer").at(-1) ?? null;
+}
+
+// When the send started: the ledger's own time is written after delivery,
+// which can be after a reply that came at once.
+function sentAtOf(entry) {
+  return entry?.sentAt ?? entry?.at ?? null;
+}
+
+// The agent's last real message (never a synthetic limit notice or an error).
+function replyAt(thread) {
+  return thread.lastAgentFullAt !== undefined ? thread.lastAgentFullAt : thread.lastAgentAt;
+}
+
+function repliedAfter(thread, entry) {
+  if (thread.agentStatus === "running") return false;
+  const reply = Date.parse(replyAt(thread) ?? "");
+  const sent = Date.parse(sentAtOf(entry) ?? "");
+  return Number.isFinite(reply) && Number.isFinite(sent) && reply > sent;
+}
+
+// "18:17", local time.
+function clock(iso) {
+  const at = Date.parse(iso ?? "");
+  if (!Number.isFinite(at)) return "?";
+  return new Date(at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 }
 
 function stuckDecision(ctx, playbook, vars, attempts, decision) {
