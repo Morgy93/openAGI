@@ -2101,6 +2101,19 @@ test("a Conductor chat busy with background tasks gets ⌘↩ (sent now) unless 
   assert.equal(normal.detail, "typed into Conductor");
 });
 
+test("⌘↩ is never pressed when a permission card came up during the last owner check", async (t) => {
+  let typed = false; let reads = 0; let app;
+  const f = setup(t, { transportOptions: { onCall: (name) => {
+    if (name === "type_text") typed = true;
+    if (name === "get_app_state" && typed && ++reads === 2) app.prompt = true;
+  } } });
+  app = f.app;
+  const result = await f.driver.deliver(f.request({ busy: true, sendNow: true }));
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /permission prompt appeared before send/);
+  assert.ok(!f.calls().some((call) => call.name === "press_key" && call.args.key === "super+Return"), "the chord was not pressed");
+});
+
 test("a message that says 'Secondary Actions:' is read back whole", () => {
   const said = `${MESSAGE} Note, Secondary Actions: none`;
   const state = stateOf(conductorComposer(said));

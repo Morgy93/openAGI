@@ -21,6 +21,8 @@ const RELAY_TIMEOUT_MS = 180_000;
 const RELAY_MIN_MS = 60_000;
 // The send-time re-read of a chat before a background relay, at most.
 const REFRESH_MAX_MS = 20_000;
+// The send-time read of a Conductor chat's tasks (send now or queue).
+const BUSY_REFRESH_MS = 8_000;
 // A remote caller with less left than this gets no background fallback: its
 // checks (a lock read, at most 10 s) and the launch must fit.
 const FALLBACK_MIN_MS = 15_000;
@@ -377,13 +379,22 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // deadlineAt: when a remote caller stops waiting (null: no such caller).
   // The Conductor chat a send lands in (the thread itself, or the one a
   // Codex thread is hosted in) is waiting on background tasks.
-  const conductorBusy = (thread, target) => {
+  // Read again at send time when it can be: a task started after the scan
+  // would otherwise queue the message behind it.
+  const conductorBusy = async (thread, target) => {
     if (target?.app !== "conductor") return false;
     let chat = thread.kind === "conductor" ? thread : null;
     if (!chat && target.sessionId) {
       let threads = [];
       try { threads = knownThreads() ?? []; } catch { threads = []; }
       chat = threads.find((item) => item?.kind === "conductor" && item.id === target.sessionId) ?? null;
+    }
+    const sessionId = chat?.id ?? target.sessionId;
+    if (refreshThread && sessionId) {
+      try {
+        const fresh = await within(Promise.resolve().then(() => refreshThread({ kind: "conductor", id: sessionId, key: `conductor:${sessionId}` })), BUSY_REFRESH_MS);
+        if (fresh) chat = fresh;
+      } catch { /* the scan's reading stands */ }
     }
     return Boolean(chat) && (chat.agentStatus === "waiting" || (chat.openTasks?.length ?? 0) > 0);
   };
@@ -392,7 +403,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // until they end: the supervisor's messages are about now, so they are
   // sent now (⌘↩) unless the caller asked to queue.
   const typeInApp = async (thread, step, base, actionId, text, spentMs, deadlineAt, queue = false) => {
-    const busy = conductorBusy(thread, step.target);
+    const busy = await conductorBusy(thread, step.target);
     const target = step.target;
     const entered = Date.now();
     const evidenceName = actionId ?? `${thread.kind}-${String(thread.id).slice(0, 8)}-${Date.now()}`;
@@ -511,6 +522,9 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
     };
     const reason = checkPreconditions(thread, route, message, config, Boolean(fallbackFrom));
+    // Only the app can queue a message behind a Conductor chat's background
+    // tasks: a relay or resume would deliver it now.
+    if (!reason && queue && route !== "computer-use" && (thread.kind === "conductor" || thread.meta?.conductorHost)) return blocked("queue needs the Conductor app: not sent another way");
     if (reason) return blocked(reason);
     // The scan's liveness is a snapshot; a session opened since then would fork.
     if (route === "claude-resume" && readLivePeers) {
@@ -543,7 +557,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       // The owner is at the Mac: a route that does not take the screen, if
       // the owner allowed one for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
-      if (!isPresenceBlock(result) || queue) return result;
+      if (!isPresenceBlock(result) || (queue && await conductorBusy(thread, step.target))) return result;
       const fallback = await fallbackRoute(thread, step.target, deadlineAt);
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };

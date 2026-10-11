@@ -1546,6 +1546,18 @@ export function createUiDriver({
       if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`, card?.prompt ? { prompt: card.prompt } : {});
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
+      if (sendNow) {
+        // ⌘↩ also answers a permission card ("Allow once ⌘↩"): one that came
+        // up during the owner check would be approved. Read once more.
+        state = await readState(ctx, signal);
+        const latest = composerIn(ctx, state).composer;
+        const raisedNow = promptBlock(state, target.bundleId);
+        if (raisedNow) return outcome(ctx, "blocked", `permission prompt appeared before send; ${LEFT_AS_DRAFT}`, raisedNow.prompt ? { prompt: raisedNow.prompt } : {});
+        if (!latest || !isComposerFocused(state, latest) || !verifyIdentity(state, identity).ok || normalizeUiText(latest.value) !== normalizeUiText(text)) {
+          return outcome(ctx, "blocked", `send not pressed: the composer changed before ⌘↩; ${LEFT_AS_DRAFT}`);
+        }
+        if (hasStopButton(state)) return outcome(ctx, "blocked", `turn started before send; ${LEFT_AS_DRAFT}`);
+      }
       await press(ctx, sendNow ? "super+Return" : "Return", signal);
       ctx.keyEnd = now();
     }
