@@ -415,7 +415,9 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       const guard = unconfirmed.get(target.targetKey);
       const previousUnconfirmed = guard?.hash === base.messageHash ? { priorCount: guard.priorCount } : false;
       try {
-        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName, spentMs: spentMs + (Date.now() - entered), deadlineAt, busy, sendNow: busy && !queue });
+        // busyNow: read again at the final send step (a task can start
+        // while the app is opened and the text typed).
+        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName, spentMs: spentMs + (Date.now() - entered), deadlineAt, busy, queue, sendNow: busy && !queue, busyNow: () => conductorBusy(thread, target) });
       } catch (error) {
         return { status: "failed", detail: `computer use failed: ${detailText(error?.message ?? error)}; nothing confirmed` };
       }
@@ -557,7 +559,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       // The owner is at the Mac: a route that does not take the screen, if
       // the owner allowed one for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
-      if (!isPresenceBlock(result) || (queue && await conductorBusy(thread, step.target))) return result;
+      if (!isPresenceBlock(result) || (queue && step.target?.app === "conductor")) return result;
       const fallback = await fallbackRoute(thread, step.target, deadlineAt);
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };

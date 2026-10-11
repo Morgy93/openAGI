@@ -1516,8 +1516,13 @@ export function createUiDriver({
     ctx.phase = "sending";
     const send = findSendButton(state, target.bundleId);
     // Conductor queues a message while the agent's background tasks run (its
-    // Send button and Return do); ⌘↩ sends it now. The caller says which.
-    const sendNow = request.sendNow === true && target.app === "conductor";
+    // Send button and Return do); ⌘↩ sends it now. Whether they run is read
+    // again here, at the send itself; the caller can ask to queue.
+    let busy = request.busy === true;
+    if (target.app === "conductor" && typeof request.busyNow === "function") {
+      try { busy = (await request.busyNow()) === true; } catch { /* the earlier reading stands */ }
+    }
+    const sendNow = target.app === "conductor" && request.queue !== true && (busy || request.sendNow === true);
     let pressed = false;
     if (send && !sendNow) {
       try {
@@ -1562,7 +1567,7 @@ export function createUiDriver({
       ctx.keyEnd = now();
     }
     ctx.phase = "sent";
-    const how = sendNow ? "; sent now (⌘↩)" : request.busy && target.app === "conductor" ? "; queued behind its background tasks" : "";
+    const how = sendNow ? "; sent now (⌘↩)" : busy && target.app === "conductor" ? "; queued behind its background tasks" : "";
 
     // 10. Confirm: composer empty and one more transcript copy of our text.
     const deadline = now() + limits.uiConfirmMs;

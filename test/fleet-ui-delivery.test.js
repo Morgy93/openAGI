@@ -2090,7 +2090,7 @@ test("a Conductor chat busy with background tasks gets ⌘↩ (sent now) unless 
   assert.ok(!now.calls().some((call) => call.name === "click" && call.args.element_index === "62"), "never the Send button");
   // Asked to queue: its Send button, and the result says it waits.
   const queued = setup(t);
-  const later = await queued.driver.deliver(queued.request({ busy: true, sendNow: false }));
+  const later = await queued.driver.deliver(queued.request({ busy: true, sendNow: false, queue: true }));
   assert.equal(later.status, "sent");
   assert.match(later.detail, /queued behind its background tasks/);
   assert.ok(queued.calls().some((call) => call.name === "click" && call.args.element_index === "62"));
@@ -2099,6 +2099,16 @@ test("a Conductor chat busy with background tasks gets ⌘↩ (sent now) unless 
   const plain = setup(t);
   const normal = await plain.driver.deliver(plain.request());
   assert.equal(normal.detail, "typed into Conductor");
+});
+
+test("a task that starts while the text is typed still gets ⌘↩; queue asked for keeps the Send button", async (t) => {
+  const f = setup(t);
+  const sent = await f.driver.deliver(f.request({ busy: false, sendNow: false, busyNow: async () => true }));
+  assert.match(sent.detail, /sent now \(⌘↩\)/);
+  const g = setup(t);
+  const queued = await g.driver.deliver(g.request({ busy: false, queue: true, busyNow: async () => true }));
+  assert.match(queued.detail, /queued behind its background tasks/);
+  assert.ok(!g.calls().some((call) => call.name === "press_key" && call.args.key === "super+Return"));
 });
 
 test("⌘↩ is never pressed when a permission card came up during the last owner check", async (t) => {
