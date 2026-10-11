@@ -2265,3 +2265,14 @@ test("owner text arriving during input is preserved and never submitted", async 
   assert.deepEqual(app.transcript, ["[OpenAGI supervisor] earlier note", "Pushed the fix."]);
   assert.equal(f.calls().some(call => call.name === "set_value"), false);
 });
+
+
+test("a Conductor draft equal to its placeholder remains a draft", () => {
+  for (const text of [CONDUCTOR_PLACEHOLDER, "Add a follow up"]) {
+    const state = stateOf(conductorComposer(text).replaceAll(CONDUCTOR_PLACEHOLDER, text));
+    const composer = findComposer(state).composer;
+    assert.equal(composer.value, text);
+    assert.equal(composerEmpty(composer), false);
+    assert.equal(screenSummary(state).draft, true);
+  }
+});

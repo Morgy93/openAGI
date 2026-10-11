@@ -234,7 +234,8 @@ export function parseAppState(result) {
       const shown = normalizeUiText(String(element.rawText ?? element.label).replace(/\\n/g, " "));
       // Real Codex empty fields have a doubled parent placeholder and a
       // single child placeholder. Never discard other child text.
-      if (placeholder && shown === `${placeholder} ${placeholder}` && normalizeUiText(value) === placeholder) {
+      if (header?.[1] === "com.openai.codex" && placeholder
+          && shown === `${placeholder} ${placeholder}` && normalizeUiText(value) === placeholder) {
         element.innerText = [];
         element.value = "";
       } else element.value = value;
@@ -461,17 +462,15 @@ function composerPlaceholder(composer) {
     || shown.startsWith(`${placeholder} `) || shown.startsWith(`${placeholder}[`)) ?? null;
 }
 
-// Empty: the row shows nothing, or only a known placeholder (Codex prints it
-// twice), and holds no text beyond an inner row that is that placeholder (an
-// empty Codex composer keeps one). An unknown label may be a draft.
+// Empty: no value or retained inner text, and only a known placeholder on
+// the row. parseAppState normalizes Codex's empty representation; Conductor
+// placeholder-valued inner text is an owner's draft and stays non-empty.
 export function composerEmpty(composer) {
-  if (!composer || composer.fields?.value) return false;
+  if (!composer || composer.fields?.value || normalizeUiText(composer.value) || composer.innerText?.length) return false;
   const shown = normalizeUiText(String(composer.label ?? "").replace(/\\n/g, " "));
   const placeholder = composerPlaceholder(composer);
   if (shown && !(placeholder && (shown === placeholder || shown === `${placeholder} ${placeholder}`))) return false;
-  const inner = (composer.innerText ?? []).map((part) => normalizeUiText(part)).filter(Boolean);
-  if (inner.length) return Boolean(placeholder) && inner.length === 1 && inner[0] === placeholder;
-  return !normalizeUiText(composer.value);
+  return true;
 }
 
 // Recover only the complete known placeholder followed by exactly our text.
