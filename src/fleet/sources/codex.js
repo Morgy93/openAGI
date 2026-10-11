@@ -363,6 +363,7 @@ const CARD_SCAN_ROWS = 4000;
 // A projection this close to the rollout's size is caught up; one further
 // behind (or past the end) leaves the newest asks and replies to the tail.
 const PROJECTION_SLACK_BYTES = 64 * 1024;
+const UNINDEXED_CARD_ROWS = /request_user_input_async|"delivery":"async"|"type":"user_message"|"type":"UserMessage"/;
 // A continuation segment (<id>_<segment id>.jsonl) is indexed under the
 // segment's id; the thread's own projection stopped with the older file.
 const SEGMENT_PATTERN = /_([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/i;
@@ -409,6 +410,10 @@ export function readHistoryCard(history, id, { bytes = null, rolloutPath = null,
     const indexed = SEGMENT_PATTERN.exec(String(rolloutPath ?? ""))?.[1] ?? id;
     const state = history.projection.get(indexed);
     if (!state || (Number.isFinite(bytes) && Math.abs(bytes - Number(state.offset)) > PROJECTION_SLACK_BYTES)) return undefined;
+    // Rows the projection has not reached yet that add an ask, answer one,
+    // or start an owner turn leave the card to the tail.
+    const lag = Number.isFinite(bytes) ? bytes - Number(state.offset) : 0;
+    if (lag > 0 && UNINDEXED_CARD_ROWS.test(readTail(rolloutPath, lag + 1))) return undefined;
     const replies = [];
     let owner = null;
     const users = history.users.all(indexed);

@@ -1030,6 +1030,30 @@ test("history cards: a lagging or overrun projection leaves the card to the tail
   assert.deepEqual(map["t-seg"].meta.pendingCard?.items.map((item) => item.itemId), ["call_seg:0"]);
 });
 
+test("history cards: a reply or an ask the projection has not reached yet is read from the tail", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.userItem("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  // Answered a moment ago: the reply is in the rollout, a few bytes past the projection.
+  const answered = addThread(ctx, { id: "t-answered", lines: asked });
+  const indexedAt = fs.statSync(answered).size;
+  fs.appendFileSync(answered, `${JSON.stringify(ev.userItem(cardReply([["call_q", 0, "Keep it"]]), MIN))}\n`);
+  // Unrelated agent rows past the projection leave the history card standing.
+  const working = addThread(ctx, { id: "t-working", lines: asked });
+  const workingAt = fs.statSync(working).size;
+  fs.appendFileSync(working, `${JSON.stringify(ev.assistant("Still checking.", MIN))}\n`);
+  for (const [id, rollout, offset] of [["t-answered", answered, indexedAt], ["t-working", working, workingAt]]) {
+    h.turn(id, "turn-a");
+    h.user(id, "turn-a", "QA it", 30 * MIN);
+    h.ask(id, "turn-a", "call_q", [{ title: "Keep the cache warm? (indexed)", options: ["Keep it", "Drop it"] }], 20 * MIN);
+    h.project(id, rollout, { offset });
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-answered"].meta.pendingCard, null);
+  assert.equal(map["t-working"].meta.pendingCard?.items[0].question, "Keep the cache warm? (indexed)");
+});
+
 test("tail cards: an owner's new turn closes them, a steer inside the ask's turn does not", async (t) => {
   const ctx = makeHome(t);
   const asked = [turnStart("turn-a", 30 * MIN), ev.userItem("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
