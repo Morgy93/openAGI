@@ -1076,6 +1076,8 @@ export function dedupeDecisions(decisions) {
     if (decision?.action === "escalate-manager") {
       const key = `${decision.targetKey ?? ""}\u0000${decision.playbook ?? ""}`;
       if (!escalated.has(key)) out.push(decision);
+      // A dropped duplicate escalation still asks its card.
+      else if (decision.cardQuestion) out.push({ ...decision, action: "none", message: null, route: null });
       escalated.add(key);
     } else if (decision?.action !== "nudge" || !sent.has(decision.threadKey)) {
       if (decision?.action === "nudge") sent.add(decision.threadKey);

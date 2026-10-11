@@ -1323,6 +1323,15 @@ test("a Codex card never holds back a limit resume, a stopped turn or the PR; it
   assert.equal(kept.length, 2);
   assert.equal(kept[1].action, "none");
   assert.equal(kept[1].cardQuestion.dedupeKey, "k");
+  // So does a duplicate escalation of the same jam.
+  const escalations = dedupeDecisions([
+    { threadKey: "infra", action: "escalate-manager", targetKey: "conductor:mgr", playbook: "bb3-jam", message: "jam" },
+    { threadKey: "codex:t2", action: "escalate-manager", targetKey: "conductor:mgr", playbook: "bb3-jam", message: "jam", cardQuestion: { dedupeKey: "k2" } }
+  ]);
+  assert.equal(escalations.length, 2);
+  assert.equal(escalations[1].action, "none");
+  assert.equal(escalations[1].message, null);
+  assert.equal(escalations[1].cardQuestion.dedupeKey, "k2");
 });
 
 // --- Context-aware nudges ----------------------------------------------------
