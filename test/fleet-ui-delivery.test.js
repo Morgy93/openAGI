@@ -592,7 +592,9 @@ test("a filled composer's text is its inner text row: one composer, its value, n
   const codex = (row) => findComposer(stateOf(`App=com.openai.codex (pid 9)\n0 standard window Codex\n  1 group\n    2 text entry area (settable, string) ${row}`)).composer;
   assert.equal(composerEmpty(codex("Do anything Do anything\\n")), true);
   assert.equal(composerEmpty(codex("Work with Codex Work with Codex")), true);
-  assert.equal(composerEmpty(codex("Work with Codex half a note")), false);
+  assert.equal(composerEmpty(codex("Work with Codex half a note")), false, "an unknown label may be a draft");
+  // Conductor's placeholder in a chat with history.
+  assert.equal(composerEmpty(findComposer(stateOf(conductorComposer(null).replace("Secondary Actions: Show Writing Tools", "Add a follow up, Secondary Actions: Show Writing Tools"))).composer), true);
 });
 
 test("our text behind a placeholder left by an earlier attempt is set back to exactly ours and sent", async (t) => {
@@ -601,8 +603,8 @@ test("our text behind a placeholder left by an earlier attempt is set back to ex
   assert.equal(result.status, "sent");
   assert.deepEqual(typed(f.calls()), [MESSAGE]);
   assert.equal(f.app.transcript.at(-1), MESSAGE);
-  // Something unreadable on the row with no value: may be the owner's.
-  const g = setup(t, { app: fakeApp({ composerLabel: "Work with Codex half a note" }) });
+  // A value the row reports outright is never replaced.
+  const g = setup(t, { app: fakeApp({ composerLabel: "Work with Codex", composer: "half a note" }) });
   const kept = await g.driver.deliver(g.request());
   assert.equal(kept.status, "blocked");
   assert.match(kept.detail, /draft in composer/);

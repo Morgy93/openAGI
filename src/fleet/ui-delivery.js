@@ -440,7 +440,8 @@ export function looksLikeOurs(value, text) {
 const COMPOSER_PLACEHOLDERS = new Set([
   "Do anything",
   "Work with Codex",
-  "Ask to make changes, @mention files, run /commands"
+  "Ask to make changes, @mention files, run /commands",
+  "Add a follow up"
 ]);
 
 function composerPlaceholder(composer) {
@@ -451,12 +452,14 @@ function composerPlaceholder(composer) {
     || shown.startsWith(`${placeholder} `) || shown.startsWith(`${placeholder}[`)) ?? null;
 }
 
+// Empty: the row shows nothing, or only a known placeholder (Codex prints it
+// twice), and holds no text beyond an inner row that is that placeholder (an
+// empty Codex composer keeps one). An unknown label may be a draft.
 export function composerEmpty(composer) {
-  if (!composer) return false;
+  if (!composer || composer.fields?.value) return false;
   const shown = normalizeUiText(String(composer.label ?? "").replace(/\\n/g, " "));
   const placeholder = composerPlaceholder(composer);
   if (shown && !(placeholder && (shown === placeholder || shown === `${placeholder} ${placeholder}`))) return false;
-  // An empty Codex composer keeps its placeholder as an inner text row.
   const inner = (composer.innerText ?? []).map((part) => normalizeUiText(part)).filter(Boolean);
   if (inner.length) return Boolean(placeholder) && inner.length === 1 && inner[0] === placeholder;
   return !normalizeUiText(composer.value);
