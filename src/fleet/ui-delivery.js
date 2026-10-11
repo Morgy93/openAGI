@@ -494,7 +494,7 @@ export function transcriptCount(state, needle, composer = null) {
   const want = normalizeUiText(needle).toLowerCase();
   if (!want) return 0;
   return (state?.elements ?? []).filter((element) => element !== composer && element.id !== composer?.id && !isEditable(element) && !element.inner
-    && normalizeUiText(`${element.label} ${element.value}`).toLowerCase().includes(want)).length;
+    && normalizeUiText(`${element.label} ${element.value} ${element.rawText ?? ""}`).toLowerCase().includes(want)).length;
 }
 
 function labelToken(element) {
@@ -1481,6 +1481,20 @@ export function createUiDriver({
     // as a draft (a retry sends exactly it), and the outcome says to check it.
     const back = await ownerCheck(ctx, target);
     if (back) return outcome(ctx, "blocked", `${back}; ${LEFT_AS_DRAFT}`);
+    // Keyboard input into an empty Conductor or Codex composer can keep the
+    // app's placeholder as text in front of ours (seen with OCU 0.3.5). A
+    // composer holding exactly the known placeholder and then exactly what
+    // this delivery just typed holds nothing of the owner's: only then is it
+    // set to exactly our text. Anything else is left as it is.
+    if (!leftover && found.composer && placeholderJunk(found.composer, text)) {
+      await act(ctx, "set_value", { app: target.bundleId, element_index: found.composer.id, value: text }, signal);
+      state = await readState(ctx, signal);
+      if (!verifyIdentity(state, identity).ok) {
+        keep(ctx, "after", state);
+        return outcome(ctx, "blocked", "thread changed before send; our text may be left as a draft in the thread, check it");
+      }
+      found = composerIn(ctx, state);
+    }
     if (!found.composer || normalizeUiText(found.composer.value) !== normalizeUiText(text)) {
       keep(ctx, "after", state);
       return outcome(ctx, "failed", `text mismatch, not sent; ${LEFT_AS_DRAFT}`);

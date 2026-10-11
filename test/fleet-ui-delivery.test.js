@@ -120,7 +120,7 @@ function fakeTransport(app, { failOn = null, failError = null, latency = null, a
       }
       if (name === "set_value") {
         if (String(args.element_index) !== "61") throw new Error("set_value: not the composer");
-        app.composer = app.onType ? app.onType(args.value) : args.value;
+        app.composer = args.value;
         return { isError: false, content: [] };
       }
       if (name === "press_key") {
@@ -2019,6 +2019,27 @@ test("Codex's 'Approve for me' permission-mode menu is not a permission prompt (
   const filled = stateOf(text.replace(/(\t+)2679 text Do anything/, `$12679 text ${MESSAGE}`).replace("Do anything Do anything\\n", `Do anything ${MESSAGE}`));
   assert.equal(findComposer(filled).composer.value, MESSAGE);
   assert.equal(composerEmpty(findComposer(filled).composer), false);
+});
+
+test("our just-typed text behind the app's placeholder is set to exactly ours; anything else is left", async (t) => {
+  const f = setup(t, { app: fakeApp({ composerLabel: CONDUCTOR_PLACEHOLDER, onType: (text) => `${CONDUCTOR_PLACEHOLDER}${text}` }) });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent");
+  assert.deepEqual(f.calls().filter((call) => call.name === "set_value").map((call) => call.args.value), [MESSAGE]);
+  assert.equal(f.app.transcript.at(-1), MESSAGE);
+  // Owner text in front of ours: not the placeholder, never replaced.
+  const g = setup(t, { app: fakeApp({ composerLabel: CONDUCTOR_PLACEHOLDER, onType: (text) => `my words ${text}` }) });
+  const kept = await g.driver.deliver(g.request());
+  assert.equal(kept.status, "failed");
+  assert.match(kept.detail, /text mismatch/);
+  assert.equal(g.calls().filter((call) => call.name === "set_value").length, 0);
+  assert.equal(g.app.composer, `my words ${MESSAGE}`);
+});
+
+test("a sent message that says 'URL:' still counts as a transcript copy", () => {
+  const said = `${MESSAGE} See URL: https://example.com`;
+  const state = stateOf(`App=com.conductor.app (pid 1)\n0 standard window Conductor\n  20 static text ${said}`);
+  assert.equal(transcriptCount(state, said), 1);
 });
 
 test("a message that says 'Secondary Actions:' is read back whole", () => {

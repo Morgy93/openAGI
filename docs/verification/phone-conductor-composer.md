@@ -20,7 +20,15 @@ the call is queued. Append input preserves intervening text; delivery requires
 an exact message readback before it can click Send or press Return. A mismatch
 stays unsent. Presence, thread identity, approvals and input-in-flight gates
 remain enforced. An exact leftover message can be sent without retyping; a
-placeholder-prefixed or otherwise edited draft is not replaced or cleared.
+placeholder-prefixed or otherwise edited draft found before typing is not
+replaced or cleared.
+
+Keyboard input into an empty Conductor or Codex composer can keep the app's
+placeholder as text in front of the message (seen live with OCU 0.3.5:
+`Ask to make changes, @mention files, run /commands[OpenAGI supervisor] …`).
+Right after typing, a composer holding exactly a known placeholder followed by
+exactly the text this delivery typed is set to exactly that text (the only
+whole-field write, and only over our own input); anything else stays as is.
 
 This removes the unconditional whole-field overwrite. It does not establish
 atomic control of arbitrary apps or guarantee that input cannot fail. Upstream
