@@ -77,6 +77,8 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
 | `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
 | `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
+| `OPENAGI_FLEET_JUDGE` | off | `1` turns on the [nudge judge](#judge) (needs a model too) |
+| `OPENAGI_FLEET_JUDGE_MODEL` | unset (judge off) | Model for the judge, run with `codex exec` through codex-lb, e.g. `gpt-6.1-sol` |
 | `OPENAGI_FLEET_STORAGE` | on with the supervisor | `0` turns off the [storage manager](#storage) |
 | `OPENAGI_FLEET_STORAGE_SD` | `/Volumes/Xtra` | The SD card the storage manager archives to |
 | `OPENAGI_FLEET_STORAGE_LOW_GB` | `100` | Mac free space below this starts safe cleanup and archiving |
@@ -422,6 +424,31 @@ on; the same outreach item updates in place. The supervisor's own questions
 The default model is `claude-sonnet-5`, confirmed by the owner on 2026-09-29. On
 26 hand-audited questions it agreed with the audit on 20, versus 17 for Haiku 4.5.
 Set `OPENAGI_FLEET_REVIEW_MODEL` to use another model.
+
+## Judge
+
+Off by default. With `OPENAGI_FLEET_JUDGE=1` and `OPENAGI_FLEET_JUDGE_MODEL`
+set, a model reads the chat before each automatic nudge, so the supervisor
+stops sending the same note to every thread.
+
+- Reads: the thread, the PR (CI, failing checks, gates, blockers, open
+  threads), the agent's last full message (newest 6000 chars), the last 3
+  nudges, and the planned nudge.
+- Says one of: **send** one short message naming what is still missing,
+  **wait** (the agent already answered, or waits on CI, a queued run, a
+  reviewer, a limit), or **ask you** (it needs your decision, approval or a
+  credential). Your answer goes to the agent like any agent question.
+- Only in Auto, only for merge-ready, ci-finished, status-check,
+  idle-report, bb3-slow-agent and resume. A resume after a limit reset or an
+  error stays automatic. Your answers and messages are never judged.
+- At most 6 calls per scan, 3 at once. A verdict holds 2 hours while the
+  chat, playbook and PR facts are the same. Cooldowns and the same-message
+  guard still apply to its sends.
+- A failure or timeout (90 s) waits; nothing is sent blind. A scan where
+  every call failed pauses the judge 5 minutes.
+- Runs `codex exec --ephemeral -s read-only` in a temp dir with the fleet's
+  child env plus `CODEX_LB_API_KEY` from `~/.codex/codex-lb.env`.
+- Every verdict shows in **Doing** (`Judge: send`, `wait`, `ask-owner`).
 
 ## One supervisor shared by main, Android and G2
 

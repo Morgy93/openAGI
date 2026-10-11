@@ -3106,3 +3106,201 @@ test("a sent nudge keeps its hash, facts and start time, and an answered one is 
   const decision = supervisor.getState().snapshot.threads.find((item) => item.key === "codex:t1").decision;
   assert.match(decision.reason, /^agent answered the \d\d:\d\d nudge; nothing new$/);
 });
+
+// ---------- the nudge judge ----------
+
+function fakeJudge(verdictFor, { enabled = true } = {}) {
+  const calls = [];
+  return {
+    calls,
+    enabled,
+    judge: async (input) => {
+      calls.push(input);
+      const verdict = typeof verdictFor === "function" ? verdictFor(input) : verdictFor;
+      if (verdict instanceof Error) throw verdict;
+      return verdict;
+    }
+  };
+}
+
+const judgeRow = (supervisor, key = "codex:t1") => supervisor.getState().snapshot.threads.find((row) => row.key === key).decision;
+
+test("judge send: its message goes out under the playbook, and the verdict is journaled", async (t) => {
+  const judge = fakeJudge({ action: "send", reason: "CI red after the reply", message: "verification failed on head bbbbbbbbbb. Fix it and push." });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 1);
+  assert.equal(judge.calls[0].decision.playbook, "merge-ready");
+  assert.match(judge.calls[0].decision.message, /Ready to merge\?/);
+  assert.equal(judge.calls[0].pr.ref, "acme/app#7");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].message, "verification failed on head bbbbbbbbbb. Fix it and push.");
+  assert.equal(delivered[0].playbook, "merge-ready");
+  const entry = supervisor.store.ledgerFor("codex:t1").nudges[0];
+  assert.equal(entry.playbook, "merge-ready");
+  assert.equal(entry.status, "sent");
+  const journal = supervisor.getState().actions.find((action) => action.kind === "judge");
+  assert.equal(journal.threadKey, "codex:t1");
+  assert.equal(journal.playbook, "merge-ready");
+  assert.equal(journal.verdict, "send");
+  assert.equal(journal.reason, "CI red after the reply");
+});
+
+test("judge wait: nothing sent, no attempt spent, no cooldown", async (t) => {
+  const judge = fakeJudge({ action: "wait", reason: "agent said BuildBot3 run is queued" });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
+  const decision = judgeRow(supervisor);
+  assert.equal(decision.action, "wait");
+  assert.equal(decision.reason, "judge: agent said BuildBot3 run is queued");
+  const ledger = supervisor.store.ledgerFor("codex:t1");
+  assert.equal(ledger.nudges?.length ?? 0, 0);
+  assert.equal(ledger.lastNudgeAt ?? null, null);
+  assert.equal(supervisor.getState().actions.find((action) => action.kind === "judge").verdict, "wait");
+});
+
+test("judge ask-owner: an agent-ask question whose answer is relayed to the agent", async (t) => {
+  const judge = fakeJudge({ action: "ask-owner", reason: "needs your merge call", question: { title: "Merge with --admin?", body: "Agent asks: --admin or wait for Nikhil.", options: ["merge --admin", "wait for Nikhil"] } });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
+  const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  assert.ok(question, "question raised");
+  assert.match(question.dedupeKey, /^judge:codex:t1:[0-9a-f]{16}$/);
+  assert.match(question.title, /Merge with --admin\?$/);
+  assert.equal(question.body, "Agent asks: --admin or wait for Nikhil.");
+  assert.deepEqual(question.options, ["merge --admin", "wait for Nikhil"]);
+  assert.equal(question.threadKey, "codex:t1");
+  const result = await supervisor.answerQuestion(question.id, "wait for Nikhil");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].message, "Owner answer: wait for Nikhil. Continue with that.");
+  assert.equal(delivered[0].playbook, "owner-answer");
+  // The owner's answer was never judged.
+  assert.equal(judge.calls.length, 1);
+});
+
+test("judge failure waits, never a blind send", async (t) => {
+  const judge = fakeJudge(new Error("codex-lb 502"));
+  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
+  assert.equal(judgeRow(supervisor).action, "wait");
+  assert.equal(judgeRow(supervisor).reason, "judge unavailable: codex-lb 502");
+  const journal = supervisor.getState().actions.find((action) => action.kind === "judge");
+  assert.equal(journal.verdict, "failed");
+  assert.equal(journal.status, "failed");
+});
+
+test("a limit-reset resume and owner answers are never judged", async (t) => {
+  const judge = fakeJudge({ action: "wait", reason: "x" });
+  const capped = makeThread({ key: "codex:capped", id: "capped", prRefs: [], agentStatus: "error", error: { kind: "session-limit", text: "limit", resetAt: ago(10 * MIN) },
+    lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN) });
+  const { supervisor, delivered } = fixture(t, { threads: [capped], mode: "auto", prs: new Map(), deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(delivered.map((item) => item.playbook), ["resume"]);
+  assert.equal(judge.calls.length, 0);
+});
+
+test("judge off or not in Auto: the playbook message goes out unchanged", async (t) => {
+  const off = fakeJudge({ action: "wait", reason: "x" }, { enabled: false });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge: off } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(off.calls.length, 0);
+  assert.equal(delivered.length, 1);
+  assert.match(delivered[0].message, /Ready to merge\?/);
+  const on = fakeJudge({ action: "wait", reason: "x" });
+  const observe = fixture(t, { mode: "observe", deps: { judge: on } });
+  await observe.supervisor.tick({ reason: "test" });
+  assert.equal(on.calls.length, 0);
+  assert.equal(observe.supervisor.getState().actions.find((a) => a.status === "planned").playbook, "merge-ready");
+});
+
+test("an unchanged chat is not judged again; the agent speaking is", async (t) => {
+  let clock = NOW;
+  const thread = makeThread({ lastAgentFull: "Waiting on the full run.", lastAgentFullAt: ago(60 * MIN) });
+  const judge = fakeJudge({ action: "wait", reason: "full run queued" });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], now: () => clock, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 1);
+  assert.equal(judgeRow(supervisor).reason, "judge: full run queued");
+  // The agent spoke: read again.
+  thread.lastAgentFull = "Full run failed on lint. Fixing.";
+  thread.lastAgentFullAt = new Date(clock - 30 * MIN).toISOString();
+  thread.lastAgentAt = thread.lastAgentFullAt;
+  thread.lastActivityAt = thread.lastAgentFullAt;
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 2);
+  assert.match(judge.calls[1].thread.lastAgentFull, /failed on lint/);
+  assert.equal(delivered.length, 0);
+});
+
+test("a cached send is held by the same-message guard until the agent replies", async (t) => {
+  let clock = NOW;
+  const judge = fakeJudge({ action: "send", reason: "CI red", message: "verification is red on head bbbbbbbbbb. Fix it." });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", now: () => clock, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  // Past the cooldown, no reply, same chat: the cached verdict is not resent.
+  clock += 30 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 1);
+  assert.equal(delivered.length, 1);
+  assert.match(judgeRow(supervisor).reason, /^judge: same message sent at \d\d:\d\d; no reply since$/);
+});
+
+test("at most 6 judge calls per scan; the rest wait for the next", async (t) => {
+  const threads = Array.from({ length: 8 }, (_, n) => makeThread({ key: `codex:t${n}`, id: `t${n}`, cwd: `/work/t${n}` }));
+  let clock = NOW;
+  let running = 0;
+  let peak = 0;
+  const judge = {
+    enabled: true, calls: [],
+    judge: async (input) => {
+      judge.calls.push(input);
+      running += 1;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      running -= 1;
+      return { action: "wait", reason: "queued" };
+    }
+  };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads, now: () => clock, limits: { maxThreads: 20 }, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 6);
+  assert.ok(peak <= 3, `at most 3 at once, saw ${peak}`);
+  const rows = supervisor.getState().snapshot.threads;
+  assert.equal(rows.filter((row) => /per-scan cap/.test(row.decision?.reason ?? "")).length, 2);
+  clock += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 8);
+  assert.equal(delivered.length, 0);
+});
+
+test("a judge question stays open while the judge cannot read the chat, and closes on its wait", async (t) => {
+  let clock = NOW;
+  const thread = makeThread();
+  let verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Merge now?", body: "b", options: ["merge", "wait"] } };
+  const judge = fakeJudge(() => verdict);
+  const { supervisor } = fixture(t, { mode: "auto", threads: [thread], now: () => clock, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  const open = () => supervisor.getState().questions.filter((q) => String(q.dedupeKey).startsWith("judge:") && q.status === "open");
+  assert.equal(open().length, 1);
+  // The agent spoke, and the judge is down: the question holds.
+  thread.lastAgentFull = "Still need your call.";
+  thread.lastAgentFullAt = new Date(clock).toISOString();
+  verdict = new Error("timed out after 90s");
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judgeRow(supervisor).reason, "judge unavailable: timed out after 90s");
+  assert.equal(open().length, 1);
+  // Back up past the pause, and it says wait: the question closes.
+  verdict = { action: "wait", reason: "owner answered in chat" };
+  clock += 10 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(open().length, 0);
+});

@@ -664,6 +664,14 @@ function repliedAfter(thread, entry) {
   return Number.isFinite(reply) && Number.isFinite(sent) && reply > sent;
 }
 
+// The judge's message, same words as the last one that reached the thread
+// with no reply since: the entry it repeats, else null.
+export function repeatsLastSend(thread, ledger, messageHash) {
+  const repeat = lastReached(ledger);
+  if (!repeat || repeat.messageHash !== messageHash || repliedAfter(thread, repeat)) return null;
+  return { ...repeat, clock: clock(sentAtOf(repeat)) };
+}
+
 // "18:17", local time.
 function clock(iso) {
   const at = Date.parse(iso ?? "");
