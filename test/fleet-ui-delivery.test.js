@@ -127,6 +127,7 @@ function fakeTransport(app, { failOn = null, failError = null, latency = null, a
         app.onKey?.(args.key);
         if (args.key === "super+a") app.selectAll = true;
         else if (args.key === "BackSpace" && app.selectAll) { app.composer = ""; app.selectAll = false; }
+        else if (args.key === "super+Return" && app.composer) { app.sentNow = (app.sentNow ?? 0) + 1; app.transcript.push(app.composer); app.composer = ""; }
         else if (args.key === "Return" && app.composer) {
           if (app.onSend) app.onSend();
           else { app.transcript.push(app.composer); app.composer = ""; }
@@ -2077,6 +2078,27 @@ test("Codex's composer is the 'Work with Codex' box, not a review comment box be
   assert.equal(found.reason, null);
   assert.equal(found.composer.id, "2132");
   assert.equal(composerEmpty(found.composer), true);
+});
+
+test("a Conductor chat busy with background tasks gets ⌘↩ (sent now) unless asked to queue", async (t) => {
+  const now = setup(t);
+  const sent = await now.driver.deliver(now.request({ busy: true, sendNow: true }));
+  assert.equal(sent.status, "sent");
+  assert.match(sent.detail, /sent now \(⌘↩\)/);
+  assert.equal(now.app.sentNow, 1);
+  assert.deepEqual(now.calls().filter((call) => call.name === "press_key").map((call) => call.args.key), ["super+Return"]);
+  assert.ok(!now.calls().some((call) => call.name === "click" && call.args.element_index === "62"), "never the Send button");
+  // Asked to queue: its Send button, and the result says it waits.
+  const queued = setup(t);
+  const later = await queued.driver.deliver(queued.request({ busy: true, sendNow: false }));
+  assert.equal(later.status, "sent");
+  assert.match(later.detail, /queued behind its background tasks/);
+  assert.ok(queued.calls().some((call) => call.name === "click" && call.args.element_index === "62"));
+  assert.equal(queued.app.sentNow ?? 0, 0);
+  // Not busy: the plain send, no note.
+  const plain = setup(t);
+  const normal = await plain.driver.deliver(plain.request());
+  assert.equal(normal.detail, "typed into Conductor");
 });
 
 test("a message that says 'Secondary Actions:' is read back whole", () => {

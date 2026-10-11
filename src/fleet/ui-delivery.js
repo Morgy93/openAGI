@@ -1515,8 +1515,11 @@ export function createUiDriver({
     within(ctx, 1);
     ctx.phase = "sending";
     const send = findSendButton(state, target.bundleId);
+    // Conductor queues a message while the agent's background tasks run (its
+    // Send button and Return do); ⌘↩ sends it now. The caller says which.
+    const sendNow = request.sendNow === true && target.app === "conductor";
     let pressed = false;
-    if (send) {
+    if (send && !sendNow) {
       try {
         await click(ctx, send, signal);
         pressed = true;
@@ -1543,10 +1546,11 @@ export function createUiDriver({
       if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`, card?.prompt ? { prompt: card.prompt } : {});
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
-      await press(ctx, "Return", signal);
+      await press(ctx, sendNow ? "super+Return" : "Return", signal);
       ctx.keyEnd = now();
     }
     ctx.phase = "sent";
+    const how = sendNow ? "; sent now (⌘↩)" : request.busy && target.app === "conductor" ? "; queued behind its background tasks" : "";
 
     // 10. Confirm: composer empty and one more transcript copy of our text.
     const deadline = now() + limits.uiConfirmMs;
@@ -1557,7 +1561,7 @@ export function createUiDriver({
       const empty = composer ? composerEmpty(composer) || !normalizeUiText(composer.value) : false;
       if (empty && transcriptCount(state, needle, composer) > beforeCount) {
         keep(ctx, "after", state);
-        return outcome(ctx, "sent", leftover ? `sent the text an earlier attempt left in ${target.name}` : `typed into ${target.name}`);
+        return outcome(ctx, "sent", `${leftover ? `sent the text an earlier attempt left in ${target.name}` : `typed into ${target.name}`}${how}`);
       }
     } while (now() < deadline);
     keep(ctx, "after", state);

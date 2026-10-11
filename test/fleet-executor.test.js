@@ -754,3 +754,16 @@ test("a remote send near its deadline takes no background route", async (t) => {
   assert.equal(result.detail, "owner using Codex");
   assert.equal(calls.length, 0);
 });
+
+test("a Conductor chat waiting on background tasks is sent to now (⌘↩) unless the caller queues", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const waiting = conductorUiThread(cwd, { agentStatus: "waiting", openTasks: [{ id: "b1", description: "bb-verify --full" }] });
+  await executor.deliver({ thread: waiting, message: "status?", route: "computer-use", playbook: "status-check" });
+  assert.equal(requests.at(-1).busy, true);
+  assert.equal(requests.at(-1).sendNow, true);
+  await executor.deliver({ thread: waiting, message: "after your tasks", route: "computer-use", playbook: "owner-message", queue: true });
+  assert.equal(requests.at(-1).sendNow, false);
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "idle", route: "computer-use" });
+  assert.equal(requests.at(-1).busy, false);
+  assert.equal(requests.at(-1).sendNow, false);
+});

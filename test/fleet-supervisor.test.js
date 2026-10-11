@@ -1385,6 +1385,10 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered[1].deadlineAt, 1234, "a remote caller's deadline reaches the send");
   assert.equal((await supervisor.sendOwnerMessage("codex:missing", "hi")).delivery.status, "blocked");
   assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
+  await supervisor.sendOwnerMessage("codex:t1", "After your tasks.", { queue: true });
+  assert.equal(delivered.at(-1).queue, true, "asked to queue: passed to the delivery");
+  await supervisor.sendOwnerMessage("codex:t1", "Now.");
+  assert.equal(delivered.at(-1).queue, false);
 });
 
 test("the ledger keeps the route a send actually took, not the one it was asked for", async (t) => {

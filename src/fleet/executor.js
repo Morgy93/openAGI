@@ -375,7 +375,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // promise and nothing for reopenIfUndelivered to wait on.
   // spentMs: what the caller's request already spent; the lock wait adds to it.
   // deadlineAt: when a remote caller stops waiting (null: no such caller).
-  const typeInApp = async (thread, step, base, actionId, text, spentMs, deadlineAt) => {
+  // A Conductor chat waiting on background tasks queues what is sent to it
+  // until they end: the supervisor's messages are about now, so they are
+  // sent now (⌘↩) unless the caller asked to queue.
+  const typeInApp = async (thread, step, base, actionId, text, spentMs, deadlineAt, queue = false) => {
+    const busy = thread.kind === "conductor" && (thread.agentStatus === "waiting" || (thread.openTasks?.length ?? 0) > 0);
     const target = step.target;
     const entered = Date.now();
     const evidenceName = actionId ?? `${thread.kind}-${String(thread.id).slice(0, 8)}-${Date.now()}`;
@@ -387,7 +391,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       const guard = unconfirmed.get(target.targetKey);
       const previousUnconfirmed = guard?.hash === base.messageHash ? { priorCount: guard.priorCount } : false;
       try {
-        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName, spentMs: spentMs + (Date.now() - entered), deadlineAt });
+        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName, spentMs: spentMs + (Date.now() - entered), deadlineAt, busy, sendNow: busy && !queue });
       } catch (error) {
         return { status: "failed", detail: `computer use failed: ${detailText(error?.message ?? error)}; nothing confirmed` };
       }
@@ -488,7 +492,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     return { route, live: { ...thread.live, peerName: fresh.live.peerName, pid: fresh.live.pid, status: fresh.live.status } };
   }
 
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null } = {}) {
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -518,7 +522,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       active.add(step.target.targetKey);
       let result;
       try {
-        result = await typeInApp(thread, step, base, actionId, text, spentMs, deadlineAt);
+        result = await typeInApp(thread, step, base, actionId, text, spentMs, deadlineAt, queue);
       } finally {
         active.delete(thread.key);
         active.delete(step.target.targetKey);

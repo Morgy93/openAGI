@@ -123,7 +123,7 @@ export function createFleetRoute({ supervisor } = {}) {
         if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
-        const result = await supervisor.sendOwnerMessage(threadKey, message, sendOptions);
+        const result = await supervisor.sendOwnerMessage(threadKey, message, body?.queue === true ? { ...sendOptions, queue: true } : sendOptions);
         return ok({ delivery: result?.delivery ?? null, state: state() });
       }
       // One thread's screen: its permission card, whether a turn runs, the
