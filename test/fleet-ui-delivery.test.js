@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
-  createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
+  screenSummary, composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
   conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController
 } from "../src/fleet/ui-delivery.js";
 
@@ -51,7 +51,7 @@ function fakeApp(overrides = {}) {
     if (app.heading) lines.push(`  5 heading ${app.heading}`);
     app.transcript.forEach((text, index) => lines.push(`  ${20 + index} static text ${text}`));
     lines.push("  60 group composer");
-    lines.push(`    61 text entry area (settable, string)${app.composer ? ` Value: ${app.composer}` : ""}`);
+    lines.push(`    61 text entry area (settable, string)${app.composerLabel ? ` ${app.composerLabel}` : ""}${app.composer ? ` Value: ${app.composer}` : ""}`);
     if (app.sendButton) lines.push("  62 button Send");
     if (app.stop) lines.push("  63 button Stop");
     if (app.prompt) {
@@ -116,6 +116,11 @@ function fakeTransport(app, { failOn = null, failError = null, latency = null, a
       if (name === "type_text") {
         if (!app.frontmost || app.focused !== "61") throw new Error("type_text requires a focused editable text element");
         app.composer += app.onType ? app.onType(args.text) : args.text;
+        return { isError: false, content: [] };
+      }
+      if (name === "set_value") {
+        if (String(args.element_index) !== "61") throw new Error("set_value: not the composer");
+        app.composer = args.value;
         return { isError: false, content: [] };
       }
       if (name === "press_key") {
@@ -544,6 +549,69 @@ test("a shared Codex title goes on only through the id link, from another open t
   assert.equal(active.status, "blocked");
   assert.match(active.detail, /^waiting for idle: Codex must be in front/);
   assert.equal(h.transports.length, 0);
+});
+
+// Real Open Computer Use rows (0.3.5), as read from Conductor and Codex.
+const CONDUCTOR_PLACEHOLDER = "Ask to make changes, @mention files, run /commands";
+const conductorComposer = (inner) => [
+  "App=com.conductor.app (pid 1)",
+  'Window: "Conductor", App: Conductor.',
+  "0 standard window Conductor",
+  "\t1 scroll area",
+  `\t\t2 HTML content Tauri + React + Typescript, URL: ${CONDUCTOR_URL}`,
+  "\t\t\t175 container composer",
+  inner === null
+    ? "\t\t\t\t176 text entry area (settable, string) Secondary Actions: Show Writing Tools"
+    : `\t\t\t\t176 text entry area (settable, string) ${CONDUCTOR_PLACEHOLDER} ${inner}, Secondary Actions: Show Writing Tools\n\t\t\t\t\t177 text (settable, string) ${inner}`,
+  "\t\t\t268 container",
+  "\t\t\t\t269 text entry area (settable, string) Terminal input, Secondary Actions: Show Writing Tools"
+].join("\n");
+
+test("a filled composer's text is its inner text row: one composer, its value, never ambiguous", () => {
+  const empty = findComposer(stateOf(conductorComposer(null))).composer;
+  assert.equal(empty.id, "176");
+  assert.equal(composerEmpty(empty), true);
+  const filled = findComposer(stateOf(conductorComposer(MESSAGE)));
+  assert.equal(filled.reason, null, "the inner text row is not a second text area");
+  assert.equal(filled.composer.id, "176");
+  assert.equal(filled.composer.value, MESSAGE);
+  assert.equal(composerEmpty(filled.composer), false);
+  assert.equal(placeholderJunk(filled.composer, MESSAGE), false, "exactly ours is a leftover, not junk");
+  // An earlier keyboard attempt left the placeholder in front of our text.
+  const junk = findComposer(stateOf(conductorComposer(`${CONDUCTOR_PLACEHOLDER}${MESSAGE}`))).composer;
+  assert.equal(placeholderJunk(junk, MESSAGE), true);
+  // The owner's draft is neither empty nor ours.
+  const draft = findComposer(stateOf(conductorComposer("half-written owner note"))).composer;
+  assert.equal(composerEmpty(draft), false);
+  assert.equal(placeholderJunk(draft, MESSAGE), false);
+  assert.equal(placeholderJunk(findComposer(stateOf(conductorComposer(`my note ${MESSAGE}`))).composer, MESSAGE), false, "owner text in front is not a placeholder");
+  // Our inner text is not a transcript copy.
+  assert.equal(transcriptCount(stateOf(conductorComposer(MESSAGE)), MESSAGE), 0);
+  // Codex prints an empty composer's placeholder twice; anything else on the
+  // row, with no inner text, may be a draft.
+  const codex = (row) => findComposer(stateOf(`App=com.openai.codex (pid 9)\n0 standard window Codex\n  1 group\n    2 text entry area (settable, string) ${row}`)).composer;
+  assert.equal(composerEmpty(codex("Do anything Do anything\\n")), true);
+  assert.equal(composerEmpty(codex("Work with Codex Work with Codex")), true);
+  assert.equal(composerEmpty(codex("Work with Codex half a note")), false, "an unknown label may be a draft");
+  // Conductor's placeholder in a chat with history.
+  assert.equal(composerEmpty(findComposer(stateOf(conductorComposer(null).replace("Secondary Actions: Show Writing Tools", "Add a follow up, Secondary Actions: Show Writing Tools"))).composer), true);
+});
+
+test("text behind a placeholder is preserved as a draft without replacement", async (t) => {
+  const f = setup(t, { app: fakeApp({ composerLabel: CONDUCTOR_PLACEHOLDER, composer: `${CONDUCTOR_PLACEHOLDER}${MESSAGE}` }) });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.deepEqual(typed(f.calls()), []);
+  assert.equal(f.app.composer, `${CONDUCTOR_PLACEHOLDER}${MESSAGE}`);
+  // Keep both the unknown-label and explicit-value draft checks.
+  const unknown = setup(t, { app: fakeApp({ composerLabel: "Work with Codex half a note" }) });
+  assert.equal((await unknown.driver.deliver(unknown.request())).status, "blocked");
+  assert.deepEqual(typed(unknown.calls()), []);
+  const g = setup(t, { app: fakeApp({ composerLabel: "Work with Codex", composer: "half a note" }) });
+  const kept = await g.driver.deliver(g.request());
+  assert.equal(kept.status, "blocked");
+  assert.match(kept.detail, /draft in composer/);
+  assert.deepEqual(typed(g.calls()), []);
 });
 
 test("a draft in the composer is never overwritten", async (t) => {
@@ -1945,6 +2013,39 @@ test("Codex's 'Approve for me' permission-mode menu is not a permission prompt (
   assert.equal(promptButtons(state), null);
   assert.equal(hasPermissionPrompt(state), false);
   assert.equal(findComposer(state).composer?.id, "2678", "the composer is still found");
+  // Empty: its only inner row is the placeholder.
+  assert.equal(composerEmpty(findComposer(state).composer), true);
+  // Filled, the same composer is not empty, and its text is the value.
+  const filled = stateOf(text.replace(/(\t+)2679 text Do anything/, `$12679 text ${MESSAGE}`).replace("Do anything Do anything\\n", `Do anything ${MESSAGE}`));
+  assert.equal(findComposer(filled).composer.value, MESSAGE);
+  assert.equal(composerEmpty(findComposer(filled).composer), false);
+});
+
+test("our just-typed text behind the app's placeholder is set to exactly ours; anything else is left", async (t) => {
+  const f = setup(t, { app: fakeApp({ composerLabel: CONDUCTOR_PLACEHOLDER, onType: (text) => `${CONDUCTOR_PLACEHOLDER}${text}` }) });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent");
+  assert.deepEqual(f.calls().filter((call) => call.name === "set_value").map((call) => call.args.value), [MESSAGE]);
+  assert.equal(f.app.transcript.at(-1), MESSAGE);
+  // Owner text in front of ours: not the placeholder, never replaced.
+  const g = setup(t, { app: fakeApp({ composerLabel: CONDUCTOR_PLACEHOLDER, onType: (text) => `my words ${text}` }) });
+  const kept = await g.driver.deliver(g.request());
+  assert.equal(kept.status, "failed");
+  assert.match(kept.detail, /text mismatch/);
+  assert.equal(g.calls().filter((call) => call.name === "set_value").length, 0);
+  assert.equal(g.app.composer, `my words ${MESSAGE}`);
+});
+
+test("a sent message that says 'URL:' still counts as a transcript copy", () => {
+  const said = `${MESSAGE} See URL: https://example.com`;
+  const state = stateOf(`App=com.conductor.app (pid 1)\n0 standard window Conductor\n  20 static text ${said}`);
+  assert.equal(transcriptCount(state, said), 1);
+});
+
+test("a message that says 'Secondary Actions:' is read back whole", () => {
+  const said = `${MESSAGE} Note, Secondary Actions: none`;
+  const state = stateOf(conductorComposer(said));
+  assert.equal(findComposer(state).composer.value, said);
 });
 
 test("a permission card needs two exact choices, one positive, outside menus", () => {
@@ -2129,4 +2230,70 @@ test("a background read with navigate off never deep links to another thread", a
   assert.equal(read.status, "blocked");
   assert.match(read.detail, /shows another thread; not moving it/);
   assert.deepEqual(f.probe.opened, []);
+});
+
+
+test("composer inner text retains field-looking message text", () => {
+  for (const marker of ["URL: https://example.test", "Title: status", "Value: expected", "Description: details"]) {
+    const message = `${MESSAGE} ${marker} finish`;
+    assert.equal(findComposer(stateOf(conductorComposer(message))).composer.value, message);
+  }
+});
+
+test("screen summaries exclude unsent composer descendants", () => {
+  const state = stateOf(conductorComposer("synthetic unsent private draft"));
+  assert.equal(screenSummary(state).draft, true);
+  assert.doesNotMatch(screenSummary(state).text, /synthetic unsent private draft/);
+});
+
+test("repeated owner draft labels do not establish an empty composer", () => {
+  for (const label of ["wait wait", "keep this keep this", "hello hello"]) {
+    assert.equal(composerEmpty({ label, value: "", fields: {} }), false);
+  }
+});
+
+test("placeholder repair requires the complete known placeholder", () => {
+  for (const prefix of ["Ask", "Ask to make", "Do", "Work with"]) {
+    assert.equal(placeholderJunk({ label: CONDUCTOR_PLACEHOLDER, value: `${prefix}${MESSAGE}` }, MESSAGE), false);
+  }
+  assert.equal(placeholderJunk({ label: CONDUCTOR_PLACEHOLDER, value: `${CONDUCTOR_PLACEHOLDER}${MESSAGE}` }, MESSAGE), true);
+});
+
+
+test("inner composer messages preserve Secondary Actions text", () => {
+  for (const message of [`${MESSAGE} check, Secondary Actions: none`, `${MESSAGE} Secondary Actions: Show Writing Tools`]) {
+    assert.equal(findComposer(stateOf(conductorComposer(message))).composer.value, message);
+  }
+});
+
+test("real Codex placeholder child is empty and excluded from screen summaries", () => {
+  const state = stateOf(fs.readFileSync(new URL("./fixtures/fleet-ui/codex-approve-for-me.txt", import.meta.url), "utf8"));
+  const composer = findComposer(state).composer;
+  assert.equal(composer.value, "");
+  assert.equal(composerEmpty(composer), true);
+  assert.equal(screenSummary(state).draft, false);
+  assert.equal(transcriptCount(state, "Do anything"), 0);
+});
+
+test("owner text arriving during input is preserved and never submitted", async (t) => {
+  const app = fakeApp();
+  const f = setup(t, { app, transportOptions: { onCall: (name) => {
+    if (name === "set_value" || name === "type_text") app.composer = "synthetic owner edit";
+  } } });
+  const result = await f.driver.deliver(f.request());
+  assert.notEqual(result.status, "sent");
+  assert.match(app.composer, /^synthetic owner edit/);
+  assert.deepEqual(app.transcript, ["[OpenAGI supervisor] earlier note", "Pushed the fix."]);
+  assert.equal(f.calls().some(call => call.name === "set_value"), false);
+});
+
+
+test("a Conductor draft equal to its placeholder remains a draft", () => {
+  for (const text of [CONDUCTOR_PLACEHOLDER, "Add a follow up"]) {
+    const state = stateOf(conductorComposer(text).replaceAll(CONDUCTOR_PLACEHOLDER, text));
+    const composer = findComposer(state).composer;
+    assert.equal(composer.value, text);
+    assert.equal(composerEmpty(composer), false);
+    assert.equal(screenSummary(state).draft, true);
+  }
 });
