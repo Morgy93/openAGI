@@ -161,8 +161,8 @@ export function registerFleetTools(registry, supervisor) {
     prepareApprovalArgs: (args) => fleetTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
     // One card per chat, thread and text: a repeated ask reuses it.
-    approvalDedupeKey: (args, context) => `fleet-send:${digest([context?.sessionId ?? null, args.key, args.message])}`,
-    summarize: (args) => `Send to ${args.name} (${args.key}):\n${args.message}`,
+    approvalDedupeKey: (args, context) => `fleet-send:${digest([context?.sessionId ?? null, args.key, args.message, args.queue === true])}`,
+    summarize: (args) => `Send to ${args.name} (${args.key})${args.queue === true ? ", queued behind its background tasks" : ""}:\n${args.message}`,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
       return deliveryReceipt(await supervisor.sendOwnerMessage(args.key, args.message, { queue: args.queue === true }));
@@ -220,7 +220,7 @@ function fleetTarget(supervisor, args = {}) {
   if (!message || message.length > MESSAGE_MAX) throw new Error(`Message must be 1-${MESSAGE_MAX} characters.`);
   const row = (readState(supervisor).snapshot?.threads ?? []).find((item) => item?.key === key);
   if (!row) throw new Error(`No fleet thread with key "${clip(key, KEY_MAX)}". Call fleet_status for the current keys.`);
-  return { key, message, name: clip(row.workspace || row.title || key, 80) };
+  return { key, message, name: clip(row.workspace || row.title || key, 80), ...(args?.queue === true ? { queue: true } : {}) };
 }
 
 function fleetClickTarget(supervisor, args = {}) {

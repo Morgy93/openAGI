@@ -225,6 +225,11 @@ test("the send and answer tools need approval and pin the exact target", async (
   assert.deepEqual(target, { key: "codex:t1", message: "Rebase on main and push.", name: "apia" });
   assert.match(send.summarize(target), /Send to apia \(codex:t1\):\nRebase on main and push\./);
   assert.throws(() => send.prepareApprovalArgs({ key: "codex:nope", message: "hi" }), /No fleet thread/);
+  // Asked to queue: kept through approval, on its own card.
+  const later = send.prepareApprovalArgs({ key: "codex:t1", message: "Rebase on main and push.", queue: true });
+  assert.equal(later.queue, true);
+  assert.match(send.summarize(later), /queued behind its background tasks/);
+  assert.notEqual(send.approvalDedupeKey(later, {}), send.approvalDedupeKey(target, {}));
   await assert.rejects(send.handler(target, {}), /approval/);
   assert.deepEqual(await send.handler(target, { __confirmed: true }), { status: "sent", route: "computer-use", detail: "typed into Codex" });
   assert.deepEqual(sent, [["codex:t1", "Rebase on main and push."]]);

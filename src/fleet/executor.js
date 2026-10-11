@@ -375,11 +375,24 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // promise and nothing for reopenIfUndelivered to wait on.
   // spentMs: what the caller's request already spent; the lock wait adds to it.
   // deadlineAt: when a remote caller stops waiting (null: no such caller).
+  // The Conductor chat a send lands in (the thread itself, or the one a
+  // Codex thread is hosted in) is waiting on background tasks.
+  const conductorBusy = (thread, target) => {
+    if (target?.app !== "conductor") return false;
+    let chat = thread.kind === "conductor" ? thread : null;
+    if (!chat && target.sessionId) {
+      let threads = [];
+      try { threads = knownThreads() ?? []; } catch { threads = []; }
+      chat = threads.find((item) => item?.kind === "conductor" && item.id === target.sessionId) ?? null;
+    }
+    return Boolean(chat) && (chat.agentStatus === "waiting" || (chat.openTasks?.length ?? 0) > 0);
+  };
+
   // A Conductor chat waiting on background tasks queues what is sent to it
   // until they end: the supervisor's messages are about now, so they are
   // sent now (⌘↩) unless the caller asked to queue.
   const typeInApp = async (thread, step, base, actionId, text, spentMs, deadlineAt, queue = false) => {
-    const busy = thread.kind === "conductor" && (thread.agentStatus === "waiting" || (thread.openTasks?.length ?? 0) > 0);
+    const busy = conductorBusy(thread, step.target);
     const target = step.target;
     const entered = Date.now();
     const evidenceName = actionId ?? `${thread.kind}-${String(thread.id).slice(0, 8)}-${Date.now()}`;
@@ -529,7 +542,8 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       }
       // The owner is at the Mac: a route that does not take the screen, if
       // the owner allowed one for this thread. Otherwise it waits for idle.
-      if (!isPresenceBlock(result)) return result;
+      // A send asked to queue never goes another way: a relay arrives now.
+      if (!isPresenceBlock(result) || queue) return result;
       const fallback = await fallbackRoute(thread, step.target, deadlineAt);
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };
