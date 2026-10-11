@@ -1040,6 +1040,19 @@ test("tail cards: an owner's new turn closes them, a steer inside the ask's turn
   assert.equal(map["t-new"].meta.pendingCard, null);
 });
 
+test("tail cards: an owner message with no turn id after the ask's turn ended closes them", async (t) => {
+  // Older rollouts write the owner's words as a user_message event, no turn id.
+  const ctx = makeHome(t);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.user("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  addThread(ctx, { id: "t-steer-old", lines: [...asked, ev.user("also check the logs", 15 * MIN)] });
+  addThread(ctx, { id: "t-moved-on", lines: [...asked, ev.complete("turn-a", 15 * MIN, "Waiting on your pick."), ev.user("forget that, fix the header", 10 * MIN)] });
+  addThread(ctx, { id: "t-aborted", lines: [...asked, ev.aborted("turn-a", 15 * MIN), ev.user("forget that, fix the header", 10 * MIN)] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.deepEqual(map["t-steer-old"].meta.pendingCard?.items.map((item) => item.itemId), ["call_q:0"]);
+  assert.equal(map["t-moved-on"].meta.pendingCard, null);
+  assert.equal(map["t-aborted"].meta.pendingCard, null);
+});
+
 test("history cards: a steer in the ask's own turn keeps the card; a reply closes items asked before it", async (t) => {
   const ctx = makeHome(t);
   const h = makeHistory(ctx);

@@ -152,7 +152,9 @@ function readUserInput(summary, raw, at, turnId = null) {
   if (kind === "context") return;
   // The owner typed a new turn instead of answering: asks of earlier turns
   // are closed (a steer inside the ask's own turn leaves them open).
-  const turn = turnId ?? summary.turnId;
+  // Older rollouts carry no turn id on the message: one typed after the
+  // last turn ended starts the next turn, whatever turn the tail last saw.
+  const turn = turnId ?? (summary.turnEnded ? null : summary.turnId);
   summary.cardAsks = summary.cardAsks.filter((ask) => turn && ask.turnId === turn);
   // Links inside the browser/IDE wrappers are ambient context, not the owner's words.
   const cleaned = cleanCodexUserText(text);
@@ -197,15 +199,18 @@ function readEvent(summary, payload, at) {
       summary.lifecycle = { type: "task_started", payload, at };
       summary.turnStartedAt = toIso(payload.started_at) ?? at;
       summary.turnId = payload.turn_id ?? payload.turn_attribution?.turn_id ?? null;
+      summary.turnEnded = false;
       break;
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
+      summary.turnEnded = true;
       setAgent(summary, payload.last_agent_message, at);
       settleSealedAsk(summary);
       break;
     case "turn_aborted":
     case "error":
       summary.lifecycle = { type: payload.type, payload, at };
+      if (payload.type === "turn_aborted") summary.turnEnded = true;
       break;
     case "agent_message":
       // Older rollouts write the async card as this event: it is the card,
@@ -244,7 +249,7 @@ function readResponseItem(summary, payload, at) {
 
 export function parseRolloutTail(text) {
   const summary = {
-    events: 0, lifecycle: null, turnStartedAt: null, turnId: null, lastAgent: null, lastUser: null,
+    events: 0, lifecycle: null, turnStartedAt: null, turnId: null, turnEnded: false, lastAgent: null, lastUser: null,
     lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null,
     cardAsks: [], cardReplies: [], rows: 0
   };
