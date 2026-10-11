@@ -415,7 +415,7 @@ test("readCodexLbErrors groups responses_retry rows by kind inside the window", 
   retry(3 * MIN, "stream disconnected before completion: failed to send websocket request: Connection closed normally", "th-2");
   retry(10 * MIN, "stream disconnected before completion: No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable", "th-3");
   retry(12 * MIN, "unexpected status 401 Unauthorized: Incorrect API key provided: sk-svcac***fvMA", "th-4");
-  retry(13 * MIN, "unexpected status 503 Service Unavailable: Server is draining, url: http://100.99.3.113:2455/backend-api/codex/responses", "th-5");
+  retry(13 * MIN, "unexpected status 503 Service Unavailable: Server is draining, url: http://192.0.2.10:2455/backend-api/codex/responses", "th-5");
   retry(14 * MIN, "You've hit your usage limit. Try again at 9:25 AM.", "th-6");
   retry(15 * MIN, "something odd happened", null);
   retry(3 * 60 * MIN, "Connection failed: error sending request retry_delay=60s", "th-old");
@@ -434,6 +434,29 @@ test("readCodexLbErrors groups responses_retry rows by kind inside the window", 
   assert.deepEqual(map.other.threadIds, []);
   assert.equal(groups[0].kind, "connection", "largest group first");
   assert.ok(!JSON.stringify(groups).includes("sk-svcac"));
+});
+
+test("readCodexLbErrors counts the fresh window apart from the hour", async (t) => {
+  const { config, retry } = makeLogsDb(t);
+  retry(50 * MIN, "Connection failed: error sending request retry_delay=5s", "th-1");
+  retry(45 * MIN, "Connection failed: error sending request retry_delay=5s", "th-2");
+  retry(2 * MIN, "Connection failed: error sending request retry_delay=5s", "th-1");
+  const [connection] = await readCodexLbErrors(config, { now: NOW, windowMs: 60 * MIN });
+  assert.equal(connection.count, 3);
+  assert.deepEqual(connection.threadIds.sort(), ["th-1", "th-2"]);
+  assert.equal(connection.freshCount, 1);
+  assert.deepEqual(connection.freshThreadIds, ["th-1"]);
+  // The fresh window is the lbErrorFreshMs limit.
+  const wide = { ...config, limits: { ...config.limits, lbErrorFreshMs: 46 * MIN } };
+  const [widened] = await readCodexLbErrors(wide, { now: NOW, windowMs: 60 * MIN });
+  assert.equal(widened.freshCount, 2);
+  assert.deepEqual(widened.freshThreadIds.sort(), ["th-1", "th-2"]);
+  // A row with no readable time counts as fresh, never as recovered.
+  const { config: odd, insert } = makeLogsDb(t);
+  insert.run("garbage", "WARN", "codex_core::responses_retry", "error=Connection failed: error sending request", "th-3");
+  const [unknown] = await readCodexLbErrors(odd, { now: NOW, windowMs: 60 * MIN });
+  assert.equal(unknown.freshCount, 1);
+  assert.deepEqual(unknown.freshThreadIds, ["th-3"]);
 });
 
 test("readCodexLbErrors degrades to [] without a log database", async (t) => {

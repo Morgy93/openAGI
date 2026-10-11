@@ -44,10 +44,19 @@ export class RemoteFleetSupervisor {
     this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
     this.timer = null;
+    this.pendingOutreachDecisions = new Map();
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
   }
   getState() { return structuredClone(this.state); }
+  beginOutreachDecision(id) {
+    this.pendingOutreachDecisions.set(id, (this.pendingOutreachDecisions.get(id) ?? 0) + 1);
+  }
+  finishOutreachDecision(id) {
+    const count = this.pendingOutreachDecisions.get(id) ?? 0;
+    if (count <= 1) this.pendingOutreachDecisions.delete(id);
+    else this.pendingOutreachDecisions.set(id, count - 1);
+  }
   async request(method, path, body) {
     let reached = false;
     try {
@@ -125,8 +134,9 @@ export class RemoteFleetSupervisor {
     if (!outreach) return;
     const openIds = new Set(this.state.questions.map(q => q.id));
     for (const item of outreach.list()) {
-      if (item.sourceRef?.kind === 'fleet' && item.sourceRef.nodeId === this.nodeId
-          && ['unseen', 'seen'].includes(item.status) && !openIds.has(item.sourceRef.id)) {
+      if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
+          && (item.sourceRef.nodeId !== this.nodeId
+            || (!openIds.has(item.sourceRef.id) && !this.pendingOutreachDecisions.has(item.sourceRef.id)))) {
         outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
       }
     }

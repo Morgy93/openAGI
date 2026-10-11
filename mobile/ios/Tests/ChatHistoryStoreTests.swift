@@ -68,10 +68,27 @@ final class ChatHistoryStoreTests: XCTestCase {
         XCTAssertEqual(restored.id, streaming.id)
         XCTAssertTrue(restored.isFailed)
         XCTAssertFalse(restored.isStreaming)
+        XCTAssertFalse(restored.retrySafe)
     }
 
     func testAFailedReplyKeepsItsOwnText() {
         let failed = ChatMessage(role: .assistant, text: "Can't reach OpenAGI.", isFailed: true)
         XCTAssertEqual(ChatHistoryCodec.saved(failed).text, "Can't reach OpenAGI.")
     }
+    func testOldFailedCacheDoesNotPermitBlindResend() {
+        let entry = SavedChatEntry(id: UUID(), role: "assistant", at: Date(), text: "Stopped", failed: true)
+        XCTAssertFalse(ChatHistoryCodec.message(entry).retrySafe)
+    }
+
+    func testRetrySafetySurvivesSavingAndLoading() {
+        let store = ChatHistoryStore(thread: "agent", directory: directory)
+        var failed = ChatMessage(role: .assistant, text: "Stopped", isFailed: true)
+        failed.retrySafe = false
+        store.save(nodeID: "n", entries: [ChatHistoryCodec.saved(failed)])
+        XCTAssertFalse(ChatHistoryCodec.message(store.load(nodeID: "n")[0]).retrySafe)
+        failed.retrySafe = true
+        store.save(nodeID: "n", entries: [ChatHistoryCodec.saved(failed)])
+        XCTAssertTrue(ChatHistoryCodec.message(store.load(nodeID: "n")[0]).retrySafe)
+    }
+
 }

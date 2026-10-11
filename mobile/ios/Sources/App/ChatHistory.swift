@@ -7,6 +7,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var text: String
     var isStreaming: Bool
     var isFailed: Bool
+    var retrySafe: Bool = true
     var timestamp: Date
     // The daemon's id once this line is known to be stored in the shared
     // thread; nil while it exists only on this phone.
@@ -46,13 +47,14 @@ enum ChatHistoryCodec {
             at: message.timestamp,
             text: stopped ? stoppedText : message.text,
             failed: message.isFailed || message.isStreaming,
+            retrySafe: !message.isStreaming && message.retrySafe,
             sourceNodeId: message.sourceNodeId,
             sourceName: message.sourceName
         )
     }
 
     static func message(_ entry: SavedChatEntry) -> ChatMessage {
-        ChatMessage(
+        var message = ChatMessage(
             id: entry.id,
             role: entry.role == "user" ? .user : .assistant,
             text: entry.text,
@@ -62,6 +64,8 @@ enum ChatHistoryCodec {
             sourceNodeId: entry.sourceNodeId,
             sourceName: entry.sourceName
         )
+        message.retrySafe = entry.retrySafe ?? !entry.failed
+        return message
     }
 }
 

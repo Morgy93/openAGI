@@ -189,10 +189,9 @@ struct ChatConversationView: View {
                     .foregroundStyle(Theme.muted)
             }
             MessageBubbleRow(message: item.message, maxContainerWidth: width)
-            // DESIGN.md: "A failed send stays in place in `alert` with a
-            // 'Try again' directly under it. It is never silently dropped
-            // and never a modal."
-            if item.message.isFailed {
+            // Offer a resend only when the daemon rejected the turn before
+            // it ran. A lost stream can hide a completed action.
+            if item.message.isFailed && item.message.retrySafe {
                 Button("Try again") {
                     Task { await conversation.retry(item.message) }
                 }
@@ -260,7 +259,7 @@ enum ChatRetry {
     static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String)? {
         guard !isSending,
               let index = messages.firstIndex(where: { $0.id == failedID }),
-              let userText = messages[..<index].last(where: { $0.role == .user })?.text
+              messages[index].isFailed && messages[index].retrySafe,              let userText = messages[..<index].last(where: { $0.role == .user })?.text
         else { return nil }
         return (index, userText)
     }

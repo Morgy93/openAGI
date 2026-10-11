@@ -11,11 +11,12 @@ public struct SavedChatEntry: Codable, Sendable, Equatable {
     public var role: String
     public var at: Date
     public var text: String
+    public var retrySafe: Bool?
     public var failed: Bool
     public var sourceNodeId: String?
     public var sourceName: String?
 
-    public init(id: UUID, serverID: String? = nil, role: String, at: Date, text: String, failed: Bool = false,
+    public init(id: UUID, serverID: String? = nil, role: String, at: Date, text: String, failed: Bool = false, retrySafe: Bool? = nil,
                 sourceNodeId: String? = nil, sourceName: String? = nil) {
         self.id = id
         self.serverID = serverID
@@ -23,6 +24,7 @@ public struct SavedChatEntry: Codable, Sendable, Equatable {
         self.at = at
         self.text = text
         self.failed = failed
+        self.retrySafe = retrySafe
         self.sourceNodeId = sourceNodeId
         self.sourceName = sourceName
     }

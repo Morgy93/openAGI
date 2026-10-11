@@ -4,6 +4,8 @@
 // literal), no inline on* handlers (CSP), and every piece of dynamic data is
 // rendered with textContent. Client code uses plain string concatenation.
 
+import { DEFAULTS } from "./contracts.js";
+
 export const fleetPage = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -106,6 +108,9 @@ details.thread>summary{padding:0}
   'use strict';
   var POLL_MS = 30000;
   var BUSY_POLL_MS = 5000;
+  // Policy's limits, filled in from DEFAULTS below: an admitted run is slow
+  // past these. A queued run is waiting for a slot, not slow.
+  var SLOW_SEC = { full: FLEET_FULL_SLOW_SEC, quick: FLEET_QUICK_SLOW_SEC };
   var MODES = ['observe', 'propose', 'auto'];
   var MODE_HINT = {
     observe: 'Watching only. Sends nothing.',
@@ -461,10 +466,13 @@ details.thread>summary{padding:0}
       pill(box, 'Gate', gate + since, gateTone);
       var full = typeof bb3.fullQueue === 'number' ? bb3.fullQueue : 0;
       pill(box, 'Queue', count(bb3.fullQueue) + ' full, ' + count(bb3.quickQueue) + ' quick', full >= 5 ? 'warn' : 'dim');
-      var runs = Array.isArray(bb3.runs) ? bb3.runs : [];
-      var oldest = runs.reduce(function (best, r) { return !best || (r.ageSec || 0) > (best.ageSec || 0) ? r : best; }, null);
+      var runs = (Array.isArray(bb3.runs) ? bb3.runs : []).filter(function (r) { return r && !r.queued; });
+      var isSlow = function (r) { return (r.ageSec || 0) >= (r.kind === 'full' ? SLOW_SEC.full : SLOW_SEC.quick); };
+      // The limits differ by kind, so a slow quick run outranks an older full one.
+      var slowRuns = runs.filter(isSlow);
+      var oldest = (slowRuns.length ? slowRuns : runs).reduce(function (best, r) { return !best || (r.ageSec || 0) > (best.ageSec || 0) ? r : best; }, null);
       if (oldest) {
-        var slow = (oldest.ageSec || 0) > (oldest.kind === 'full' ? 1800 : 900);
+        var slow = isSlow(oldest);
         pill(box, 'Oldest run', secs(oldest.ageSec) + ' ' + (oldest.kind || '') + (oldest.pr ? ' #' + oldest.pr : ''), slow ? 'warn' : 'dim');
       } else {
         pill(box, 'Oldest run', 'none', 'dim');
@@ -478,6 +486,21 @@ details.thread>summary{padding:0}
     pill(box, 'LB', lbHealthy === true ? 'ok' : (lbHealthy === false ? 'down' : 'unknown'), lbHealthy === true ? 'good' : (lbHealthy === false ? 'hot' : 'dim'));
     var local = Array.isArray(infra.localVerify) ? infra.localVerify.length : 0;
     pill(box, 'Laptop verify', String(local), local ? 'warn' : 'dim');
+    var storage = snap.storage || null;
+    var vols = storage && Array.isArray(storage.volumes) ? storage.volumes : [];
+    vols.forEach(function (v) {
+      var name = v.id === 'sd' ? 'SD card' : 'Disk';
+      if (v.mounted === false) { pill(box, name, 'not mounted', 'dim'); return; }
+      var free = typeof v.freeGb === 'number' ? v.freeGb : null;
+      // low and critical come from the manager's live thresholds.
+      var low = typeof v.low === 'boolean' ? v.low : free !== null && free < (v.id === 'sd' ? 50 : 100);
+      var critical = typeof v.critical === 'boolean' ? v.critical : v.id !== 'sd' && free !== null && free < 15;
+      var tone = free === null ? 'dim' : (critical ? 'hot' : (low ? 'warn' : 'good'));
+      var text = free === null ? 'unknown' : Math.round(free) + ' GB free';
+      if (v.id === 'sd' && v.identityOk === false) text += ', unverified';
+      pill(box, name, text, tone);
+    });
+    if (storage && storage.lastFreed && typeof storage.lastFreed.gb === 'number') pill(box, 'Freed', storage.lastFreed.gb + ' GB ' + ago(storage.lastFreed.at), 'dim');
     var errors = snap.sourceErrors || {};
     Object.keys(errors).forEach(function (source) {
       pill(box, source, clip(errors[source], 120), 'hot');
@@ -660,4 +683,6 @@ details.thread>summary{padding:0}
   load();
 })();
 </script>
-</body></html>`;
+</body></html>`
+  .replace("FLEET_FULL_SLOW_SEC", String(DEFAULTS.fullRunSlowMs / 1000))
+  .replace("FLEET_QUICK_SLOW_SEC", String(DEFAULTS.quickVerifyEscalateMs / 1000));

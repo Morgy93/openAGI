@@ -103,7 +103,7 @@ final class ChatConversation {
                     messages[index].isStreaming = false
                 case .failure(let frame):
                     sawTerminalFrame = true
-                    fail(replyID, text: frame.error ?? "OpenAGI couldn't reply. Try again.")
+                    fail(replyID, text: (frame.error ?? "OpenAGI couldn't finish.") + " Check the conversation before sending again.")
                 case .status, .session:
                     break
                 }
@@ -113,22 +113,30 @@ final class ChatConversation {
             // still finish and store the reply -- the refresh below brings it
             // in and clears this failure if so.
             if !sawTerminalFrame {
-                fail(replyID, text: "Reply stopped early. Try again.")
+                fail(replyID, text: "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
             }
         } catch let error as DaemonError {
-            fail(replyID, text: ChatErrorCopy.message(for: error))
+            if !sawTerminalFrame {
+                fail(replyID, text: error == .agentHostDisabled || error == .unauthorized
+                     ? ChatErrorCopy.message(for: error)
+                     : "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.",
+                     retrySafe: error == .agentHostDisabled)
+            }
         } catch {
-            fail(replyID, text: "Can't reach OpenAGI. Check your connection and try again.")
+            if !sawTerminalFrame {
+                fail(replyID, text: "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
+            }
         }
         persist()
         await refresh()
     }
 
-    private func fail(_ replyID: UUID, text: String) {
+    private func fail(_ replyID: UUID, text: String, retrySafe: Bool = false) {
         guard let index = messages.firstIndex(where: { $0.id == replyID }) else { return }
         messages[index].text = text
         messages[index].isStreaming = false
         messages[index].isFailed = true
+        messages[index].retrySafe = retrySafe
     }
 
     // MARK: - Shared history

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { fleetPage } from "../src/fleet/page.js";
+import { DEFAULTS } from "../src/fleet/contracts.js";
 
 function pageScript() {
   const scripts = [...fleetPage.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
@@ -117,6 +118,7 @@ function sampleState(overrides = {}) {
         lb: { healthy: false, detail: "503", watchLine: null, recentErrors: [] },
         localVerify: [{ pid: 9, command: "pnpm build", cwd: "/x", ageSec: 60, threadKey: "codex:a" }]
       },
+      storage: { volumes: [{ id: "data", freeGb: 137.4, totalGb: 1858, mounted: true, identityOk: true, low: true, critical: false }, { id: "sd", freeGb: 63, totalGb: 1863, mounted: true, identityOk: false }], lastFreed: { gb: 8.2, at: new Date().toISOString(), what: "safe cleanup" }, pendingAsks: 1 },
       sourceErrors: { github: evil }
     },
     questions: [
@@ -195,6 +197,10 @@ test("page renders state with text only and neutralises unsafe links", async () 
   assert.ok(fleet.textContent.includes("PR not ready"));
   assert.ok(page.el("infraStrip").textContent.includes("blocked"));
   assert.ok(page.el("infraStrip").textContent.includes("github"));
+  assert.ok(page.el("infraStrip").textContent.includes("137 GB free"), "disk free on the infra strip");
+  // Low by the manager's own threshold (an env override), not a fixed 100.
+  assert.equal(findAll(page.el("infraStrip"), (e) => e.textContent === "137 GB free")[0].className, "warn");
+  assert.ok(page.el("infraStrip").textContent.includes("63 GB free, unverified"));
   const doing = page.el("doingList");
   assert.equal(findAll(doing, (e) => e.tagName === "BUTTON" && e.textContent === "Send").length, 1, "Send only on proposed");
   assert.equal(page.el("mode-propose").getAttribute("aria-pressed"), "true");
@@ -368,4 +374,32 @@ test("an open question shows why the supervisor kept it, with the full reason on
   assert.ok(note.title.startsWith(long), "full reason on hover");
   assert.match(note.title, /reviewed /);
   assert.equal(cards[1].textContent.includes("Supervisor:"), false, "no review, no line");
+});
+
+test("Oldest run skips queued runs and uses policy's slow limits", async () => {
+  assert.doesNotMatch(fleetPage, /FLEET_(?:FULL|QUICK)_SLOW_SEC/, "limits filled in");
+  const fullSlowSec = DEFAULTS.fullRunSlowMs / 1000;
+  const oldestPill = async (runs) => {
+    const state = sampleState();
+    state.snapshot.infra.bb3.runs = runs;
+    const page = boot({ state });
+    await settle();
+    const pill = findAll(page.el("infraStrip"), (e) => e.className === "pill" && e.textContent.startsWith("Oldest run"))[0];
+    return { text: pill.textContent, tone: pill.children[0].className };
+  };
+  const full = (pr, ageSec, queued) => ({ pid: pr, kind: "full", pr, head: "abc", ageSec, owner: null, queued });
+  // Hours in the queue, and a 40-min admitted run past the old 30-min line.
+  let pill = await oldestPill([full(1, 4 * 3600, true), full(2, 40 * 60, false)]);
+  assert.match(pill.text, /#2$/, "the queued run is not the oldest");
+  assert.equal(pill.tone, "dim", "under fullRunSlowMs is not slow");
+  pill = await oldestPill([full(3, fullSlowSec, false)]);
+  assert.equal(pill.tone, "warn", "slow from fullRunSlowMs");
+  pill = await oldestPill([full(4, 4 * 3600, true)]);
+  assert.match(pill.text, /none$/, "only queued runs: none running");
+  const quick = { pid: 5, kind: "quick", pr: 5, head: "abc", ageSec: DEFAULTS.quickVerifyEscalateMs / 1000, owner: null };
+  pill = await oldestPill([quick]);
+  assert.equal(pill.tone, "warn", "quick runs keep quickVerifyEscalateMs");
+  pill = await oldestPill([full(2, 40 * 60, false), quick, null]);
+  assert.match(pill.text, /#5$/, "an older full run under its limit does not hide a slow quick run");
+  assert.equal(pill.tone, "warn");
 });

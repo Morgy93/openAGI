@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
   BB3_PROBE_SCRIPT, checkLb, ownerFromLog, parseBb3Probe, parseTimersDead, probeBuildBot3, readLocalWatchState
@@ -12,6 +16,8 @@ function config(overrides = {}) {
     home: "/home/fixture",
     bins: { ssh: "/fake/ssh" },
     paths: { lbWatchLog: "/fake/lb-watch.log", bb3WatchState: "/fake/state", bb3WatchGateState: "/fake/gate" },
+    bb3Host: "build@192.0.2.10",
+    lbUrl: "http://192.0.2.10:2455",
     ...overrides
   });
 }
@@ -22,52 +28,52 @@ function config(overrides = {}) {
 const CAPTURED_PROBE = [
   "@@ps",
   " 168945       1    6476 bash -c ~/bin/bb-verify --full --pr 6874 > ~/monrovia-pr6874-full.log 2>&1; echo $? > ~/monrovia-pr6874-full.exit",
-  " 168956  168945    6476 python3 /home/dev/bin/bb-verify --full --pr 6874",
-  " 407274       1     739 python3 /home/dev/bin/bb-quick --head 1b9f8efadbd17b0e46b09ee42b68824c5b703b78 --base 9b2531de41f95c7971f3130105f1dedef007d414",
-  " 407276       1     739 python3 /home/dev/bin/bb-quick --head e688697a66a3c0e4d05124afb35550337cffcd7b --base 1b9f8efadbd17b0e46b09ee42b68824c5b703b78",
-  " 579339  579084    9518 python3 /home/dev/bin/bb-verify --full --pr 6758",
-  " 579652       1    6142 python3 /home/dev/bin/bb-verify --full --pr 6848",
-  " 581841       1    6140 python3 /home/dev/bin/bb-verify --full --pr 6846",
-  " 583707       1    6138 python3 /home/dev/bin/bb-verify --full --pr 6711",
+  " 168956  168945    6476 python3 /home/build/bin/bb-verify --full --pr 6874",
+  " 407274       1     739 python3 /home/build/bin/bb-quick --head 1b9f8efadbd17b0e46b09ee42b68824c5b703b78 --base 9b2531de41f95c7971f3130105f1dedef007d414",
+  " 407276       1     739 python3 /home/build/bin/bb-quick --head e688697a66a3c0e4d05124afb35550337cffcd7b --base 1b9f8efadbd17b0e46b09ee42b68824c5b703b78",
+  " 579339  579084    9518 python3 /home/build/bin/bb-verify --full --pr 6758",
+  " 579652       1    6142 python3 /home/build/bin/bb-verify --full --pr 6848",
+  " 581841       1    6140 python3 /home/build/bin/bb-verify --full --pr 6846",
+  " 583707       1    6138 python3 /home/build/bin/bb-verify --full --pr 6711",
   " 865062  864934    9305 bash -c cd ~/buildbetter && ~/bin/bb-verify --full --pr 6470 > ~/bb-verify-6470-c6cbdba0be.log 2>&1; echo \"exit=$?\"; grep -a -E \"Verification evidence|Testing|merge|cache\" ~/bb",
-  " 865070  865062    9305 python3 /home/dev/bin/bb-verify --full --pr 6470",
+  " 865070  865062    9305 python3 /home/build/bin/bb-verify --full --pr 6470",
   " 881817  881604     430 bash -c cd ~/buildbetter && git fetch -q /tmp/convert-wip3.bundle HEAD && timeout 2400 ~/bin/bb-quick --head 80ccb2c425b645dc87aaf6de527335aa19e7aaf0 --base c3fc2f675230dddd4d7",
-  " 882221  881817     430 timeout 2400 /home/dev/bin/bb-quick --head 80ccb2c425b645dc87aaf6de527335aa19e7aaf0 --base c3fc2f675230dddd4d70f27867931c9c23a62c3b",
-  " 882229  882221     430 python3 /home/dev/bin/bb-quick --head 80ccb2c425b645dc87aaf6de527335aa19e7aaf0 --base c3fc2f675230dddd4d70f27867931c9c23a62c3b",
+  " 882221  881817     430 timeout 2400 /home/build/bin/bb-quick --head 80ccb2c425b645dc87aaf6de527335aa19e7aaf0 --base c3fc2f675230dddd4d70f27867931c9c23a62c3b",
+  " 882229  882221     430 python3 /home/build/bin/bb-quick --head 80ccb2c425b645dc87aaf6de527335aa19e7aaf0 --base c3fc2f675230dddd4d70f27867931c9c23a62c3b",
   "1338953       1    3081 bash -c ~/bin/bb-verify --full --pr 6877 > ~/monrovia-pr6877-full.log 2>&1; echo $? > ~/monrovia-pr6877-full.exit",
-  "1338956 1338953    3081 python3 /home/dev/bin/bb-verify --full --pr 6877",
+  "1338956 1338953    3081 python3 /home/build/bin/bb-verify --full --pr 6877",
   "1338960       1    3081 bash -c ~/bin/bb-verify --full --pr 6878 > ~/monrovia-pr6878-full.log 2>&1; echo $? > ~/monrovia-pr6878-full.exit",
-  "1338965 1338960    3081 python3 /home/dev/bin/bb-verify --full --pr 6878",
-  "2370000       1    4716 python3 /home/dev/bin/bb-verify --full --pr 6849",
-  "2505676       1    2205 python3 /home/dev/bin/bb-verify --full --pr 6847",
-  "2505682       1    2205 python3 /home/dev/bin/bb-verify --full --pr 6844",
+  "1338965 1338960    3081 python3 /home/build/bin/bb-verify --full --pr 6878",
+  "2370000       1    4716 python3 /home/build/bin/bb-verify --full --pr 6849",
+  "2505676       1    2205 python3 /home/build/bin/bb-verify --full --pr 6847",
+  "2505682       1    2205 python3 /home/build/bin/bb-verify --full --pr 6844",
   "3008811       1    7636 bash -c cd ~/buildbetter && nohup ~/bin/bb-verify --full --pr 6859 > ~/bbverify-6859.log 2>&1 & echo PID=$!",
-  "3008819 3008811    7636 python3 /home/dev/bin/bb-verify --full --pr 6859",
-  "3062861 3062672    1921 python3 /home/dev/bin/bb-quick --head 9b1db14ab62794060d29e3cb7d97f018287e08a4 --base f3436593f1 --tests",
-  "3743085 3742780    4031 python3 /home/dev/bin/bb-verify --full --pr 5312",
+  "3008819 3008811    7636 python3 /home/build/bin/bb-verify --full --pr 6859",
+  "3062861 3062672    1921 python3 /home/build/bin/bb-quick --head 9b1db14ab62794060d29e3cb7d97f018287e08a4 --base f3436593f1 --tests",
+  "3743085 3742780    4031 python3 /home/build/bin/bb-verify --full --pr 5312",
   "@@out",
   "168945 /dev/null",
-  "168956 /home/dev/monrovia-pr6874-full.log",
-  "407274 /home/dev/bbq-pr6851-r5.log",
-  "407276 /home/dev/bbq-pr6862-r2.log",
+  "168956 /home/build/monrovia-pr6874-full.log",
+  "407274 /home/build/bbq-pr6851-r5.log",
+  "407276 /home/build/bbq-pr6862-r2.log",
   "579339 pipe:[17307461]",
-  "579652 /home/dev/bb-verify-6848-write.log",
-  "581841 /home/dev/bb-verify-6846-write.log",
-  "583707 /home/dev/bb-verify-6711-write.log",
+  "579652 /home/build/bb-verify-6848-write.log",
+  "581841 /home/build/bb-verify-6846-write.log",
+  "583707 /home/build/bb-verify-6711-write.log",
   "865062 pipe:[18361647]",
-  "865070 /home/dev/bb-verify-6470-c6cbdba0be.log",
+  "865070 /home/build/bb-verify-6470-c6cbdba0be.log",
   "881817 pipe:[64515756]",
   "882221 /tmp/convert-quick-3.log",
   "882229 /tmp/convert-quick-3.log",
   "1338953 /dev/null",
-  "1338956 /home/dev/monrovia-pr6877-full.log",
+  "1338956 /home/build/monrovia-pr6877-full.log",
   "1338960 /dev/null",
-  "1338965 /home/dev/monrovia-pr6878-full.log",
-  "2370000 /home/dev/logs/bb-verify-6849-rerun.log",
-  "2505676 /home/dev/bb-verify-6847-write2.log",
-  "2505682 /home/dev/bb-verify-6844-write2.log",
+  "1338965 /home/build/monrovia-pr6878-full.log",
+  "2370000 /home/build/logs/bb-verify-6849-rerun.log",
+  "2505676 /home/build/bb-verify-6847-write2.log",
+  "2505682 /home/build/bb-verify-6844-write2.log",
   "3008811 pipe:[26380569]",
-  "3008819 /home/dev/bbverify-6859.log",
+  "3008819 /home/build/bbverify-6859.log",
   "3062861 pipe:[57346656]",
   "3743085 pipe:[44174242]",
   "@@quick",
@@ -171,13 +177,13 @@ test("parseBb3Probe reads the captured BuildBot3 probe", () => {
 });
 
 test("ownerFromLog keeps the workspace name and drops PR, lane, and retry noise", () => {
-  assert.equal(ownerFromLog("/home/dev/monrovia-pr6874-full.log"), "monrovia");
+  assert.equal(ownerFromLog("/home/build/monrovia-pr6874-full.log"), "monrovia");
   assert.equal(ownerFromLog("~/bb-verify-6873-sydney.log"), "sydney");
-  assert.equal(ownerFromLog("/home/dev/la-paz-pr6847-full.log"), "la-paz");
-  assert.equal(ownerFromLog("/home/dev/bbverify-6859.log"), null);
-  assert.equal(ownerFromLog("/home/dev/bbq-pr6851-r5.log"), null);
-  assert.equal(ownerFromLog("/home/dev/bb-verify-6470-c6cbdba0be.log"), null);
-  assert.equal(ownerFromLog("/home/dev/bb-verify-6847-write2.log"), null);
+  assert.equal(ownerFromLog("/home/build/la-paz-pr6847-full.log"), "la-paz");
+  assert.equal(ownerFromLog("/home/build/bbverify-6859.log"), null);
+  assert.equal(ownerFromLog("/home/build/bbq-pr6851-r5.log"), null);
+  assert.equal(ownerFromLog("/home/build/bb-verify-6470-c6cbdba0be.log"), null);
+  assert.equal(ownerFromLog("/home/build/bb-verify-6847-write2.log"), null);
   assert.equal(ownerFromLog("pipe:[17307461]"), null);
   assert.equal(ownerFromLog("/dev/null"), null);
   assert.equal(ownerFromLog(null), null);
@@ -187,12 +193,12 @@ test("parseBb3Probe falls back to the wrapper redirect for owner and PR", () => 
   const text = sections({
     ps: [
       "   100     1   2000 bash -c cd ~/buildbetter && timeout 3000 ~/bin/bb-quick --pr 6801 > ~/cairo-pr6801-quick.log 2>&1",
-      "   101   100   1990 timeout 3000 /home/dev/bin/bb-quick --pr 6801",
-      "   102   101   1990 python3 /home/dev/bin/bb-quick --pr 6801",
-      "   200     1    100 python3 /home/dev/bin/bb-verify --pr 6802",
-      "   300     1     50 python3 /home/dev/bin/bb-verify-sweep --apply"
+      "   101   100   1990 timeout 3000 /home/build/bin/bb-quick --pr 6801",
+      "   102   101   1990 python3 /home/build/bin/bb-quick --pr 6801",
+      "   200     1    100 python3 /home/build/bin/bb-verify --pr 6802",
+      "   300     1     50 python3 /home/build/bin/bb-verify-sweep --apply"
     ],
-    out: ["100 pipe:[1]", "101 pipe:[1]", "102 pipe:[1]", "200 /home/dev/bb-verify-6802-sydney.log"]
+    out: ["100 pipe:[1]", "101 pipe:[1]", "102 pipe:[1]", "200 /home/build/bb-verify-6802-sydney.log"]
   });
   const bb3 = parseBb3Probe(text, NOW);
   assert.deepEqual(bb3.runs, [
@@ -260,7 +266,7 @@ test("probeBuildBot3 runs one batch-mode ssh and parses it", async () => {
   const bb3 = await probeBuildBot3(config(), { run, now: NOW });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, "/fake/ssh");
-  assert.deepEqual(calls[0].args, ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "dev@100.99.3.113", BB3_PROBE_SCRIPT]);
+  assert.deepEqual(calls[0].args, ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "build@192.0.2.10", BB3_PROBE_SCRIPT]);
   assert.equal(calls[0].options.timeoutMs, 40000);
   assert.equal(bb3.reachable, true);
   assert.equal(bb3.gate.state, "blocked");
@@ -270,7 +276,7 @@ test("probeBuildBot3 runs one batch-mode ssh and parses it", async () => {
 test("probeBuildBot3 reports unreachable hosts without throwing", async () => {
   const refused = await probeBuildBot3(config(), {
     now: NOW,
-    run: async () => ({ code: 255, stdout: "", stderr: "ssh: connect to host 100.99.3.113 port 22: Operation timed out\n", timedOut: false, error: null })
+    run: async () => ({ code: 255, stdout: "", stderr: "ssh: connect to host 192.0.2.10 port 22: Operation timed out\n", timedOut: false, error: null })
   });
   assert.equal(refused.reachable, false);
   assert.match(refused.error, /Operation timed out/);
@@ -316,8 +322,8 @@ test("checkLb reports health from /health and the last lb-watch line", async () 
     assert.equal(file, "/fake/lb-watch.log");
     return "2026-09-26T07:35:53Z healthy=no old\n2026-09-26T08:05:54Z healthy=no 93 req since start, v1.24.0, problems: report is 406 min old; lb-health timer dead?\n";
   };
-  const lb = await checkLb(config({ lbUrl: "http://100.99.3.113:2455/" }), { fetchImpl, readFile, now: NOW });
-  assert.deepEqual(urls, ["http://100.99.3.113:2455/health"]);
+  const lb = await checkLb(config({ lbUrl: "http://192.0.2.10:2455/" }), { fetchImpl, readFile, now: NOW });
+  assert.deepEqual(urls, ["http://192.0.2.10:2455/health"]);
   assert.equal(lb.healthy, true);
   assert.equal(lb.detail, "200 v1.24.0");
   assert.equal(lb.watchLine, "2026-09-26T08:05:54Z healthy=no 93 req since start, v1.24.0, problems: report is 406 min old; lb-health timer dead?");
@@ -362,4 +368,114 @@ test("an SSH probe cut off after the first marker is unknown, never reachable", 
   assert.equal(bb3.reachable, null);
   assert.equal(bb3.gate.state, "blocked", "the last known gate state carries over");
   assert.ok(bb3.error);
+});
+
+test("queued full runs are aged and judged apart from running ones", () => {
+  // ps etimes counts the wait in the queue; only the slot holder is running.
+  const text = [
+    "@@ps",
+    "  100     1  2400 python3 /home/build/bin/bb-verify --full --pr 7321",
+    "  200     1  1800 python3 /home/build/bin/bb-verify --full --pr 7447",
+    "  300     1  9000 python3 /home/build/bin/bb-verify --full --pr 7210",
+    "@@out", "@@slots",
+    "100 2200",
+    "300 900000",
+    "@@slots-ok",
+    "@@full", "2", "@@quick", "0", "@@gate", "{}", "@@load", "1 1 1 1/1 1", "@@timers", "@@end"
+  ].join("\n");
+  const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
+  assert.equal(runs[7321].queued, false);
+  assert.equal(runs[7321].ageSec, 2200);
+  assert.equal(runs[7447].queued, true);
+  // A record older than its process belongs to a recycled pid.
+  assert.equal(runs[7210].queued, true);
+});
+
+test("an older probe without a slots section keeps process ages", () => {
+  const text = ["@@ps", "  100     1  2400 python3 /home/build/bin/bb-verify --full --pr 7321", "@@out", "@@end"].join("\n");
+  const [run] = parseBb3Probe(text, NOW).runs;
+  assert.equal(run.queued, undefined);
+  assert.equal(run.ageSec, 2400);
+});
+
+test("a slot scan that did not finish keeps process ages", () => {
+  // Rows printed before the scan crashed are not the whole slot list.
+  const text = [
+    "@@ps",
+    "  100     1  2400 python3 /home/build/bin/bb-verify --full --pr 7321",
+    "  200     1  9000 python3 /home/build/bin/bb-verify --full --pr 7210",
+    "@@out", "@@slots", "100 2200", "@@gate", "{}", "@@end"
+  ].join("\n");
+  const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
+  assert.equal(runs[7321].queued, undefined);
+  assert.equal(runs[7321].ageSec, 2400);
+  assert.equal(runs[7210].queued, undefined);
+  assert.equal(runs[7210].ageSec, 9000);
+});
+
+test("a stale record sharing a reused pid does not hide the live one", () => {
+  for (const rows of [["100 900000", "100 2200"], ["100 2200", "100 900000"]]) {
+    const text = [
+      "@@ps", "  100     1  2400 python3 /home/build/bin/bb-verify --full --pr 7321",
+      "@@out", "@@slots", ...rows, "@@slots-ok", "@@end"
+    ].join("\n");
+    const [run] = parseBb3Probe(text, NOW).runs;
+    assert.equal(run.queued, false, rows.join(", "));
+    assert.equal(run.ageSec, 2200, rows.join(", "));
+  }
+});
+
+const hasPython = spawnSync("python3", ["-c", ""]).status === 0;
+
+test("the slot scan skips unreadable records and says when it finished", { skip: !hasPython && "no python3" }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-bb3-slots-"));
+  try {
+    const record = (name, body) => {
+      const dir = path.join(home, ".bb-ci/canonical-verification", name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "ownership.json"), body);
+    };
+    const createdAt = Date.now() / 1000 - 600;
+    record("run-a", "{\"state\": \"run");
+    record("run-b", "[1, 2]");
+    record("run-c", JSON.stringify({ state: "running", pid: 4242, created_at: createdAt }));
+    record("run-d", JSON.stringify({ state: "finished", pid: 4343, created_at: createdAt }));
+    record("run-e", JSON.stringify({ state: "starting", pid: 4444, created_at: createdAt }));
+    const lines = BB3_PROBE_SCRIPT.split("\n");
+    const scan = lines.slice(lines.indexOf('echo "@@slots"'), lines.indexOf('echo "@@gate"')).join("\n");
+    const result = spawnSync("bash", ["-c", scan], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const text = [
+      "@@ps",
+      "  4242     1  700 python3 /home/build/bin/bb-verify --full --pr 7321",
+      "  4343     1  700 python3 /home/build/bin/bb-verify --full --pr 7322",
+      "  4444     1  700 python3 /home/build/bin/bb-verify --full --pr 7323",
+      "@@out", result.stdout, "@@end"
+    ].join("\n");
+    const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
+    // A setup that hangs holds its slot too, so it must still read as slow.
+    for (const pr of [7321, 7323]) {
+      assert.equal(runs[pr].queued, false, String(pr));
+      assert.ok(runs[pr].ageSec >= 600 && runs[pr].ageSec < 660, String(runs[pr].ageSec));
+    }
+    assert.equal(runs[7322].queued, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("unset build host and LB URL are not configured, never an outage", async () => {
+  const bare = resolveFleetConfig({}, { home: "/home/fixture", bins: { ssh: "/fake/ssh" }, paths: { lbWatchLog: "/fake/lb-watch.log" } });
+  assert.equal(bare.bb3Host, null);
+  assert.equal(bare.lbUrl, null);
+  assert.equal(bare.managerRef, null);
+  let ran = false;
+  const bb3 = await probeBuildBot3(bare, { run: async () => { ran = true; return { code: 0, stdout: "" }; }, now: NOW });
+  assert.equal(ran, false);
+  assert.equal(bb3.reachable, null);
+  assert.equal(bb3.error, "not configured");
+  let fetched = false;
+  const lb = await checkLb(bare, { fetchImpl: async () => { fetched = true; return { ok: true, status: 200 }; }, now: NOW });
+  assert.equal(fetched, false);
+  assert.equal(lb.healthy, null);
 });

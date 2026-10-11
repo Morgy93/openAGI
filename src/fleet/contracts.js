@@ -50,6 +50,10 @@ export const DEFAULTS = Object.freeze({
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
+  // A run holding a verification slot is slow only past this: normal runs
+  // finish well inside it, and the verifier kills one at 90 min. The 30-min
+  // thread-wait limit above would page about normal runs.
+  fullRunSlowMs: 75 * MIN,
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
   // No transcript row this long: a Conductor "working" turn is hung, and a
@@ -59,6 +63,9 @@ export const DEFAULTS = Object.freeze({
   idleReportMaxAgeMs: 6 * 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   lbErrorFreshMs: 15 * MIN,
+  // Connection/unavailable errors seen in chats alarm only at this count (or
+  // across two threads); one dropped stream is routine.
+  lbTransientErrorMin: 3,
   managerEscalationCooldownMs: 60 * MIN,
   // An idle thread with no delivery route waits this long before the owner
   // is asked to open it.
@@ -104,9 +111,14 @@ export const DEFAULTS = Object.freeze({
   uiPollMs: 500
 });
 
-export const DEFAULT_BB3_HOST = "dev@100.99.3.113";
-export const DEFAULT_LB_URL = "http://100.99.3.113:2455";
-export const DEFAULT_MANAGER_REF = "0056f770-e054-484b-a712-4cc036dacf6f";
+// Deployment-specific targets have no built-in value: set them with
+// OPENAGI_FLEET_BB3_HOST (ssh destination of the build box),
+// OPENAGI_FLEET_LB_URL (base URL of the Codex load balancer) and
+// OPENAGI_FLEET_BB3_MANAGER (the session that manages the box). A source whose
+// target is unset reports itself as not configured rather than guessing.
+export const DEFAULT_BB3_HOST = null;
+export const DEFAULT_LB_URL = null;
+export const DEFAULT_MANAGER_REF = null;
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
 // Model for the review of the needs-you list, chosen by the owner on
 // 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
@@ -114,6 +126,15 @@ export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
 export const DEFAULT_REVIEW_MS = 30 * MIN;
 // Sonnet took about 3 minutes on 13 questions, mostly thinking.
 export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
+// Storage manager: the Mac's data volume and the SD card (sizes in GB of 2^30).
+export const DEFAULT_DATA_MOUNT = "/System/Volumes/Data";
+export const DEFAULT_SD_MOUNT = "/Volumes/Xtra";
+export const STORAGE_DEFAULTS = Object.freeze({
+  lowGb: 100, targetFreeGb: 150, criticalGb: 15, sdLowGb: 50, sdReserveGb: 30,
+  // A plan smaller than this is not worth a question.
+  askMinGb: 1,
+  scanMs: 60 * MIN, scanLowMs: 15 * MIN, scanBudgetMs: 120_000
+});
 
 export function defaultPaths(home = os.homedir()) {
   return {
@@ -144,7 +165,12 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     lsof: pick(["/usr/sbin/lsof"], "lsof"),
     lsappinfo: pick(["/usr/bin/lsappinfo"], "lsappinfo"),
     ioreg: pick(["/usr/sbin/ioreg"], "ioreg"),
-    open: pick(["/usr/bin/open"], "open")
+    open: pick(["/usr/bin/open"], "open"),
+    du: pick(["/usr/bin/du"], "du"),
+    df: pick(["/bin/df"], "df"),
+    ditto: pick(["/usr/bin/ditto"], "ditto"),
+    diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
+    rm: pick(["/bin/rm"], "rm")
   };
 }
 
@@ -154,14 +180,27 @@ const OCU_NATIVE = ["dist", "Open Computer Use.app", "Contents", "MacOS", "OpenC
 // The standalone Open Computer Use binary the fleet drives apps with. The npm
 // "open-computer-use" command is a node launcher: a launchd PATH may lack
 // node, and killing the launcher would orphan the engine, so the bundled
-// native executable next to it is used instead when present.
-export function resolveOcuPath(env = process.env, { exists = fs.existsSync, realpath = fs.realpathSync, execPath = process.execPath } = {}) {
+// native executable next to it is used instead when present. The app starts
+// the daemon with its own node and a bare PATH (after a reboot, say), so the
+// usual per-user install dirs are searched too, newest nvm node first.
+export function resolveOcuPath(env = process.env, { exists = fs.existsSync, realpath = fs.realpathSync, execPath = process.execPath, readdir = fs.readdirSync, home = env?.HOME || os.homedir() } = {}) {
   const explicit = String(env?.OPENAGI_FLEET_OCU_PATH ?? "").trim();
+  let nvm = [];
+  try {
+    const versions = path.join(home, ".nvm", "versions", "node");
+    nvm = readdir(versions).filter((name) => /^v\d/.test(name))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+      .map((name) => path.join(versions, name, "bin", OCU_NAME));
+  } catch { /* no nvm */ }
   const candidates = explicit ? [explicit] : [
     ...String(env?.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, OCU_NAME)),
     path.join(path.dirname(execPath), OCU_NAME),
     `/opt/homebrew/bin/${OCU_NAME}`,
-    `/usr/local/bin/${OCU_NAME}`
+    `/usr/local/bin/${OCU_NAME}`,
+    ...nvm,
+    // pnpm's global bin is a generated shell launcher (needs node on PATH,
+    // and does not lead to the native engine), so it is not searched.
+    ...[".volta/bin", ".npm-global/bin", ".local/bin", ".bun/bin"].map((dir) => path.join(home, dir, OCU_NAME))
   ];
   const found = candidates.find((candidate) => path.isAbsolute(candidate) && exists(candidate));
   if (!found) return explicit || null;
@@ -245,9 +284,23 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
       timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
     },
+    // Disk space: safe cleanup, archive to the SD card, and asks. On with
+    // the supervisor unless OPENAGI_FLEET_STORAGE=0.
+    storage: {
+      ...STORAGE_DEFAULTS,
+      lowGb: envNumber(env.OPENAGI_FLEET_STORAGE_LOW_GB, STORAGE_DEFAULTS.lowGb),
+      targetFreeGb: envNumber(env.OPENAGI_FLEET_STORAGE_TARGET_GB, STORAGE_DEFAULTS.targetFreeGb),
+      criticalGb: envNumber(env.OPENAGI_FLEET_STORAGE_CRITICAL_GB, STORAGE_DEFAULTS.criticalGb),
+      sdLowGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_LOW_GB, STORAGE_DEFAULTS.sdLowGb),
+      sdReserveGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_RESERVE_GB, STORAGE_DEFAULTS.sdReserveGb),
+      dataMount: DEFAULT_DATA_MOUNT,
+      sdMount: String(env.OPENAGI_FLEET_STORAGE_SD ?? "").trim() || DEFAULT_SD_MOUNT,
+      ...(overrides.storage ?? {}),
+      enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
-    bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env), ...(overrides.bins ?? {}) }
+    bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
   };
 }
 
@@ -593,10 +646,12 @@ export async function openReadOnlyDb(filePath) {
  * @typedef {Object} FleetInfra
  * @property {{reachable: boolean|null, checkedAt: string|null, gate: {state: string|null, reason: string|null, since: string|null},
  *   fullQueue: number|null, quickQueue: number|null, load: number[]|null,
- *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null}[],
- *   timersDead: string[], error: string|null}} bb3
+ *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null,
+ *     queued?: boolean}[],
+ *   timersDead: string[], error: string|null}} bb3   a full run is queued while it waits for a slot; once admitted its ageSec is from admission
  * @property {{healthy: boolean|null, detail: string|null, watchLine: string|null,
- *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[]}[]}} lb
+ *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[],
+ *     freshCount?: number, freshThreadIds?: string[]}[]}} lb   fresh*: the rows inside lbErrorFreshMs
  * @property {{pid: number, command: string, cwd: string|null, ageSec: number, threadKey: string|null}[]} localVerify
  */
 

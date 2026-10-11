@@ -30,11 +30,10 @@ const SLOW_NAVIGATION = new Set(["com.openai.codex"]);
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
 // Presence is read from HIDIdleTime alone, and any input there counts as the
-// owner's. Open Computer Use types into a settable composer by setting its
-// accessibility value and clicks through accessibility, neither of which
-// posts a HID event; its key presses (Return) and keyboard-fallback typing
-// do, and nothing that follows them needs the owner away except putting
-// their app back, which then simply waits for real idle.
+// owner's. Accessibility clicks do not post HID events. Keyboard typing
+// and key presses (Return) can reset that clock; subsequent checks must
+// continue to respect owner activity rather than assuming input was ours.
+// Putting the owner's app back waits for real idle.
 // After a Return send, the owner's app goes back on a later readiness check
 // once nothing but that key has happened and they have been away long
 // enough; given up after this long.
@@ -156,8 +155,6 @@ const ROW_STATS = /(?:\s+[+-](?:[\d.,]+[kKmM]?|✱+))+$/;
 
 function parseElementLine(depth, id, rest) {
   let body = String(rest ?? "");
-  const secondary = body.search(/,? Secondary Actions: /);
-  if (secondary >= 0) body = body.slice(0, secondary);
   const lower = body.toLowerCase();
   let role = ROLE_PHRASES.find((phrase) => lower === phrase || lower.startsWith(`${phrase} `) || lower.startsWith(`${phrase}(`) || lower.startsWith(`${phrase},`));
   if (!role) role = lower.split(/[\s(,]/)[0] ?? "";
@@ -168,6 +165,12 @@ function parseElementLine(depth, id, rest) {
     flags = flagMatch[1].split(",").map((flag) => flag.trim().toLowerCase()).filter(Boolean);
     body = body.slice(flagMatch[0].length);
   }
+  // The text as printed, before any suffix is cut: an editable's inner text
+  // rows carry no OCU suffix, and a message may say "Secondary Actions:".
+  const rawText = body;
+  // OCU appends ", Secondary Actions: …" to a row; only the last one can be it.
+  const secondary = [...body.matchAll(/(?:^|,?\s+)Secondary Actions: /g)].at(-1)?.index ?? -1;
+  if (secondary >= 0) body = body.slice(0, secondary);
   const fields = {};
   const markers = [...body.matchAll(FIELD_MARKER)];
   const label = (markers.length ? body.slice(0, markers[0].index) : body).replace(/[,\s]+$/, "").trim();
@@ -180,7 +183,7 @@ function parseElementLine(depth, id, rest) {
   const search = normalizeUiText([label, value, fields.title, fields.description, fields.help, fields.id].filter(Boolean).join(" ")).toLowerCase();
   const hint = normalizeUiText([label, fields.placeholder, fields.description, fields.help, fields.id].filter(Boolean).join(" "));
   return {
-    id: String(id), depth, role, flags, label, value, fields, search, hint,
+    id: String(id), depth, role, flags, label, rawText, value, fields, search, hint,
     selected: flags.includes("selected"),
     focused: flags.includes("focused"),
     disabled: flags.includes("disabled") || flags.includes("dimmed")
@@ -214,6 +217,30 @@ export function parseAppState(result) {
     element.parent = stack[stack.length - 1] ?? null;
     stack.push(element);
   }
+  // OCU prints a filled editable's text as "text" rows inside it, with no
+  // "Value:" (and the app's placeholder ahead of it on the row itself). Those
+  // rows are the editable's value, not editables of their own.
+  for (const element of elements) {
+    if (element.role !== "text") continue;
+    const owner = ancestors(element).find((node) => EDITABLE_ROLES.has(node.role));
+    if (!owner) continue;
+    element.inner = true;
+    (owner.innerText ??= []).push(element.rawText);
+  }
+  for (const element of elements) {
+    if (element.innerText) {
+      const value = element.innerText.join("\n");
+      const placeholder = composerPlaceholder(element);
+      const shown = normalizeUiText(String(element.rawText ?? element.label).replace(/\\n/g, " "));
+      // Real Codex empty fields have a doubled parent placeholder and a
+      // single child placeholder. Never discard other child text.
+      if (header?.[1] === "com.openai.codex" && placeholder
+          && shown === `${placeholder} ${placeholder}` && normalizeUiText(value) === placeholder) {
+        element.innerText = [];
+        element.value = "";
+      } else element.value = value;
+    }
+  }
   const focusedMatch = /The focused UI element is\s+(\d+)\b/.exec(text);
   return {
     bundleId: header?.[1] ?? null,
@@ -233,6 +260,7 @@ function ancestors(element) {
 }
 
 function isEditable(element) {
+  if (element.inner) return false;
   if (EDITABLE_ROLES.has(element.role)) return true;
   return element.flags.includes("settable") && /text/.test(element.role) && !/search|secure/.test(element.role);
 }
@@ -385,7 +413,8 @@ function resumeButtons(state, bundleId = state?.bundleId) {
 export function screenSummary(state, bundleId = state?.bundleId) {
   const composer = findComposer(state, bundleId).composer;
   const ownPage = OWN_PAGE[bundleId] ?? null;
-  const text = (state?.elements ?? []).filter((element) => !BUTTON_ROLE.test(element.role) && !isEditable(element)
+  const text = (state?.elements ?? []).filter((element) => !element.inner && !ancestors(element).some(isEditable)
+    && !BUTTON_ROLE.test(element.role) && !isEditable(element)
     && !(ownPage && inOtherPage(element, ownPage)) && /text|heading/.test(element.role))
     .map((element) => normalizeUiText(element.label || element.value)).filter(Boolean).join("\n");
   return {
@@ -416,6 +445,44 @@ export function looksLikeOurs(value, text) {
   return have.startsWith(ours.slice(0, Math.min(ours.length, SUPERVISOR_PREFIX.length + 10)));
 }
 
+// Only observed application placeholders establish emptiness. An arbitrary
+// repeated label can be an owner's unsent draft, not a placeholder.
+const COMPOSER_PLACEHOLDERS = new Set([
+  "Do anything",
+  "Work with Codex",
+  "Ask to make changes, @mention files, run /commands",
+  "Add a follow up"
+]);
+
+function composerPlaceholder(composer) {
+  const explicit = normalizeUiText(composer?.fields?.placeholder);
+  if (COMPOSER_PLACEHOLDERS.has(explicit)) return explicit;
+  const shown = normalizeUiText(String(composer?.label ?? "").replace(/\\n/g, " "));
+  return [...COMPOSER_PLACEHOLDERS].find((placeholder) => shown === placeholder
+    || shown.startsWith(`${placeholder} `) || shown.startsWith(`${placeholder}[`)) ?? null;
+}
+
+// Empty: no value or retained inner text, and only a known placeholder on
+// the row. parseAppState normalizes Codex's empty representation; Conductor
+// placeholder-valued inner text is an owner's draft and stays non-empty.
+export function composerEmpty(composer) {
+  if (!composer || composer.fields?.value || normalizeUiText(composer.value) || composer.innerText?.length) return false;
+  const shown = normalizeUiText(String(composer.label ?? "").replace(/\\n/g, " "));
+  const placeholder = composerPlaceholder(composer);
+  if (shown && !(placeholder && (shown === placeholder || shown === `${placeholder} ${placeholder}`))) return false;
+  return true;
+}
+
+// Recover only the complete known placeholder followed by exactly our text.
+// Partial prefixes may be an owner's edit and must never be discarded.
+export function placeholderJunk(composer, text) {
+  const have = normalizeUiText(composer?.value);
+  const ours = normalizeUiText(text);
+  if (!have || !ours || have === ours || !have.endsWith(ours)) return false;
+  const prefix = have.slice(0, have.length - ours.length).trim();
+  return prefix === composerPlaceholder(composer);
+}
+
 // Only OCU's focus line counts; it prints one only for the frontmost app.
 export function isComposerFocused(state, composer) {
   return Boolean(composer) && state?.focusedId === composer.id;
@@ -426,8 +493,8 @@ export function isComposerFocused(state, composer) {
 export function transcriptCount(state, needle, composer = null) {
   const want = normalizeUiText(needle).toLowerCase();
   if (!want) return 0;
-  return (state?.elements ?? []).filter((element) => element !== composer && element.id !== composer?.id && !isEditable(element)
-    && normalizeUiText(`${element.label} ${element.value}`).toLowerCase().includes(want)).length;
+  return (state?.elements ?? []).filter((element) => element !== composer && element.id !== composer?.id && !isEditable(element) && !element.inner
+    && normalizeUiText(`${element.label} ${element.value} ${element.rawText ?? ""}`).toLowerCase().includes(want)).length;
 }
 
 function labelToken(element) {
@@ -1355,10 +1422,13 @@ export function createUiDriver({
     let found = composerIn(ctx, state);
     if (!found.composer) return outcome(ctx, "blocked", found.reason);
     const leftover = normalizeUiText(found.composer.value) === normalizeUiText(text);
-    if (normalizeUiText(found.composer.value) && !leftover) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
+    // A leftover prefix may include an owner's edit. Never replace or clear
+    // it: only an empty composer or exactly our prior message is eligible.
+    if (!leftover && !composerEmpty(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
     const beforeCount = transcriptCount(state, needle, found.composer);
     keep(ctx, "before", state);
-    const holds = (composer) => normalizeUiText(composer.value) === (leftover ? normalizeUiText(text) : "");
+    const expected = leftover ? normalizeUiText(text) : null;
+    const holds = (composer) => (expected === null ? composerEmpty(composer) : normalizeUiText(composer.value) === expected);
 
     // 6. Focus the composer with an accessibility click; OCU reports focus
     // only for the frontmost app, so that is checked first.
@@ -1390,6 +1460,9 @@ export function createUiDriver({
     const beforeTyping = await ownerCheck(ctx, target);
     if (beforeTyping) return outcome(ctx, "blocked", beforeTyping);
     ctx.phase = "typing";
+    // Append through Open Computer's keyboard input. A queued set_value
+    // replaces the whole field and can erase an owner's intervening text.
+    // Readback must still equal exactly our text before any send is allowed.
     if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs });
     ctx.phase = "typed";
 
@@ -1408,6 +1481,20 @@ export function createUiDriver({
     // as a draft (a retry sends exactly it), and the outcome says to check it.
     const back = await ownerCheck(ctx, target);
     if (back) return outcome(ctx, "blocked", `${back}; ${LEFT_AS_DRAFT}`);
+    // Keyboard input into an empty Conductor or Codex composer can keep the
+    // app's placeholder as text in front of ours (seen with OCU 0.3.5). A
+    // composer holding exactly the known placeholder and then exactly what
+    // this delivery just typed holds nothing of the owner's: only then is it
+    // set to exactly our text. Anything else is left as it is.
+    if (!leftover && found.composer && placeholderJunk(found.composer, text)) {
+      await act(ctx, "set_value", { app: target.bundleId, element_index: found.composer.id, value: text }, signal);
+      state = await readState(ctx, signal);
+      if (!verifyIdentity(state, identity).ok) {
+        keep(ctx, "after", state);
+        return outcome(ctx, "blocked", "thread changed before send; our text may be left as a draft in the thread, check it");
+      }
+      found = composerIn(ctx, state);
+    }
     if (!found.composer || normalizeUiText(found.composer.value) !== normalizeUiText(text)) {
       keep(ctx, "after", state);
       return outcome(ctx, "failed", `text mismatch, not sent; ${LEFT_AS_DRAFT}`);
@@ -1462,7 +1549,7 @@ export function createUiDriver({
       await sleep(limits.uiPollMs);
       state = await readState(ctx, signal);
       const composer = composerIn(ctx, state).composer;
-      const empty = composer ? !normalizeUiText(composer.value) : false;
+      const empty = composer ? composerEmpty(composer) || !normalizeUiText(composer.value) : false;
       if (empty && transcriptCount(state, needle, composer) > beforeCount) {
         keep(ctx, "after", state);
         return outcome(ctx, "sent", leftover ? `sent the text an earlier attempt left in ${target.name}` : `typed into ${target.name}`);
