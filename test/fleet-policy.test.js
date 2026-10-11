@@ -1451,6 +1451,18 @@ test("an answered nudge is waited on only so long: then the owner hears it once,
   assert.equal(spent.question.kind, "stuck");
 });
 
+test("a new head is a new fact however many checks fail", () => {
+  const thread = makeThread();
+  const failing = ["a", "b", "c", "d", "e", "f", "g", "h"];
+  const first = run(thread, { pr: redPr({ ci: { state: "FAILURE", failing, pending: [] } }) }).decision;
+  assert.equal(first.facts.length, 8);
+  assert.ok(first.facts.includes(`head ${HEAD.slice(0, 10)}`));
+  const newHead = "b".repeat(40);
+  const pushed = run(thread, { pr: redPr({ headOid: newHead, ci: { state: "FAILURE", failing, pending: [] } }), localGit: { ...cleanGit, head: newHead }, ledger: sentLedger(first, 40 * MIN) }).decision;
+  assert.equal(pushed.action, "nudge");
+  assert.match(pushed.message, /new: head bbbbbbbbbb/);
+});
+
 test("a rerun that fails again on the same head is a new fact", () => {
   const thread = makeThread();
   const pr = (failedAt) => redPr({ ci: { state: "FAILURE", failing: ["lint"], pending: [], failedAt } });

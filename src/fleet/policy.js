@@ -632,9 +632,10 @@ function nudgeFacts(ctx) {
   // A rerun that fails again on the same head is news.
   const failedAt = Date.parse(pr?.ci?.failedAt ?? "");
   if (failing.length && Number.isFinite(failedAt)) out.push(`checks failed at ${new Date(failedAt).toISOString().slice(11, 16)}Z`);
+  // The head always counts: a push is news however many checks fail.
   const head = shortSha(pr?.headOid);
-  if (head) out.push(`head ${head}`);
-  return [...new Set(out)].sort().slice(0, FACTS_KEPT);
+  const kept = [...new Set(out)].sort().slice(0, head ? FACTS_KEPT - 1 : FACTS_KEPT);
+  return head ? [...kept, `head ${head}`].sort() : kept;
 }
 
 function lastSent(ledger, playbookId) {
