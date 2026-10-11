@@ -46,7 +46,7 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 | codex-lb | escalate to manager; `infra-recovered` when LB healthy | manager offline, or LB down 1 h+ |
 | logged out / disk full | nothing | at once, one line |
 | waiting-ci | watch; when CI ends on the head, `ci-finished` | never |
-| waiting-ci too long | bb-quick over 15 min or needed full verify over 30 min: escalate to manager. Unneeded full verify: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
+| waiting-ci too long | bb-quick over 15 min, or a full verify over 30 min where it is the merge gate (a required check that is the full run itself, e.g. buildbetter-app/buildbetter) or hosted CI is failing: escalate to manager; never told to drop a gating run. Elsewhere a full verify over 30 min with hosted CI not failing: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
 | local-verify | `no-local-verify` | never |
 | asked-in-scope | `in-scope-yes` | never |
 | needs-human | nothing | one caveman question with buttons |
@@ -55,6 +55,8 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 | done, idle-no-pr, running | nothing | never |
 
 Readiness blockers: `CI red: <names>`, `CI running`, `no CI on head`, `unpushed commits`, `local head differs`, `<n> open threads`, `merge conflicts`, `Codex review not on head`, `UI QA missing`, `draft`.
+
+A repo with required checks (config `requiredChecks`, repo -> check names; buildbetter-app/buildbetter requires the `BuildBot3 full verification` status) gates on them instead of `no CI on head`: `BuildBot3 full run missing`, `... failed`, `... pending`, `... skipped`. A skipped or neutral one wakes a waiting agent with `merge-ready`. Each is read by name on the head, not only from the first 100 checks. Other green or skipped checks never make it ready; other red or running ones still block.
 
 ## Limits
 
@@ -90,7 +92,7 @@ When BuildBot3 or codex-lb comes back, every thread blocked on it gets `infra-re
 
 Wording lives in `playbooks/<id>.md`: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`, `bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `status-check`.
 Frontmatter: `id`, `cooldown_min`, `max_attempts`, `ask` (owner question after max attempts; empty = never ping).
-Placeholders: `{pr}`, `{head}`, `{blockers}`, `{blocker}`, `{ci}`, `{reset}`, `{thread}`, `{repo}`, `{label}`, `{attempts}`, `{what}`, `{problems}`.
+Placeholders: `{pr}`, `{head}`, `{blockers}`, `{blocker}`, `{ci}`, `{reset}`, `{thread}`, `{repo}`, `{label}`, `{mergeGate}` (the repo's required checks, else hosted CI), `{attempts}`, `{what}`, `{problems}`. Unknown placeholders render empty.
 Override: copy a file to `<dataDir>/skills/fleet-supervisor/playbooks/<id>.md`.
 
 ## Never

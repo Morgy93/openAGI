@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { classifyThread } from "../src/fleet/classify.js";
 import { DEFAULTS, shortHash } from "../src/fleet/contracts.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks } from "../src/fleet/playbooks.js";
@@ -148,11 +151,19 @@ test("row: waiting-ci past its threshold escalates to the BuildBot3 manager", ()
   assert.equal(offline.question.title, "BB3 jammed. Manager offline. Open Remote dev setup?");
   const limited = run(thread, { mgr: { ...manager, error: { kind: "session-limit", text: "x", resetAt: null } } }).decision;
   assert.equal(limited.action, "ask-user");
-  // A full verify the PR does not need gets the owner's "bb-quick, push, hosted CI" line instead.
+  // A slow full run where it is the merge gate goes to the manager; the agent
+  // is never told to drop it for hosted CI.
   const full = makeThread({ agentStatus: "waiting", openTasks: [{ ...quick, description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) }] });
-  const slow = run(full).decision;
-  assert.equal(slow.action, "nudge");
-  assert.equal(slow.playbook, "bb3-slow-agent");
+  // Where hosted CI is the gate (acme/app has no required check), a full run
+  // with CI not failing is still told to stop.
+  const ungated = run(full).decision;
+  assert.equal(ungated.action, "nudge");
+  assert.equal(ungated.playbook, "bb3-slow-agent");
+  const bb = "buildbetter-app/buildbetter";
+  const gatedThread = { ...full, repo: bb, prRefs: [`${bb}#6522`] };
+  const gated = run(gatedThread, { pr: makePr({ ref: `${bb}#6522`, repo: bb }) }).decision;
+  assert.equal(gated.action, "escalate-manager");
+  assert.notEqual(gated.playbook, "bb3-slow-agent");
 });
 
 test("row: a Conductor wait on a non-verify task is idle after 45 min", () => {
@@ -895,6 +906,110 @@ test("a stopped CI waiter with no checks on head resumes after the wait threshol
   assert.equal(decision.playbook, "merge-ready");
 });
 
+test("the BuildBot3 full run gates the merge ask and the CI-finished nudge", () => {
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  // Green hosted checks but no full run: work for the agent, not a merge ask.
+  const missing = run(makeThread(), { pr: makePr({ gates: gate(null) }) }).decision;
+  assert.equal(missing.action, "nudge");
+  assert.equal(missing.playbook, "merge-ready");
+  assert.match(missing.message, /BuildBot3 full run missing/);
+  // A full run still going: wait, like hosted CI running.
+  assert.equal(run(makeThread(), { pr: makePr({ gates: gate("PENDING") }) }).decision.action, "wait");
+  assert.equal(run(makeThread(), { pr: makePr({ gates: gate("SUCCESS") }) }).decision.action, "ask-user");
+  // An agent waiting on the full run is not told CI finished because hosted checks did.
+  const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(10 * MIN), lastAgentAt: ago(10 * MIN), lastUserAt: ago(120 * MIN) });
+  assert.notEqual(run(waiting, { pr: makePr({ gates: gate("PENDING") }) }).decision.playbook, "ci-finished");
+  assert.equal(run(waiting, { pr: makePr({ gates: gate("SUCCESS") }) }).decision.playbook, "ci-finished");
+});
+
+test("an unread full-run gate is never called missing", () => {
+  const gate = [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: null, unread: true }];
+  // Idle on a PR whose gate lookup failed: wait for the next read, no merge-ready nudge.
+  const idle = run(makeThread(), { pr: makePr({ gates: gate }) }).decision;
+  assert.equal(idle.action, "wait");
+  assert.doesNotMatch(String(idle.message ?? idle.reason), /missing/);
+  const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(60 * MIN), lastAgentAt: ago(60 * MIN), lastUserAt: ago(120 * MIN) });
+  const waited = run(waiting, { pr: makePr({ gates: gate }) }).decision;
+  assert.notEqual(waited.playbook, "merge-ready");
+  assert.doesNotMatch(String(waited.message ?? waited.reason), /missing/);
+  // A long background task with only the unread gate blocking is not nudged.
+  const task = makeThread({ agentStatus: "waiting", openTasks: [{ id: "t1", kind: "local_bash", description: "tail -f build.log", startedAt: ago(60 * MIN) }] });
+  assert.notEqual(run(task, { pr: makePr({ gates: gate }) }).decision.playbook, "merge-ready");
+});
+
+test("a slow full verify whose gate already passed gets ci-finished, not the manager", () => {
+  const full = { id: "t1", kind: "local_bash", description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [full] });
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state }];
+  const decide = (state) => {
+    const pr = makePr({ gates: gate(state) });
+    const classified = classifyThread(thread, { pr, localGit: cleanGit, now: NOW, config });
+    return decideThread(classified, thread, { playbooks, config, now: NOW, pr, mode: "auto", manager });
+  };
+  assert.equal(decide("SUCCESS").playbook, "ci-finished");
+  assert.equal(decide("PENDING").action, "escalate-manager");
+  // The full-run gate passed, hosted CI still running: wait, never the manager.
+  const pending = makePr({ gates: gate("SUCCESS"), ci: { state: "PENDING", failing: [], pending: ["lint"] } });
+  const held = decideThread(classifyThread(thread, { pr: pending, localGit: cleanGit, now: NOW, config }), thread, { playbooks, config, now: NOW, pr: pending, mode: "auto", manager });
+  assert.equal(held.action, "wait");
+  // A merged PR is never "CI still running": a task left past its gate is
+  // not held forever (escalated, or a status check once the agent is quiet).
+  const merged = makePr({ state: "MERGED", gates: gate("SUCCESS") });
+  const after = decideThread(classifyThread(thread, { pr: merged, localGit: cleanGit, now: NOW, config }), thread, { playbooks, config, now: NOW, pr: merged, mode: "auto", manager });
+  assert.notEqual(after.action, "wait");
+  // A finished gate that is not the full run proves nothing: failed hosted CI still escalates.
+  const cfg = { ...config, requiredChecks: { "acme/app": ["deploy"] } };
+  const deployed = makePr({ gates: [{ name: "deploy", label: "deploy", state: "SUCCESS" }], ci: { state: "FAILURE", failing: ["unit"], pending: [] } });
+  const other = decideThread(classifyThread(thread, { pr: deployed, localGit: cleanGit, now: NOW, config: cfg }), thread, { playbooks, config: cfg, now: NOW, pr: deployed, mode: "auto", manager });
+  assert.equal(other.action, "escalate-manager");
+  // The BuildBot3 manager message lists only threads whose full run is still unfinished.
+  const bb3 = { ...bb3Base, gate: { state: "blocked", reason: "slot held", since: ago(40 * MIN) } };
+  const item = (key, state) => {
+    const t = makeThread({ key, id: key, agentStatus: "waiting", openTasks: [full], prRefs: [`acme/app#${key === "s1" ? 6522 : 6523}`] });
+    const pr = makePr({ ref: t.prRefs[0], number: key === "s1" ? 6522 : 6523, gates: gate(state) });
+    return { thread: t, classified: classifyThread(t, { pr, localGit: cleanGit, now: NOW, config }), pr };
+  };
+  const [infra] = decideInfra({ bb3, lb: lbOk, localVerify: [] }, { ledger: {}, playbooks, config, now: NOW, threads: [item("s1", "SUCCESS"), item("s2", "PENDING")], manager, mode: "auto" });
+  assert.equal(infra.action, "escalate-manager");
+  assert.match(infra.message, /#6523 head .*bb-verify --full/);
+  assert.doesNotMatch(infra.message, /#6522 head/);
+});
+
+test("merge-ready names the repo's gate, or hosted CI when it has none", () => {
+  const bb3 = [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state: null }];
+  const gated = run(makeThread(), { pr: makePr({ gates: bb3 }) }).decision;
+  assert.equal(gated.playbook, "merge-ready");
+  assert.match(gated.message, /push, a green BuildBot3 full run \(bb-verify --full --pr\) on the exact head/);
+  const plain = run(makeThread(), { pr: makePr({ unresolvedThreads: 2 }) }).decision;
+  assert.equal(plain.playbook, "merge-ready");
+  assert.match(plain.message, /push, green hosted CI on the exact head/);
+  assert.doesNotMatch(plain.message, /BuildBot3 full/);
+  // A user override with an unknown var renders it empty, not as raw braces.
+  const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-playbooks-"));
+  fs.writeFileSync(path.join(userDir, "merge-ready.md"), "---\nid: merge-ready\nask: \"#{pr} stuck\"\n---\nGate: {mergeGate}. Other: {nope}.\n");
+  const override = loadPlaybooks({ bundledDir: BUNDLED_PLAYBOOKS_DIR, userDir });
+  fs.rmSync(userDir, { recursive: true, force: true });
+  const thread = makeThread();
+  const classified = classifyThread(thread, { pr: makePr({ gates: bb3 }), localGit: cleanGit, now: NOW, config });
+  const custom = decideThread(classified, thread, { ledger: {}, playbooks: override, config, now: NOW, pr: makePr({ gates: bb3 }), mode: "auto", manager });
+  assert.equal(custom.message, "Gate: a green BuildBot3 full run (bb-verify --full --pr). Other: .");
+});
+
+test("a waiter is woken when the required check finishes skipped or neutral", () => {
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(20 * MIN), lastAgentAt: ago(20 * MIN), lastUserAt: ago(120 * MIN) });
+  for (const state of ["SKIPPED", "NEUTRAL"]) {
+    const { decision } = run(waiting, { pr: makePr({ gates: gate(state) }) });
+    assert.equal(decision.action, "nudge", state);
+    assert.equal(decision.playbook, "merge-ready", state);
+    assert.match(decision.reason, new RegExp(`BuildBot3 full run ${state.toLowerCase()}`));
+  }
+  // Hosted CI still running: keep waiting for it.
+  const running = run(waiting, { pr: makePr({ gates: gate("SKIPPED"), ci: { state: "PENDING", failing: [], pending: ["build"] } }) }).decision;
+  assert.equal(running.action, "wait");
+  assert.equal(running.playbook ?? null, null);
+});
+
 test("local git the supervisor could not read waits instead of asking to merge or nudging", () => {
   const { decision } = run(makeThread(), { localGit: { unreadable: true } });
   assert.equal(decision.action, "wait");
@@ -1035,4 +1150,40 @@ test("a permission card read on screen: its buttons (up to three) plus later, on
   const terminal = makeThread({ kind: "claude", key: "claude:c9", id: "c9", agentStatus: "waiting", lastAgentAt: ago(24 * 60 * MIN), lastActivityAt: ago(24 * 60 * MIN),
     live: { peerName: "p9", pid: 9, status: "waiting" }, meta: { blockedOnOwner: true, prompt: card } });
   assert.deepEqual(run(terminal, { pr: makePr() }).decision.question.options, ["opened", "later"]);
+});
+
+test("only a full-run gate keeps a slow full verify from the bb3-slow-agent nudge", () => {
+  const quick = { id: "t1", kind: "local_bash", description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [quick] });
+  const decide = (gates, requiredChecks) => {
+    const cfg = { ...config, requiredChecks };
+    const pr = makePr({ gates });
+    const classified = classifyThread(thread, { pr, localGit: cleanGit, now: NOW, config: cfg });
+    return decideThread(classified, thread, { playbooks, config: cfg, now: NOW, pr, mode: "auto", manager });
+  };
+  // A required deploy or lint check is not the full run: hosted CI still gates.
+  const deploy = decide([{ name: "deploy", label: "deploy", state: "PENDING" }], { "acme/app": ["deploy"] });
+  assert.equal(deploy.playbook, "bb3-slow-agent");
+  const configuredOnly = decide([], { "acme/app": ["lint"] });
+  assert.equal(configuredOnly.playbook, "bb3-slow-agent");
+  // The full run by name, or by the command that produces it, is the gate.
+  const named = decide([{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: "PENDING" }], {});
+  assert.equal(named.action, "escalate-manager");
+  const byHow = decide([{ name: "full", label: "full", how: "bb-verify --full --pr", state: "PENDING" }], {});
+  assert.equal(byHow.action, "escalate-manager");
+});
+
+test("the no-local-verify nudge names the repo's own merge gate", () => {
+  const infra = { localVerify: [{ pid: 9, command: "pnpm verify:pr", cwd: "/work/madrid", ageSec: 400, threadKey: "conductor:s1" }] };
+  const fresh = { lastAgentAt: ago(MIN), lastActivityAt: ago(MIN) };
+  // Hosted CI gates an ungated repo; no full run is called its gate.
+  const ungated = run(makeThread(fresh), { infra }).decision;
+  assert.equal(ungated.playbook, "no-local-verify");
+  assert.match(ungated.message, /merge gate is green hosted CI on the exact head/);
+  assert.doesNotMatch(ungated.message, /--full/);
+  // BuildBetter's gate is the full run, even before a PR is read.
+  const bb = "buildbetter-app/buildbetter";
+  const gated = run(makeThread({ ...fresh, repo: bb, prRefs: [] }), { infra, pr: null }).decision;
+  assert.equal(gated.playbook, "no-local-verify");
+  assert.match(gated.message, /merge gate is a green BuildBot3 full run \(bb-verify --full --pr\) on the exact head/);
 });

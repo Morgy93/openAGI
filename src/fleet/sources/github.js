@@ -27,18 +27,77 @@ export const DEFAULT_UI_PATH_PREFIXES = Object.freeze({
   ])
 });
 
+// Checks that must pass on the exact head before a PR is ready. BuildBetter's
+// hosted PR verification is paused; its gate is the BuildBot3 full run, which
+// posts this commit status.
+export const DEFAULT_REQUIRED_CHECKS = Object.freeze({
+  "buildbetter-app/buildbetter": Object.freeze([Object.freeze({ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr" })])
+});
+
 const PR_FRAGMENT = [
   "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision createdAt updatedAt mergedAt closedAt",
-  " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:30){nodes{__typename",
-  " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state}}}}}}}",
+  " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:100){nodes{__typename",
+  " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state createdAt}}}}}}}",
   " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
   " comments(last:30){pageInfo{hasPreviousPage} nodes{author{login} body createdAt}}",
   " files(first:100){pageInfo{hasNextPage} nodes{path}} }"
 ].join("");
 
+// The rollup reads only its first 100 contexts, so a repo's required checks
+// are also looked up by name on the last commit: the commit status directly,
+// a check run through its check suites. The batch reads the first 20 suites;
+// a gate still missing pages on (gateSuitePages), up to MAX_GATE_SUITES.
+const FIRST_GATE_SUITES = 20;
+const MORE_GATE_SUITES = 40;
+const MAX_GATE_SUITES = 100;
+
+function gateRunSelection(required) {
+  return required.map(({ name }, i) => `g${i}: checkRuns(last:1,filterBy:{checkName:${JSON.stringify(name)}}){nodes{__typename name status conclusion startedAt completedAt}}`).join(" ");
+}
+
+function gateSelection(required) {
+  if (!required.length) return "";
+  const statuses = required.map(({ name }, i) => `g${i}: context(name:${JSON.stringify(name)}){__typename context state createdAt}`).join(" ");
+  return ` gateCommit: commits(last:1){nodes{commit{oid status{${statuses}} checkSuites(first:${FIRST_GATE_SUITES}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}}}}}`;
+}
+
+export function buildGateSuitesQuery(repo, oid, after, required) {
+  const [owner, name] = repo.split("/");
+  return `query { rateLimit{cost remaining} repository(owner:"${owner}",name:"${name}"){ object(oid:${JSON.stringify(oid)}){ ... on Commit { checkSuites(first:${MORE_GATE_SUITES},after:${JSON.stringify(after)}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}} } } } }`;
+}
+
+// Pages the head's remaining check suites while a required check is still
+// missing, so a check run past the first page is not read as never run.
+// Bounded to MAX_GATE_SUITES suites. A failed page marks the lookup unread,
+// so a gate still not found is unknown rather than confirmed absent.
+async function gateSuitePages(repo, node, config, run) {
+  const required = requiredChecksFor(repo, config);
+  const gateCommit = node.gateCommit?.nodes?.[0]?.commit;
+  const suites = gateCommit?.checkSuites;
+  if (!required.length || !suites?.pageInfo?.hasNextPage || !/^[0-9a-f]{40}$/i.test(String(gateCommit.oid ?? ""))) return;
+  const gates = () => gatesFor(node.commits?.nodes?.[0]?.commit ?? null, node.headRefOid ?? "", required, gateCommit);
+  let page = suites.pageInfo;
+  let read = suites.nodes?.length ?? 0;
+  gateCommit.suitesUnread = true;
+  while (page?.hasNextPage && page.endCursor && read < MAX_GATE_SUITES && gates().some((gate) => gate.state === null)) {
+    let result;
+    try {
+      result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildGateSuitesQuery(repo, gateCommit.oid, page.endCursor, required)}`], { timeoutMs: GH_TIMEOUT_MS });
+    } catch {
+      return;
+    }
+    const more = parseJson(result?.stdout)?.data?.repository?.object?.checkSuites;
+    if (!more || !Array.isArray(more.nodes)) return;
+    suites.nodes = [...(suites.nodes ?? []), ...more.nodes];
+    read += more.nodes.length;
+    page = more.pageInfo;
+  }
+  gateCommit.suitesUnread = false;
+}
+
 // refs: [{repo, number}] already validated by parsePrRef, so owner and name
 // only contain [A-Za-z0-9_.-] and are safe inside GraphQL string literals.
-export function buildPrQuery(refs) {
+export function buildPrQuery(refs, config = null) {
   const byRepo = new Map();
   for (const { repo, number } of refs) {
     if (!byRepo.has(repo)) byRepo.set(repo, []);
@@ -46,7 +105,8 @@ export function buildPrQuery(refs) {
   }
   const repos = [...byRepo].map(([repo, numbers], index) => {
     const [owner, name] = repo.split("/");
-    const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){...P}`).join(" ");
+    const gates = gateSelection(requiredChecksFor(repo, config));
+    const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){...P${gates}}`).join(" ");
     return `r${index}: repository(owner:"${owner}",name:"${name}"){ ${pulls} }`;
   });
   return `${PR_FRAGMENT}\nquery { rateLimit{cost remaining}\n${repos.join("\n")} }`;
@@ -66,21 +126,39 @@ function parseJson(text) {
 }
 
 function checkStamp(node) {
-  return Date.parse(node?.startedAt ?? node?.completedAt ?? "") || 0;
+  return Date.parse(node?.startedAt ?? node?.completedAt ?? node?.createdAt ?? "") || 0;
 }
 
-function summarizeChecks(commit, headOid) {
+// The newer of two results for one check name. Without both times, the
+// result that does not pass wins, so a stale green never masks a red.
+function newerCheck(best, next) {
+  if (!best) return next;
+  const [a, b] = [checkStamp(best), checkStamp(next)];
+  if (a && b) return b >= a ? next : best;
+  const passes = (node) => checkState(node) === "SUCCESS";
+  return passes(next) && !passes(best) ? best : next;
+}
+
+// The newest run of each check on the head, or null when the head's CI is
+// unknown.
+function latestChecks(commit, headOid) {
   const rollup = commit?.statusCheckRollup ?? null;
   // A last commit that is not the head means GitHub has not caught up; the
   // head's CI is unknown rather than whatever the older commit reported.
-  if (!rollup || (headOid && commit.oid && commit.oid !== headOid)) return { state: null, failing: [], pending: [] };
+  if (!rollup || (headOid && commit.oid && commit.oid !== headOid)) return null;
   const latest = new Map();
   for (const node of rollup.contexts?.nodes ?? []) {
     const name = node?.name ?? node?.context;
     if (!name) continue;
-    const previous = latest.get(name);
-    if (!previous || checkStamp(node) >= checkStamp(previous)) latest.set(name, node);
+    latest.set(name, newerCheck(latest.get(name), node));
   }
+  return latest;
+}
+
+function summarizeChecks(commit, headOid) {
+  const latest = latestChecks(commit, headOid);
+  if (!latest) return { state: null, failing: [], pending: [] };
+  const rollup = commit.statusCheckRollup;
   const failing = [];
   const pending = [];
   for (const [name, node] of latest) {
@@ -94,6 +172,46 @@ function summarizeChecks(commit, headOid) {
     }
   }
   return { state: rollup.state ?? null, failing, pending };
+}
+
+// One check's result: SUCCESS, FAILURE, PENDING, another conclusion
+// (SKIPPED, NEUTRAL), or null when it never ran on the head.
+function checkState(node) {
+  if (!node) return null;
+  if (node.__typename === "StatusContext") {
+    if (FAILED_STATUSES.has(node.state)) return "FAILURE";
+    if (PENDING_STATUSES.has(node.state)) return "PENDING";
+    return node.state ?? null;
+  }
+  if (node.status && node.status !== "COMPLETED") return "PENDING";
+  if (FAILED_CONCLUSIONS.has(node.conclusion)) return "FAILURE";
+  return node.conclusion ?? null;
+}
+
+export function requiredChecksFor(repo, config) {
+  const list = config?.requiredChecks?.[repo] ?? DEFAULT_REQUIRED_CHECKS[repo] ?? [];
+  return list.map((check) => typeof check === "string" ? { name: check, label: check } : { name: check?.name, label: check?.label || check?.name, how: check?.how })
+    .filter((check) => check.name);
+}
+
+// The repo's required checks on the exact head: [{name, label, how?, state}].
+// how, when set, is the command that produces the check. gateCommit holds
+// the by-name lookups (gateSelection); the newest of those and the rollup's
+// entry wins.
+function gatesFor(commit, headOid, required, gateCommit) {
+  if (!required.length) return [];
+  const latest = latestChecks(commit, headOid);
+  const direct = gateCommit && (!headOid || gateCommit.oid === headOid) ? gateCommit : null;
+  return required.map(({ name, label, how }, i) => {
+    const found = [latest?.get(name), direct?.status?.[`g${i}`],
+      ...(direct?.checkSuites?.nodes ?? []).flatMap((suite) => suite?.[`g${i}`]?.nodes ?? [])]
+      .filter((node) => node && (node.name ?? node.context) === name);
+    const node = found.reduce(newerCheck, null);
+    const state = checkState(node);
+    // A suite page that failed to load: not found is unknown, not missing.
+    const unread = state === null && direct?.suitesUnread === true;
+    return { name, label, ...(typeof how === "string" && how ? { how } : {}), state, ...(unread ? { unread: true } : {}) };
+  });
 }
 
 // The Codex bot keeps one summary comment per PR and edits it in place:
@@ -148,6 +266,7 @@ export function normalizePr(repo, node, config) {
     mergeable: node.mergeable ?? null,
     reviewDecision: node.reviewDecision ?? null,
     ci: summarizeChecks(node.commits?.nodes?.[0]?.commit ?? null, headOid),
+    gates: gatesFor(node.commits?.nodes?.[0]?.commit ?? null, headOid, requiredChecksFor(repo, config), node.gateCommit?.nodes?.[0]?.commit ?? null),
     unresolvedThreads: (node.reviewThreads?.nodes ?? []).filter((thread) => thread && !thread.isResolved).length,
     // More than 100 threads: unread pages may hold unresolved ones.
     threadsTruncated: node.reviewThreads?.pageInfo?.hasNextPage === true,
@@ -169,7 +288,7 @@ async function fetchBatch(batch, config, run, out, unread) {
   const miss = (refs) => { for (const ref of refs) unread?.add(prRefKey(ref.repo, ref.number)); };
   let result;
   try {
-    result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch)}`], { timeoutMs: GH_TIMEOUT_MS });
+    result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch, config)}`], { timeoutMs: GH_TIMEOUT_MS });
   } catch {
     miss(batch);
     return;
@@ -189,6 +308,8 @@ async function fetchBatch(batch, config, run, out, unread) {
     if (!repoNode || typeof repoNode !== "object") { miss([ref]); continue; }
     const node = repoNode[`p${ref.number}`];
     if (!node || typeof node !== "object") continue;
+    // A failed suite page leaves the gate as read from the batch.
+    try { await gateSuitePages(ref.repo, node, config, run); } catch { /* keep the batch read */ }
     try {
       const pr = normalizePr(ref.repo, node, config);
       out.set(pr.ref, pr);

@@ -123,13 +123,13 @@ function ok(stdout) {
 test("buildPrQuery batches refs by repository with safe aliases", () => {
   const query = buildPrQuery([
     { repo: BBAPP, number: 6878 }, { repo: "Spshulem/openAGI", number: 108 }, { repo: BBAPP, number: 6849 }
-  ]);
+  ], config({ requiredChecks: { [BBAPP]: [] } }));
   assert.match(query, /r0: repository\(owner:"buildbetter-app",name:"buildbetter"\)\{ p6878: pullRequest\(number:6878\)\{\.\.\.P\} p6849: pullRequest\(number:6849\)\{\.\.\.P\} \}/);
   assert.match(query, /r1: repository\(owner:"Spshulem",name:"openAGI"\)\{ p108: pullRequest\(number:108\)\{\.\.\.P\} \}/);
   assert.match(query, /comments\(last:30\)\{pageInfo\{hasPreviousPage\} nodes\{author\{login\} body createdAt\}\}/);
   assert.match(query, /files\(first:100\)\{pageInfo\{hasNextPage\} nodes\{path\}\}/);
   assert.match(query, /reviewThreads\(first:100\)\{totalCount pageInfo\{hasNextPage\}/);
-  assert.match(query, /statusCheckRollup\{state contexts\(first:30\)/);
+  assert.match(query, /statusCheckRollup\{state contexts\(first:100\)/);
   assert.match(query, /reviewThreads\(first:100\)/);
   assert.match(query, /createdAt updatedAt mergedAt closedAt/);
 });
@@ -477,4 +477,136 @@ test("a file list cut at 100 never waives UI QA", () => {
   const pr = normalizePr(BBAPP, node, config());
   assert.equal(pr.qa.required, true);
   assert.equal(pr.threadsTruncated, true);
+});
+
+test("the BuildBot3 full run is the required check on BuildBetter PR heads", async () => {
+  const statusOn = (state) => {
+    const response = capturedResponse();
+    const nodes = response.data.r0.p6878.commits.nodes[0].commit.statusCheckRollup.contexts.nodes;
+    if (state) nodes.push({ __typename: "StatusContext", context: "BuildBot3 full verification", state });
+    return response;
+  };
+  const gateOf = async (response, cfg = config()) => (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`).gates;
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state }];
+  assert.deepEqual(await gateOf(statusOn("SUCCESS")), gate("SUCCESS"));
+  assert.deepEqual(await gateOf(statusOn("ERROR")), gate("FAILURE"));
+  assert.deepEqual(await gateOf(statusOn("PENDING")), gate("PENDING"));
+  assert.deepEqual(await gateOf(statusOn(null)), gate(null));
+  // A green run on an older commit is not on the head.
+  const stale = statusOn("SUCCESS");
+  stale.data.r0.p6878.commits.nodes[0].commit.oid = "1336362a18000000000000000000000000000000";
+  assert.deepEqual(await gateOf(stale), gate(null));
+  // Other repos keep no gate unless configured.
+  const prs = await fetchPrStates([`${BBAPP}#6878`, "Spshulem/openAGI#108"], config(), { run: fakeRun(() => ok(capturedResponse())).run });
+  assert.deepEqual(prs.get("Spshulem/openAGI#108").gates, []);
+  const custom = config({ requiredChecks: { [BBAPP]: ["verification"] } });
+  assert.deepEqual(await gateOf(statusOn("SUCCESS"), custom), [{ name: "verification", label: "verification", state: "FAILURE" }]);
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }]), /contexts\(first:100\)/);
+});
+
+test("the required check is read by name, not only from the first 100 rollup contexts", async () => {
+  const query = buildPrQuery([{ repo: BBAPP, number: 6878 }, { repo: "Spshulem/openAGI", number: 108 }], config());
+  assert.match(query, /p6878: pullRequest\(number:6878\)\{\.\.\.P gateCommit: commits\(last:1\)/);
+  assert.match(query, /status\{g0: context\(name:"BuildBot3 full verification"\)/);
+  assert.match(query, /checkRuns\(last:1,filterBy:\{checkName:"BuildBot3 full verification"\}\)/);
+  assert.match(query, /p108: pullRequest\(number:108\)\{\.\.\.P\}/);
+  // A quote in a configured name stays inside the string literal.
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 1 }], config({ requiredChecks: { [BBAPP]: ['a"b'] } })), /context\(name:"a\\"b"\)/);
+
+  // 100 other contexts fill the rollup page; the gate is past it.
+  const crowded = () => {
+    const response = capturedResponse();
+    const pr = response.data.r0.p6878;
+    pr.commits.nodes[0].commit.statusCheckRollup.contexts.nodes = Array.from({ length: 100 }, (_, i) => ({ __typename: "StatusContext", context: `lint-${i}`, state: "SUCCESS" }));
+    pr.commits.nodes[0].commit.statusCheckRollup.state = "SUCCESS";
+    return response;
+  };
+  const gateOf = async (response, cfg = config()) => (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`).gates;
+  const status = crowded();
+  status.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: { g0: { __typename: "StatusContext", context: "BuildBot3 full verification", state: "SUCCESS" } }, checkSuites: { nodes: [] } } }] };
+  assert.deepEqual((await gateOf(status)).map((gate) => gate.state), ["SUCCESS"]);
+  // A required check run, found through its suite.
+  const checkRun = crowded();
+  checkRun.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: null, checkSuites: { nodes: [
+    { g0: { nodes: [] } },
+    { g0: { nodes: [{ __typename: "CheckRun", name: "deploy", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-09-26T07:38:29Z" }] } }
+  ] } } }] };
+  assert.deepEqual((await gateOf(checkRun, config({ requiredChecks: { [BBAPP]: ["deploy"] } }))).map((gate) => gate.state), ["FAILURE"]);
+  // A lookup on an older commit is not the head's.
+  const stale = crowded();
+  stale.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: "1".repeat(40), status: { g0: { __typename: "StatusContext", context: "BuildBot3 full verification", state: "SUCCESS" } } } }] };
+  assert.deepEqual((await gateOf(stale)).map((gate) => gate.state), [null]);
+});
+
+test("a required check run past the first 20 check suites is paged in, bounded", async () => {
+  const cfg = config({ requiredChecks: { [BBAPP]: ["deploy"] } });
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }], cfg), /checkSuites\(first:20\)\{pageInfo\{hasNextPage endCursor\}/);
+  const empty = (n) => Array.from({ length: n }, () => ({ g0: { nodes: [] } }));
+  const deploy = { g0: { nodes: [{ __typename: "CheckRun", name: "deploy", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:38:29Z" }] } };
+  const batch = (hasNextPage = true) => {
+    const response = capturedResponse();
+    response.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: null, checkSuites: { pageInfo: { hasNextPage, endCursor: "c20" }, nodes: empty(20) } } }] };
+    return response;
+  };
+  const page = (nodes, hasNextPage, endCursor) => ({ data: { repository: { object: { checkSuites: { pageInfo: { hasNextPage, endCursor }, nodes } } } } });
+
+  // The run sits in suite 30: one follow-up page finds it.
+  let pages = fakeRun((cmd, args, options, n) => ok(n === 1 ? batch() : page([...empty(9), deploy], true, "c60")));
+  let pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.gates.map((gate) => gate.state), ["SUCCESS"]);
+  assert.equal(pages.calls.length, 2);
+  assert.match(pages.calls[1].args.at(-1), /object\(oid:"95720cc5[0-9a-f]+"\)\{ \.\.\. on Commit \{ checkSuites\(first:40,after:"c20"\)/);
+
+  // Never found: paging stops at 100 suites (two follow-ups), still missing.
+  pages = fakeRun((cmd, args, options, n) => ok(n === 1 ? batch() : page(empty(40), true, `c${n}`)));
+  pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.gates.map((gate) => gate.state), [null]);
+  assert.equal(pages.calls.length, 3);
+
+  // No more suites, or the gate already found: no follow-up.
+  pages = fakeRun(() => ok(batch(false)));
+  await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run });
+  assert.equal(pages.calls.length, 1);
+  const found = batch();
+  found.data.r0.p6878.gateCommit.nodes[0].commit.checkSuites.nodes[3] = deploy;
+  pages = fakeRun(() => ok(found));
+  await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run });
+  assert.equal(pages.calls.length, 1);
+
+  // A failed follow-up keeps the PR, gate unread rather than missing.
+  pages = fakeRun((cmd, args, options, n) => { if (n === 1) return ok(batch()); throw new Error("gh: 502"); });
+  const unread = new Set();
+  pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run, unread })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.gates.map((gate) => [gate.state, gate.unread]), [[null, true]]);
+  assert.equal(unread.size, 0);
+  // Non-JSON, or a page without checkSuites: unread too.
+  for (const stdout of ["<html>502</html>", JSON.stringify({ data: { repository: { object: {} } } })]) {
+    pages = fakeRun((cmd, args, options, n) => (n === 1 ? ok(batch()) : { code: 0, stdout, stderr: "" }));
+    pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run })).get(`${BBAPP}#6878`);
+    assert.deepEqual(pr.gates.map((gate) => [gate.state, gate.unread]), [[null, true]]);
+  }
+  // Paging that finished (bounded at 100) is a read: confirmed missing.
+  pages = fakeRun((cmd, args, options, n) => ok(n === 1 ? batch() : page(empty(40), true, `c${n}`)));
+  pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run })).get(`${BBAPP}#6878`);
+  assert.equal(pr.gates[0].unread, undefined);
+});
+
+test("a status with no matching time never loses to a stale green check run", async () => {
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }], config()), /status\{g0: context\(name:"BuildBot3 full verification"\)\{__typename context state createdAt\}/);
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }], config()), /on StatusContext\{context state createdAt\}/);
+  const name = "BuildBot3 full verification";
+  const run = { __typename: "CheckRun", name, status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:00:00Z" };
+  const withStatus = (status) => {
+    const response = capturedResponse();
+    response.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: { g0: status }, checkSuites: { nodes: [{ g0: { nodes: [run] } }] } } }] };
+    return response;
+  };
+  const gateOf = async (response) => (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`).gates[0].state;
+  // A newer pending or failed status wins over the older green run.
+  assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "PENDING", createdAt: "2026-09-26T08:00:00Z" })), "PENDING");
+  assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "FAILURE", createdAt: "2026-09-26T08:00:00Z" })), "FAILURE");
+  // An older status loses to the newer run.
+  assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "FAILURE", createdAt: "2026-09-26T06:00:00Z" })), "SUCCESS");
+  // No time on the status: the non-passing result wins.
+  assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "PENDING" })), "PENDING");
 });
