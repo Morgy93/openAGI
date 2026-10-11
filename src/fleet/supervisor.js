@@ -1170,7 +1170,9 @@ export class FleetSupervisor {
   // The owner's own words to one thread (the supervisor chat's
   // fleet_send_message, after approval). Same delivery as an owner answer:
   // on a computer-use Mac it is typed into the app, never a CLI.
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null } = {}) {
+  // queue: a Conductor chat busy with background tasks gets it after them
+  // (its Send button) instead of now (⌘↩).
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
@@ -1178,7 +1180,7 @@ export class FleetSupervisor {
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it

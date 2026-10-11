@@ -754,3 +754,61 @@ test("a remote send near its deadline takes no background route", async (t) => {
   assert.equal(result.detail, "owner using Codex");
   assert.equal(calls.length, 0);
 });
+
+test("a Conductor chat waiting on background tasks is sent to now (⌘↩) unless the caller queues", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const waiting = conductorUiThread(cwd, { agentStatus: "waiting", openTasks: [{ id: "b1", description: "bb-verify --full" }] });
+  await executor.deliver({ thread: waiting, message: "status?", route: "computer-use", playbook: "status-check" });
+  assert.equal(requests.at(-1).busy, true);
+  assert.equal(requests.at(-1).sendNow, true);
+  await executor.deliver({ thread: waiting, message: "after your tasks", route: "computer-use", playbook: "owner-message", queue: true });
+  assert.equal(requests.at(-1).sendNow, false);
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "idle", route: "computer-use" });
+  assert.equal(requests.at(-1).busy, false);
+  assert.equal(requests.at(-1).sendNow, false);
+});
+
+test("a Codex thread hosted in a busy Conductor chat is sent to now too; a queued send never falls back to a relay", async (t) => {
+  const base = setup(t);
+  const host = conductorUiThread(base.cwd, { agentStatus: "waiting", openTasks: [{ id: "b1" }] });
+  const hosted = { key: "codex:h1", kind: "codex", id: "h1", cwd: base.cwd, archived: false, writerLocked: false, agentStatus: "idle",
+    meta: { originator: "codex_sdk_ts", conductorHost: { workspaceId: "w-madrid", sessionId: "s1", workspace: "madrid", title: "Fix billing" } } };
+  const requests = [];
+  const ui = { async deliver(request) { requests.push(request); return { status: "sent", detail: "typed into Conductor" }; } };
+  const executor = createExecutor({ config: { ...base.config, delivery: "computer-use" }, run: base.run, store: base.store, ui, uiLock: createUiLock(), knownThreads: () => [host, hosted] });
+  await executor.deliver({ thread: hosted, message: "status?", route: "computer-use" });
+  assert.equal(requests.at(-1).sendNow, true, "busy is the Conductor chat it lands in");
+  // Owner at the Mac, background routes on, asked to queue: it waits, no relay.
+  const peers = new Map([["cs1", { peerName: "p-1", pid: 6, status: "idle", waitingFor: null }]]);
+  const blocked = createExecutor({ config: { ...base.config, delivery: "computer-use", backgroundRoutes: ["peer-relay"] }, run: base.run, store: base.store,
+    ui: { deliver: async () => ({ status: "blocked", detail: "owner using Conductor" }) }, uiLock: createUiLock(), readLivePeers: () => peers, refreshThread: async () => tab });
+  const tab = conductorUiThread(base.cwd, { claudeSessionId: "cs1", agentStatus: "waiting", live: { peerName: "p-1", pid: 6, status: "idle" } });
+  const result = await blocked.deliver({ thread: tab, message: "after your tasks", route: "computer-use", queue: true });
+  assert.equal(result.status, "blocked");
+  assert.equal(base.calls.length, 0, "no relay ran");
+});
+
+test("send now or queue is read at send time; a queued Conductor send goes by the app or not at all", async (t) => {
+  const { cwd, base } = (() => { const b = setup(t); return { cwd: b.cwd, base: b }; })();
+  const requests = [];
+  const ui = { async deliver(request) { requests.push(request); return { status: "sent", detail: "typed into Conductor" }; } };
+  const stale = conductorUiThread(cwd, { agentStatus: "idle", openTasks: [] });
+  const executor = createExecutor({ config: { ...base.config, delivery: "computer-use" }, run: base.run, store: base.store, ui, uiLock: createUiLock(),
+    refreshThread: async () => ({ ...stale, agentStatus: "waiting", openTasks: [{ id: "b9" }] }) });
+  await executor.deliver({ thread: stale, message: "status?", route: "computer-use" });
+  assert.equal(requests.at(-1).sendNow, true, "a task started after the scan");
+  const cli = createExecutor({ config: base.config, run: base.run, store: base.store, ui, uiLock: createUiLock() });
+  const relay = await cli.deliver({ thread: conductorUiThread(cwd, { live: { peerName: "p", pid: 1, status: "idle" } }), message: "later", route: "peer-relay", queue: true });
+  assert.equal(relay.status, "blocked");
+  assert.match(relay.detail, /queue needs the Conductor app/);
+  assert.equal(base.calls.length, 0);
+});
+
+test("queue is Conductor's: a Codex thread asked to queue still falls back while the owner is at the Mac", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, executor } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use", queue: true });
+  assert.equal(result.route, "codex-exec");
+  assert.equal(calls.length, 1);
+  await executor.whenIdle();
+});

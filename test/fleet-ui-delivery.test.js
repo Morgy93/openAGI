@@ -127,6 +127,7 @@ function fakeTransport(app, { failOn = null, failError = null, latency = null, a
         app.onKey?.(args.key);
         if (args.key === "super+a") app.selectAll = true;
         else if (args.key === "BackSpace" && app.selectAll) { app.composer = ""; app.selectAll = false; }
+        else if (args.key === "super+Return" && app.composer) { app.sentNow = (app.sentNow ?? 0) + 1; app.transcript.push(app.composer); app.composer = ""; }
         else if (args.key === "Return" && app.composer) {
           if (app.onSend) app.onSend();
           else { app.transcript.push(app.composer); app.composer = ""; }
@@ -2077,6 +2078,50 @@ test("Codex's composer is the 'Work with Codex' box, not a review comment box be
   assert.equal(found.reason, null);
   assert.equal(found.composer.id, "2132");
   assert.equal(composerEmpty(found.composer), true);
+});
+
+test("a Conductor chat busy with background tasks gets ⌘↩ (sent now) unless asked to queue", async (t) => {
+  const now = setup(t);
+  const sent = await now.driver.deliver(now.request({ busy: true, sendNow: true }));
+  assert.equal(sent.status, "sent");
+  assert.match(sent.detail, /sent now \(⌘↩\)/);
+  assert.equal(now.app.sentNow, 1);
+  assert.deepEqual(now.calls().filter((call) => call.name === "press_key").map((call) => call.args.key), ["super+Return"]);
+  assert.ok(!now.calls().some((call) => call.name === "click" && call.args.element_index === "62"), "never the Send button");
+  // Asked to queue: its Send button, and the result says it waits.
+  const queued = setup(t);
+  const later = await queued.driver.deliver(queued.request({ busy: true, sendNow: false, queue: true }));
+  assert.equal(later.status, "sent");
+  assert.match(later.detail, /queued behind its background tasks/);
+  assert.ok(queued.calls().some((call) => call.name === "click" && call.args.element_index === "62"));
+  assert.equal(queued.app.sentNow ?? 0, 0);
+  // Not busy: the plain send, no note.
+  const plain = setup(t);
+  const normal = await plain.driver.deliver(plain.request());
+  assert.equal(normal.detail, "typed into Conductor");
+});
+
+test("a task that starts while the text is typed still gets ⌘↩; queue asked for keeps the Send button", async (t) => {
+  const f = setup(t);
+  const sent = await f.driver.deliver(f.request({ busy: false, sendNow: false, busyNow: async () => true }));
+  assert.match(sent.detail, /sent now \(⌘↩\)/);
+  const g = setup(t);
+  const queued = await g.driver.deliver(g.request({ busy: false, queue: true, busyNow: async () => true }));
+  assert.match(queued.detail, /queued behind its background tasks/);
+  assert.ok(!g.calls().some((call) => call.name === "press_key" && call.args.key === "super+Return"));
+});
+
+test("⌘↩ is never pressed when a permission card came up during the last owner check", async (t) => {
+  let typed = false; let reads = 0; let app;
+  const f = setup(t, { transportOptions: { onCall: (name) => {
+    if (name === "type_text") typed = true;
+    if (name === "get_app_state" && typed && ++reads === 2) app.prompt = true;
+  } } });
+  app = f.app;
+  const result = await f.driver.deliver(f.request({ busy: true, sendNow: true }));
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /permission prompt appeared before send/);
+  assert.ok(!f.calls().some((call) => call.name === "press_key" && call.args.key === "super+Return"), "the chord was not pressed");
 });
 
 test("a message that says 'Secondary Actions:' is read back whole", () => {

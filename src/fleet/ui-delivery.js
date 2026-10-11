@@ -1515,8 +1515,16 @@ export function createUiDriver({
     within(ctx, 1);
     ctx.phase = "sending";
     const send = findSendButton(state, target.bundleId);
+    // Conductor queues a message while the agent's background tasks run (its
+    // Send button and Return do); ⌘↩ sends it now. Whether they run is read
+    // again here, at the send itself; the caller can ask to queue.
+    let busy = request.busy === true;
+    if (target.app === "conductor" && typeof request.busyNow === "function") {
+      try { busy = (await request.busyNow()) === true; } catch { /* the earlier reading stands */ }
+    }
+    const sendNow = target.app === "conductor" && request.queue !== true && (busy || request.sendNow === true);
     let pressed = false;
-    if (send) {
+    if (send && !sendNow) {
       try {
         await click(ctx, send, signal);
         pressed = true;
@@ -1543,10 +1551,23 @@ export function createUiDriver({
       if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`, card?.prompt ? { prompt: card.prompt } : {});
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
-      await press(ctx, "Return", signal);
+      if (sendNow) {
+        // ⌘↩ also answers a permission card ("Allow once ⌘↩"): one that came
+        // up during the owner check would be approved. Read once more.
+        state = await readState(ctx, signal);
+        const latest = composerIn(ctx, state).composer;
+        const raisedNow = promptBlock(state, target.bundleId);
+        if (raisedNow) return outcome(ctx, "blocked", `permission prompt appeared before send; ${LEFT_AS_DRAFT}`, raisedNow.prompt ? { prompt: raisedNow.prompt } : {});
+        if (!latest || !isComposerFocused(state, latest) || !verifyIdentity(state, identity).ok || normalizeUiText(latest.value) !== normalizeUiText(text)) {
+          return outcome(ctx, "blocked", `send not pressed: the composer changed before ⌘↩; ${LEFT_AS_DRAFT}`);
+        }
+        if (hasStopButton(state)) return outcome(ctx, "blocked", `turn started before send; ${LEFT_AS_DRAFT}`);
+      }
+      await press(ctx, sendNow ? "super+Return" : "Return", signal);
       ctx.keyEnd = now();
     }
     ctx.phase = "sent";
+    const how = sendNow ? "; sent now (⌘↩)" : busy && target.app === "conductor" ? "; queued behind its background tasks" : "";
 
     // 10. Confirm: composer empty and one more transcript copy of our text.
     const deadline = now() + limits.uiConfirmMs;
@@ -1557,7 +1578,7 @@ export function createUiDriver({
       const empty = composer ? composerEmpty(composer) || !normalizeUiText(composer.value) : false;
       if (empty && transcriptCount(state, needle, composer) > beforeCount) {
         keep(ctx, "after", state);
-        return outcome(ctx, "sent", leftover ? `sent the text an earlier attempt left in ${target.name}` : `typed into ${target.name}`);
+        return outcome(ctx, "sent", `${leftover ? `sent the text an earlier attempt left in ${target.name}` : `typed into ${target.name}`}${how}`);
       }
     } while (now() < deadline);
     keep(ctx, "after", state);

@@ -107,7 +107,7 @@ export class RemoteFleetSupervisor {
   // Brings back a question the computer's review closed.
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message) { return this.request('POST', '/fleet/api/send', { threadKey, message }); }
+  async sendOwnerMessage(threadKey, message, { queue = false } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}) }); }
   async screenThread(threadKey) {
     const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });
     return screen;
