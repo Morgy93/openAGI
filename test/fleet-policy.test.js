@@ -870,6 +870,26 @@ test("a slow full verify whose gate already passed gets ci-finished, not the man
   };
   assert.equal(decide("SUCCESS").playbook, "ci-finished");
   assert.equal(decide("PENDING").action, "escalate-manager");
+  // The full-run gate passed, hosted CI still running: wait, never the manager.
+  const pending = makePr({ gates: gate("SUCCESS"), ci: { state: "PENDING", failing: [], pending: ["lint"] } });
+  const held = decideThread(classifyThread(thread, { pr: pending, localGit: cleanGit, now: NOW, config }), thread, { playbooks, config, now: NOW, pr: pending, mode: "auto", manager });
+  assert.equal(held.action, "wait");
+  // A finished gate that is not the full run proves nothing: failed hosted CI still escalates.
+  const cfg = { ...config, requiredChecks: { "acme/app": ["deploy"] } };
+  const deployed = makePr({ gates: [{ name: "deploy", label: "deploy", state: "SUCCESS" }], ci: { state: "FAILURE", failing: ["unit"], pending: [] } });
+  const other = decideThread(classifyThread(thread, { pr: deployed, localGit: cleanGit, now: NOW, config: cfg }), thread, { playbooks, config: cfg, now: NOW, pr: deployed, mode: "auto", manager });
+  assert.equal(other.action, "escalate-manager");
+  // The BuildBot3 manager message lists only threads whose full run is still unfinished.
+  const bb3 = { ...bb3Base, gate: { state: "blocked", reason: "slot held", since: ago(40 * MIN) } };
+  const item = (key, state) => {
+    const t = makeThread({ key, id: key, agentStatus: "waiting", openTasks: [full], prRefs: [`acme/app#${key === "s1" ? 6522 : 6523}`] });
+    const pr = makePr({ ref: t.prRefs[0], number: key === "s1" ? 6522 : 6523, gates: gate(state) });
+    return { thread: t, classified: classifyThread(t, { pr, localGit: cleanGit, now: NOW, config }), pr };
+  };
+  const [infra] = decideInfra({ bb3, lb: lbOk, localVerify: [] }, { ledger: {}, playbooks, config, now: NOW, threads: [item("s1", "SUCCESS"), item("s2", "PENDING")], manager, mode: "auto" });
+  assert.equal(infra.action, "escalate-manager");
+  assert.match(infra.message, /#6523 head .*bb-verify --full/);
+  assert.doesNotMatch(infra.message, /#6522 head/);
 });
 
 test("merge-ready names the repo's gate, or hosted CI when it has none", () => {

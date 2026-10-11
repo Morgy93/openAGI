@@ -278,10 +278,20 @@ function backoffIntent(ctx, errorAt, kind) {
 const FULL_RUN_CHECK = "BuildBot3 full verification";
 const FULL_RUN_HOW = /\bbb-verify\b.*--full\b/;
 
+function isFullRunGate(gate) {
+  return gate?.name === FULL_RUN_CHECK || FULL_RUN_HOW.test(String(gate?.how ?? ""));
+}
+
 function fullRunGated(pr, thread, config) {
   const repo = pr?.repo ?? thread?.repo ?? null;
   const gates = pr?.gates?.length ? pr.gates : repo ? requiredChecksFor(repo, config) : [];
-  return gates.some((gate) => gate?.name === FULL_RUN_CHECK || FULL_RUN_HOW.test(String(gate?.how ?? "")));
+  return gates.some(isFullRunGate);
+}
+
+// The full-run gate already finished on the head: a slow full run is over,
+// whatever the task says. Another gate finishing proves nothing about it.
+function fullRunGateDone(pr) {
+  return (pr?.gates ?? []).some((gate) => isFullRunGate(gate) && CI_DONE.has(gate.state));
 }
 
 function ciFailing(pr) {
@@ -306,8 +316,9 @@ function waitingIntent(ctx) {
     // manager, never a nudge to drop it. Elsewhere hosted CI is the gate: a
     // full run only reproduces a hosted CI failure.
     if (!fullRunGated(pr, thread, ctx.config) && !ciFailing(pr)) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
-    // The full-run gate already passed on the head: the run is over, whatever the task says.
-    if (ciDone && gates.length) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
+    if (fullRunGateDone(pr)) {
+      return ciDone ? nudge("ci-finished", "CI done; task still waiting", { immediate: true }) : { type: "wait", reason: "full-run gate done; hosted CI still running" };
+    }
     if (silent) return statusCheck("bb-verify --full", quietMs);
     return escalateIntent(ctx, "bb-verify --full", age);
   }
@@ -377,7 +388,7 @@ function escalatedWait(classified, pr, limits, thread = null, config = null) {
   if (classified?.state !== "waiting-ci") return null;
   const wait = classified.wait ?? {};
   const age = wait.ageMs ?? 0;
-  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs && (fullRunGated(pr, thread, config) || ciFailing(pr))) return { what: "bb-verify --full", age };
+  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs && !fullRunGateDone(pr) && (fullRunGated(pr, thread, config) || ciFailing(pr))) return { what: "bb-verify --full", age };
   if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return { what: "bb-quick", age };
   return null;
 }
