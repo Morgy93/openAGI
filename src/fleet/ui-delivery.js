@@ -30,11 +30,10 @@ const SLOW_NAVIGATION = new Set(["com.openai.codex"]);
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
 // Presence is read from HIDIdleTime alone, and any input there counts as the
-// owner's. Open Computer Use types into a settable composer by setting its
-// accessibility value and clicks through accessibility, neither of which
-// posts a HID event; its key presses (Return) and keyboard-fallback typing
-// do, and nothing that follows them needs the owner away except putting
-// their app back, which then simply waits for real idle.
+// owner's. Accessibility clicks do not post HID events. Keyboard typing
+// and key presses (Return) can reset that clock; subsequent checks must
+// continue to respect owner activity rather than assuming input was ours.
+// Putting the owner's app back waits for real idle.
 // After a Return send, the owner's app goes back on a later readiness check
 // once nothing but that key has happened and they have been away long
 // enough; given up after this long.
@@ -156,8 +155,6 @@ const ROW_STATS = /(?:\s+[+-](?:[\d.,]+[kKmM]?|✱+))+$/;
 
 function parseElementLine(depth, id, rest) {
   let body = String(rest ?? "");
-  const secondary = body.search(/,? Secondary Actions: /);
-  if (secondary >= 0) body = body.slice(0, secondary);
   const lower = body.toLowerCase();
   let role = ROLE_PHRASES.find((phrase) => lower === phrase || lower.startsWith(`${phrase} `) || lower.startsWith(`${phrase}(`) || lower.startsWith(`${phrase},`));
   if (!role) role = lower.split(/[\s(,]/)[0] ?? "";
@@ -169,6 +166,8 @@ function parseElementLine(depth, id, rest) {
     body = body.slice(flagMatch[0].length);
   }
   const rawText = body;
+  const secondary = body.search(/(?:^|,? )Secondary Actions: /);
+  if (secondary >= 0) body = body.slice(0, secondary);
   const fields = {};
   const markers = [...body.matchAll(FIELD_MARKER)];
   const label = (markers.length ? body.slice(0, markers[0].index) : body).replace(/[,\s]+$/, "").trim();
@@ -226,7 +225,17 @@ export function parseAppState(result) {
     (owner.innerText ??= []).push(element.rawText);
   }
   for (const element of elements) {
-    if (element.innerText) element.value = element.innerText.join("\n");
+    if (element.innerText) {
+      const value = element.innerText.join("\n");
+      const placeholder = composerPlaceholder(element);
+      const shown = normalizeUiText(String(element.rawText ?? element.label).replace(/\\n/g, " "));
+      // Real Codex empty fields have a doubled parent placeholder and a
+      // single child placeholder. Never discard other child text.
+      if (placeholder && shown === `${placeholder} ${placeholder}` && normalizeUiText(value) === placeholder) {
+        element.innerText = [];
+        element.value = "";
+      } else element.value = value;
+    }
   }
   const focusedMatch = /The focused UI element is\s+(\d+)\b/.exec(text);
   return {
@@ -1405,13 +1414,12 @@ export function createUiDriver({
     let found = composerIn(ctx, state);
     if (!found.composer) return outcome(ctx, "blocked", found.reason);
     const leftover = normalizeUiText(found.composer.value) === normalizeUiText(text);
-    // Our text behind the placeholder an earlier keyboard attempt left: set
-    // back to exactly our text.
-    const junk = !leftover && placeholderJunk(found.composer, text);
-    if (!leftover && !junk && !composerEmpty(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
+    // A leftover prefix may include an owner's edit. Never replace or clear
+    // it: only an empty composer or exactly our prior message is eligible.
+    if (!leftover && !composerEmpty(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
     const beforeCount = transcriptCount(state, needle, found.composer);
     keep(ctx, "before", state);
-    const expected = leftover ? normalizeUiText(text) : junk ? normalizeUiText(found.composer.value) : null;
+    const expected = leftover ? normalizeUiText(text) : null;
     const holds = (composer) => (expected === null ? composerEmpty(composer) : normalizeUiText(composer.value) === expected);
 
     // 6. Focus the composer with an accessibility click; OCU reports focus
@@ -1444,10 +1452,10 @@ export function createUiDriver({
     const beforeTyping = await ownerCheck(ctx, target);
     if (beforeTyping) return outcome(ctx, "blocked", beforeTyping);
     ctx.phase = "typing";
-    // The composer's value is set, not typed key by key: typing into an empty
-    // composer can keep the app's placeholder as text in front of ours.
-    // Setting it is safe only because it holds nothing (or only our text).
-    if (!leftover) await act(ctx, "set_value", { app: target.bundleId, element_index: found.composer.id, value: text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs });
+    // Append through Open Computer's keyboard input. A queued set_value
+    // replaces the whole field and can erase an owner's intervening text.
+    // Readback must still equal exactly our text before any send is allowed.
+    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs });
     ctx.phase = "typed";
 
     // 8. Same thread, and the composer holds exactly our text.
