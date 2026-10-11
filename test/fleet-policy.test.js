@@ -1350,12 +1350,19 @@ test("the d1dbe71a report asks the owner about their decision, not another merge
   assert.match(decision.question.body, /Your decision on the two P1s/);
 });
 
-test("a PR with 100+ threads, the rest green, still gets the agent to read past the first 100", () => {
+test("the supervisor's own read limits are no reason to nudge: 100+ threads, a certificate the pending full run publishes", () => {
   const pr = makePr({ threadsTruncated: true });
   const { classified, decision } = run(makeThread(), { pr });
   assert.deepEqual(classified.blockers, ["100+ threads, not all read"]);
-  assert.equal(decision.action, "nudge");
-  assert.equal(decision.playbook, "merge-ready");
+  assert.equal(decision.action, "wait", "its merge-ready pass reads them all; nothing new to say");
+  // The red verification-certificate while the BuildBot3 full run is still
+  // pending is that same wait; with the run missing it is the agent's.
+  const bb = "buildbetter-app/buildbetter";
+  const gated = (state) => makePr({ ref: `${bb}#6522`, repo: bb, gates: [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }], ci: { state: "FAILURE", failing: ["verification-certificate"], pending: [] } });
+  const pendingRun = run(makeThread({ repo: bb, prRefs: [`${bb}#6522`] }), { pr: gated("PENDING") });
+  assert.equal(pendingRun.decision.action, "wait", JSON.stringify(pendingRun.classified.blockers));
+  const missingRun = run(makeThread({ repo: bb, prRefs: [`${bb}#6522`] }), { pr: gated(null) });
+  assert.equal(missingRun.decision.action, "nudge");
   // GitHub's own lag still waits.
   const lag = run(makeThread(), { pr: makePr({ codexReview: { reviewedHead: false, sha: "bbbbbbb" } }) }).decision;
   assert.equal(lag.action, "wait");
@@ -1522,7 +1529,8 @@ test("a long background wait on GitHub's own lag waits; a mid-turn reply is not 
   const lag = run(waiting, { pr: gated({ codexReview: { reviewedHead: false, sha: "bbbbbbb" } }) });
   assert.equal(lag.classified.state, "waiting-ci");
   assert.equal(lag.decision.action, "wait");
-  assert.equal(run(waiting, { pr: gated({ threadsTruncated: true }) }).decision.playbook, "merge-ready");
+  // The supervisor's own read limit is that same wait.
+  assert.equal(run(waiting, { pr: gated({ threadsTruncated: true }) }).decision.action, "wait");
   // Words from a turn still running answer nothing yet.
   const first = run(makeThread(), { pr: redPr() }).decision;
   const ledger = sentLedger(first, 40 * MIN);

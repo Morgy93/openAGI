@@ -28,13 +28,16 @@ const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
 const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
-// does nothing for them. "100+ threads, not all read" is not one: threads
-// past the first 100 may hold open comments, and the agent can read them.
-const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
+// does nothing for them. "100+ threads, not all read" is the supervisor's own
+// read limit, not news for the agent (its merge-ready pass reads them all).
+const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown", "100+ threads, not all read"]);
 // "CI running", or a required check still running ("BuildBot3 full run pending").
 // A gate GitHub did not finish reading waits for the next read like a running one.
 const ciRunning = (blocker) => blocker === "CI running" || / (?:pending|unread)$/.test(blocker);
-const passive = (blocker) => PASSIVE_BLOCKERS.has(blocker) || ciRunning(blocker);
+// The BuildBot3 full run publishes the verification certificate: while that
+// run is still pending, its red certificate check is the same wait.
+const passiveAmong = (blockers) => (blocker) => PASSIVE_BLOCKERS.has(blocker) || ciRunning(blocker)
+  || (blocker === "CI red: verification-certificate" && blockers.some((item) => /^BuildBot3 full run (?:pending|unread)$/.test(item)));
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
 // A single dropped stream or timeout in one chat is routine, not an outage,
 // even more so while the LB's own probe says it is healthy. These kinds alarm
@@ -348,7 +351,7 @@ function waitingIntent(ctx) {
     if (wait.taskKind || age < limits.waitingTaskMaxMs) return { type: "wait", reason: wait.reason ?? "waiting on a background task" };
     if (ciDone) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
     const blockers = classified.readiness?.blockers ?? [];
-    if (pr?.state === "OPEN" && blockers.length && !blockers.some(ciRunning) && !blockers.every(passive)) {
+    if (pr?.state === "OPEN" && blockers.length && !blockers.some(ciRunning) && !blockers.every(passiveAmong(blockers))) {
       return nudge("merge-ready", `waiting ${minutes(age)}m; not ready: ${blockers.join("; ")}`, { immediate: true });
     }
     if (silent) return statusCheck("a background task", quietMs);
@@ -498,7 +501,7 @@ function agentAskIntent(ctx) {
 function prIntent(ctx) {
   const { classified, thread } = ctx;
   const blockers = classified.blockers ?? [];
-  if (blockers.length && blockers.every(passive)) {
+  if (blockers.length && blockers.every(passiveAmong(blockers))) {
     return { type: "wait", reason: blockers.includes("CI running") ? "CI running on head" : `waiting: ${blockers.join("; ")}` };
   }
   const playbook = RESUME_STATUSES.has(thread.agentStatus) ? "resume" : "merge-ready";
@@ -624,7 +627,7 @@ function nudgeFacts(ctx) {
   const { classified, pr } = ctx;
   const blockers = (classified.blockers?.length ? classified.blockers : classified.readiness?.blockers) ?? [];
   const failing = (pr?.ci?.failing ?? []).map((name) => fact(name, 60)).filter(Boolean);
-  const out = blockers.filter((blocker) => !passive(blocker) && !(failing.length && /^CI red:/.test(blocker))).map((blocker) => fact(blocker, 80));
+  const out = blockers.filter((blocker) => !passiveAmong(blockers)(blocker) && !(failing.length && /^CI red:/.test(blocker))).map((blocker) => fact(blocker, 80));
   for (const name of failing) out.push(`${name} failing`);
   // A rerun that fails again on the same head is news.
   const failedAt = Date.parse(pr?.ci?.failedAt ?? "");
