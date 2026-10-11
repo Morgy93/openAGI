@@ -1112,6 +1112,27 @@ test("tail cards: a card is never the agent's last words, in either rollout form
   }
 });
 
+test("carded automation and no-repo threads on pages past the in-scope stop are still read", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // maxThreads 2 reads pages of 10 rows: the first page fills the cap.
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 12; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  for (const [id, spec] of [["t-auto", { threadSource: "automation" }], ["t-norepo", { cwd: path.join(ctx.home, "gone") }], ["t-quiet", { threadSource: "automation" }]]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, ...spec });
+    h.turn(id, "turn-a");
+    if (id !== "t-quiet") h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_t-auto:0");
+  assert.equal(map["t-norepo"]?.excluded, "no-repo");
+  assert.equal(map["t-norepo"].meta.pendingCard?.items[0].itemId, "call_t-norepo:0");
+  assert.equal(map["t-quiet"], undefined, "a thread with no card past the stop is not built");
+});
+
 test("cards on automation and no-repo threads survive the cap; guardian reviews are never read for one", async (t) => {
   const ctx = makeHome(t);
   const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };

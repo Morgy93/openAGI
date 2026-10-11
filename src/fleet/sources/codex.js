@@ -808,6 +808,19 @@ function capThreads(threads, max) {
   return threads.filter((thread) => keep.has(thread));
 }
 
+// Threads past the paging stop whose history index holds an open card.
+function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes }) {
+  const carded = readThreadRows(db, cutoff, pageSize, after).filter((row) => {
+    if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) return false;
+    let bytes = null;
+    try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
+    return readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now })?.items?.length > 0;
+  });
+  const attachments = readPrAttachments(db, carded.map((row) => String(row.id)));
+  return carded.map((row) => buildThread(row, { config, now, attachments, history, tailBytes }))
+    .filter((thread) => Date.parse(thread.lastActivityAt ?? "") >= cutoff);
+}
+
 export async function listCodexThreads(config, options = {}) {
   const now = options.now ?? Date.now();
   const run = options.run ?? runCommand;
@@ -828,6 +841,7 @@ export async function listCodexThreads(config, options = {}) {
     // Guardian reviews, automation, and settings-only rows fill pages too,
     // so read on until maxThreads in-scope threads are found or the
     // lookback window runs out; no fixed row cap hides an older real thread.
+    let unread = null;
     for (let after = null, inScope = 0; inScope < limits.maxThreads;) {
       const rows = readThreadRows(db, cutoff, pageSize, after);
       const attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
@@ -841,7 +855,12 @@ export async function listCodexThreads(config, options = {}) {
       }
       if (rows.length < pageSize) break;
       after = rows.at(-1);
+      unread = after;
     }
+    // capThreads keeps an automation or no-repo thread with an open card, so
+    // the older rows the loop stopped before are checked for one too: one
+    // more page, in the history index only (no tail reads).
+    if (unread && history) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES }));
     // A failed title scan marks nothing shared; identity checks still see
     // every thread the supervisor retained.
     let shared = { names: new Set(), labels: new Map() };
