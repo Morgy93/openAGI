@@ -2042,6 +2042,43 @@ test("a sent message that says 'URL:' still counts as a transcript copy", () => 
   assert.equal(transcriptCount(state, said), 1);
 });
 
+// Real rows read live on 2026-10-11 (OCU 0.3.5).
+test("Conductor's empty composer in a chat with history is empty; the placeholder typed in is a draft", () => {
+  const rows = (row, child) => stateOf([
+    "App=com.conductor.app (pid 1)", 'Window: "Conductor", App: Conductor.', "0 standard window Conductor", "\t1 scroll area",
+    `\t\t2 HTML content Tauri + React + Typescript, URL: ${CONDUCTOR_URL}`,
+    "\t\t\t\t\t236 container composer",
+    `\t\t\t\t\t\t237 text entry area (settable, string) ${row}, Secondary Actions: Show Writing Tools`,
+    `\t\t\t\t\t\t\t238 text ${child}`,
+    "\t\t\t\t\t\t239 button Frame: x=347, y=1233, w=146, h=28"
+  ].join("\n"));
+  const empty = findComposer(rows("Add a follow up", "Add a follow up"));
+  assert.equal(empty.composer?.id, "237");
+  assert.equal(composerEmpty(empty.composer), true);
+  const typed = findComposer(rows("Add a follow up Add a follow up", "Add a follow up")).composer;
+  assert.equal(composerEmpty(typed), false, "the owner typed the placeholder's words");
+  const draft = findComposer(rows("Add a follow up half a note", "half a note")).composer;
+  assert.equal(composerEmpty(draft), false);
+});
+
+test("Codex's composer is the 'Work with Codex' box, not a review comment box beside it", () => {
+  const state = stateOf([
+    "App=com.openai.codex (pid 9)", 'Window: "ChatGPT", App: ChatGPT.', "0 standard window ChatGPT",
+    "  1 HTML content Fix billing, URL: app://-/index.html",
+    "    1939 container Conversation",
+    "      2131 container",
+    "        2132 text entry area (settable, string) Work with Codex Work with Codex\\n",
+    "          2133 text Work with Codex",
+    "    3461 container Add a comment",
+    "      3488 container Write",
+    "        3490 text entry area (settable, string) Comment"
+  ].join("\n"));
+  const found = findComposer(state, "com.openai.codex");
+  assert.equal(found.reason, null);
+  assert.equal(found.composer.id, "2132");
+  assert.equal(composerEmpty(found.composer), true);
+});
+
 test("a message that says 'Secondary Actions:' is read back whole", () => {
   const said = `${MESSAGE} Note, Secondary Actions: none`;
   const state = stateOf(conductorComposer(said));
