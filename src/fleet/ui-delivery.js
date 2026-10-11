@@ -123,7 +123,7 @@ const HEADING_ROLE = /^heading$/;
 // puts the open workspace and session ids in its URL.
 const WEB_AREA_ROLE = /^(html content|web area)$/;
 const BUTTON_ROLE = /button$/;
-const COMPOSER_HINT = /composer|message|prompt|reply|follow[- ]?up|ask (?:codex|anything)|do anything|type a|send a/i;
+const COMPOSER_HINT = /composer|message|prompt|reply|follow[- ]?up|ask (?:codex|anything)|do anything|work with codex|type a|send a/i;
 // The app's own page; any other web area is an in-app browser tab (Codex's
 // shows GitHub, whose comment box is no composer).
 const OWN_PAGE = { "com.openai.codex": /^app:\/\//, "com.conductor.app": /^tauri:\/\/localhost/ };
@@ -231,11 +231,16 @@ export function parseAppState(result) {
     if (element.innerText) {
       const value = element.innerText.join("\n");
       const placeholder = composerPlaceholder(element);
-      const shown = normalizeUiText(String(element.rawText ?? element.label).replace(/\\n/g, " "));
-      // Real Codex empty fields have a doubled parent placeholder and a
-      // single child placeholder. Never discard other child text.
-      if (header?.[1] === "com.openai.codex" && placeholder
-          && shown === `${placeholder} ${placeholder}` && normalizeUiText(value) === placeholder) {
+      // The row as shown, without OCU's ", Secondary Actions: …" suffix.
+      const shown = normalizeUiText(String(element.label ?? "").replace(/\\n/g, " "));
+      // Real empty fields keep the placeholder as their one child: Codex
+      // prints the row's placeholder twice (placeholder and value), Conductor
+      // once (a chat with history: "Add a follow up"). The placeholder typed
+      // into Conductor would print it twice: that stays a draft. Never
+      // discard other child text.
+      const codexEmpty = header?.[1] === "com.openai.codex" && shown === `${placeholder} ${placeholder}`;
+      const conductorEmpty = header?.[1] === "com.conductor.app" && shown === placeholder;
+      if (placeholder && (codexEmpty || conductorEmpty) && normalizeUiText(value) === placeholder) {
         element.innerText = [];
         element.value = "";
       } else element.value = value;
