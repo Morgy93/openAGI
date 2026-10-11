@@ -616,6 +616,31 @@ test("a result row closes a card out of the tail; a subagent card out of the tai
   assert.equal(byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard?.cardId, "toolu_sub");
 });
 
+test("a trailing row with no turn_id or an ambient broadcast never hides or drops an open card", async (t) => {
+  // The turn's init aged out of the tail; a subagent card is in the tail, the
+  // agent's own card is not, and the newest rows are a commands_changed
+  // broadcast (its own turn id) and a row with no turn_id at all.
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 450 });
+  let db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", subagentAsk("toolu_sub"), iso(0.2 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "commands_changed", session_id: "s-run" }, iso(0.15 * MIN), { turnId: "ambient-turn" });
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "commands_changed", session_id: "s-run" }, iso(0.1 * MIN));
+  db.close();
+  let card = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard;
+  assert.deepEqual(card?.items.map((item) => item.itemId), ["toolu_card:0", "toolu_card:1", "toolu_sub:0", "toolu_sub:1"]);
+
+  // An older Conductor with no turn_id column: the tail card stands alone.
+  const other = makeHome(t);
+  const old = seedCard(other, { subagentRows: 450 });
+  db = new DatabaseSync(old);
+  addMessage(db, "s-run", "assistant", subagentAsk("toolu_sub"), iso(0.2 * MIN));
+  db.exec("ALTER TABLE session_messages DROP COLUMN turn_id");
+  db.close();
+  card = byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard;
+  assert.equal(card?.cardId, "toolu_sub");
+});
+
 test("rows that only mention AskUserQuestion never hide the real call out of the tail", async (t) => {
   // 221fbf69: subagents read conductor.js and its tests while a card is open.
   const home = makeHome(t);
