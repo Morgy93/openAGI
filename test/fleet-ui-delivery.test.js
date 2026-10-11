@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
-  composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
+  screenSummary, composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
   conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController
 } from "../src/fleet/ui-delivery.js";
 
@@ -2192,4 +2192,31 @@ test("a background read with navigate off never deep links to another thread", a
   assert.equal(read.status, "blocked");
   assert.match(read.detail, /shows another thread; not moving it/);
   assert.deepEqual(f.probe.opened, []);
+});
+
+
+test("composer inner text retains field-looking message text", () => {
+  for (const marker of ["URL: https://example.test", "Title: status", "Value: expected", "Description: details"]) {
+    const message = `${MESSAGE} ${marker} finish`;
+    assert.equal(findComposer(stateOf(conductorComposer(message))).composer.value, message);
+  }
+});
+
+test("screen summaries exclude unsent composer descendants", () => {
+  const state = stateOf(conductorComposer("synthetic unsent private draft"));
+  assert.equal(screenSummary(state).draft, true);
+  assert.doesNotMatch(screenSummary(state).text, /synthetic unsent private draft/);
+});
+
+test("repeated owner draft labels do not establish an empty composer", () => {
+  for (const label of ["wait wait", "keep this keep this", "hello hello"]) {
+    assert.equal(composerEmpty({ label, value: "", fields: {} }), false);
+  }
+});
+
+test("placeholder repair requires the complete known placeholder", () => {
+  for (const prefix of ["Ask", "Ask to make", "Do", "Work with"]) {
+    assert.equal(placeholderJunk({ label: CONDUCTOR_PLACEHOLDER, value: `${prefix}${MESSAGE}` }, MESSAGE), false);
+  }
+  assert.equal(placeholderJunk({ label: CONDUCTOR_PLACEHOLDER, value: `${CONDUCTOR_PLACEHOLDER}${MESSAGE}` }, MESSAGE), true);
 });

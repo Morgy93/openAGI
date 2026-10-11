@@ -168,6 +168,7 @@ function parseElementLine(depth, id, rest) {
     flags = flagMatch[1].split(",").map((flag) => flag.trim().toLowerCase()).filter(Boolean);
     body = body.slice(flagMatch[0].length);
   }
+  const rawText = body;
   const fields = {};
   const markers = [...body.matchAll(FIELD_MARKER)];
   const label = (markers.length ? body.slice(0, markers[0].index) : body).replace(/[,\s]+$/, "").trim();
@@ -180,7 +181,7 @@ function parseElementLine(depth, id, rest) {
   const search = normalizeUiText([label, value, fields.title, fields.description, fields.help, fields.id].filter(Boolean).join(" ")).toLowerCase();
   const hint = normalizeUiText([label, fields.placeholder, fields.description, fields.help, fields.id].filter(Boolean).join(" "));
   return {
-    id: String(id), depth, role, flags, label, value, fields, search, hint,
+    id: String(id), depth, role, flags, label, rawText, value, fields, search, hint,
     selected: flags.includes("selected"),
     focused: flags.includes("focused"),
     disabled: flags.includes("disabled") || flags.includes("dimmed")
@@ -222,10 +223,10 @@ export function parseAppState(result) {
     const owner = ancestors(element).find((node) => EDITABLE_ROLES.has(node.role));
     if (!owner) continue;
     element.inner = true;
-    (owner.innerText ??= []).push(element.label);
+    (owner.innerText ??= []).push(element.rawText);
   }
   for (const element of elements) {
-    if (element.innerText && element.fields.value === undefined) element.value = element.innerText.join("\n");
+    if (element.innerText) element.value = element.innerText.join("\n");
   }
   const focusedMatch = /The focused UI element is\s+(\d+)\b/.exec(text);
   return {
@@ -399,7 +400,8 @@ function resumeButtons(state, bundleId = state?.bundleId) {
 export function screenSummary(state, bundleId = state?.bundleId) {
   const composer = findComposer(state, bundleId).composer;
   const ownPage = OWN_PAGE[bundleId] ?? null;
-  const text = (state?.elements ?? []).filter((element) => !BUTTON_ROLE.test(element.role) && !isEditable(element)
+  const text = (state?.elements ?? []).filter((element) => !element.inner && !ancestors(element).some(isEditable)
+    && !BUTTON_ROLE.test(element.role) && !isEditable(element)
     && !(ownPage && inOtherPage(element, ownPage)) && /text|heading/.test(element.role))
     .map((element) => normalizeUiText(element.label || element.value)).filter(Boolean).join("\n");
   return {
@@ -430,27 +432,38 @@ export function looksLikeOurs(value, text) {
   return have.startsWith(ours.slice(0, Math.min(ours.length, SUPERVISOR_PREFIX.length + 10)));
 }
 
-// Empty for sure: no value, no inner text, and the row shows nothing or only
-// the placeholder (Codex prints it twice: label and value). Anything else may
-// be the owner's draft, which setting the value would erase.
+// Only observed application placeholders establish emptiness. An arbitrary
+// repeated label can be an owner's unsent draft, not a placeholder.
+const COMPOSER_PLACEHOLDERS = new Set([
+  "Do anything",
+  "Work with Codex",
+  "Ask to make changes, @mention files, run /commands"
+]);
+
+function composerPlaceholder(composer) {
+  const explicit = normalizeUiText(composer?.fields?.placeholder);
+  if (COMPOSER_PLACEHOLDERS.has(explicit)) return explicit;
+  const shown = normalizeUiText(String(composer?.label ?? "").replace(/\\n/g, " "));
+  return [...COMPOSER_PLACEHOLDERS].find((placeholder) => shown === placeholder
+    || shown.startsWith(`${placeholder} `) || shown.startsWith(`${placeholder}[`)) ?? null;
+}
+
 export function composerEmpty(composer) {
   if (!composer || normalizeUiText(composer.value) || composer.innerText?.length) return false;
   const shown = normalizeUiText(String(composer.label ?? "").replace(/\\n/g, " "));
   if (!shown) return true;
-  const words = shown.split(" ");
-  const half = words.length / 2;
-  return Number.isInteger(half) && words.slice(0, half).join(" ") === words.slice(half).join(" ");
+  const placeholder = composerPlaceholder(composer);
+  return Boolean(placeholder) && (shown === placeholder || shown === `${placeholder} ${placeholder}`);
 }
 
-// An earlier attempt typed with keys left the app's placeholder in front of
-// our text ("Ask to make changes…[OpenAGI supervisor] …"): still exactly ours
-// after that prefix, and the prefix is what the row shows first.
+// Recover only the complete known placeholder followed by exactly our text.
+// Partial prefixes may be an owner's edit and must never be discarded.
 export function placeholderJunk(composer, text) {
   const have = normalizeUiText(composer?.value);
   const ours = normalizeUiText(text);
   if (!have || !ours || have === ours || !have.endsWith(ours)) return false;
   const prefix = have.slice(0, have.length - ours.length).trim();
-  return prefix.length > 0 && prefix.length <= 80 && !prefix.includes(SUPERVISOR_PREFIX.trim()) && normalizeUiText(composer.label).startsWith(prefix);
+  return prefix === composerPlaceholder(composer);
 }
 
 // Only OCU's focus line counts; it prints one only for the frontmost app.
