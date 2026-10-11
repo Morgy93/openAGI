@@ -316,8 +316,11 @@ function waitingIntent(ctx) {
     // manager, never a nudge to drop it. Elsewhere hosted CI is the gate: a
     // full run only reproduces a hosted CI failure.
     if (!fullRunGated(pr, thread, ctx.config) && !ciFailing(pr)) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
-    if (fullRunGateDone(pr)) {
-      return ciDone ? nudge("ci-finished", "CI done; task still waiting", { immediate: true }) : { type: "wait", reason: "full-run gate done; hosted CI still running" };
+    // The gate already reported on an open PR: the task outlived it. Not
+    // slow, so no manager; once CI is done the agent hears it.
+    if (pr?.state === "OPEN" && fullRunGateDone(pr)) {
+      if (ciDone) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
+      if (!silent) return { type: "wait", reason: "full-run gate done; hosted CI still running" };
     }
     if (silent) return statusCheck("bb-verify --full", quietMs);
     return escalateIntent(ctx, "bb-verify --full", age);

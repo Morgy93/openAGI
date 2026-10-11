@@ -874,6 +874,11 @@ test("a slow full verify whose gate already passed gets ci-finished, not the man
   const pending = makePr({ gates: gate("SUCCESS"), ci: { state: "PENDING", failing: [], pending: ["lint"] } });
   const held = decideThread(classifyThread(thread, { pr: pending, localGit: cleanGit, now: NOW, config }), thread, { playbooks, config, now: NOW, pr: pending, mode: "auto", manager });
   assert.equal(held.action, "wait");
+  // A merged PR is never "CI still running": a task left past its gate is
+  // not held forever (escalated, or a status check once the agent is quiet).
+  const merged = makePr({ state: "MERGED", gates: gate("SUCCESS") });
+  const after = decideThread(classifyThread(thread, { pr: merged, localGit: cleanGit, now: NOW, config }), thread, { playbooks, config, now: NOW, pr: merged, mode: "auto", manager });
+  assert.notEqual(after.action, "wait");
   // A finished gate that is not the full run proves nothing: failed hosted CI still escalates.
   const cfg = { ...config, requiredChecks: { "acme/app": ["deploy"] } };
   const deployed = makePr({ gates: [{ name: "deploy", label: "deploy", state: "SUCCESS" }], ci: { state: "FAILURE", failing: ["unit"], pending: [] } });
