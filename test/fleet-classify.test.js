@@ -265,6 +265,17 @@ test("classifyThread: a PR merged or closed after the ask settles it; an ask mad
   assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ mergedAt: null, closedAt: null }) }).state, "needs-human");
 });
 
+test("classifyThread: a report's Blocked-on list is settled against the report's own time", () => {
+  const merged = makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
+  const report = "Shipped the fix.\n\n**Blocked on:**\n- **Your decision** on cutting the production release";
+  // The report, the merge, then a synthetic limit notice that moved lastAgentAt.
+  const thread = makeThread({ lastAgentText: "You've hit your session limit", lastAgentAt: ago(5 * MIN), lastAgentFull: report, lastAgentFullAt: ago(30 * MIN) });
+  assert.notEqual(classify(thread, { pr: merged }).state, "needs-human");
+  // A report written after the merge still asks.
+  const later = makeThread({ lastAgentText: report, lastAgentAt: ago(5 * MIN), lastAgentFull: report, lastAgentFullAt: ago(5 * MIN) });
+  assert.equal(classify(later, { pr: merged }).state, "needs-human");
+});
+
 test("classifyThread: a structured Codex ask is settled by a later merge, not an earlier one", () => {
   const merged = makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
   const structured = (at, lastAgentAt, text = "Checked the build. Start a huddle and send a screenshot?") => makeThread({
