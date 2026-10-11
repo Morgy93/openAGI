@@ -38,6 +38,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,6 +58,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import java.net.SocketTimeoutException
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.FleetAction
@@ -66,6 +72,11 @@ import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetState
 import sh.openagi.mobile.protocol.FleetThread
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.store.NotifiedQuestionsStore
+import sh.openagi.mobile.sync.AnswerOutcome
+import sh.openagi.mobile.sync.SupervisorNotifier
+import sh.openagi.mobile.sync.answerOutcome
+import sh.openagi.mobile.sync.withAlertLock
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.ui.components.ConnectionState
@@ -73,15 +84,11 @@ import sh.openagi.mobile.ui.components.EmptyState
 import sh.openagi.mobile.ui.components.PrimaryButton
 import sh.openagi.mobile.ui.components.RowGroup
 import sh.openagi.mobile.ui.components.ScreenHeader
+import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
 import sh.openagi.mobile.util.ErrorCopy
 import sh.openagi.mobile.util.RelativeTime
-import java.net.SocketTimeoutException
-import java.time.Instant
-import java.time.LocalDate
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 // FEATURES.md's "Supervisor": the fleet supervisor's view of every coding
 // thread, read from /fleet/api/state. What needs a person comes first (its
@@ -96,6 +103,9 @@ fun SupervisorScreen(
     resumeSignal: Int = 0,
     streamAttached: Boolean = false,
     chatConversationState: ChatConversationState,
+    // Held by the Activity so leaving the tab, or the phone folding, returns
+    // to the open supervisor conversation rather than the dashboard.
+    chatOpenState: MutableState<Boolean> = remember { mutableStateOf(false) },
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -119,7 +129,7 @@ fun SupervisorScreen(
     // another thread opened while a nudge relays, and the result is not theirs.
     var actionNoteThread by remember { mutableStateOf<String?>(null) }
     var openThread by remember { mutableStateOf<FleetThread?>(null) }
-    var chatOpen by remember { mutableStateOf(false) }
+    var chatOpen by chatOpenState
 
     // Responses can land out of order: a 30s poll sent while an answer was
     // relaying may return after it with the state from before. A poll is
@@ -202,6 +212,14 @@ fun SupervisorScreen(
                     SupervisorFormat.deliveryNote(result.delivery, "Answered.")
                 }
                 questionNote = question.id to note
+                // Answered here: clear its ping, unless the daemon kept it open
+                // because nothing was delivered.
+                if (answer == null || answerOutcome(null, 0, result.delivery?.status) == AnswerOutcome.Done) {
+                    withAlertLock {
+                        SupervisorNotifier.cancel(context, question.id)
+                        NotifiedQuestionsStore(context.filesDir).remove(question.id)
+                    }
+                }
                 result.state?.let { accept(order.next(), it) } ?: refresh()
             } catch (error: DaemonException) {
                 questionNote = question.id to failureNote(error, credentials.server)
@@ -262,8 +280,6 @@ fun SupervisorScreen(
                     credentials = credentials,
                     streamAttached = streamAttached,
                     title = "Supervisor",
-                    sessionId = SupervisorFormat.SESSION_ID,
-                    from = SupervisorFormat.SESSION_ID,
                     starters = SupervisorFormat.STARTERS,
                     conversationState = chatConversationState,
                 )
@@ -647,7 +663,7 @@ private fun QuestionRow(
     ) {
         Text(question.title?.takeIf { it.isNotBlank() } ?: "Question", style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
         if (context.isNotEmpty()) Text(context.joinToString(" · "), style = OpenAGIType.caption, color = muted)
-        question.body?.takeIf { it.isNotBlank() }?.let { Text(it, style = OpenAGIType.secondary, color = muted) }
+        question.body?.takeIf { it.isNotBlank() }?.let { MarkdownView(it, textColor = muted, style = OpenAGIType.secondary) }
         // "dismiss" can arrive as an option; it is the Dismiss button below.
         val options = question.options.filter { it.isNotBlank() && it != "dismiss" }
         FlowRow(
@@ -846,8 +862,8 @@ private fun ThreadDetailSheet(
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("Last agent message (unverified)", style = OpenAGIType.caption, color = muted)
                     Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        Box(modifier = Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState()).padding(10.dp)) {
-                            Text(text, style = OpenAGIType.dataMono, color = MaterialTheme.colorScheme.onSurface)
+                        Box(modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()).padding(10.dp)) {
+                            MarkdownView(text, textColor = MaterialTheme.colorScheme.onSurface, style = OpenAGIType.secondary)
                         }
                     }
                 }

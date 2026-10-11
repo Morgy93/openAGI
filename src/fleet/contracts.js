@@ -20,13 +20,17 @@ export const ERROR_KINDS = Object.freeze([
 
 // Supervisor-level classification. Order matters: first match wins.
 export const STATES = Object.freeze([
-  "excluded", "running", "infra-blocked", "waiting-ci", "local-verify", "needs-human",
+  "excluded", "running", "infra-blocked", "stopped", "waiting-ci", "local-verify", "needs-human",
   "asked-in-scope", "pr-not-ready", "ready-needs-human", "done", "idle-no-pr"
 ]);
 
 export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager", "ask-user"]);
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
-export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume"]);
+export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use"]);
+// How supervisor text reaches a thread. "cli" is the original set of routes;
+// "computer-use" types into the app that shows the thread and never runs a
+// CLI; "computer-use-first" types when computer use is ready, else falls back.
+export const DELIVERY_MODES = Object.freeze(["cli", "computer-use", "computer-use-first"]);
 
 // The executor prefixes every message with this. Sources and policy use it
 // to tell the supervisor's own sends apart from the owner typing.
@@ -46,10 +50,22 @@ export const DEFAULTS = Object.freeze({
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
+  // A run holding a verification slot is slow only past this: normal runs
+  // finish well inside it, and the verifier kills one at 90 min. The 30-min
+  // thread-wait limit above would page about normal runs.
+  fullRunSlowMs: 75 * MIN,
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
+  // No transcript row this long: a Conductor "working" turn is hung, and a
+  // wait on a background task gets the agent asked for a status.
+  silentTurnMs: 60 * MIN,
+  // An idle-report nudge only for a turn that stopped within this long.
+  idleReportMaxAgeMs: 6 * 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   lbErrorFreshMs: 15 * MIN,
+  // Connection/unavailable errors seen in chats alarm only at this count (or
+  // across two threads); one dropped stream is routine.
+  lbTransientErrorMin: 3,
   managerEscalationCooldownMs: 60 * MIN,
   // An idle thread with no delivery route waits this long before the owner
   // is asked to open it.
@@ -61,14 +77,64 @@ export const DEFAULTS = Object.freeze({
   titleMax: 100,
   bodyMax: 220,
   excerptMax: 600,
+  // The self-review reads this much of each thread's last agent message.
+  reviewTailMax: 1500,
   maxThreads: 150,
-  maxActionsKept: 300
+  maxActionsKept: 300,
+  // Computer-use delivery: the owner counts as away after this much input
+  // idle time; each Open Computer Use call and each whole delivery is capped.
+  // A Codex app state read alone takes 11-25 s.
+  uiOwnerIdleMs: 2 * MIN,
+  uiStepTimeoutMs: 10_000,
+  // A presence command that ignores SIGTERM settles this long after its
+  // timeout (runCommand's kill grace).
+  uiKillGraceMs: 5_000,
+  uiReadTimeoutMs: 45_000,
+  // Codex: link, two reads, activate, read, focus, type, read, send, confirm,
+  // typing included.
+  uiDeliveryTimeoutMs: 205_000,
+  // After that deadline: the one probe still running (two commands, kill
+  // grace included) or readiness, then clearing (up to two reads) and
+  // putting the owner's app back in what is left, none past it. Both count
+  // from the owner's request start (its probes and the lock wait included),
+  // so delivery and this stay under the node broker's 5 min.
+  uiCleanupMs: 90_000,
+  // Another delivery holding the lock: busy at once, retried next scan (a
+  // remote send has no room in the broker's 5 min to wait it out).
+  uiLockWaitMs: 0,
+  uiNavigateMs: 5_000,
+  // Codex can still show the previous thread on the first read after its link.
+  uiNavigateSlowMs: 60_000,
+  // Bringing the app to the front for the send.
+  uiActivateMs: 3_000,
+  uiConfirmMs: 8_000,
+  uiPollMs: 500
 });
 
-export const DEFAULT_BB3_HOST = "dev@100.99.3.113";
-export const DEFAULT_LB_URL = "http://100.99.3.113:2455";
-export const DEFAULT_MANAGER_REF = "0056f770-e054-484b-a712-4cc036dacf6f";
+// Deployment-specific targets have no built-in value: set them with
+// OPENAGI_FLEET_BB3_HOST (ssh destination of the build box),
+// OPENAGI_FLEET_LB_URL (base URL of the Codex load balancer) and
+// OPENAGI_FLEET_BB3_MANAGER (the session that manages the box). A source whose
+// target is unset reports itself as not configured rather than guessing.
+export const DEFAULT_BB3_HOST = null;
+export const DEFAULT_LB_URL = null;
+export const DEFAULT_MANAGER_REF = null;
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
+// Model for the review of the needs-you list, chosen by the owner on
+// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
+export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
+export const DEFAULT_REVIEW_MS = 30 * MIN;
+// Sonnet took about 3 minutes on 13 questions, mostly thinking.
+export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
+// Storage manager: the Mac's data volume and the SD card (sizes in GB of 2^30).
+export const DEFAULT_DATA_MOUNT = "/System/Volumes/Data";
+export const DEFAULT_SD_MOUNT = "/Volumes/Xtra";
+export const STORAGE_DEFAULTS = Object.freeze({
+  lowGb: 100, targetFreeGb: 150, criticalGb: 15, sdLowGb: 50, sdReserveGb: 30,
+  // A plan smaller than this is not worth a question.
+  askMinGb: 1,
+  scanMs: 60 * MIN, scanLowMs: 15 * MIN, scanBudgetMs: 120_000
+});
 
 export function defaultPaths(home = os.homedir()) {
   return {
@@ -96,12 +162,75 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     ssh: pick(["/usr/bin/ssh"], "ssh"),
     git: pick(["/usr/bin/git", "/opt/homebrew/bin/git"], "git"),
     ps: pick(["/bin/ps"], "ps"),
-    lsof: pick(["/usr/sbin/lsof"], "lsof")
+    lsof: pick(["/usr/sbin/lsof"], "lsof"),
+    lsappinfo: pick(["/usr/bin/lsappinfo"], "lsappinfo"),
+    ioreg: pick(["/usr/sbin/ioreg"], "ioreg"),
+    open: pick(["/usr/bin/open"], "open"),
+    du: pick(["/usr/bin/du"], "du"),
+    df: pick(["/bin/df"], "df"),
+    ditto: pick(["/usr/bin/ditto"], "ditto"),
+    diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
+    rm: pick(["/bin/rm"], "rm")
   };
+}
+
+const OCU_NAME = "open-computer-use";
+const OCU_NATIVE = ["dist", "Open Computer Use.app", "Contents", "MacOS", "OpenComputerUse"];
+
+// The standalone Open Computer Use binary the fleet drives apps with. The npm
+// "open-computer-use" command is a node launcher: a launchd PATH may lack
+// node, and killing the launcher would orphan the engine, so the bundled
+// native executable next to it is used instead when present. The app starts
+// the daemon with its own node and a bare PATH (after a reboot, say), so the
+// usual per-user install dirs are searched too, newest nvm node first.
+export function resolveOcuPath(env = process.env, { exists = fs.existsSync, realpath = fs.realpathSync, execPath = process.execPath, readdir = fs.readdirSync, home = env?.HOME || os.homedir() } = {}) {
+  const explicit = String(env?.OPENAGI_FLEET_OCU_PATH ?? "").trim();
+  let nvm = [];
+  try {
+    const versions = path.join(home, ".nvm", "versions", "node");
+    nvm = readdir(versions).filter((name) => /^v\d/.test(name))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+      .map((name) => path.join(versions, name, "bin", OCU_NAME));
+  } catch { /* no nvm */ }
+  const candidates = explicit ? [explicit] : [
+    ...String(env?.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, OCU_NAME)),
+    path.join(path.dirname(execPath), OCU_NAME),
+    `/opt/homebrew/bin/${OCU_NAME}`,
+    `/usr/local/bin/${OCU_NAME}`,
+    ...nvm,
+    // pnpm's global bin is a generated shell launcher (needs node on PATH,
+    // and does not lead to the native engine), so it is not searched.
+    ...[".volta/bin", ".npm-global/bin", ".local/bin", ".bun/bin"].map((dir) => path.join(home, dir, OCU_NAME))
+  ];
+  const found = candidates.find((candidate) => path.isAbsolute(candidate) && exists(candidate));
+  if (!found) return explicit || null;
+  let real = found;
+  try { real = realpath(found); } catch { /* keep the path as given */ }
+  const native = path.join(path.dirname(real), "..", ...OCU_NATIVE);
+  return exists(native) ? path.normalize(native) : real;
+}
+
+// Non-UI routes a computer-use send may fall back to while the owner is at
+// the Mac (so nothing takes the screen). claude-resume is never one: it
+// forks a session behind Conductor.
+export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay"]);
+
+export function parseBackgroundRoutes(value) {
+  const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return [...new Set(names.filter((name) => BACKGROUND_ROUTES.includes(name)))];
+}
+
+export function parseDeliveryMode(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return DELIVERY_MODES.includes(text) ? text : "cli";
 }
 
 function envFlag(value) {
   return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
+}
+
+function envOff(value) {
+  return /^(0|false|no|off)$/i.test(String(value ?? "").trim());
 }
 
 function envNumber(value, fallback) {
@@ -118,8 +247,9 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     : "observe";
   const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...(overrides.selfSessionIds ?? [])]
     .filter(Boolean);
+  const enabled = overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR);
   return {
-    enabled: overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR),
+    enabled,
     mode,
     push: (overrides.push ?? String(env.OPENAGI_FLEET_PUSH ?? "").trim()) || null,
     lookbackHours: overrides.lookbackHours ?? envNumber(env.OPENAGI_FLEET_LOOKBACK_HOURS, DEFAULTS.lookbackHours),
@@ -133,10 +263,135 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // repo -> UI path prefixes that make visual QA required; github.js has
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},
+    delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
+    // Off unless listed: OPENAGI_FLEET_BACKGROUND_ROUTES=codex-exec,peer-relay.
+    backgroundRoutes: Array.isArray(overrides.backgroundRoutes) ? parseBackgroundRoutes(overrides.backgroundRoutes.join(",")) : parseBackgroundRoutes(env.OPENAGI_FLEET_BACKGROUND_ROUTES),
+    // The watcher that sends app deliveries soon after the owner steps away,
+    // instead of at the next scheduled scan. On unless OPENAGI_FLEET_IDLE_DRAIN=0.
+    idleDrain: {
+      enabled: overrides.idleDrain?.enabled ?? !envOff(env.OPENAGI_FLEET_IDLE_DRAIN),
+      pollMs: overrides.idleDrain?.pollMs ?? envNumber(env.OPENAGI_FLEET_IDLE_POLL_MS, 15_000)
+    },
+    // The supervisor's review of its own needs-you list: on with the
+    // supervisor unless OPENAGI_FLEET_REVIEW=0.
+    review: {
+      enabled: overrides.review?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_REVIEW)),
+      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
+      intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
+      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
+    },
+    // Disk space: safe cleanup, archive to the SD card, and asks. On with
+    // the supervisor unless OPENAGI_FLEET_STORAGE=0.
+    storage: {
+      ...STORAGE_DEFAULTS,
+      lowGb: envNumber(env.OPENAGI_FLEET_STORAGE_LOW_GB, STORAGE_DEFAULTS.lowGb),
+      targetFreeGb: envNumber(env.OPENAGI_FLEET_STORAGE_TARGET_GB, STORAGE_DEFAULTS.targetFreeGb),
+      criticalGb: envNumber(env.OPENAGI_FLEET_STORAGE_CRITICAL_GB, STORAGE_DEFAULTS.criticalGb),
+      sdLowGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_LOW_GB, STORAGE_DEFAULTS.sdLowGb),
+      sdReserveGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_RESERVE_GB, STORAGE_DEFAULTS.sdReserveGb),
+      dataMount: DEFAULT_DATA_MOUNT,
+      sdMount: String(env.OPENAGI_FLEET_STORAGE_SD ?? "").trim() || DEFAULT_SD_MOUNT,
+      ...(overrides.storage ?? {}),
+      enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
-    bins: { ...defaultBinaries(home), ...(overrides.bins ?? {}) }
+    bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
   };
+}
+
+// ---------------------------------------------------------------------------
+// Computer-use delivery targets. Pure: policy asks "which app shows this
+// thread?" without I/O. Only these bundle ids are ever driven.
+
+export const UI_APPS = Object.freeze({
+  conductor: Object.freeze({ app: "conductor", name: "Conductor", bundleId: "com.conductor.app" }),
+  codex: Object.freeze({ app: "codex", name: "Codex", bundleId: "com.openai.codex" })
+});
+
+// Codex threads started by Conductor's Codex agent carry this originator;
+// they show in Conductor, not in the Codex app.
+export const CONDUCTOR_CODEX_ORIGINATOR = "codex_sdk_ts";
+
+// sessionTitle: the Conductor tab title (null when untitled); sessionCount:
+// visible sessions in the workspace; titleShared: another tab there has the
+// same title. They decide whether the workspace name alone proves the tab.
+function conductorTarget({ workspaceId, sessionId, workspace = null, title = null, sessionCount = null, titleShared = false }) {
+  const id = String(workspaceId);
+  const session = String(sessionId);
+  return {
+    ...UI_APPS.conductor,
+    targetKey: `conductor-session:${session}`,
+    deepLink: `conductor://workspace?id=${encodeURIComponent(id)}&session=${encodeURIComponent(session)}`,
+    workspaceId: id,
+    sessionId: session,
+    workspace: workspace ?? null,
+    title: title ?? null,
+    sessionCount: Number.isInteger(sessionCount) ? sessionCount : null,
+    titleShared: titleShared === true
+  };
+}
+
+function conductorFields(thread) {
+  const meta = thread.meta ?? {};
+  return {
+    workspaceId: meta.conductorWorkspaceId,
+    sessionId: meta.conductorSessionId,
+    workspace: thread.workspace ?? null,
+    // The source's own tab title when it read one; older rows fall back to the thread title.
+    title: Object.hasOwn(meta, "conductorSessionTitle") ? meta.conductorSessionTitle : (thread.title ?? null),
+    sessionCount: meta.conductorWorkspaceSessions ?? null,
+    titleShared: meta.conductorTitleShared === true
+  };
+}
+
+// The app that shows this thread, or null (loose Claude terminal sessions,
+// Conductor-hosted Codex threads without a Conductor row, archived threads).
+export function uiTargetFor(thread) {
+  if (!thread || thread.archived) return null;
+  const meta = thread.meta ?? {};
+  if (thread.kind === "conductor") {
+    if (!meta.conductorWorkspaceId || !meta.conductorSessionId) return null;
+    return conductorTarget(conductorFields(thread));
+  }
+  if (thread.kind === "codex" && thread.id) {
+    if (meta.originator === CONDUCTOR_CODEX_ORIGINATOR) {
+      const host = meta.conductorHost;
+      return host?.workspaceId && host?.sessionId ? conductorTarget(host) : null;
+    }
+    return {
+      ...UI_APPS.codex,
+      targetKey: `codex-thread:${thread.id}`,
+      deepLink: `codex://threads/${encodeURIComponent(thread.id)}`,
+      threadId: String(thread.id),
+      title: thread.title ?? null,
+      // Another unarchived Codex thread anywhere in the catalog has this title.
+      titleShared: meta.codexTitleShared === true,
+      // The first message, which the app shows instead of some names.
+      altTitle: meta.firstMessageTitle ?? null,
+      altTitleShared: meta.codexFirstMessageShared === true
+    };
+  }
+  return null;
+}
+
+// Links each Conductor-hosted Codex thread to the Conductor session that
+// runs it (Conductor stores the Codex thread id as claude_session_id).
+// Returns new thread objects; the inputs are left untouched.
+export function linkUiHosts(threads) {
+  const list = Array.isArray(threads) ? threads : [];
+  const hosts = new Map();
+  for (const thread of list) {
+    if (thread?.kind === "conductor" && !thread.archived && thread.claudeSessionId && thread.meta?.conductorWorkspaceId && thread.meta?.conductorSessionId) {
+      hosts.set(thread.claudeSessionId, thread);
+    }
+  }
+  return list.map((thread) => {
+    if (thread?.kind !== "codex" || thread.meta?.originator !== CONDUCTOR_CODEX_ORIGINATOR) return thread;
+    const host = hosts.get(thread.id);
+    const conductorHost = host ? { ...conductorFields(host), key: host.key } : null;
+    return { ...thread, meta: { ...(thread.meta ?? {}), conductorHost } };
+  });
 }
 
 // Runs a child process and never throws. Timeouts kill only the child this
@@ -334,6 +589,7 @@ export async function openReadOnlyDb(filePath) {
  * @property {string} agentStatus         one of AGENT_STATUS
  * @property {string|null} lastActivityAt ISO
  * @property {string} lastAgentText       untrusted, redacted, <= excerptMax
+ * @property {string} lastAgentTail       the same message, <= reviewTailMax (self-review only)
  * @property {string|null} lastAgentAt
  * @property {string} lastUserText
  * @property {string|null} lastUserAt
@@ -369,6 +625,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {{reviewedHead: boolean|null, sha: string|null}} codexReview
  * @property {{required: boolean|null, freshOnHead: boolean|null, sha: string|null}} qa
  * @property {string|null} updatedAt
+ * @property {string|null} mergedAt
+ * @property {string|null} closedAt
  */
 
 /**
@@ -384,10 +642,12 @@ export async function openReadOnlyDb(filePath) {
  * @typedef {Object} FleetInfra
  * @property {{reachable: boolean|null, checkedAt: string|null, gate: {state: string|null, reason: string|null, since: string|null},
  *   fullQueue: number|null, quickQueue: number|null, load: number[]|null,
- *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null}[],
- *   timersDead: string[], error: string|null}} bb3
+ *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null,
+ *     queued?: boolean}[],
+ *   timersDead: string[], error: string|null}} bb3   a full run is queued while it waits for a slot; once admitted its ageSec is from admission
  * @property {{healthy: boolean|null, detail: string|null, watchLine: string|null,
- *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[]}[]}} lb
+ *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[],
+ *     freshCount?: number, freshThreadIds?: string[]}[]}} lb   fresh*: the rows inside lbErrorFreshMs
  * @property {{pid: number, command: string, cwd: string|null, ageSec: number, threadKey: string|null}[]} localVerify
  */
 

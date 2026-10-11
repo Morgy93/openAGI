@@ -65,10 +65,25 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_PUSH` | off | `buzzkit` pushes needs-you items to the phone (uses `~/.claude/buzz/endpoint`). Quiet 22:00-08:00, max 3/hour |
 | `OPENAGI_FLEET_LOOKBACK_HOURS` | `48` | Threads active this recently are in scope |
 | `OPENAGI_FLEET_TICK_MS` | `300000` | Time between scans (5 min) |
-| `OPENAGI_FLEET_BB3_HOST` | `dev@100.99.3.113` | BuildBot3 SSH target (read-only probe, never docker) |
-| `OPENAGI_FLEET_LB_URL` | `http://100.99.3.113:2455` | codex-lb base URL; `/health` is checked |
-| `OPENAGI_FLEET_BB3_MANAGER` | Remote dev setup session | Conductor session id or workspace name that gets BuildBot3 / LB escalations |
+| `OPENAGI_FLEET_BB3_HOST` | unset (probe off) | Build-box SSH target, e.g. `build@192.0.2.10` (read-only probe, never docker). Unset: reported as not configured |
+| `OPENAGI_FLEET_LB_URL` | unset (check off) | codex-lb base URL, e.g. `http://192.0.2.10:2455`; `/health` is checked. Unset: reported as not configured |
+| `OPENAGI_FLEET_BB3_MANAGER` | unset (no escalations) | Conductor session id or workspace name that gets build-box / LB escalations |
 | `OPENAGI_FLEET_RELAY_MODEL` | `claude-haiku-4-5-20251001` | Model for the `claude -p` relay to live Claude/Conductor sessions |
+| `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
+| `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
+| `OPENAGI_FLEET_BACKGROUND_ROUTES` | none | `codex-exec`, `peer-relay`, or both: routes an app send may take while you are at the Mac. See [While you work](#while-you-work) |
+| `OPENAGI_FLEET_IDLE_DRAIN` | on | `0` turns off the [idle watcher](#while-you-work) |
+| `OPENAGI_FLEET_IDLE_POLL_MS` | `15000` | How often the idle watcher reads idle time while sends wait |
+| `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
+| `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
+| `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
+| `OPENAGI_FLEET_STORAGE` | on with the supervisor | `0` turns off the [storage manager](#storage) |
+| `OPENAGI_FLEET_STORAGE_SD` | `/Volumes/Xtra` | The SD card the storage manager archives to |
+| `OPENAGI_FLEET_STORAGE_LOW_GB` | `100` | Mac free space below this starts safe cleanup and archiving |
+| `OPENAGI_FLEET_STORAGE_TARGET_GB` | `150` | Cleanup stops once the Mac has this much free |
+| `OPENAGI_FLEET_STORAGE_CRITICAL_GB` | `15` | Below this, one "Disk almost full" ask |
+| `OPENAGI_FLEET_STORAGE_SD_LOW_GB` | `50` | SD free space below this starts safe cleanup there |
+| `OPENAGI_FLEET_STORAGE_SD_RESERVE_GB` | `30` | An archive move never leaves the SD card with less |
 
 `OPENAGI_PUBLIC_URL`, when set, makes phone pushes deep-link to `/fleet?q=<id>`.
 
@@ -82,12 +97,40 @@ Override one without a code change: copy it to
 `~/.openagi/skills/fleet-supervisor/playbooks/`) and edit. Same `id` wins.
 
 Ids: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`,
-`bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`.
-Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max attempts).
+`bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `account-switched`,
+`status-check`.
+Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max attempts),
+`restart_apps` (`account-switched` only: `conductor` and/or `codex`).
+
+## Your workspace, kept out of this repo
+
+Anything specific to your machine belongs in `~/.openagi/skills/fleet-supervisor/`,
+not in this public repo. The supervisor reads two things there:
+
+- `playbooks/<id>.md`: your copies of the playbooks above.
+- `SKILL.md`: notes about your setup, in plain words. The self-review reads
+  them as your instructions (the first 4,000 characters).
+
+After you answer **added** on a "threads capped" question, the supervisor sends
+`account-switched` to each capped thread. If your copy sets `restart_apps`, it first
+restarts that app in the background, since some apps only pick up a new account at
+launch. It won't restart while you are using the app or while another chat there is
+running, and it restarts at most once every 10 minutes. Example:
+
+```markdown
+---
+id: account-switched
+restart_apps: conductor
+---
+retry
+```
+
+To keep these files in version control, make `~/.openagi/skills` its own private git repo.
 
 ## Safety limits
 
-- Read-only everywhere except sending templated text to a thread.
+- Read-only everywhere except sending templated text to a thread, and the
+  storage cleanup below.
 - Every message starts with `[OpenAGI supervisor]` and is journaled.
 - 15 min idle before a nudge. 12 min between nudges to one thread.
 - 3 nudges without progress (no new head, no thread resolved), then it asks you.
@@ -95,7 +138,85 @@ Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max at
 - Never nudges its own session. Never resends `continue` before a limit resets.
 - One manager escalation per incident per hour.
 - Never kills processes, merges PRs, changes permissions, or answers out-of-scope questions.
+- Deletes files only through the [storage manager](#storage) rules, and asks
+  first for anything not clearly regenerable.
 - Agent text is untrusted: shown as plain text, never forwarded to other agents.
+
+## Storage
+
+Watches free space on the Mac (`/System/Volumes/Data`) and the SD card
+(`/Volumes/Xtra`). Free space is read every scan (cheap). A deeper scan for
+things to clean runs on its own timer: hourly, every 15 min while a disk is low,
+at most ~2 min each, one at a time. Results show on the **Infra** strip.
+
+**Deleted on its own** (Auto only, only while that disk is below 100 GB free,
+and only until 150 GB free). All regenerable:
+
+- git temp files (`tmp_pack_*`, `tmp_idx_*`, `tmp_rev_*`, `tmp_obj_*`) older
+  than 2 h, in `~/conductor/repos/*` and the repos behind agent worktrees.
+- build output (`node_modules`, `.next`, `.turbo`, `target` next to a
+  `Cargo.toml`) in agent worktrees with no file changed in 14 days, no process
+  inside, no running agent turn, and git ignoring the dir.
+- partial downloads (`*.part`, `*.crdownload`, `*.download`) older than 7 days
+  in `~/Downloads` and the SD card's `Downloads`.
+- `~/.rustup/tmp/*` (no rustup or cargo running) and Xcode DerivedData folders
+  idle 14 days (no xcodebuild running).
+
+If the last five deletes of a kind freed (by `df`) under a tenth of their size
+(pnpm clones and hard links), that kind stops on that disk for a day. A delete
+or move that failed waits a day (doubling) before it is tried again.
+
+Agent worktrees: `~/Dev/bbapp/.conductor/*`, `~/Dev/bbapp/.worktrees/*`,
+`~/Dev/bbapp-worktrees/*`, `~/Dev/worktrees/*`, `~/conductor/workspaces/*/*`,
+`/Volumes/Xtra/codex-worktrees/*`. Symlinks are never followed.
+
+**Moved to the SD card** (Auto only, Mac below 100 GB free): top-level
+`~/Downloads` items of 100 MB or more, unchanged and unopened for 30 days, not
+open in any app. Each is copied with `ditto` to
+`/Volumes/Xtra/OpenAGI-Archive/Downloads/<name>`, checked (bytes and file
+count), then the original is replaced by a symlink to the copy. A failed copy
+is removed and the original kept. Never when the card is missing, is not the
+card first seen (its `.codex-xtra-volume-identity` marker or VolumeUUID), or
+would keep less than 30 GB free, or when anything under the item changed or
+was opened during the copy. Old installers are asked about instead.
+
+**Asked first, never automatic.** One question per kind, only while that disk is
+low, with the exact items pinned:
+
+| Ask | Items |
+|---|---|
+| Trash | `~/.Trash` items trashed 30+ days ago, and the SD card's trash (any age) |
+| Finished worktrees | archived Conductor workspaces whose folder is left, or worktrees idle 30 days that no open Codex/Conductor thread uses. Only with nothing uncommitted and nothing unpushed (or merged into `origin/main`). A full clone also needs every local branch pushed, no stash, no linked worktree it hosts, and no repo nested inside |
+| Old installers | `.dmg`, `.pkg`, `.iso` in `~/Downloads`, 30+ days old (a `.zip` may be yours: it is moved, not asked about) |
+
+While a question is open its list is pinned: items can drop out, none are
+added. Buttons: **Delete N (X GB)** checks every pinned item again (still
+there, same file, not a symlink, not in use right now, still idle, still clean
+and pushed) and deletes only those that pass, in the background. A card for an
+older list (another count) cannot answer a newer one. **Keep** leaves those
+items out of asks for 30 days. **Later**, or dismissing it, asks again in 24 h.
+Below 15 GB free one more ask comes: **Disk almost full: N GB left** with
+**Clean safe now** (runs the safe cleanup at once, any mode) and **Later**.
+Your answers act in every mode; Observe and Propose only log what Auto would
+clean or move (**Doing**, `storage-safe`).
+
+Freed space is measured with `df` before and after (pnpm clones make folder
+sizes overstate it). Trees are removed with `/bin/rm -rf` in its own process. Each pass is one line in **Doing**; every item is
+journaled in `~/.openagi/fleet/storage/journal.jsonl`.
+
+**Restore an archived item.** Moves are listed in
+`~/.openagi/fleet/storage/archive.jsonl` (`from`, `to`, `bytes`). With the SD
+card mounted:
+
+```sh
+rm "<from>"                    # the symlink only
+ditto "<to>" "<from>" && rm -rf "<to>"
+```
+
+Deleted worktrees leave their git metadata; `git worktree prune` in the main
+repo tidies it once the SD card is mounted.
+
+**Turn it off:** `OPENAGI_FLEET_STORAGE=0` in `~/.openagi/.env`, then restart.
 
 ## Phone app
 
@@ -115,10 +236,130 @@ colour, needs-you questions with buttons, mode, and **Scan now**.
   `fleet_thread` (one thread's row, decision, PR, and questions). They read the
   last scan only; they never scan, send, answer, or change the mode.
 
-## Known gaps
+## Computer-use delivery
 
-- Non-live Conductor sessions: no delivery route yet. You get "open it" after 90 min stuck.
-- Codex threads held open by Codex Desktop (writer lock): blocked. Close the thread in Desktop, or send by hand.
+Types each supervisor message into the app that shows the thread, then presses
+Send. No `codex exec` and no `claude -p`. Covers nudges, owner answers,
+**retry**, grouped **added** resumes, and manager escalations.
+
+| `OPENAGI_FLEET_DELIVERY` | Does |
+|---|---|
+| `cli` (default) | The CLI routes above. Nothing changes. |
+| `computer-use` | App UI only, never a CLI. Not ready: the send waits. No app shows the thread (plain terminal `claude`): the usual "open it?" question. |
+| `computer-use-first` | App UI when ready, otherwise the CLI routes. |
+
+Which app:
+
+- Conductor sessions: `conductor://workspace?id=<workspace>&session=<session>`.
+- Codex threads: the Codex app, `codex://threads/<id>` (never `?prompt=`).
+- Codex threads Conductor started (`originator=codex_sdk_ts`): their Conductor
+  tab. No Conductor row: no route.
+
+Setup on the coding Mac:
+
+1. `npm install -g open-computer-use` (0.3.5 on the owner's Mac). The fleet runs the
+   bundled `Open Computer Use.app` engine through its app agent, so macOS checks
+   that app's permissions, not the daemon's node.
+2. Grant **Open Computer Use** Accessibility and Screen Recording in System
+   Settings > Privacy & Security. `open-computer-use doctor` shows both.
+3. Keep `OPENAGI_COMPUTER_USE=1`. Turning it off in the dashboard stops
+   computer-use delivery too.
+4. Check what a delivery would see, read-only (no clicks, no typing):
+
+   ```sh
+   open-computer-use snapshot com.conductor.app | node scripts/fleet-ui-probe.mjs --expect <workspace>
+   ```
+
+   It should find one composer, the Send button, and the open workspace.
+5. Add `OPENAGI_FLEET_DELIVERY=computer-use` to `~/.openagi/.env`, start with
+   `OPENAGI_FLEET_MODE=propose`, and restart OpenAGI. Set
+   `OPENAGI_FLEET_OCU_PATH` if the launchd `PATH` cannot find the binary.
+
+The supervisor types only while you are away: 2+ min with no keyboard or
+mouse input, screen unlocked, no screen saver. Open Computer Use can only type
+into the frontmost app, so it brings Conductor or Codex forward for the send,
+then puts your previous app back. If you come back mid-send, it stops and
+leaves your app alone.
+
+Each send, in order. Any failed check stops before typing:
+
+- Ready: permissions granted, screen unlocked, secure input off, no OpenAGI
+  computer-use session running.
+- The app is already running (never launched) and you are away. Input in the
+  last 2 min blocks as "owner using <App>" (it is in front) or "waiting for
+  idle" (it is not). Any input counts, a key the fleet pressed included: it
+  cannot be told apart from yours. Typing sets the composer's value and
+  clicks go through accessibility, so neither counts.
+- Opens the thread with its deep link (`open -g`), then brings the app to the
+  front.
+- Proves the right thread is open: workspace name, plus the tab title when the
+  workspace has more than one tab (Codex: thread title). Shared or missing
+  names block as "ambiguous".
+- Blocks on a running turn (Stop visible) or a permission prompt.
+- The composer must be empty. A draft is never overwritten.
+- Types the message as one line (newlines become spaces), checks the composer
+  holds exactly that text, checks the thread again, then clicks Send (or
+  Return).
+- Confirms the message shows in the thread within 8 s. Otherwise the result is
+  **failed** and *unconfirmed*: check the thread before retrying.
+
+Safety rules:
+
+- One app delivery at a time; a second one is **blocked** as busy at once
+  and retried. 45 s per app read, 10 s per other UI step, 205 s per delivery,
+  typing included; putting your app back after it gets up to 90 s more,
+  never past it. From the phone or the main, the time counts from when
+  the main sent the request (time queued before the Mac picked it up
+  included), so the whole request ends inside the 5 min limit. After the deep link, every app gets at least two reads
+  (Codex up to 60 s) to show the thread. Typing starts only with time left to
+  type, send, and confirm; otherwise it is **blocked** with nothing typed. An
+  input call (typing, a key, a click) that times out may still land: the
+  result is **failed** and *unconfirmed*, and nothing more is typed or
+  brought forward. The tick's other app sends wait, and no app send (a
+  remote one included) types until Open Computer Use answers that call late,
+  however long it takes: computer use shows as not ready ("an earlier input
+  call has not finished; typing paused until it answers") and the
+  paused-nudge alert tells you. If its engine exits first, nothing can prove
+  the input stopped, so typing stays paused for 30 min, across restarts.
+- A Codex thread the app labels by its first message is verified by that
+  label only after the link moved the app onto it; already open, it is
+  **blocked** (another thread can show the same first message).
+- Only Conductor (`com.conductor.app`) and the Codex app (`com.openai.codex`).
+  No clipboard, no paste, no app launch, no pointer moves.
+- Typed text is never erased: a select-all and delete could take your edits
+  with it. Text typed before a failed check stays as a draft (a retry sends
+  exactly it), and the result says to check it.
+- Before and after screenshots go to `<dataDir>/fleet/logs/ui/` (0600, newest
+  200 kept). Their paths are on the action record.
+- Blocked means nothing was typed: no attempt spent, retried next scan.
+
+### While you work
+
+An app send that waits only because you are at the Mac (`owner using <App>`
+or `waiting for idle`) is not left for the next 5-min scan:
+
+- **Idle watcher** (on by default). While such a send waits, the supervisor
+  reads your idle time every 15 s (one `ioreg` call, no screen read). Once
+  you have been away long enough, it starts one scan timed so its sends begin
+  at about 2 min idle. That scan decides everything fresh and skips the
+  needs-you review (the next scheduled scan runs it). At most one a minute.
+- **Background routes** (off until listed in `OPENAGI_FLEET_BACKGROUND_ROUTES`).
+  The send goes now, without the screen, instead of waiting:
+  - `codex-exec`: a Codex thread no app holds open (no writer lock, read again
+    at send time) and that Conductor did not start.
+  - `peer-relay`: a Conductor chat whose live Claude session is idle right
+    now, with no open pick in the chat.
+  Never `claude-resume`, never a thread with a running turn or a permission
+  prompt, and never after an app send that may have left text in the composer.
+  The action record keeps `fallbackFrom` (why the app send waited).
+
+
+- Non-live Conductor sessions: no CLI delivery route. You get "open it" after
+  90 min stuck, unless computer-use delivery is on.
+- Codex threads held open by Codex Desktop (writer lock): blocked on the CLI
+  route. Close the thread in Desktop, send by hand, or use computer-use delivery.
+- Computer-use delivery reads the apps' accessibility trees. An app update can
+  change them; a thread it cannot verify is blocked, never guessed.
 - Main mirroring requires an explicitly selected enrolled coding Mac; without
   `OPENAGI_FLEET_NODE`, Fleet remains local to that daemon.
 
@@ -133,6 +374,54 @@ unreachable, so retrying the group does not resend to those threads.
 Switching away from **Propose** invalidates pending Send buttons. The scan CLI
 copies persisted state into a temporary directory when given `--data-dir`; it
 never writes the daemon's state or sends messages.
+
+## The supervisor reviews its own list
+
+The supervisor manages its own needs-you list. After each scan, one batched
+`claude -p` call (structured output, no tools, no hooks, not saved as a
+session) reads the open questions that are new, changed, or due, up to 15,
+each with its thread, PR, the agent message it came from, and related
+threads (same PR, workspace, or repo). The other open questions are listed
+briefly so duplicates still show. It closes what no longer needs you:
+
+- an optional offer ("want me to X?") that blocks nothing,
+- an ask about a PR that shipped (work after the merge, like a release or
+  staging QA, still counts), or a thread that moved on,
+- work another thread did, or a call you already made elsewhere,
+- status lines, automation relays, and duplicates of a question about the
+  same thread (two threads asking the same thing each need their answer).
+
+When unsure it keeps the question. An agent's own question it keeps may get
+a clearer title (repo #PR plus the ask) and short answers the agent can act
+on; the same outreach item updates in place. The supervisor's own questions
+(ready, stuck, limits) keep their title and buttons.
+
+- New questions are reviewed before they reach the phone, glasses, or main,
+  so junk never pings.
+- It runs right away for a new question, and at most every 10 minutes when a
+  question's thread or PR changed or it is due: `OPENAGI_FLEET_REVIEW_MS`
+  after its last review, then 2x and 4x that while nothing changes. The
+  longest-unreviewed go first; a new question past the 15 waits (unseen)
+  for the next review.
+- At most a quarter of a batch (3 at least) closes per review; the rest wait
+  for the next one. A close needs a reason.
+- A closed question stays closed while the same ask repeats, for up to 6
+  hours. Then the same ask is a new question, reviewed again before it pings.
+  A changed ask is a new question.
+- If the model fails or times out (6 min), questions go out as before and the
+  error shows in **Doing**. It retries after 15 minutes.
+- Every decision is in **Doing** (`review`). **Cleared by supervisor** under
+  **Needs you** lists every close asked in the last day, one per ask, with
+  category, reason and time; **Reopen** brings one back as
+  the same item and pins it, so the review keeps it until its ask changes.
+  An open question shows the review's reason under it. API:
+  `POST /fleet/api/questions/<id>` with `{ "reopen": true }`.
+- It runs in every mode. It only edits the supervisor's own list; it never
+  messages a thread.
+
+The default model is `claude-sonnet-5`, confirmed by the owner on 2026-09-29. On
+26 hand-audited questions it agreed with the audit on 20, versus 17 for Haiku 4.5.
+Set `OPENAGI_FLEET_REVIEW_MODEL` to use another model.
 
 ## One supervisor shared by main, Android and G2
 

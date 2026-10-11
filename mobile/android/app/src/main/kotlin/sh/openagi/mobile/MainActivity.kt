@@ -1,9 +1,13 @@
 package sh.openagi.mobile
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
@@ -14,25 +18,36 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
+import sh.openagi.mobile.protocol.ConversationUpdated
 import sh.openagi.mobile.protocol.PairingPayload
+import sh.openagi.mobile.protocol.ProtocolJson
+import sh.openagi.mobile.store.AlertPrefs
+import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.sync.fetchInboxBadgeCount
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.EventStream
 import sh.openagi.mobile.ui.ChatScreen
 import sh.openagi.mobile.ui.ChatConversationState
+import sh.openagi.mobile.ui.SharedThreadSupport
 import sh.openagi.mobile.ui.InboxScreen
+import sh.openagi.mobile.ui.LifelogScreen
 import sh.openagi.mobile.ui.PairingScreen
 import sh.openagi.mobile.ui.SettingsScreen
+import sh.openagi.mobile.ui.SupervisorFormat
 import sh.openagi.mobile.ui.SupervisorScreen
 import sh.openagi.mobile.ui.TasksScreen
 import sh.openagi.mobile.ui.TodayScreen
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import sh.openagi.mobile.sync.SupervisorAlertService
+import sh.openagi.mobile.sync.SupervisorNotifier
 import sh.openagi.mobile.sync.forgetPairing
 import sh.openagi.mobile.ui.components.SwitchDaemonDialog
 import sh.openagi.mobile.ui.components.AppNavigationBar
@@ -54,6 +69,14 @@ internal val REFRESH_TRIGGERING_EVENTS = setOf(
 internal val INBOX_AFFECTING_EVENTS =
     setOf("pending-action", "pending-action-resolved", "clarification-created", "clarification-resolved")
 
+// A shared chat thread has a new stored message (PROTOCOL.md §3.1). Returns
+// which thread, or null for any other frame or an unreadable one.
+internal const val CONVERSATION_UPDATED_EVENT = "conversation.updated"
+internal fun updatedConversationThread(event: String?, data: String): String? {
+    if (event != CONVERSATION_UPDATED_EVENT) return null
+    return runCatching { ProtocolJson.json.decodeFromString(ConversationUpdated.serializer(), data).thread }.getOrNull()
+}
+
 class MainActivity : ComponentActivity() {
     // Plain mutableStateOf held on the Activity, not inside setContent's
     // composition: a deep-link tap while the app is already open arrives via
@@ -69,6 +92,15 @@ class MainActivity : ComponentActivity() {
     private val inboxBadgeState = mutableIntStateOf(0)
     private val streamAttachedState = mutableStateOf(false)
 
+    // A tap on a supervisor notification names the tab to open. Held here for
+    // the same reason as pendingPairingState: with the app already open, the
+    // tap arrives via onNewIntent, outside any composition.
+    private val pendingTabState = mutableStateOf<AppTab?>(null)
+
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         credentialsState.value = Credentials.load(this)
@@ -77,9 +109,19 @@ class MainActivity : ComponentActivity() {
         // hands it back on every later relaunch from the launcher or recents,
         // re-raising the switch prompt for a code the daemon already spent.
         intent?.data = null
+        // Only on a fresh start: a restored Activity keeps its original
+        // intent, and the notification tapped long ago must not override the
+        // tab the person has since moved to.
+        if (savedInstanceState == null) takeAlertTab(intent)
 
         setContent {
-            var selectedTab by remember { mutableStateOf(AppTab.TODAY) }
+            // Folding, unfolding, or rotating the phone is handled in place
+            // (configChanges in the manifest); rememberSaveable still keeps
+            // the tab if Android recreates the Activity for another reason.
+            var selectedTab by rememberSaveable { mutableStateOf(AppTab.TODAY) }
+            val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
+            // Lifelog opens from Today; six tabs leave no room for a seventh.
+            var lifelogOpen by rememberSaveable { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
@@ -104,8 +146,18 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     val conversationScope = rememberCoroutineScope()
-                    val chatConversation = remember(credentials) { ChatConversationState(conversationScope) }
-                    val supervisorConversation = remember(credentials) { ChatConversationState(conversationScope) }
+                    // Both are the daemon's shared threads, the same ones every
+                    // paired phone and G2 talks in; the files are offline caches.
+                    val threadSupport = remember(credentials) { SharedThreadSupport() }
+                    val chatConversation = remember(credentials) {
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent", threadSupport = threadSupport)
+                    }
+                    val supervisorConversation = remember(credentials) {
+                        ChatConversationState(
+                            conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD,
+                            legacySessionKey = SupervisorFormat.LEGACY_SESSION_ID, threadSupport = threadSupport,
+                        )
+                    }
                     // One background SSE connection for the life of this
                     // pairing, reconnected with backoff by EventStream. This
                     // is what makes Inbox's badge and the other tabs feel
@@ -120,6 +172,30 @@ class MainActivity : ComponentActivity() {
                             if (frame.event in INBOX_AFFECTING_EVENTS) {
                                 inboxBadgeState.intValue = runCatching { fetchInboxBadgeCount(client) }.getOrDefault(inboxBadgeState.intValue)
                             }
+                            // Every (re)connect opens with hello: reload both
+                            // threads, catching up on anything missed while
+                            // offline or a history load that failed then.
+                            if (frame.event == "hello") {
+                                chatConversation.requestRefresh(client)
+                                supervisorConversation.requestRefresh(client)
+                            }
+                            when (updatedConversationThread(frame.event, frame.data)) {
+                                chatConversation.thread -> chatConversation.requestRefresh(client)
+                                supervisorConversation.thread -> supervisorConversation.requestRefresh(client)
+                            }
+                        }
+                    }
+                    // Once per pairing: the app opened already paired, or a
+                    // pairing just completed.
+                    LaunchedEffect(credentials) { startSupervisorAlerts() }
+                    // Opened from a supervisor notification: show the
+                    // questions themselves, not a chat left open over them.
+                    val pendingTab = pendingTabState.value
+                    LaunchedEffect(pendingTab) {
+                        if (pendingTab != null) {
+                            selectedTab = pendingTab
+                            if (pendingTab == AppTab.SUPERVISOR) supervisorChatOpen.value = false
+                            pendingTabState.value = null
                         }
                     }
                     LaunchedEffect(credentials) {
@@ -156,12 +232,17 @@ class MainActivity : ComponentActivity() {
                         // gap, with the header pushed off.
                         Box(modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                             when (selectedTab) {
-                                AppTab.TODAY -> TodayScreen(
-                                    context = this@MainActivity,
-                                    credentials = credentials,
-                                    resumeSignal = resumeSignal,
-                                    onOpenInbox = { selectedTab = AppTab.INBOX },
-                                )
+                                AppTab.TODAY -> if (lifelogOpen) {
+                                    LifelogScreen(credentials = credentials, onBack = { lifelogOpen = false })
+                                } else {
+                                    TodayScreen(
+                                        context = this@MainActivity,
+                                        credentials = credentials,
+                                        resumeSignal = resumeSignal,
+                                        onOpenInbox = { selectedTab = AppTab.INBOX },
+                                        onOpenLifelog = { lifelogOpen = true },
+                                    )
+                                }
                                 AppTab.TASKS -> TasksScreen(context = this@MainActivity, credentials = credentials, resumeSignal = resumeSignal)
                                 AppTab.INBOX -> InboxScreen(
                                     context = this@MainActivity,
@@ -176,6 +257,7 @@ class MainActivity : ComponentActivity() {
                                     resumeSignal = resumeSignal,
                                     streamAttached = streamAttachedState.value,
                                     chatConversationState = supervisorConversation,
+                                    chatOpenState = supervisorChatOpen,
                                 )
                                 AppTab.SETTINGS -> SettingsScreen(
                                     context = this@MainActivity,
@@ -224,10 +306,41 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         pendingPairingState.value = intent.data?.let { PairingPayload.from(it) }
         intent.data = null
+        takeAlertTab(intent)
     }
 
     override fun onResume() {
         super.onResume()
         resumeSignalState.intValue += 1
+        // Also how alerts come back after notifications were turned on in
+        // system settings, or the service was stopped from the task manager.
+        SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
+    }
+
+    // Consumed once, like the pair link above: left on the intent, a later
+    // relaunch from recents would jump back to Supervisor.
+    private fun takeAlertTab(intent: Intent?) {
+        if (intent == null) return
+        if (intent.getStringExtra(SupervisorNotifier.EXTRA_TAB) == SupervisorNotifier.TAB_SUPERVISOR ||
+            intent.hasExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+        ) {
+            pendingTabState.value = AppTab.SUPERVISOR
+        }
+        intent.removeExtra(SupervisorNotifier.EXTRA_TAB)
+        intent.removeExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+    }
+
+    // Asks for the notification permission once, ever: someone who said no is
+    // not asked again on every launch, and Settings' switch leads them to the
+    // system page instead.
+    private fun startSupervisorAlerts() {
+        SupervisorNotifier.ensureChannels(this)
+        val needsGrant = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (needsGrant && !AlertPrefs.notificationPermissionAsked(this)) {
+            AlertPrefs.setNotificationPermissionAsked(this)
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        SupervisorAlertService.startIfEnabled(this, paired = true)
     }
 }

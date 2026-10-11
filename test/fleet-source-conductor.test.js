@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { resolveFleetConfig } from "../src/fleet/contracts.js";
+import { DEFAULTS, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
 import { findManagerSession, listConductorThreads } from "../src/fleet/sources/conductor.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
@@ -172,8 +172,8 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.equal(run.title, "Fix uploads");
   assert.equal(run.lastUserText, "keep going");
   assert.equal(run.lastUserAt, iso(10 * MIN));
-  // SQLite datetime('now') is UTC even without a zone suffix.
-  assert.equal(run.lastActivityAt, iso(MIN));
+  // The last turn row, not sessions.updated_at.
+  assert.equal(run.lastActivityAt, iso(2 * MIN));
   assert.equal(run.excluded, null);
   assert.equal(run.live, null);
   assert.equal(run.meta.derivedStatus, "in-progress");
@@ -186,7 +186,7 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.deepEqual(wait.openTasks, [{ id: "open-1", description: "Run bb-quick on fixed candidate", kind: "local_bash", startedAt: iso(23 * MIN) }]);
   assert.deepEqual(wait.live, { peerName: "sydney-5a", pid: 501, status: "idle" });
   assert.equal(wait.meta.unreadCount, 1);
-  assert.equal(wait.lastActivityAt, iso(20 * MIN));
+  assert.equal(wait.lastActivityAt, iso(21 * MIN));
 
   const limited = threads["s-limit"];
   assert.equal(limited.agentStatus, "error");
@@ -215,6 +215,8 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.equal(aborted.error, null);
 
   assert.equal(threads["s-self"].excluded, "self");
+  // No turn rows: updated_at stands in. SQLite datetime('now') is UTC even without a zone suffix.
+  assert.equal(threads["s-self"].lastActivityAt, iso(MIN));
   // The manager stays visible for escalation even when it is outside the lookback.
   assert.equal(threads["mgr-1"].excluded, "stale");
   assert.equal(threads["mgr-1"].meta.dbRemote, null);
@@ -248,15 +250,15 @@ test("findManagerSession matches id, Claude session id, or workspace name", () =
     thread("r1", { workspace: "remote-dev", lastActivityAt: iso(5 * MIN) }),
     thread("r2", { workspace: "remote-dev", lastActivityAt: iso(50 * MIN), live: { peerName: "remote-dev-d4", pid: 1, status: "idle" } }),
     thread("r3", { workspace: "remote-dev", lastActivityAt: iso(1 * MIN) }),
-    { ...thread("0056f770-e054-484b-a712-4cc036dacf6f"), kind: "claude", key: "claude:0056f770-e054-484b-a712-4cc036dacf6f" },
-    thread("0056f770-e054-484b-a712-4cc036dacf6f")
+    { ...thread("00000000-0000-4000-8000-000000000001"), kind: "claude", key: "claude:00000000-0000-4000-8000-000000000001" },
+    thread("00000000-0000-4000-8000-000000000001")
   ];
   const find = (managerRef) => findManagerSession(resolveFleetConfig({}, { home: "/h", managerRef }), threads);
   assert.equal(find("a").id, "a");
   assert.equal(find("claude-b").id, "b");
   // A live tab wins over a newer offline one.
   assert.equal(find("remote-dev").id, "r2");
-  assert.equal(find("0056f770").kind, "conductor");
+  assert.equal(find("00000000").kind, "conductor");
   assert.equal(find("missing"), null);
   assert.equal(findManagerSession(resolveFleetConfig({}, { home: "/h", managerRef: "" }), threads), null);
   assert.equal(find("0056"), null, "short prefixes never match");
@@ -304,12 +306,44 @@ test("zoneless message times read as UTC on a non-UTC machine", async (t) => {
   assert.equal(threads["s-wait"].openTasks.find((task) => task.id === "tz-1")?.startedAt, iso(4 * MIN));
 });
 
+test("a broadcast row or updated_at bump does not make an idle tab look active", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-idle", "assistant", { type: "system", subtype: "commands_changed", session_id: "s-idle" }, iso(2 * MIN));
+  db.prepare("UPDATE sessions SET updated_at = ? WHERE id = 's-idle'").run(sqliteTime(2 * MIN));
+  db.close();
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-idle"].lastActivityAt, iso(16 * MIN));
+});
+
 test("an aborted session exposes when the owner stopped it", async (t) => {
   const home = makeHome(t);
   seed(home);
   const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
   assert.equal(threads["s-abort"].meta.abortedAt, iso(45 * MIN));
   assert.equal(threads["s-idle"].meta.abortedAt, null);
+});
+
+test("a working tab silent past silentTurnMs is stalled, or waiting when it owns live tasks", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  // s-run's last turn row is 2 min before NOW; s-self has no turn rows at all.
+  const later = NOW + DEFAULTS.silentTurnMs;
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: later - 5 * MIN, peers: new Map() }));
+  assert.equal(threads["s-run"].agentStatus, "running");
+  const silent = byId(await listConductorThreads(makeConfig(home), { now: later, peers: new Map() }));
+  assert.equal(silent["s-run"].agentStatus, "stalled");
+  assert.equal(silent["s-run"].meta.conductorStatus, "working");
+  assert.equal(silent["s-self"].agentStatus, "running");
+  // A background task the live process still owns makes it a wait on that task.
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", sdk.taskStarted("s-run", "bbq-1", "Wait for bb-quick"), iso(3 * MIN));
+  db.close();
+  writePeer(home, { pid: 801, sessionId: "s-run", name: "madrid-8a", status: "idle", entrypoint: "sdk-ts", updatedAt: NOW });
+  const tasks = byId(await listConductorThreads(makeConfig(home), { now: later, isPidAlive: (pid) => pid === 801 }));
+  assert.equal(tasks["s-run"].agentStatus, "waiting");
+  assert.equal(tasks["s-run"].openTasks[0]?.id, "bbq-1");
 });
 
 test("a live peer on a permission prompt is waiting on the owner", async (t) => {
@@ -323,4 +357,71 @@ test("a live peer on a permission prompt is waiting on the owner", async (t) => 
   assert.equal(threads["s-run"].meta.waitingFor, "permission prompt");
   assert.equal(threads["s-idle"].agentStatus, "idle");
   assert.equal(threads["s-idle"].meta.blockedOnOwner, false);
+});
+
+test("sessions carry the workspace id, tab title, and tab count the app deep link and UI check need", async (t) => {
+  const home = makeHome(t);
+  seed(home);
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  const run = threads["s-run"];
+  assert.equal(run.meta.conductorWorkspaceId, "w-madrid");
+  assert.equal(run.meta.conductorSessionId, "s-run");
+  assert.equal(run.meta.conductorSessionTitle, "Fix uploads");
+  // s-self shares the workspace; s-hidden is hidden and does not count.
+  assert.equal(run.meta.conductorWorkspaceSessions, 2);
+  assert.equal(run.meta.conductorTitleShared, false);
+  assert.equal(threads["s-wait"].meta.conductorSessionTitle, null, "Untitled is no title");
+  assert.equal(threads["s-idle"].meta.conductorWorkspaceSessions, 4);
+  assert.equal(threads["mgr-1"].meta.conductorWorkspaceSessions, 1);
+  const target = uiTargetFor(run);
+  assert.equal(target.deepLink, "conductor://workspace?id=w-madrid&session=s-run");
+  assert.equal(target.title, "Fix uploads");
+  assert.equal(target.sessionCount, 2);
+});
+
+test("two tabs with one title in a workspace are flagged as shared", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  db.prepare("UPDATE sessions SET title = 'Cairo work' WHERE id = 's-err'").run();
+  db.close();
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-idle"].meta.conductorTitleShared, true);
+  assert.equal(threads["s-abort"].meta.conductorTitleShared, false);
+});
+
+test("a pending AskUserQuestion is the owner's question; its answer clears it", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  // Real shape from conductor.db (2026-09-28): the pick is a tool call.
+  const ask = (id) => ({
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [
+      { type: "text", text: "Here is the plan." },
+      { type: "tool_use", id, name: "mcp__conductor__AskUserQuestion", input: { questions: [{ header: "Split plan", question: "Split into two PRs. Go?", options: ["Go", { label: "Change it" }] }] } }
+    ] }
+  });
+  addMessage(db, "s-idle", "assistant", ask("toolu_ask1"), iso(5 * MIN));
+  db.close();
+  let threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.deepEqual(threads["s-idle"].meta.pendingQuestion, { text: "Split into two PRs. Go? (Go / Change it)", options: [], at: iso(5 * MIN) });
+
+  const again = new DatabaseSync(file);
+  addMessage(again, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ask1", content: "Go" }] } }, iso(3 * MIN));
+  again.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+
+  // Unanswered, then a new turn starts (brussels #7394): the agent moved on.
+  const later = new DatabaseSync(file);
+  addMessage(later, "s-idle", "assistant", ask("toolu_ask2"), iso(2 * MIN));
+  later.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.ok(threads["s-idle"].meta.pendingQuestion, "asked again");
+  const moved = new DatabaseSync(file);
+  addMessage(moved, "s-idle", "assistant", { type: "system", subtype: "init", session_id: "s-idle" }, iso(1 * MIN));
+  moved.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
 });

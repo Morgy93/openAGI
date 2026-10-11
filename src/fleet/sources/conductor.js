@@ -17,7 +17,7 @@ const MIN_REF_PREFIX = 8;
 
 const SESSIONS_SQL = `
   SELECT s.id, s.status, s.claude_session_id, s.title, s.model, s.updated_at, s.unread_count,
-         w.directory_name, w.branch, w.derived_status, w.workspace_path, w.pr_title, w.active_session_id,
+         w.local_id AS workspace_local_id, w.directory_name, w.branch, w.derived_status, w.workspace_path, w.pr_title, w.active_session_id,
          r.remote_url
   FROM sessions s
   JOIN workspaces w ON w.local_id = s.workspace_id
@@ -67,12 +67,13 @@ function eventText(event) {
 
 function summarizeTail(rowsNewestFirst) {
   const summary = {
-    lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null
+    lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
+    pendingAsk: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
-    summary.lastAt = latestIso(summary.lastAt, at);
     if (row.role === "user") {
+      summary.lastAt = latestIso(summary.lastAt, at);
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
@@ -84,10 +85,19 @@ function summarizeTail(rowsNewestFirst) {
     }
     const event = parseEvent(row.content);
     if (!event) continue;
-    // Every SDK turn opens with system/init.
-    if (event.type === "system" && event.subtype === "init") summary.turnStartedAt = at;
+    // System rows (commands_changed and other state broadcasts) also land
+    // on idle tabs; only turn rows are activity.
+    if (event.type !== "system") summary.lastAt = latestIso(summary.lastAt, at);
+    // Every SDK turn opens with system/init. A new turn after an unanswered
+    // AskUserQuestion means the agent moved on without the pick.
+    if (event.type === "system" && event.subtype === "init") {
+      summary.turnStartedAt = at;
+      summary.pendingAsk = null;
+    }
     else if (event.type === "assistant" && !event.parent_tool_use_id) {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
+      const ask = askUserQuestion(event, at);
+      if (ask) summary.pendingAsk = ask;
       const text = eventText(event);
       if (text) {
         summary.lastAgentText = text;
@@ -104,9 +114,32 @@ function summarizeTail(rowsNewestFirst) {
       }
     } else if (event.type === "error") {
       summary.lastEnd = { isError: true, text: String(event.content ?? ""), at };
+    } else if (event.type === "user" && summary.pendingAsk && answersTool(event, summary.pendingAsk.id)) {
+      summary.pendingAsk = null;
     }
   }
   return summary;
+}
+
+// Conductor's AskUserQuestion: the turn waits on the owner's pick while the
+// session reads "idle", and the question is in the tool call, not the text.
+function askUserQuestion(event, at) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  const call = content.find((block) => block?.type === "tool_use" && /AskUserQuestion$/.test(String(block.name ?? "")));
+  const questions = Array.isArray(call?.input?.questions) ? call.input.questions.filter((q) => q && typeof q.question === "string") : [];
+  if (!call?.id || !questions.length) return null;
+  // The pick is a widget in Conductor: typed text does not answer it, so the
+  // choices ride in the text and the owner answers in the app.
+  const choices = (q) => (Array.isArray(q.options) ? q.options : [])
+    .map((option) => (typeof option === "string" ? option : option?.label))
+    .filter((option) => typeof option === "string" && option.trim());
+  const text = questions.map((q) => (choices(q).length ? `${q.question.trim()} (${choices(q).join(" / ")})` : q.question.trim())).join(" / ");
+  return { id: String(call.id), at, text, options: [] };
+}
+
+function answersTool(event, id) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  return content.some((block) => block?.type === "tool_result" && String(block.tool_use_id ?? "") === id);
 }
 
 function readRecentMessages(db, sessionId) {
@@ -152,22 +185,47 @@ function statusAndError(sessionStatus, lastEnd, now, excerptMax) {
   return { agentStatus, error: null, abortReason: null };
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
+// Per workspace: how many visible sessions (tabs) it has, and how many share
+// each tab title. Computer-use delivery needs the tab title to tell tabs apart.
+function sessionTitleKey(title) {
+  const text = String(title ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  return text && text !== "untitled" ? text : null;
+}
+
+function workspaceTabs(rows) {
+  const out = new Map();
+  for (const { row } of rows) {
+    const id = row.workspace_local_id;
+    if (!id) continue;
+    const entry = out.get(id) ?? { count: 0, titles: new Map() };
+    entry.count += 1;
+    const key = sessionTitleKey(row.title);
+    if (key) entry.titles.set(key, (entry.titles.get(key) ?? 0) + 1);
+    out.set(id, entry);
+  }
+  return out;
+}
+
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null }) {
   const { limits } = config;
   const summary = summarizeTail(readRecentMessages(db, row.id));
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
   const blockedOnOwner = peerBlockedOnOwner(peer);
-  const { agentStatus, error, abortReason, abortedAt = null } = blockedOnOwner
+  const { agentStatus: reported, error, abortReason, abortedAt = null } = blockedOnOwner
     ? { agentStatus: "waiting", error: null, abortReason: null }
     : statusAndError(row.status, summary.lastEnd, now, limits.excerptMax);
   // Only running or waiting sessions still own background tasks, and only
   // those started by the live process: conductor.db never records the ones
   // killed with an earlier process.
-  const openTasks = agentStatus === "waiting" || agentStatus === "running"
+  const openTasks = reported === "waiting" || reported === "running"
     ? liveTasks(readOpenTasks(db, row.id, sinceIso), peer)
     : [];
+  // Conductor keeps a hung turn "working" for hours. With no transcript row
+  // for that long it is a wait on its tasks, or stalled like a silent Codex turn.
+  const silent = reported === "running" && now - Date.parse(summary.lastAt ?? "") >= limits.silentTurnMs;
+  const agentStatus = silent ? (openTasks.length ? "waiting" : "stalled") : reported;
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const title = row.title && row.title !== "Untitled" ? row.title : row.pr_title || row.directory_name || row.id;
   const selfIds = config.selfSessionIds ?? [];
@@ -188,8 +246,11 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
     workspace: row.directory_name || null,
     claudeSessionId,
     agentStatus,
-    lastActivityAt: latestIso(dbTimeToIso(row.updated_at), summary.lastAt),
+    // sessions.updated_at moves on any row update (unread count, broadcasts),
+    // so it only stands in for a tab with no turn rows.
+    lastActivityAt: summary.lastAt ?? dbTimeToIso(row.updated_at),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
+    lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,
@@ -207,6 +268,9 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
       abortReason,
       abortedAt,
       blockedOnOwner,
+      pendingQuestion: summary.pendingAsk
+        ? { text: clampText(redactSecrets(summary.pendingAsk.text), limits.bodyMax), options: summary.pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: summary.pendingAsk.at }
+        : null,
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,
@@ -214,7 +278,15 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
       activeTab: row.active_session_id === row.id,
       prTitle: row.pr_title ?? null,
       dbRemote: repoFromRemote(row.remote_url),
-      conductorHosted: true
+      conductorHosted: true,
+      // conductor://workspace?id=<workspace local_id>&session=<sessions.id>
+      conductorWorkspaceId: row.workspace_local_id || null,
+      conductorSessionId: row.id,
+      // The tab's own title (null when untitled) and its siblings, so the
+      // computer-use route can prove which tab is open.
+      conductorSessionTitle: sessionTitleKey(row.title) ? clampText(redactSecrets(row.title), limits.titleMax) : null,
+      conductorWorkspaceSessions: tabs?.count ?? null,
+      conductorTitleShared: Boolean(sessionTitleKey(row.title) && (tabs?.titles.get(sessionTitleKey(row.title)) ?? 0) > 1)
     }
   };
 }
@@ -239,21 +311,24 @@ export async function listConductorThreads(config, options = {}) {
     const ref = String(config.managerRef ?? "").trim();
     const rows = db.prepare(SESSIONS_SQL).all().map((row) => ({ row, updatedMs: Date.parse(dbTimeToIso(row.updated_at) ?? "") }));
     const newestFirst = (a, b) => (b.updatedMs || 0) - (a.updatedMs || 0) || String(a.row.id).localeCompare(String(b.row.id));
-    const recent = rows.filter((entry) => entry.updatedMs >= cutoff).sort(newestFirst).slice(0, config.limits.maxThreads);
+    // options.only: just these sessions (a send-time re-read), whatever their age.
+    const only = Array.isArray(options.only) ? new Set(options.only) : null;
+    const recent = rows.filter((entry) => (only ? only.has(entry.row.id) : entry.updatedMs >= cutoff)).sort(newestFirst).slice(0, config.limits.maxThreads);
     const picked = new Set(recent.map((entry) => entry.row.id));
     // The BuildBot3 manager stays visible for escalation even when it is quiet.
-    const manager = rows
+    const manager = only ? [] : rows
       .filter((entry) => !picked.has(entry.row.id)
         && matchesRef(ref, { id: entry.row.id, claudeSessionId: entry.row.claude_session_id, workspace: entry.row.directory_name }))
       .sort(newestFirst)
       .slice(0, MAX_STALE_MANAGER_ROWS);
     const peers = options.peers ?? readLivePeers(config, { isPidAlive });
+    const tabs = workspaceTabs(rows);
     const threads = [];
     for (const [list, stale] of [[recent, false], [manager, true]]) {
       for (const { row } of list) {
         // A query failure means the source is unknown this tick. Returning a
         // partial catalog would close questions from sessions we failed to read.
-        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale }));
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null }));
       }
     }
     return threads;

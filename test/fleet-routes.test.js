@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFleetRoute } from "../src/fleet/routes.js";
+import { DEADLINE_MARGIN_MS } from "../src/fleet/ui-delivery.js";
 
 function fakeSupervisor() {
   const calls = [];
@@ -85,9 +86,22 @@ test("POST /fleet/api/scan runs a manual tick and returns state", async () => {
   const route = createFleetRoute({ supervisor });
   const result = await route("POST", "/fleet/api/scan", url("/fleet/api/scan"), body({}));
   assert.equal(result.status, 200);
-  assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "manual"]);
+  assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "owner-scan"]);
   assert.equal(result.body.lastTickAt, "2026-09-26T01:00:00.000Z");
   assert.equal((await route("GET", "/fleet/api/scan", url("/fleet/api/scan"), body({}))).status, 405);
+});
+
+test("a scan through the broker answers before its deadline, even when the tick it rides runs on", async () => {
+  const supervisor = fakeSupervisor();
+  let calls = 0;
+  supervisor.tick = (opts) => { calls += 1; supervisor.calls.push(["tick", opts.reason, opts.deferUi]); return new Promise(() => {}); };
+  const route = createFleetRoute({ supervisor });
+  const started = Date.now();
+  const result = await route("POST", "/fleet/api/scan", url("/fleet/api/scan"), body({}), { remote: true, deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 50 });
+  assert.equal(result.status, 200);
+  assert.ok(Date.now() - started < DEADLINE_MARGIN_MS, "answered before the deadline");
+  assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "owner-scan", true]);
+  assert.equal(calls, 1);
 });
 
 test("scan failure is a 500 with state, never a thrown error", async () => {
@@ -155,6 +169,50 @@ test("{ dismiss: true } dismisses the question", async () => {
   assert.equal((await route("POST", path, url(path), body({ dismiss: true }))).status, 404);
 });
 
+test("{ reopen: true } reopens a question the review closed", async () => {
+  const supervisor = fakeSupervisor();
+  supervisor.reopenReviewed = (id) => {
+    supervisor.calls.push(["reopenReviewed", id]);
+    return id === "fq_closed" ? { id, status: "open", pinned: true } : null;
+  };
+  const route = createFleetRoute({ supervisor });
+  const path = "/fleet/api/questions/fq_closed";
+  const result = await route("POST", path, url(path), body({ reopen: true }));
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.question, { id: "fq_closed", status: "open", pinned: true });
+  assert.ok(result.body.state);
+  assert.equal(supervisor.calls.some((c) => c[0] === "answerQuestion" || c[0] === "dismissQuestion"), false);
+  const other = "/fleet/api/questions/fq_open1";
+  assert.equal((await route("POST", other, url(other), body({ reopen: true }))).status, 409);
+  delete supervisor.reopenReviewed;
+  assert.equal((await route("POST", path, url(path), body({ reopen: true }))).status, 503);
+});
+
+test("state carries the supervisor's clears and review notes; a reopen answers with the fresh state", async () => {
+  const supervisor = fakeSupervisor();
+  const cleared = { id: "fq_closed", dedupeKey: "k2", title: "#7 ready. Merge?", status: "resolved", resolvedBy: "review", reviewCategory: "stale", reviewReason: "merged", answeredAt: "2026-09-26T00:30:00.000Z" };
+  Object.assign(supervisor.state.questions[0], { reviewCategory: "live", reviewReason: "the agent waits on you", reviewedAt: "2026-09-26T00:10:00.000Z" });
+  supervisor.state.reviewClosed = [cleared];
+  supervisor.reopenReviewed = (id) => {
+    const question = supervisor.state.reviewClosed.find((q) => q.id === id);
+    if (!question) return null;
+    supervisor.state.reviewClosed = [];
+    const open = { ...question, status: "open", resolvedBy: null, pinned: true };
+    supervisor.state.questions.push(open);
+    return open;
+  };
+  const route = createFleetRoute({ supervisor });
+  const got = await route("GET", "/fleet/api/state", url("/fleet/api/state"), body({}));
+  assert.deepEqual(got.body.reviewClosed, [cleared]);
+  assert.equal(got.body.questions[0].reviewReason, "the agent waits on you");
+  const path = "/fleet/api/questions/fq_closed";
+  const result = await route("POST", path, url(path), body({ reopen: true }));
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.state.reviewClosed, []);
+  assert.deepEqual(result.body.state.questions.map((q) => q.id), ["fq_open1", "fq_closed"]);
+  assert.equal((await route("POST", path, url(path), body({ reopen: true }))).status, 409, "reopens once");
+});
+
 test("answer race: question closed between check and answer is 409", async () => {
   const supervisor = fakeSupervisor();
   supervisor.answerQuestion = async () => null;
@@ -203,4 +261,36 @@ test("a supervisor method that throws becomes a 500 JSON body", async () => {
   const result = await route("POST", "/fleet/api/actions/fa_prop1/send", url("/fleet/api/actions/fa_prop1/send"), body({}));
   assert.equal(result.status, 500);
   assert.equal(typeof result.body.error, "string");
+});
+
+test("screen, click and app routes validate their input and reach the supervisor", async () => {
+  const supervisor = fakeSupervisor();
+  supervisor.screenThread = async (key, options) => { supervisor.calls.push(["screenThread", key, options.deadlineAt]); return { status: "read", detail: "read Codex", screen: { prompt: null } }; };
+  supervisor.clickThread = async (key, label, options) => { supervisor.calls.push(["clickThread", key, label, options.stateId]); return { delivery: { status: "sent", detail: `clicked ${label}` }, prompt: null }; };
+  supervisor.appAction = async (app, action, options) => { supervisor.calls.push(["appAction", app, action, options.expectRunning]); return { ok: true, detail: "restarted Conductor" }; };
+  const route = createFleetRoute({ supervisor });
+  const post = (path, body) => route("POST", path, null, async () => body);
+  const screen = await post("/fleet/api/screen", { threadKey: "codex:t1" });
+  assert.equal(screen.status, 200);
+  assert.equal(screen.body.status, "read");
+  assert.equal((await post("/fleet/api/screen", { threadKey: "../etc" })).status, 400);
+  const clicked = await post("/fleet/api/click", { threadKey: "codex:t1", label: "Allow once", stateId: "0123456789abcdef" });
+  assert.equal(clicked.body.delivery.status, "sent");
+  assert.equal((await post("/fleet/api/click", { threadKey: "codex:t1", label: "" })).status, 400);
+  assert.equal((await post("/fleet/api/click", { threadKey: "codex:t1", label: "Allow", stateId: "x" })).status, 400);
+  const restarted = await post("/fleet/api/apps/conductor/restart", { expectRunning: ["conductor:s1", "../bad", 7] });
+  assert.equal(restarted.status, 200);
+  assert.equal(restarted.body.result.ok, true);
+  assert.equal((await post("/fleet/api/apps/finder/quit", {})).status, 404);
+  assert.equal((await post("/fleet/api/apps/codex/kill", {})).status, 404);
+  assert.equal((await route("GET", "/fleet/api/screen", null, async () => ({}))).status, 405);
+  supervisor.runningInApp = async (app) => (app === "codex" ? [{ key: "codex:t1", name: "billing" }] : null);
+  assert.deepEqual((await route("GET", "/fleet/api/apps/codex/running", null, async () => ({}))).body.running, [{ key: "codex:t1", name: "billing" }]);
+  assert.equal((await route("GET", "/fleet/api/apps/conductor/running", null, async () => ({}))).status, 503, "unreadable is not idle");
+  assert.equal((await post("/fleet/api/apps/codex/running", {})).status, 405);
+  assert.deepEqual(supervisor.calls.filter((call) => call[0] !== "getState"), [
+    ["screenThread", "codex:t1", null],
+    ["clickThread", "codex:t1", "Allow once", "0123456789abcdef"],
+    ["appAction", "conductor", "restart", ["conductor:s1"]]
+  ]);
 });

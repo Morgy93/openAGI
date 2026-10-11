@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveFleetConfig } from "../src/fleet/contracts.js";
+import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { MESSAGE_PREFIX, buildRelayPrompt, createExecutor, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { MESSAGE_PREFIX, backgroundRouteFor, buildRelayPrompt, createExecutor, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-"));
@@ -147,6 +148,29 @@ test("dry-run checks preconditions but never calls run", async (t) => {
   assert.equal(calls.length, 0);
   assert.deepEqual(executor.inFlight(), []);
   assert.deepEqual(store.actions(), []);
+});
+
+test("a remote caller's deadline bounds non-UI sends: no relay it cannot finish, no background resume after it", async (t) => {
+  const { cwd, calls, executor } = setup(t, { results: [{ code: 0, stdout: "DONE\n" }, { code: 0, stdout: "done" }] });
+  const peer = claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 4242, status: "idle" } });
+  // 30 s left after the trip back: too little for a relay.
+  const short = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 30_000 });
+  assert.equal(short.status, "blocked");
+  assert.equal(short.detail, "no time left in this request to deliver; not sent, retry");
+  // Past the deadline: no background resume starts either.
+  const late = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() - 1 });
+  assert.equal(late.status, "blocked");
+  assert.equal(calls.length, 0, "nothing started");
+  assert.deepEqual(executor.inFlight(), []);
+  // 100 s left: the relay runs, bounded by them less the kill grace.
+  const bounded = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 100_000 });
+  assert.equal(bounded.status, "sent", bounded.detail);
+  assert.ok(calls[0].timeoutMs <= 100_000 - DEFAULTS.uiKillGraceMs && calls[0].timeoutMs > 90_000, String(calls[0].timeoutMs));
+  // Before the deadline a background resume starts (its turn is not bounded by it).
+  const resumed = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 1_000 });
+  assert.equal(resumed.status, "sent");
+  assert.equal(calls.length, 2);
+  await executor.whenIdle();
 });
 
 test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) => {
@@ -402,4 +426,331 @@ test("claude-resume re-reads live peers at send time and never forks a live sess
   const idle = createExecutor({ config, run, store, readLivePeers: () => new Map() });
   assert.equal((await idle.deliver({ thread: claudeThread(cwd), message: `${MESSAGE_PREFIX}continue`, route: "claude-resume" })).status, "sent");
   await idle.whenIdle();
+});
+
+// --- computer-use route (a fake UI driver; nothing touches a real app) -------
+
+const conductorUiThread = (cwd, extra = {}) => ({
+  key: "conductor:s1", kind: "conductor", id: "s1", title: "Fix billing", workspace: "madrid", cwd, archived: false, writerLocked: false,
+  live: null, agentStatus: "idle",
+  meta: { conductorWorkspaceId: "w-madrid", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1 },
+  ...extra
+});
+
+function uiSetup(t, { results = [], delivery = "computer-use", hold = false, knownThreads = () => [] } = {}) {
+  const base = setup(t);
+  const config = { ...base.config, delivery };
+  const requests = [];
+  const releases = [];
+  let running = 0;
+  let maxRunning = 0;
+  const ui = {
+    async deliver(request) {
+      requests.push(request);
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      try {
+        if (hold) await new Promise((resolve) => releases.push(resolve));
+        return { status: "sent", detail: "typed into Conductor", evidence: ["/tmp/fa-before.png", "/tmp/fa-after.png"], ...(results.shift() ?? {}) };
+      } finally {
+        running -= 1;
+      }
+    }
+  };
+  // A private lock per test, so tests never wait on each other.
+  const executor = createExecutor({ config, run: base.run, store: base.store, logDir: path.join(base.home, "fleet", "logs"), ui, knownThreads, uiLock: createUiLock() });
+  return { ...base, config, executor, requests, releases, get maxRunning() { return maxRunning; } };
+}
+
+test("computer-use types through the UI driver: one line, no CLI, final result, evidence journaled", async (t) => {
+  const { cwd, calls, store, executor, requests } = uiSetup(t);
+  const result = await executor.deliver({ thread: conductorUiThread(cwd), message: "Ready to merge?\nCI red: lint.\n\nFix it.", route: "computer-use", playbook: "merge-ready" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "computer-use");
+  assert.equal(result.done, undefined, "a UI send is final: no background child");
+  assert.equal(calls.length, 0, "never runs codex or claude");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].text, `${MESSAGE_PREFIX}Ready to merge? CI red: lint. Fix it.`);
+  assert.ok(requests[0].spentMs >= 0 && requests[0].spentMs < 1000, "the caller's time, lock wait added");
+  // A caller's request time carries through to the driver.
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "Second note.", route: "computer-use", playbook: "owner-answer", spentMs: 60_000 });
+  assert.ok(requests[1].spentMs >= 60_000);
+  assert.equal(requests[1].deadlineAt, null, "a local caller has no broker deadline");
+  // A remote caller's broker deadline (its queue time included) reaches the driver.
+  const deadlineAt = Date.now() + 100_000;
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "Third note.", route: "computer-use", playbook: "owner-message", deadlineAt });
+  assert.equal(requests[2].deadlineAt, deadlineAt);
+  assert.equal(requests[0].target.deepLink, "conductor://workspace?id=w-madrid&session=s1");
+  assert.deepEqual(requests[0].identity.tokens, ["madrid"]);
+  assert.equal(requests[0].previousUnconfirmed, false);
+  const action = store.action(result.actionId);
+  assert.equal(action.status, "sent");
+  assert.equal(action.route, "computer-use");
+  assert.deepEqual(action.evidence, ["/tmp/fa-before.png", "/tmp/fa-after.png"]);
+  assert.deepEqual(executor.inFlight(), []);
+});
+
+test("computer-use: a desktop-held Codex writer lock does not block; a running turn and app-less threads do", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const codex = codexThread(cwd, { title: "Fix uploads", writerLocked: true, agentStatus: "idle" });
+  assert.equal((await executor.deliver({ thread: codex, message: "continue", route: "computer-use" })).status, "sent");
+  assert.equal(requests[0].target.deepLink, "codex://threads/t1");
+  const running = await executor.deliver({ thread: { ...codex, agentStatus: "running" }, message: "continue", route: "computer-use" });
+  assert.equal(running.status, "blocked");
+  assert.match(running.detail, /turn running/);
+  const terminal = await executor.deliver({ thread: claudeThread(cwd, { live: { peerName: "cli-1", pid: 9 } }), message: "continue", route: "computer-use" });
+  assert.equal(terminal.status, "blocked");
+  assert.match(terminal.detail, /no app shows this thread/);
+  const prompt = await executor.deliver({ thread: conductorUiThread(cwd, { meta: { ...conductorUiThread(cwd).meta, blockedOnOwner: true } }), message: "continue", route: "computer-use" });
+  assert.equal(prompt.status, "blocked");
+  assert.equal(requests.length, 1);
+});
+
+test("computer-use-only config refuses every CLI route, even from an older proposal", async (t) => {
+  const { cwd, calls, executor } = uiSetup(t);
+  for (const [thread, route] of [[codexThread(cwd), "codex-exec"], [claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 1 } }), "peer-relay"], [claudeThread(cwd), "claude-resume"]]) {
+    const result = await executor.deliver({ thread, message: "continue", route });
+    assert.equal(result.status, "blocked");
+    assert.match(result.detail, /computer-use delivery only/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("computer-use maps blocked and failed results; an unconfirmed send is flagged on the retry", async (t) => {
+  const { cwd, store, executor, requests } = uiSetup(t, {
+    results: [
+      { status: "blocked", detail: "owner using Conductor", evidence: undefined },
+      { status: "failed", detail: "unconfirmed: may have been sent; check the thread before retrying", unconfirmed: true, priorCount: 2 },
+      { status: "sent", detail: "already in thread (the earlier unconfirmed send landed)" }
+    ]
+  });
+  const thread = conductorUiThread(cwd);
+  const blocked = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.detail, "owner using Conductor");
+  assert.equal(blocked.actionId, null, "nothing typed: not journaled as an action");
+  const failed = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.unconfirmed, true);
+  assert.equal(store.action(failed.actionId).unconfirmed, true);
+  const retried = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.deepEqual(requests[2].previousUnconfirmed, { priorCount: 2 });
+  assert.equal(retried.status, "sent");
+  assert.equal(store.action(retried.actionId).unconfirmed, false);
+  // A different message is not the unconfirmed one.
+  await executor.deliver({ thread, message: "something else", route: "computer-use" });
+  assert.equal(requests[3].previousUnconfirmed, false);
+});
+
+test("an unconfirmed UI send stays guarded after the executor is recreated", async (t) => {
+  const { cwd, store, config, executor } = uiSetup(t, {
+    results: [{ status: "failed", detail: "unconfirmed: may have been sent", unconfirmed: true, priorCount: 1 }]
+  });
+  const thread = conductorUiThread(cwd);
+  await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  const requests = [];
+  const ui = { async deliver(request) { requests.push(request); return { status: "sent", detail: "already in thread" }; } };
+  const restarted = createExecutor({ config, run: async () => ({ code: 0 }), store, ui, uiLock: createUiLock() });
+  await restarted.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.deepEqual(requests[0].previousUnconfirmed, { priorCount: 1 });
+  // Once it is confirmed, a later restart no longer carries the guard.
+  const again = createExecutor({ config, run: async () => ({ code: 0 }), store, ui, uiLock: createUiLock() });
+  await again.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(requests[1].previousUnconfirmed, false);
+});
+
+test("computer-use runs one app delivery at a time and one per app thread", async (t) => {
+  const { cwd, executor, releases, requests } = uiSetup(t, { hold: true });
+  const a = executor.deliver({ thread: conductorUiThread(cwd), message: "one", route: "computer-use" });
+  const b = executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "two", route: "computer-use" });
+  // The Codex thread Conductor hosts reaches the same Conductor tab.
+  const hosted = codexThread(cwd, { key: "codex:t9", id: "t9", meta: { originator: "codex_sdk_ts", conductorHost: { workspaceId: "w-madrid", sessionId: "s1", workspace: "madrid", title: "Fix billing", sessionCount: 1 } } });
+  const twin = await executor.deliver({ thread: hosted, message: "three", route: "computer-use" });
+  assert.equal(twin.status, "blocked");
+  assert.match(twin.detail, /in flight/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1, "the second waits for the UI lock");
+  releases.shift()();
+  assert.equal((await a).status, "sent");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  releases.shift()();
+  assert.equal((await b).status, "sent");
+});
+
+test("computer-use dry run describes the step without touching the UI; a missing driver blocks", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const dry = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use", dryRun: true });
+  assert.equal(dry.status, "dry-run");
+  assert.equal(dry.detail, "would type into Conductor: madrid");
+  assert.equal(requests.length, 0);
+  const base = setup(t);
+  const bare = createExecutor({ config: { ...base.config, delivery: "computer-use" }, run: base.run, store: base.store, uiLock: createUiLock() });
+  const none = await bare.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
+  assert.equal(none.status, "blocked");
+  assert.match(none.detail, /computer use unavailable/);
+});
+
+test("computer-use passes every known thread so shared titles block as ambiguous", async (t) => {
+  const twin = codexThread("/x", { key: "codex:t2", id: "t2", title: "Fix uploads" });
+  const { cwd, executor, requests } = uiSetup(t, { knownThreads: () => [twin] });
+  await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use" });
+  assert.equal(requests[0].identity.ambiguous, true);
+});
+
+test("a blocked app send carries the permission card and the failure kind back to the supervisor", async (t) => {
+  const prompt = { text: "Run npm test?", buttons: ["Allow once", "Deny"], stateId: "0123456789abcdef" };
+  const { cwd, executor } = uiSetup(t, { results: [
+    { status: "blocked", detail: "permission prompt visible: open it", prompt },
+    { status: "blocked", detail: "can't read Conductor", code: "appUnreadable" }
+  ] });
+  const carded = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
+  assert.equal(carded.status, "blocked");
+  assert.deepEqual(carded.prompt, prompt);
+  const unreadable = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
+  assert.equal(unreadable.code, "appUnreadable");
+});
+
+// --- background routes while the owner is at the Mac -------------------------
+
+function fallbackSetup(t, { results = [], routes = ["codex-exec", "peer-relay"], peers = new Map(), relay = [], refresh = async (thread) => thread } = {}) {
+  const base = setup(t, { results: relay });
+  const config = { ...base.config, delivery: "computer-use", backgroundRoutes: routes };
+  const requests = [];
+  const ui = {
+    async deliver(request) {
+      requests.push(request);
+      return { status: "sent", detail: "typed", ...(results.shift() ?? {}) };
+    }
+  };
+  const executor = createExecutor({ config, run: base.run, store: base.store, logDir: path.join(base.home, "fleet", "logs"), ui, uiLock: createUiLock(), readLivePeers: () => peers, refreshThread: refresh });
+  return { ...base, config, executor, requests };
+}
+
+const ownerAtCodex = () => [{ status: "blocked", detail: "owner using Codex", evidence: undefined }];
+
+test("an app send blocked only by the owner's presence goes by an allowed background route", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, store, executor, requests } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads", agentStatus: "idle" }), message: "continue", route: "computer-use", playbook: "idle-report" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "codex-exec");
+  assert.equal(requests.length, 1, "the app was tried first");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(0, 3), ["exec", "resume", "t1"]);
+  await executor.whenIdle();
+  const action = store.action(result.actionId);
+  assert.equal(action.route, "codex-exec");
+  assert.equal(action.fallbackFrom, "owner using Codex");
+  // Waiting for idle is the same block.
+  const waiting = fallbackSetup(t, { results: [{ status: "blocked", detail: "waiting for idle: Codex must be in front to type" }] });
+  assert.equal((await waiting.executor.deliver({ thread: codexThread(waiting.cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use" })).route, "codex-exec");
+  await waiting.executor.whenIdle();
+});
+
+test("no background route unless allowed, safe and the block was only the owner's presence", async (t) => {
+  withoutLbKey(t);
+  const thread = (cwd, extra = {}) => codexThread(cwd, { title: "Fix uploads", agentStatus: "idle", ...extra });
+  const cases = [
+    ["not allowed", { routes: [] }, {}],
+    ["a draft left in the composer", { results: [{ status: "blocked", detail: "owner using Codex; our text is left as a draft" }] }, {}],
+    ["another app send running", { results: [{ status: "blocked", detail: "busy: another app delivery is running; retry" }] }, {}],
+    ["writer-locked in the scan", {}, { writerLocked: true }],
+    ["started by Conductor", {}, { meta: { originator: "codex_sdk_ts" } }],
+    ["waiting on a permission prompt", {}, { meta: { blockedOnOwner: true } }]
+  ];
+  for (const [label, options, extra] of cases) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results: ownerAtCodex(), ...options });
+    const result = await executor.deliver({ thread: thread(cwd, extra), message: "continue", route: "computer-use" });
+    assert.equal(result.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+  // A writer lock taken since the scan is read at send time: who holds it
+  // decides, so a lock file a crash left behind holds nothing.
+  const lockFile = (home) => {
+    fs.mkdirSync(path.join(home, ".codex", "thread-writer-locks"), { recursive: true });
+    const file = path.join(home, ".codex", "thread-writer-locks", "t1.lock");
+    fs.writeFileSync(file, "");
+    return file;
+  };
+  const held = fallbackSetup(t, { results: ownerAtCodex() });
+  const file = lockFile(held.home);
+  held.calls.length = 0;
+  const heldRun = createExecutor({ config: held.config, run: async (cmd, args) => { held.calls.push({ cmd, args }); return { code: 0, stdout: `p${process.pid}\nn${file}\n` }; }, store: held.store, ui: { deliver: async () => ownerAtCodex()[0] }, uiLock: createUiLock() });
+  assert.equal((await heldRun.deliver({ thread: thread(held.cwd), message: "continue", route: "computer-use" })).status, "blocked");
+  assert.deepEqual(held.calls.map((call) => call.cmd), [held.config.bins.lsof], "only the lock read ran");
+  const stale = fallbackSetup(t, { results: ownerAtCodex(), relay: [{ code: 1, stdout: "" }] });
+  lockFile(stale.home);
+  assert.equal((await stale.executor.deliver({ thread: thread(stale.cwd), message: "continue", route: "computer-use" })).route, "codex-exec");
+  assert.deepEqual(stale.calls.map((call) => call.cmd), [stale.config.bins.lsof, "/abs/codex"]);
+  await stale.executor.whenIdle();
+});
+
+test("a Conductor chat goes by peer relay to its live peer only when that peer is idle now", async (t) => {
+  const tab = (cwd) => conductorUiThread(cwd, { claudeSessionId: "cs1", live: { peerName: "old-1", pid: 5, status: "idle" } });
+  const atConductor = () => [{ status: "blocked", detail: "owner using Conductor" }];
+  const fresh = new Map([["cs1", { peerName: "new-2", pid: 6, status: "idle", waitingFor: null }]]);
+  // The re-read chat carries its peer as read now.
+  const now = async (thread) => ({ ...thread, live: { peerName: "new-2", pid: 6, status: "idle" } });
+  const relayed = fallbackSetup(t, { results: atConductor(), peers: fresh, relay: [{ stdout: "DONE" }], refresh: now });
+  const result = await relayed.executor.deliver({ thread: tab(relayed.cwd), message: "continue", route: "computer-use" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "peer-relay");
+  assert.equal(relayed.calls.length, 1);
+  assert.match(relayed.calls[0].args[1], /new-2/, "relays to the peer's name now, not the scan's");
+  for (const [label, peers, extra] of [
+    ["peer busy", new Map([["cs1", { peerName: "new-2", pid: 6, status: "busy" }]]), {}],
+    ["peer waiting on a prompt", new Map([["cs1", { peerName: "new-2", pid: 6, status: "idle", waitingFor: "permission" }]]), {}],
+    ["peer gone", new Map(), {}],
+    ["an open pick in the chat", fresh, { meta: { ...conductorUiThread("x").meta, pendingQuestion: { text: "Which one?" } } }]
+  ]) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers, refresh: now });
+    const blocked = await executor.deliver({ thread: { ...tab(cwd), ...extra }, message: "continue", route: "computer-use" });
+    assert.equal(blocked.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+  // The chat is read again at send time: a pick, a turn or a message since
+  // the scan, or a chat that cannot be read, means no relay.
+  for (const [label, refresh] of [
+    ["a pick asked since the scan", async (thread) => ({ ...(await now(thread)), meta: { ...thread.meta, pendingQuestion: { text: "Which one?" } } })],
+    ["a turn started", async (thread) => ({ ...(await now(thread)), agentStatus: "running" })],
+    ["a message since the scan", async (thread) => ({ ...(await now(thread)), lastActivityAt: "2026-10-08T12:05:00Z" })],
+    ["its peer busy by the second read", async (thread) => ({ ...thread, live: { peerName: "new-2", pid: 6, status: "busy" } })],
+    ["another process by the second read", async (thread) => ({ ...thread, live: { peerName: "new-3", pid: 7, status: "idle" } })],
+    ["unreadable", async () => { throw new Error("SQLITE_BUSY"); }],
+    ["gone", async () => null]
+  ]) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers: fresh, refresh });
+    const extra = { lastActivityAt: "2026-10-08T12:00:00Z" };
+    const blocked = await executor.deliver({ thread: { ...tab(cwd), ...extra }, message: "continue", route: "computer-use" });
+    assert.equal(blocked.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+});
+
+test("background route helpers: the presence block and the per-thread route", () => {
+  assert.equal(isPresenceBlock({ status: "blocked", detail: "owner using Codex" }), true);
+  assert.equal(isPresenceBlock({ status: "blocked", detail: "waiting for idle: Conductor must be in front to type" }), true);
+  for (const delivery of [{ status: "failed", detail: "owner using Codex" }, { status: "blocked", detail: "owner using Codex; our text is left as a draft" }, { status: "blocked", detail: "frontmost app changed" }, null]) {
+    assert.equal(isPresenceBlock(delivery), false, JSON.stringify(delivery));
+  }
+  const config = { backgroundRoutes: ["codex-exec"] };
+  const codex = { kind: "codex", id: "t1", cwd: "/w", meta: {} };
+  assert.equal(backgroundRouteFor(codex, config), "codex-exec");
+  assert.equal(backgroundRouteFor({ ...codex, cwd: null }, config), null);
+  assert.equal(backgroundRouteFor({ ...codex, agentStatus: "running" }, config), null);
+  assert.equal(backgroundRouteFor(codex, { backgroundRoutes: ["peer-relay"] }), null);
+  const live = { kind: "conductor", id: "s1", meta: {}, live: { peerName: "p", pid: 1, status: "idle" } };
+  assert.equal(backgroundRouteFor(live, config), null, "peer-relay not allowed");
+  assert.equal(backgroundRouteFor(live, { backgroundRoutes: ["peer-relay"] }), "peer-relay");
+  assert.equal(backgroundRouteFor({ ...live, kind: "claude", live: null }, { backgroundRoutes: ["peer-relay", "claude-resume"] }), null, "never claude-resume");
+});
+
+test("a remote send near its deadline takes no background route", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, executor } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 5_000 });
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Codex");
+  assert.equal(calls.length, 0);
 });

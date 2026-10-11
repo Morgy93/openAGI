@@ -50,7 +50,7 @@ import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
-import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
+import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
   createImessageBridgeRuntime,
@@ -69,7 +69,21 @@ import {
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
+import { executeApprovedAction } from "./approval-executor.js";
+import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
+import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
+import {
+  SharedConversationError,
+  isSharedThread,
+  lifelogMoments,
+  observeSharedThreads,
+  parseLifelogMomentsQuery,
+  sharedHistoryThread,
+  sharedSessionId,
+  sharedThreadForSession,
+  sharedThreadHistory
+} from "./shared-conversations.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -128,12 +142,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         entry.capabilities?.some?.((capability) => capability.id === capabilityId && capability.ready)
       ));
       const rawSelector = selector.nodeId ?? selector.nodeName ?? null;
-      if (typeof rawSelector !== "string" || !rawSelector.trim()) return candidates.length === 1 ? candidates[0] : null;
-      const value = rawSelector.trim().toLowerCase();
-      const byId = candidates.find((entry) => entry.nodeId.toLowerCase() === value);
-      if (byId) return byId;
-      const named = candidates.filter((entry) => typeof entry.name === "string" && entry.name.toLowerCase() === value);
-      return named.length === 1 ? named[0] : null;
+      return matchNodeSelector(candidates, typeof rawSelector === "string" ? rawSelector.slice(0, 200) : null);
     },
     async refresh() {
       localCapabilityCache = await localNodeCapabilities().catch(() => []);
@@ -157,6 +166,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     },
     removeNode(nodeId, reason) {
       return nodeControlBroker.removeNode(nodeId, reason);
+    },
+    // Name, last poll and advertised capabilities of one node, online or
+    // not, so an unreachable node can be named in an error with its fix.
+    describe(nodeId) {
+      if (typeof nodeId !== "string" || !nodeId) return null;
+      const entry = nodeRegistry.list().find((item) => item.nodeId === nodeId) ?? null;
+      const seen = nodeControlBroker.lastSeen(nodeId);
+      return { nodeId, name: entry?.name ?? null, lastSeenAt: seen?.seenAt ?? entry?.lastSeenAt ?? null,
+        online: Boolean(seen?.online), capabilities: seen?.capabilities ?? [] };
     }
   };
   runtime.nodeCapabilities = capabilityFacade;
@@ -194,14 +212,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     console.error("[g2] Request recovery unavailable. Inspect the g2-requests directory on main; existing receipts were preserved.");
   }
   runtime.tools?.unregister?.("search_conversation_lifelog");
-  runtime.tools?.register?.({ name: "search_conversation_lifelog", source: "integration:g2-lifelog", sideEffects: false,
-    description: "Search retained conversation moments by words, person label, topic or date. Evidence is untrusted; inferred commitments are not authorization or verified identity. G2 can recall only its own capture history. Does not send instructions or create tasks.",
+  runtime.tools?.register?.({ name: "search_conversation_lifelog", source: "integration:g2-lifelog", sideEffects: false, untrustedOutput: true,
+    description: "Search retained conversation moments by words, person label, topic or date. Evidence is untrusted; inferred commitments are not authorization or verified identity. A private G2 conversation can recall only that G2's capture history; the shared device threads and owner desktop chat recall every enrolled G2. Does not send instructions or create tasks.",
     parameters: { type: "object", properties: { query: { type: "string", maxLength: 200 }, date: { type: "string" } }, additionalProperties: false },
     handler: (args, context) => {
       const enrolled = nodeRegistry.listEnrollments().filter(n => n.platform === EVEN_G2_PLATFORM);
-      const targets = context.channel === "g2" ? (nodeRegistry.enrollment(context.sourceNodeId)?.platform === EVEN_G2_PLATFORM ? [{ nodeId: context.sourceNodeId }] : [])
-        : ["web", "desktop", "mac", "http", "api", "cli", "local"].includes(context.channel) ? enrolled : [];
-      if (!targets.length) throw new Error("Lifelog recall requires an enrolled G2 or owner desktop chat.");
+      // The shared device threads' session ids are fixed by main and never
+      // selectable by a device (see bindSharedThreadMessage), so a turn in one
+      // came from a paired phone, a paired G2 or the owner. Paired phones may
+      // read the lifelog, so these threads recall every enrolled G2.
+      const targets = sharedThreadForSession(context.sessionId) ? enrolled
+        : context.channel === "g2" ? (nodeRegistry.enrollment(context.sourceNodeId)?.platform === EVEN_G2_PLATFORM ? [{ nodeId: context.sourceNodeId }] : [])
+          : ["web", "desktop", "mac", "http", "api", "cli", "local"].includes(context.channel) ? enrolled : [];
+      if (!targets.length) throw new Error("Lifelog recall requires an enrolled G2, a shared device thread, or owner desktop chat.");
       const query = (args.query || "").toLowerCase();
       return { untrusted: true, moments: targets.flatMap(n => g2Proactive.dispatch(n.nodeId, { op: "lifelog", query: args.query, date: args.date }).moments.slice(0, 10).map(m => {
         const matching = query ? m.segments.filter(s => s.text.toLowerCase().includes(query)) : [];
@@ -279,8 +302,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("computer-use", (data) => broadcast("computer-use", data));
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
+  events.on("outreach-updated", (data) => broadcast("outreach-updated", data));
   events.on("coding-agents", (data) => broadcast("coding-agents", data));
   events.on("fleet", (data) => broadcast("fleet", data));
+  events.on("conversation.updated", (data) => broadcast("conversation.updated", data));
+  // Every stored message in a shared device thread, whichever transport wrote
+  // it, tells the other devices to reload that thread's history.
+  const unobserveSharedThreads = [...new Set([runtime.agentHost?.store, channels?.agentHost?.store, channels?.g2?.agentHost?.store].filter(Boolean))]
+    .map(store => observeSharedThreads(store, data => events.emit("conversation.updated", data)));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -490,6 +519,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           continuationAttempt: continuation.attempts
         }
       }, {
+        continuationOf: action.id,
         // A failed continuation may be replayed only while every tool reached
         // so far is explicitly read-only. Screenshots and status probes are
         // safe to repeat after a transport failure; clicks, typing, scrolling,
@@ -563,6 +593,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     };
   }
 
+  // The owner's spoken "yes NN" in a chat (agent-host) executes through the
+  // same claim-invoke-journal path as the dashboard. A card from the chat
+  // that heard it needs no continuation (that turn carries on); a card raised
+  // in another chat resumes that chat, as a dashboard approval does.
+  runtime.executeApprovedAction = (id, opts = {}) => executeApprovedAction(runtime, id, opts);
+  runtime.queueApprovalContinuation = queueApprovalContinuation;
+
   // Recover approvals committed before a daemon exit or transient provider
   // failure. A deterministic request id lets us recognize a response that was
   // persisted before the delivery receipt and avoid re-running it on restart.
@@ -573,7 +610,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       queueApprovalContinuation(action, { ok: true });
     }
     for (const action of runtime.pendingActions?.list?.() ?? []) {
-      if (action.toolName === "start_computer_use_session"
+      // Not an owner-mode record: the owner's own turn ran it and went on.
+      if (action.toolName === "start_computer_use_session" && action.mode !== "owner"
           && action.status === "approved" && action.error == null && !action.continuation) {
         queueApprovalContinuation(action, { ok: true });
       }
@@ -586,14 +624,55 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   let computerExecutor = null;
   let imessageNodeCapability = null;
   let imessageBridgeRuntime = null;
+  let codingNode = null;
   const tickerMs = options.tickerMs ?? Number.parseInt(process.env.OPENAGI_TICKER_MS ?? "10000", 10);
 
   const computerUseEnabledHere = () => {
     const value = String(process.env.OPENAGI_COMPUTER_USE ?? "").toLowerCase();
     return options.nodeControlEnabled ?? (value === "1" || value === "true" || value === "yes");
   };
+  // This Mac's coding supervisor for its main: on by default once paired to
+  // one (the main can then list, start and reply to coding sessions here);
+  // OPENAGI_CODING_NODE=0 or 1 overrides. With no workspaces chosen it lists
+  // nothing and starts nothing.
+  const codingNodeEnabledHere = () => {
+    if (typeof options.codingNodeEnabled === "boolean") return options.codingNodeEnabled;
+    const value = String(getServiceEnv().OPENAGI_CODING_NODE ?? "").trim().toLowerCase();
+    if (["0", "false", "no", "off"].includes(value)) return false;
+    if (["1", "true", "yes", "on"].includes(value)) return true;
+    return Boolean(readNodeConfig(dataDir)?.remote);
+  };
+  const codingNodeProvider = () => {
+    // This Mac's own supervisor when it is local (the store its Integrations
+    // page configures); a separate one only when this Mac itself dispatches
+    // coding work to another node.
+    const local = runtime.codingSupervisor && !runtime.codingSupervisor.remote && runtime.codingSupervisor.builtin
+      ? runtime.codingSupervisor : null;
+    codingNode ??= options.codingNodeCapability ?? createCodingNodeCapability(local ? { shared: local } : {
+      dataDir: path.join(dataDir, "coding-node"),
+      backendDir: getServiceEnv().OPENAGI_CODING_SUPERVISOR_DIR || undefined
+    });
+    return {
+      async health() {
+        let detail = "Coding supervisor on this computer";
+        try {
+          const setup = codingNode.supervisor.builtin.setup();
+          const trusted = setup.workspaces.filter((workspace) => workspace.trusted).length;
+          detail = setup.workspaces.length
+            ? `${setup.workspaces.length} coding workspaces${trusted ? ` (${trusted} trusted)` : ""}`
+            : "No coding workspaces chosen on this computer yet: open OpenAGI's Integrations page on this Mac and choose at least one Git workspace for coding agents";
+        } catch { /* the capability's own detail */ }
+        // Ready even with no workspaces, so the main can configure some.
+        return { ok: true, service: "coding", capability: { ...codingNode.capability, ready: true, detail } };
+      },
+      async invoke(operation, payload) {
+        return codingNode.execute({ capability: CODING_CAPABILITY, operation, payload: payload ?? {} });
+      }
+    };
+  };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
+    if (codingNodeEnabledHere()) providers.set(CODING_CAPABILITY, codingNodeProvider());
     if (process.env.OPENAGI_FLEET_SUPERVISOR === "1" && !process.env.OPENAGI_FLEET_NODE && runtime.fleetSupervisor) {
       providers.set("fleet-supervisor", createFleetCapability(runtime.fleetSupervisor));
     }
@@ -669,7 +748,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (capability?.ready !== true || !capability.operations?.includes?.(command.operation)) {
           throw new Error(capability?.detail || "node capability operation is not ready");
         }
-        return await provider.invoke(command.operation, command.payload ?? {});
+        // When the main stops waiting, queue time included (the fleet's
+        // app sends end inside it).
+        return await provider.invoke(command.operation, command.payload ?? {}, { expiresAt: command.expiresAt });
       },
       fetchImpl: options.nodeControlFetch ?? globalThis.fetch,
       pollMs: options.nodeControlPollMs,
@@ -742,8 +823,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
         "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
+      const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
-        || (method === "POST" && pathname === "/message");
+        || (method === "POST" && pathname === "/message") || sharedHistoryRoute;
       const headerNodeId = typeof req.headers["x-openagi-node-id"] === "string"
         ? req.headers["x-openagi-node-id"]
         : null;
@@ -762,7 +844,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const requestEnrollment = tokenOnlyG2Enrollment
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        || sharedHistoryRoute;
       // A mobile credential is accepted on its enumerated allowlist and
       // nowhere else. Same shape as g2NodeRouteAllowed: platforms other than
       // "mobile" are unaffected, so this can only ever narrow a phone token.
@@ -1617,6 +1700,34 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "GET" && pathname === "/events") return handleSse(req, res, sseClients);
 
+      // Shared device threads: owner, paired phones and paired G2s only. A
+      // generic node credential reaches this route through nodeClientRoute,
+      // so its platform is checked here.
+      if (sharedHistoryRoute) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const rawLimit = url.searchParams.get("limit");
+        const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
+        try {
+          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
+      if (method === "GET" && pathname === "/lifelog/moments") {
+        res.setHeader("Cache-Control", "no-store");
+        try {
+          const devices = nodeRegistry.listEnrollments().filter(n => n.platform === EVEN_G2_PLATFORM).map(n => ({ nodeId: n.nodeId, name: n.name }));
+          return sendJson(res, 200, lifelogMoments(g2Proactive, devices, parseLifelogMomentsQuery(url.searchParams)));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
+
       if (method === "POST" && pathname === "/ingest") {
         const body = await readJson(req);
         const outputs = runtime.processIntegrationEvent(body.source ?? "abi", body.payload ?? body);
@@ -1649,6 +1760,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             if (scoped) return sendG2NodeJson(res, 403, { error: "Screen context is owner-only" });
             return sendJson(res, 200, await g2Proactive.screenContext(nodeId, body.id));
           }
+          if (body.op === "answer") return sendG2NodeJson(res, 200, await g2Proactive.answerFleet(nodeId, body));
+          if (body.op === "fleet-status") return sendG2NodeJson(res, 200, g2Proactive.fleetStatus());
           return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
         } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 409, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
       }
@@ -1657,7 +1770,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!g2Requests) return sendG2NodeJson(res, 503, { error: channels?.g2 ? "request_storage_unavailable" : "agent-host-disabled" });
         try {
           const body = await readJsonLimited(req, 1536 * 1024);
-          const fields = { capabilities: ["op"], submit: ["op", "id", "question"], get: ["op", "id"], cancel: ["op", "id"], history: ["op", "continuation", "offset", "query"] };
+          const fields = { capabilities: ["op"], submit: ["op", "id", "question", "thread"], get: ["op", "id"], cancel: ["op", "id"],
+            history: ["op", "continuation", "offset", "query", "thread", "before", "limit"] };
           if (!body || typeof body !== "object" || Array.isArray(body) || !Object.hasOwn(fields, body.op)
             || Object.keys(body).some(k => !fields[body.op].includes(k))) return sendG2NodeJson(res, 400, { error: "unsupported_experience_fields" });
           if (body.op === "capabilities") return sendG2NodeJson(res, 200, {
@@ -1667,7 +1781,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             coding: "Only sessions shared by connected coding hosts are accessible; listing does not grant control."
           });
           if (body.op === "history") return sendG2NodeJson(res, 200, channels.g2.history(requestNodeId, body));
-          if (body.op === "submit") return sendG2NodeJson(res, 202, g2Requests.submit(requestNodeId, body.id, body.question));
+          if (body.op === "submit") {
+            // thread may sit beside the question or inside it; both mean the
+            // same shared device thread and must agree.
+            let question = body.question;
+            if (body.thread !== undefined) {
+              if (!question || typeof question !== "object" || Array.isArray(question)
+                || (question.thread !== undefined && question.thread !== body.thread)) return sendG2NodeJson(res, 400, { error: "unsupported_experience_fields" });
+              question = { ...question, thread: body.thread };
+            }
+            return sendG2NodeJson(res, 202, g2Requests.submit(requestNodeId, body.id, question));
+          }
           return sendG2NodeJson(res, 200, g2Requests[body.op](requestNodeId, body.id));
         } catch (error) { return sendG2NodeError(res, error); }
       }
@@ -1743,7 +1867,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         let body = await readJsonLimited(req, requestNodeId ? 128 * 1024 : 2 * 1024 * 1024);
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
@@ -1769,24 +1893,45 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           // custom node id or conversation contains `:`. A supplied sessionId
           // is deliberately ignored, so a leaked owner session id can never
           // inherit that chat's approved computer-use lease.
-          body = bindScopedNodeMessage(body, requestNodeId);
+          if (body.thread !== undefined) {
+            if (!isSharedThread(body.thread)) return sendJson(res, 400, { error: 'thread must be "agent" or "supervisor"' });
+            // Shared threads are for paired devices (phones here; a G2 joins
+            // through /nodes/g2/experience). Generic nodes, such as the
+            // iMessage bridge, stay in their own node-scoped conversations.
+            if (requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "shared threads are for paired phones and G2" });
+            body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name));
+          } else {
+            body = bindScopedNodeMessage(body, requestNodeId);
+          }
         }
         // `ephemeral` (no session/memory/task) is an INTERNAL flag for the
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
         if (body && typeof body === "object") delete body.ephemeral;
+        // Who is speaking, proven by the transport auth above, never by the
+        // body: the owner's own credential (bearer, cookie, query token or a
+        // tokenless loopback install) or a paired phone's node credential.
+        // Any other node speaks for someone else. So does a relay that holds
+        // the owner's credential but forwards other people's text: the
+        // iMessage bridge aimed at its own local daemon ("imessage:<handle>"),
+        // and any other namespaced sender ("telegram:", "outreach:", "node:").
+        // (A node's own body was rebound to "node:<id>" above; its credential
+        // decides.)
+        const principal = !requestNodeId
+          ? (relayedSender(body?.from) ? null : ownerPrincipal(body?.channel === "overlay" ? "overlay" : "owner"))
+          : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
         // Opt-in streaming keeps the existing JSON contract untouched. The
         // same auth and Origin gates above protect both forms; this is a direct
         // response stream, not a broadcast that another signed-in client can
         // accidentally observe.
         if (acceptsEventStream(req)) {
-          return streamLocalMessage(res, channels, body);
+          return streamLocalMessage(res, channels, body, principal);
         }
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
         try {
-          const result = await channels.handleLocalMessage(body);
+          const result = await channels.handleLocalMessage(body, { principal });
           return sendJson(res, 200, result);
         } catch (error) {
           return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
@@ -2314,48 +2459,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/approve")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/approve".length));
-        let action = runtime.pendingActions?.get(id);
-        if (!action) return sendJson(res, 404, { error: "unknown pending action" });
-        if (action.status === "expired") {
-          return sendJson(res, 410, { error: "approval expired; request it again" });
-        }
-        if (action.status === "approved" && action.error == null
-            && action.toolName === "start_computer_use_session") {
-          const continuation = queueApprovalContinuation(action, { ok: true }, { resetFailed: true });
-          return sendJson(res, 200, {
-            ok: true,
-            alreadyApproved: true,
-            ...(continuation ? { continuation } : {})
-          });
-        }
-        if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
-        const claim = runtime.pendingActions?.claimForExecution?.(id, { claimedBy: "user" });
-        if (!claim) {
-          action = runtime.pendingActions?.get(id);
-          return sendJson(res, 409, { error: `action already ${action?.status ?? "claimed"}` });
-        }
-        action = claim.action;
-        // Re-invoke the original tool with the bypass flag so the gate
-        // doesn't re-queue the same call. Persist the result on the action.
-        const invokeResult = await runtime.tools.invoke(action.toolName, action.args, {
-          ...action.context,
-          __confirmed: true,
-          __confirmationActionId: action.id
-        });
-        const executionError = invokeResult?.ok ? null : invokeResult?.error ?? "approved tool execution failed";
-        recordApprovedActionOutcome(runtime, action, invokeResult);
-        runtime.pendingActions.decide(id, {
-          decision: "approve",
-          decidedBy: "user",
-          result: invokeResult.ok ? invokeResult.result : null,
-          error: executionError,
-          executionId: claim.executionId
-        });
-        const continuation = queueApprovalContinuation(action, invokeResult);
-        return sendJson(res, invokeResult.ok ? 200 : 400, {
-          ...invokeResult,
-          ...(continuation ? { continuation } : {})
-        });
+        const executed = await executeApprovedAction(runtime, id, { decidedBy: "user", continuation: queueApprovalContinuation });
+        return sendJson(res, executed.status, executed.body);
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/deny")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/deny".length));
@@ -3435,6 +3540,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      for (const unobserve of unobserveSharedThreads) unobserve();
       g2Requests?.close();
       clearInterval(g2RetentionTimer);
       g2Proactive.close();
@@ -3449,6 +3555,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         sseClients.clear();
         channels?.stop?.();
         runtime.codingSupervisor?.stop();
+        codingNode?.stop?.();
         runtime.fleetSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
@@ -3491,6 +3598,22 @@ function acceptsEventStream(req) {
     .some((part) => part.trim().toLowerCase().split(";")[0] === "text/event-stream");
 }
 
+// The shared device thread version of bindScopedNodeMessage. The session id
+// is main's fixed id for the thread, never the caller's sessionId or `from`,
+// so the same lease guarantee holds: no owner chat can be addressed and no
+// owner-approved computer-use lease is inherited.
+function bindSharedThreadMessage(body, requestNodeId, sourceName) {
+  const conversationNamespace = createHash("sha256").update(`thread:${body.thread}`, "utf8").digest("base64url");
+  return {
+    text: body.text,
+    channel: "node",
+    from: `node:${requestNodeId}:${conversationNamespace}`,
+    agentId: "main",
+    sessionId: sharedSessionId(body.thread),
+    metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread }
+  };
+}
+
 function bindScopedNodeMessage(body, requestNodeId) {
   const conversation = body.from ?? "cli";
   const nodeNamespace = createHash("sha256").update(requestNodeId, "utf8").digest("base64url");
@@ -3519,7 +3642,14 @@ function bindScopedNodeMessage(body, requestNodeId) {
 // assistant record remains authoritative and a disconnected client recovers it
 // from the named session. Provider adapters expose text only, never reasoning,
 // tool arguments or tool results.
-async function streamLocalMessage(res, channels, body) {
+// A "<namespace>:<id>" sender is a relay of someone else's words (the iMessage
+// bridge, Telegram, outreach, a node). Owner clients send plain names
+// ("user", "cli", "browser", "mobile-supervisor") or none.
+export function relayedSender(from) {
+  return typeof from === "string" && /^[a-z][a-z0-9_-]*:/i.test(from.trim());
+}
+
+async function streamLocalMessage(res, channels, body, principal = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -3581,7 +3711,7 @@ async function streamLocalMessage(res, channels, body) {
   };
 
   try {
-    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta });
+    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta, principal });
     sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
     write("final", result);
   } catch (error) {
@@ -3769,7 +3899,7 @@ function sendG2NodeJson(res, status, value) {
 }
 
 function sendG2NodeError(res, error) {
-  if (error instanceof G2ChannelError) {
+  if (error instanceof G2ChannelError || error instanceof SharedConversationError) {
     return sendG2NodeJson(res, error.status, { error: error.code, message: error.message });
   }
   if (error?.message === "request body too large") {
@@ -3935,27 +4065,11 @@ async function applyOutreachAction(runtime, item, action, note) {
         if (a.status !== "pending") {
           throw outreachActionConflict(`pending action already ${a.status}`);
         }
-        const claim = runtime.pendingActions?.claimForExecution?.(ref.id, { claimedBy: "user" });
-        if (!claim) {
-          const latest = runtime.pendingActions?.get(ref.id);
-          throw outreachActionConflict(`pending action already ${latest?.status ?? "claimed"}`);
-        }
-        a = claim.action;
-        const r = await runtime.tools.invoke(a.toolName, a.args, {
-          ...a.context,
-          __confirmed: true,
-          __confirmationActionId: a.id
-        });
-        const executionError = r?.ok ? null : r?.error ?? "approved tool execution failed";
-        recordApprovedActionOutcome(runtime, a, r);
-        runtime.pendingActions.decide(ref.id, {
-          decision: "approve",
-          decidedBy: "user",
-          result: r.ok ? r.result : null,
-          error: executionError,
-          executionId: claim.executionId
-        });
-        if (!r.ok) throw new Error(executionError);
+        const executed = await executeApprovedAction(runtime, ref.id, { decidedBy: "user" });
+        if (!executed.invokeResult) throw outreachActionConflict(`pending ${executed.body?.error ?? "action already claimed"}`);
+        a = executed.action;
+        const r = executed.invokeResult;
+        if (!r.ok) throw new Error(r.error ?? "approved tool execution failed");
         return { pendingAction: a, invokeResult: r };
       }
       throw new Error(`unsupported pending-action action: ${action}`);
@@ -3999,48 +4113,6 @@ function outreachActionConflict(message) {
   const error = new Error(message);
   error.code = "OUTREACH_ACTION_CONFLICT";
   return error;
-}
-
-// Approval is only intent. Record an outcome at the point the confirmed tool
-// actually returns, preserving the original autonomous/user provenance. This
-// keeps queued approvals out of the scorecard while making the eventual work
-// (including a real failure) measurable once—and only once—it executes.
-function recordApprovedActionOutcome(runtime, action, invokeResult) {
-  if (!runtime.outcomes?.record || !approvedInvocationWasAttempted(invokeResult)) return null;
-  const origin = String(action?.context?.origin ?? action?.context?.channel ?? "local").toLowerCase();
-  const kind = origin === "autopilot"
-    ? "autopilot-fire"
-    : origin === "cron"
-      ? "cron-fire"
-      : "tool-call";
-  try {
-    return runtime.outcomes.record({
-      kind,
-      refId: action.id,
-      sessionId: action.context?.sessionId ?? null,
-      agentId: action.context?.agentId ?? "main",
-      channel: action.context?.channel ?? null,
-      toolCalls: [{ name: action.toolName, ok: invokeResult?.ok === true }],
-      metadata: {
-        approvalActionId: action.id,
-        approvedExecution: true,
-        origin
-      }
-    });
-  } catch {
-    // Outcome accounting is an audit side effect. It must never undo a tool
-    // action the user explicitly approved.
-    return null;
-  }
-}
-
-function approvedInvocationWasAttempted(invokeResult) {
-  if (!invokeResult || typeof invokeResult !== "object") return false;
-  if (invokeResult.ok !== true) return true;
-  const result = invokeResult.result;
-  const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
-  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
-  return !(result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true);
 }
 
 async function applyOutreachFeedback(runtime, item, verdict, note = null) {

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { G2Proactive } from "../src/g2-proactive.js";
+import { OutreachStore } from "../src/outreach-store.js";
 import { NodeRegistry } from "../src/node-registry.js";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 
@@ -22,7 +23,7 @@ function fixture(t) {
   return { dir, store, runtime, call, consent, capture, tasks, outreach, advance: ms => { now += ms; }, now: () => now };
 }
 
-test("retention is opt-in, consent is scoped/expiring, passive text never invokes an agent", t => {
+test("retention is opt-in, consent is scoped and persists until revoked, passive text never invokes an agent", t => {
   const f = fixture(t);
   assert.equal(f.call({ op: "settings" }).settings.enabled, false);
   assert.throws(() => f.capture("missing"), /consent/);
@@ -32,8 +33,29 @@ test("retention is opt-in, consent is scoped/expiring, passive text never invoke
   assert.equal(f.call({ op: "transcripts" }).segments.length, 1);
   assert.equal(f.call({ op: "transcripts" }, "two").segments.length, 0);
   assert.throws(() => f.call({ op: "capture", consentId: id, texts: ["test"], batchId: crypto.randomUUID() }, "two"), /consent/);
-  f.advance(4 * 3600_000);
+  // No expiry: the same grant keeps working days later.
+  f.advance(3 * 86400_000); f.store.prune();
+  assert.equal(f.capture(id).saved, 1);
+  // Only an explicit consent-off revokes it.
+  f.call({ op: "consent", enabled: false, consentId: id });
   assert.throws(() => f.capture(id), /consent/);
+});
+
+test("new grants have no expiry, legacy expiring grants stay valid, and delete-memory revokes", t => {
+  const f = fixture(t), id = f.consent();
+  const grant = f.call({ op: "settings" }).consent;
+  assert.equal(grant.until, null); assert.equal(grant.grantedAt, f.now());
+  // A grant written by an older main carries a numeric until; it is accepted
+  // and never pruned, even long after that time.
+  const node = Object.values(f.store.nodes)[0];
+  node.consent = { id: "legacy-grant", until: f.now() + 1000 }; f.store.save();
+  f.advance(86400_000);
+  const reopened = new G2Proactive({ dir: f.dir, runtime: f.runtime, now: () => f.now() });
+  assert.equal(reopened.dispatch("one", { op: "settings" }).consent.id, "legacy-grant");
+  assert.equal(reopened.dispatch("one", { op: "capture", consentId: "legacy-grant", texts: ["Legacy words"], batchId: crypto.randomUUID() }).saved, 1);
+  assert.throws(() => reopened.dispatch("one", { op: "capture", consentId: id, texts: ["Stale id"], batchId: crypto.randomUUID() }), /consent/);
+  reopened.dispatch("one", { op: "delete-memory" });
+  assert.equal(reopened.dispatch("one", { op: "settings" }).consent, null);
 });
 
 test("settings verifies existing consent without renewing it or exposing another node's grant", t => {
@@ -42,7 +64,7 @@ test("settings verifies existing consent without renewing it or exposing another
   assert.equal(original.id, id);
   assert.equal(f.call({ op: "settings" }, "two").consent, null);
   f.advance(1000); assert.deepEqual(f.call({ op: "settings" }).consent, original);
-  f.advance(4 * 3600_000); assert.equal(f.call({ op: "settings" }).consent, null);
+  f.advance(4 * 3600_000); assert.deepEqual(f.call({ op: "settings" }).consent, original);
 });
 
 test("reminder proposals resolve tomorrow in main timezone and need confirmed time", t => {
@@ -246,4 +268,114 @@ test("due tasks outside the first page and email drafts retain their categories"
   assert.equal(f.store.node("one").notifications, undefined);
   f.call({ op: "seen", id: due.id }); f.call({ op: "notify", id: due.id });
   assert.equal(f.store.node("one").notifications, 1);
+});
+
+test("supervisor questions carry their choices and Supervisor mode keeps only them", (t) => {
+  const { call, outreach, tasks, now } = fixture(t);
+  const at = new Date(now()).toISOString();
+  outreach.push(
+    { id: "o-fleet", status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: "fq_1" }, title: "#7 ready. Merge?", summary: "CI green", needsDecision: true, actions: ["merged", "later", "dismiss"] },
+    { id: "o-mail", status: "unseen", createdAt: at, sourceRef: { kind: "email", id: "m1" }, title: "Invoice", summary: "", needsDecision: false, actions: [] }
+  );
+  tasks.push({ id: "t1", title: "Pay rent", status: "pending", dueDate: at });
+  call({ op: "configure", settings: { enabled: true } });
+  const all = call({ op: "feed" }).items;
+  const fleet = all.find(i => i.id === "o-fleet");
+  assert.deepEqual(fleet.options, ["merged", "later"]);
+  assert.equal(fleet.action, "answer-fleet");
+  assert.equal(fleet.supervisor, true);
+  assert.ok(all.some(i => i.id === "o-mail") && all.some(i => i.id.startsWith("due:")));
+  // Supervisor mode: only supervisor items, even with approvals deselected.
+  call({ op: "configure", settings: { supervisorOnly: true, categories: ["email"] } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
+  assert.throws(() => call({ op: "configure", settings: { supervisorOnly: "yes" } }), /Invalid settings/);
+  // Supervisor mode shows and pings its questions before general updates
+  // are turned on.
+  call({ op: "configure", settings: { enabled: false } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
+  assert.equal(call({ op: "can-notify", id: "o-fleet" }).notify, true);
+  call({ op: "configure", settings: { supervisorOnly: false } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
+});
+
+test("answering a supervisor question from the glasses uses its fixed choices", async (t) => {
+  const { store, runtime, call, outreach, now } = fixture(t);
+  outreach.push({ id: "o-fleet", status: "unseen", createdAt: new Date(now()).toISOString(), sourceRef: { kind: "fleet", id: "fq_1" }, title: "Which plan?", summary: "", needsDecision: true, actions: ["Starter", "Business", "dismiss"] });
+  const answered = [];
+  const resolved = [];
+  let open = true;
+  runtime.outreach.get = (id) => outreach.find(i => i.id === id);
+  runtime.outreach.resolve = (id, decision, opts) => resolved.push([id, decision.action, opts.status]);
+  runtime.fleetSupervisor = {
+    answerQuestion: async (id, answer) => { answered.push([id, answer]); return open ? { question: { status: "open" }, delivery: { detail: "owner using Conductor" } } : { question: { status: "answered" }, delivery: { detail: "typed into Conductor" } }; },
+    getState: () => ({ mode: "auto", lastTickAt: null, questions: [{}], snapshot: { threads: [
+      { key: "a", workspace: "apia", health: "red", state: "needs-human", reason: "asks", lastActivityAt: "2" },
+      { key: "b", title: "Fix", health: "green", state: "running", reason: "", lastActivityAt: "3" },
+      { key: "c", workspace: "cairo", health: "yellow", state: "pr-not-ready", reason: "CI red", lastActivityAt: "1" }
+    ] } })
+  };
+  call({ op: "configure", settings: { enabled: true } });
+  await assert.rejects(store.answerFleet("one", { id: "o-fleet", answer: "Enterprise" }), /choices/);
+  // Not delivered yet: the question stays open and on the glasses.
+  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: false, detail: "owner using Conductor" });
+  assert.ok(call({ op: "feed" }).items.some(i => i.id === "o-fleet"));
+  open = false;
+  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: true, detail: "typed into Conductor" });
+  assert.deepEqual(answered, [["fq_1", "Starter"], ["fq_1", "Starter"]]);
+  assert.deepEqual(resolved, [["o-fleet", "Starter", "acted"]]);
+  assert.equal(call({ op: "feed" }).items.some(i => i.id === "o-fleet"), false);
+  const status = store.fleetStatus();
+  assert.deepEqual(status.counts, { red: 1, yellow: 1, green: 1, gray: 0 });
+  assert.deepEqual(status.threads.map(r => r.name), ["apia", "cairo"]);
+  assert.equal(status.needsYou, 1);
+});
+
+test("dismissing a supervisor question on the glasses closes it on the fleet computer; snooze stays local", async (t) => {
+  const { runtime, call, outreach, now, advance } = fixture(t);
+  const at = new Date(now()).toISOString();
+  const question = (id, ref) => ({ id, status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: ref }, title: `Merge ${ref}?`, summary: "", needsDecision: true, actions: ["merged", "dismiss"] });
+  outreach.push(question("o-1", "fq_1"), question("o-2", "fq_2"), question("o-3", "fq_3"),
+    { id: "o-mail", status: "unseen", createdAt: at, sourceRef: { kind: "email", id: "m1" }, title: "Invoice", summary: "", needsDecision: true, actions: [] });
+  runtime.outreach.get = (id) => outreach.find(i => i.id === id);
+  const dismissed = [];
+  let offline = false;
+  runtime.fleetSupervisor = { dismissQuestion: async (id) => { dismissed.push(id); if (offline) throw new Error("Fleet computer unavailable"); return { id, status: "dismissed" }; } };
+  call({ op: "configure", settings: { enabled: true } });
+  call({ op: "snooze", id: "o-1" });
+  call({ op: "dismiss", id: "o-mail" });
+  assert.deepEqual(dismissed, []);
+  advance(3600_000);
+  call({ op: "dismiss", id: "o-1" });
+  assert.deepEqual(dismissed, ["fq_1"]);
+  // Computer offline: the glasses still drop it.
+  offline = true;
+  assert.equal(call({ op: "dismiss", id: "o-2" }).ok, true);
+  await new Promise(setImmediate);
+  assert.deepEqual(dismissed, ["fq_1", "fq_2"]);
+  // A local supervisor that throws cannot fail the glasses dismissal either.
+  runtime.fleetSupervisor = { dismissQuestion: () => { throw new Error("store busy"); } };
+  assert.equal(call({ op: "dismiss", id: "o-3" }).ok, true);
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
+});
+
+test("a long-lived supervisor question stays on the glasses past 200 newer resolved items and its first week", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g2-proactive-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const outreach = new OutreachStore({ dir: path.join(dir, "outreach") });
+  const store = new G2Proactive({ dir: path.join(dir, "g2"), runtime: { outreach } });
+  const call = (body) => store.dispatch("one", body);
+  const ask = (ref, title) => outreach.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: ref, nodeId: "mac" }, title, summary: "", needsDecision: true, actions: ["merged", "dismiss"] });
+  const live = ask("fq_live", "#7 ready. Merge?");
+  const orphan = ask("fq_gone", "#8 ready. Merge?");
+  // Both first asked 8 days ago.
+  live.createdAt = orphan.createdAt = new Date(Date.now() - 8 * 86400_000).toISOString();
+  for (let n = 0; n < 200; n += 1) {
+    const done = outreach.append({ type: "draft", title: `Draft ${n}`, needsDecision: true });
+    outreach.resolve(done.id, { action: "approve", by: "user" });
+  }
+  call({ op: "configure", settings: { supervisorOnly: true } });
+  // The supervisor still asks the live one: the mirror refreshes its copy.
+  outreach.update(live.id, { title: "#7 ready. Merge?" });
+  // The orphan, which nothing refreshes, still ages out.
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), [live.id]);
 });

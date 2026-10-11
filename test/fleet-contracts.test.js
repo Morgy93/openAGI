@@ -4,8 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  clampTail, clampText, isPidAlive, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  resolveFleetConfig, runCommand, toIso
+  ROUTES, UI_APPS, clampTail, clampText, isPidAlive, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
@@ -81,4 +81,92 @@ test("runCommand settles after a timeout even if SIGTERM is ignored or a descend
   const grandchild = Number(held.stdout.trim().split("\n")[0]);
   t.after(() => { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } });
   assert.ok(grandchild > 0);
+});
+
+test("OPENAGI_FLEET_DELIVERY picks cli, computer-use, or computer-use-first; anything else is cli", () => {
+  assert.ok(ROUTES.includes("computer-use"));
+  assert.equal(resolveFleetConfig({}, { home: "/h" }).delivery, "cli");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: "computer-use" }, { home: "/h" }).delivery, "computer-use");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: " Computer-Use-First " }, { home: "/h" }).delivery, "computer-use-first");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: "ui" }, { home: "/h" }).delivery, "cli");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: "computer-use" }, { home: "/h", delivery: "cli" }).delivery, "cli");
+  assert.equal(parseDeliveryMode(undefined), "cli");
+  const limits = resolveFleetConfig({}, { home: "/h" }).limits;
+  assert.equal(limits.uiOwnerIdleMs, 120_000);
+  assert.equal(limits.uiStepTimeoutMs, 10_000);
+  assert.equal(limits.uiDeliveryTimeoutMs, 205_000);
+  assert.equal(limits.uiCleanupMs, 90_000);
+  assert.equal(limits.uiLockWaitMs, 0, "busy at once: no room to wait inside the broker ceiling");
+  assert.equal(limits.uiNavigateSlowMs, 60_000);
+  assert.equal(limits.uiReadTimeoutMs, 45_000);
+  assert.equal(limits.uiActivateMs, 3_000);
+});
+
+test("resolveOcuPath: explicit path, else open-computer-use on PATH, preferring the bundled native engine", () => {
+  const launcher = "/nvm/lib/node_modules/open-computer-use/bin/open-computer-use";
+  const native = "/nvm/lib/node_modules/open-computer-use/dist/Open Computer Use.app/Contents/MacOS/OpenComputerUse";
+  const files = new Set(["/nvm/bin/open-computer-use", launcher, native, "/opt/ocu/custom"]);
+  const exists = (file) => files.has(file);
+  const realpath = (file) => (file === "/nvm/bin/open-computer-use" ? launcher : file);
+  const options = { exists, realpath, execPath: "/nowhere/node", home: "/nohome", readdir: () => [] };
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin:/nvm/bin" }, options), native);
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin", OPENAGI_FLEET_OCU_PATH: "/opt/ocu/custom" }, options), "/opt/ocu/custom");
+  // An explicit path that does not exist is kept, so readiness names it as missing.
+  assert.equal(resolveOcuPath({ OPENAGI_FLEET_OCU_PATH: "/missing/ocu" }, options), "/missing/ocu");
+  // A launchd PATH without nvm still finds the engine next to the daemon's node.
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, { ...options, execPath: "/nvm/bin/node" }), native);
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, options), null);
+  // Started by the app with its own node and a bare PATH (after a reboot):
+  // the newest nvm node's install is found.
+  const nvmFiles = new Set(["/h/.nvm/versions/node/v22.21.1/bin/open-computer-use", "/h/.nvm/versions/node/v9.0.0/bin/open-computer-use"]);
+  const viaNvm = { exists: (file) => nvmFiles.has(file), realpath: (file) => file, execPath: "/Applications/OpenAGI.app/node/bin/node", home: "/h", readdir: () => ["v9.0.0", "v22.21.1", ".cache"] };
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin:/bin" }, viaNvm), "/h/.nvm/versions/node/v22.21.1/bin/open-computer-use");
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin:/bin" }, { ...viaNvm, readdir: () => { throw new Error("ENOENT"); } }), null);
+  // The configured home is the one searched, not the process user's.
+  const configHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ocu-home-")));
+  const installed = path.join(configHome, ".nvm", "versions", "node", "v22.0.0", "bin", "open-computer-use");
+  fs.mkdirSync(path.dirname(installed), { recursive: true });
+  fs.writeFileSync(installed, "");
+  try {
+    assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, { home: configHome, execPath: "/nowhere/node" }), installed);
+  } finally {
+    fs.rmSync(configHome, { recursive: true, force: true });
+  }
+  // pnpm's generated launcher is never picked.
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, { ...viaNvm, readdir: () => [], exists: (file) => file === "/h/Library/pnpm/open-computer-use" }), null);
+  // Without the bundled app, the resolved launcher itself.
+  files.delete(native);
+  assert.equal(resolveOcuPath({ PATH: "/nvm/bin" }, options), launcher);
+});
+
+test("uiTargetFor maps threads to the app that shows them, or none", () => {
+  const conductor = {
+    key: "conductor:s1", kind: "conductor", id: "s1", workspace: "madrid", title: "Fix billing",
+    meta: { conductorWorkspaceId: "w 1", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 3 }
+  };
+  const target = uiTargetFor(conductor);
+  assert.equal(target.bundleId, UI_APPS.conductor.bundleId);
+  assert.equal(target.deepLink, "conductor://workspace?id=w%201&session=s1");
+  assert.equal(target.sessionCount, 3);
+  assert.equal(uiTargetFor({ ...conductor, meta: {} }), null, "no workspace id: no deep link, no route");
+  assert.equal(uiTargetFor({ ...conductor, archived: true }), null);
+  const codex = uiTargetFor({ key: "codex:t1", kind: "codex", id: "t1", title: "Fix uploads", meta: { originator: "Codex Desktop" } });
+  assert.equal(codex.bundleId, "com.openai.codex");
+  assert.equal(codex.deepLink, "codex://threads/t1");
+  assert.equal(uiTargetFor({ key: "codex:t2", kind: "codex", id: "t2", meta: { originator: "codex_sdk_ts" } }), null);
+  assert.equal(uiTargetFor({ key: "claude:c1", kind: "claude", id: "c1", meta: { entrypoint: "cli" } }), null, "terminal Claude: no app");
+  assert.equal(uiTargetFor(null), null);
+});
+
+test("background routes are off unless listed, and never include claude-resume; the idle watcher is on unless turned off", () => {
+  assert.deepEqual(parseBackgroundRoutes("codex-exec, peer-relay claude-resume bogus codex-exec"), ["codex-exec", "peer-relay"]);
+  assert.deepEqual(parseBackgroundRoutes(""), []);
+  assert.deepEqual(parseBackgroundRoutes("off"), []);
+  const plain = resolveFleetConfig({}, { home: "/home/fixture" });
+  assert.deepEqual(plain.backgroundRoutes, []);
+  assert.deepEqual(plain.idleDrain, { enabled: true, pollMs: 15_000 });
+  const set = resolveFleetConfig({ OPENAGI_FLEET_BACKGROUND_ROUTES: "codex-exec", OPENAGI_FLEET_IDLE_DRAIN: "0", OPENAGI_FLEET_IDLE_POLL_MS: "5000" }, { home: "/home/fixture" });
+  assert.deepEqual(set.backgroundRoutes, ["codex-exec"]);
+  assert.deepEqual(set.idleDrain, { enabled: false, pollMs: 5000 });
+  assert.deepEqual(resolveFleetConfig({}, { home: "/home/fixture", backgroundRoutes: ["claude-resume", "peer-relay"] }).backgroundRoutes, ["peer-relay"]);
 });

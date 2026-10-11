@@ -3,10 +3,16 @@
 // { status, body }, or null for paths it does not own.
 
 import { MODES } from "./contracts.js";
+import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const ANSWER_MAX = 200;
+const SEND_MAX = 2000;
+const LABEL_MAX = 80;
+const THREAD_KEY = /^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/;
+const APPS = new Set(["conductor", "codex"]);
+const APP_ACTIONS = new Set(["open", "quit", "restart"]);
 
 const ok = (body) => ({ status: 200, body });
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
@@ -27,9 +33,16 @@ async function readObject(readBody) {
 export function createFleetRoute({ supervisor } = {}) {
   const state = () => supervisor.getState();
 
-  async function handleQuestion(id, readBody) {
+  async function handleQuestion(id, readBody, sendOptions) {
     const body = await readObject(readBody);
-    if (!body) return fail(400, "Send a JSON object: { answer } or { dismiss: true }.");
+    if (!body) return fail(400, "Send a JSON object: { answer }, { dismiss: true } or { reopen: true }.");
+    // Brings back a question the supervisor's review closed.
+    if (body.reopen === true) {
+      if (typeof supervisor.reopenReviewed !== "function") return fail(503, "Reopening is not available.");
+      const question = await supervisor.reopenReviewed(id);
+      if (!question) return fail(409, "Only a question the review closed can be reopened.");
+      return ok({ question, state: state() });
+    }
     const open = (state().questions ?? []).find((q) => q?.id === id);
     if (body.dismiss === true) {
       if (!open) return fail(404, "No open question with that id.");
@@ -42,19 +55,22 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!open) return fail(404, "No open question with that id.");
     const options = Array.isArray(open.options) ? open.options : [];
     if (answer !== "dismiss" && !options.includes(answer)) return fail(400, "Pick one of the question's options.");
-    const result = await supervisor.answerQuestion(id, answer);
+    const result = await supervisor.answerQuestion(id, answer, sendOptions);
     if (!result) return fail(409, "Question already closed.");
     return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
   }
 
-  async function handleSend(id) {
-    const result = await supervisor.sendProposed(id);
+  async function handleSend(id, sendOptions) {
+    const result = await supervisor.sendProposed(id, sendOptions);
     if (result) return ok({ action: result.action ?? null, delivery: result.delivery ?? null, state: state() });
     const known = (state().actions ?? []).some((a) => a?.id === id);
     return known ? fail(409, "Only a proposed action can be sent.") : fail(404, "No action with that id.");
   }
 
-  return async function fleetRoute(method, pathname, url, readBody) {
+  // deadlineAt: when a remote caller stops waiting (ms, this clock); app
+  // sends end before it. remote: the request came through the node broker.
+  return async function fleetRoute(method, pathname, url, readBody, { deadlineAt = null, remote = false } = {}) {
+    const sendOptions = { deadlineAt };
     if (!pathname.startsWith(PREFIX)) return null;
     if (!supervisor) return fail(503, "Fleet supervisor is not available.");
     const parts = pathname.slice(PREFIX.length).split("/");
@@ -67,7 +83,19 @@ export function createFleetRoute({ supervisor } = {}) {
       if (parts.length === 1 && parts[0] === "scan") {
         if (method !== "POST") return fail(405, "Use POST.");
         try {
-          await supervisor.tick({ reason: "manual" });
+          // The owner's Scan now: rechecks every open question too. One
+          // through the broker types nothing: the broker would stop waiting
+          // mid-send, and a retried scan would nudge again.
+          const scan = supervisor.tick({ reason: "owner-scan", ...(remote ? { deferUi: true } : {}) });
+          // It can ride a follow-up a local scan shares, which may type: a
+          // broker caller gets its answer before its deadline, the scan still
+          // running if it must.
+          if (remote && Number.isFinite(deadlineAt)) {
+            let timer;
+            const cutoff = new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, deadlineAt - DEADLINE_MARGIN_MS - Date.now()), false); });
+            const done = await Promise.race([Promise.resolve(scan).then(() => true), cutoff]).finally(() => clearTimeout(timer));
+            if (!done) Promise.resolve(scan).catch(() => {});
+          } else await scan;
         } catch {
           return fail(500, "Scan failed.", { state: state() });
         }
@@ -85,12 +113,69 @@ export function createFleetRoute({ supervisor } = {}) {
       if (parts.length === 2 && parts[0] === "questions") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad question id.");
-        return await handleQuestion(parts[1], readBody);
+        return await handleQuestion(parts[1], readBody, sendOptions);
+      }
+      if (parts.length === 1 && parts[0] === "send") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
+        const message = typeof body?.message === "string" ? body.message.trim() : "";
+        if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
+        if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
+        const result = await supervisor.sendOwnerMessage(threadKey, message, sendOptions);
+        return ok({ delivery: result?.delivery ?? null, state: state() });
+      }
+      // One thread's screen: its permission card, whether a turn runs, the
+      // transcript's tail. No input.
+      if (parts.length === 1 && parts[0] === "screen") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
+        if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (typeof supervisor.screenThread !== "function") return fail(503, "Screen reads are not available.");
+        const screen = await supervisor.screenThread(threadKey, sendOptions);
+        return ok({ ...screen, state: state() });
+      }
+      // One button of a thread's permission card (or its Resume button), by
+      // exact label; stateId pins the card the caller read.
+      if (parts.length === 1 && parts[0] === "click") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
+        const label = typeof body?.label === "string" ? body.label.trim() : "";
+        const stateId = body?.stateId === undefined || body?.stateId === null ? null : String(body.stateId);
+        if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (!label || label.length > LABEL_MAX) return fail(400, `Label must be 1-${LABEL_MAX} characters.`);
+        if (stateId !== null && !/^[0-9a-f]{16}$/.test(stateId)) return fail(400, "Bad stateId.");
+        if (typeof supervisor.clickThread !== "function") return fail(503, "Clicking is not available.");
+        const result = await supervisor.clickThread(threadKey, label, { ...sendOptions, stateId });
+        return ok({ delivery: result?.delivery ?? null, prompt: result?.prompt ?? null, state: state() });
+      }
+      // The chats a quit or restart would stop right now, read live.
+      if (parts.length === 3 && parts[0] === "apps" && parts[2] === "running") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (!APPS.has(parts[1])) return fail(404, "Unknown fleet route.");
+        if (typeof supervisor.runningInApp !== "function") return fail(503, "App control is not available.");
+        const running = await supervisor.runningInApp(parts[1]);
+        if (!running) return fail(503, "Could not read which chats are running.");
+        return ok({ running, state: state() });
+      }
+      // Open, quit or restart Conductor or the Codex app. expectRunning: the
+      // chats the caller approved stopping.
+      if (parts.length === 3 && parts[0] === "apps") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (!APPS.has(parts[1]) || !APP_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
+        const body = (await readObject(readBody)) ?? {};
+        const expectRunning = Array.isArray(body.expectRunning) ? body.expectRunning.filter((key) => typeof key === "string" && THREAD_KEY.test(key)).slice(0, 50) : [];
+        if (typeof supervisor.appAction !== "function") return fail(503, "App control is not available.");
+        const result = await supervisor.appAction(parts[1], parts[2], { ...sendOptions, expectRunning });
+        return ok({ result, state: state() });
       }
       if (parts.length === 3 && parts[0] === "actions" && parts[2] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad action id.");
-        return await handleSend(parts[1]);
+        return await handleSend(parts[1], sendOptions);
       }
     } catch {
       // Supervisor internals can carry paths or transcript text; keep them out.

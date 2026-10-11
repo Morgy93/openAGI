@@ -8,15 +8,33 @@ export function createFleetCapability(supervisor) {
     async health() {
       return { capability: { id: 'fleet-supervisor', ready: true, operations: ['request'], detail: 'Fleet on this computer' } };
     },
-    async invoke(operation, payload) {
+    // expiresAt: the broker's deadline for this command (from its dispatch,
+    // so time queued before this Mac picked it up counts): app sends end
+    // inside it.
+    async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
-      const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {});
+      const deadlineAt = Date.parse(expiresAt ?? '');
+      const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
+        { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
     }
   };
 }
+
+const REQUEST_TIMEOUT_MS = 120000;
+// A request that types into an app waits for the whole UI delivery (a Codex
+// one runs 1-3 min): uiDeliveryTimeoutMs, then uiCleanupMs for clearing on
+// failure and putting the owner's app back, which the driver never runs
+// past. Both count from the request's start (probes, lock wait and earlier
+// sends in it included), and end inside the command's expiresAt (time queued
+// before the Mac picked it up included). The broker's own ceiling (dispatch
+// in src/node-control.js), so the main does not report a failure for an
+// answer the Mac then sends.
+const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
+// A click waits for the card to go; an app quit or restart for the app.
+const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000 }) {
@@ -27,6 +45,8 @@ export class RemoteFleetSupervisor {
     this.refreshing = null;
     this.timer = null;
     this.pendingOutreachDecisions = new Map();
+    // Glasses dismissals the computer was offline for, sent on the next refresh.
+    this.pendingDismissals = new Set();
   }
   getState() { return structuredClone(this.state); }
   beginOutreachDecision(id) {
@@ -38,11 +58,11 @@ export class RemoteFleetSupervisor {
     else this.pendingOutreachDecisions.set(id, count - 1);
   }
   async request(method, path, body) {
+    let reached = false;
     try {
-      // Peer relays may take 180 seconds on the coding Mac. Leave time for
-      // its result to return before telling the owner that delivery failed.
-      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: 200000 });
+      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
+      reached = true;
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
       this.mirrorQuestions();
       if (result.response?.status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
@@ -50,18 +70,58 @@ export class RemoteFleetSupervisor {
     } catch (error) {
       this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw new Error(this.state.lastError);
+      throw Object.assign(new Error(this.state.lastError), { reached });
     }
   }
   refresh() {
-    if (!this.refreshing) this.refreshing = this.request('GET', '/fleet/api/state').finally(() => { this.refreshing = null; });
+    if (!this.refreshing) {
+      this.refreshing = this.request('GET', '/fleet/api/state')
+        .then(async (body) => { await this.replayDismissals(); return body; })
+        .finally(() => { this.refreshing = null; });
+    }
     return this.refreshing;
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
   async answerQuestion(id, answer) { return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
-  async dismissQuestion(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true })).question; }
+  // replay: a dismissal that could not reach the computer is kept and sent
+  // again once it is back (the glasses already dropped the question).
+  async dismissQuestion(id, { replay = false } = {}) {
+    try {
+      const body = await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true });
+      this.pendingDismissals.delete(id);
+      return body.question;
+    } catch (error) {
+      if (replay && !error.reached) this.pendingDismissals.add(id);
+      else this.pendingDismissals.delete(id);
+      throw error;
+    }
+  }
+  async replayDismissals() {
+    for (const id of [...this.pendingDismissals]) {
+      // Closed on the computer meanwhile: nothing left to dismiss.
+      if (!this.state.questions.some(q => q.id === id)) { this.pendingDismissals.delete(id); continue; }
+      try { await this.dismissQuestion(id, { replay: true }); } catch { /* kept if still unreachable */ }
+    }
+  }
+  // Brings back a question the computer's review closed.
+  async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
+  async sendOwnerMessage(threadKey, message) { return this.request('POST', '/fleet/api/send', { threadKey, message }); }
+  async screenThread(threadKey) {
+    const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });
+    return screen;
+  }
+  async clickThread(threadKey, label, { stateId = null } = {}) {
+    const body = await this.request('POST', '/fleet/api/click', { threadKey, label, ...(stateId ? { stateId } : {}) });
+    return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
+  }
+  async runningInApp(app) {
+    return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;
+  }
+  async appAction(app, action, { expectRunning = [] } = {}) {
+    return (await this.request('POST', `/fleet/api/apps/${app}/${action}`, { expectRunning })).result;
+  }
   start() {
     if (this.timer) return;
     this.refresh().catch(() => {});
@@ -80,10 +140,17 @@ export class RemoteFleetSupervisor {
         outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
       }
     }
+    const items = outreach.list();
     for (const q of this.state.questions) {
-      outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: q.id, nodeId: this.nodeId },
-        title: q.title, summary: q.body, needsDecision: true,
-        actions: [...(q.options ?? []), "dismiss"], dedupeOpen: true });
+      const shown = { title: q.title, summary: q.body, actions: [...(q.options ?? []), "dismiss"] };
+      // A question the computer closed on a blip and reopened keeps its id:
+      // its old copy comes back, so the glasses do not ping for it again.
+      const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;
+      const item = (last && outreach.reopen?.(last.id))
+        || outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: q.id, nodeId: this.nodeId },
+          ...shown, needsDecision: true, dedupeOpen: true });
+      // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
+      if (item?.id) outreach.update?.(item.id, shown);
     }
   }
 }

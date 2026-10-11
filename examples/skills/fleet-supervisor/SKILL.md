@@ -46,7 +46,7 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 | codex-lb | escalate to manager; `infra-recovered` when LB healthy | manager offline, or LB down 1 h+ |
 | logged out / disk full | nothing | at once, one line |
 | waiting-ci | watch; when CI ends on the head, `ci-finished` | never |
-| waiting-ci too long | bb-quick over 15 min or needed full verify over 30 min: escalate to manager. Unneeded full verify: `bb3-slow-agent` | manager offline |
+| waiting-ci too long | bb-quick over 15 min or needed full verify over 30 min: escalate to manager. Unneeded full verify: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
 | local-verify | `no-local-verify` | never |
 | asked-in-scope | `in-scope-yes` | never |
 | needs-human | nothing | one caveman question with buttons |
@@ -72,6 +72,9 @@ Readiness blockers: `CI red: <names>`, `CI running`, `no CI on head`, `unpushed 
 | Claude or Conductor, live | `peer-relay`: `claude -p` SendMessage relay to its peer name; success = DONE | peer pid alive |
 | Claude CLI, not live | `claude-resume`: `claude -p --resume <id> --permission-mode bypassPermissions <msg>` | `auto` mode only; never Conductor |
 | Conductor not live, Codex writer-locked | none | ask owner "open it" only if stuck 90 min+ |
+| Conductor tab or Codex app thread, `OPENAGI_FLEET_DELIVERY=computer-use` or `computer-use-first` | `computer-use`: open the thread in Conductor / the Codex app, type one line into the empty composer, press Send, confirm it shows | Open Computer Use permissions, screen unlocked, owner not using that app, thread verified by name, no running turn, no draft |
+
+With `OPENAGI_FLEET_DELIVERY=computer-use` no CLI route is ever used; threads no app shows (terminal `claude`) get the "open it" question.
 
 Every message starts with `[OpenAGI supervisor]`. Every send is journaled.
 
@@ -85,7 +88,7 @@ When BuildBot3 or codex-lb comes back, every thread blocked on it gets `infra-re
 
 ## Playbooks
 
-Wording lives in `playbooks/<id>.md`: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`, `bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`.
+Wording lives in `playbooks/<id>.md`: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`, `bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `status-check`.
 Frontmatter: `id`, `cooldown_min`, `max_attempts`, `ask` (owner question after max attempts; empty = never ping).
 Placeholders: `{pr}`, `{head}`, `{blockers}`, `{blocker}`, `{ci}`, `{reset}`, `{thread}`, `{repo}`, `{label}`, `{attempts}`, `{what}`, `{problems}`.
 Override: copy a file to `<dataDir>/skills/fleet-supervisor/playbooks/<id>.md`.

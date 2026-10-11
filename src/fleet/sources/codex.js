@@ -5,15 +5,25 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  runCommand, threadKey, toIso
+  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
+import { asksOwner } from "../classify.js";
 import { classifyCodexErrorCode } from "../errors.js";
+import { identityToken } from "../ui-delivery.js";
 
 const HOUR = 3_600_000;
 const TAIL_BYTES = 1024 * 1024;
 const AUTOMATION_SOURCES = new Set(["guardian_review", "subagent", "automation"]);
 const HEARTBEAT_PATTERN = /<heartbeat>|<automation_id>/;
+// Scheduled sweeps (usage-reset checks, chat watchdogs) run as codex exec;
+// their status tables quote other chats' asks.
+const EXEC_SOURCE = "exec";
+const CHAT_CHECKER_PATTERN = /\bchecking the user['’]s existing agent chats\b/i;
+// request_user_input titles are sometimes an encrypted blob ("gAAAAAB...").
+const FERNET_PATTERN = /^gAAAAA[A-Za-z0-9_=-]{20,}$/;
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]{80,}={0,2}$/;
+const SEALED_QUESTION = "Codex asked in the app";
 const PR_URL_PATTERN = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 const WRAPPER_TAGS = [
   "environment_context", "in-app-browser-context", "user_instructions", "user_shell_command", "turn_aborted", "subagent_notification"
@@ -22,7 +32,7 @@ const WRAPPER_TAGS = [
 const METADATA_EVENTS = new Set(["thread_settings_applied"]);
 const THREAD_COLUMNS = [
   "id", "rollout_path", "updated_at", "updated_at_ms", "source", "model_provider", "cwd", "title", "name",
-  "archived", "git_branch", "git_origin_url", "model", "thread_source"
+  "archived", "git_branch", "git_origin_url", "model", "thread_source", "originator"
 ];
 
 const LB_TARGET = "codex_core::responses_retry";
@@ -81,7 +91,24 @@ function contentText(content, types) {
 }
 
 function setAgent(summary, text, at) {
-  if (typeof text === "string" && text.trim()) summary.lastAgent = { text, at };
+  if (typeof text !== "string" || !text.trim()) return;
+  summary.lastAgent = { text, at };
+  settleSealedAsk(summary);
+}
+
+// A sealed ask the agent talked past, or ended its turn on, was not waiting
+// on the owner (#6896: "No additional user input is needed", then done),
+// unless the words standing in for it ask something themselves.
+function settleSealedAsk(summary) {
+  if (summary.pendingQuestion?.sealed && !asksOwner(summary.pendingQuestion.text)) summary.pendingQuestion = null;
+}
+
+// Long slash paths fit the base64 alphabet too; a real blob is very long,
+// or carries + or = and no path slash.
+function isCiphertext(value) {
+  if (FERNET_PATTERN.test(value)) return true;
+  if (!BASE64_PATTERN.test(value)) return false;
+  return value.length >= 200 || (/[+=]/.test(value) && !value.includes("/"));
 }
 
 function readUserInput(summary, raw, at) {
@@ -103,16 +130,22 @@ function readUserInput(summary, raw, at) {
   if (cleaned) summary.lastUser = { text: cleaned, at };
 }
 
-function questionTitle(args) {
+// fallback: the agent's last words, shown when the title is ciphertext.
+// keyText: the raw title, when the text shown is not it. The question is
+// keyed on it, so an owner's dismissal outlives a change in the stand-in.
+function questionTitle(args, fallback) {
   try {
     const parsed = typeof args === "string" ? JSON.parse(args) : args;
     const first = parsed?.questions?.[0];
-    const text = String(first?.title ?? first?.question ?? "").trim();
-    if (!text) return null;
+    const texts = [first?.title, first?.question].map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (!texts.length) return null;
+    const text = texts.find((value) => !isCiphertext(value));
     const options = (first.options ?? []).map((option) => typeof option === "string" ? option : option?.label).filter(Boolean);
     // Multiple prompts and free text need the original thread's input surface.
     const supported = parsed.questions.length === 1 && options.length > 0 && options.length <= 4 && options.every((option) => option.length <= 40);
-    return { text, options: supported ? options : ["open thread"] };
+    const raw = text === texts[0] ? {} : { keyText: texts[0] };
+    if (!text) return { text: fallback?.trim() || SEALED_QUESTION, options: supported ? options : ["open thread"], sealed: true, ...raw };
+    return { text, options: supported ? options : ["open thread"], ...raw };
   } catch {
     return null;
   }
@@ -134,6 +167,7 @@ function readEvent(summary, payload, at) {
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
       setAgent(summary, payload.last_agent_message, at);
+      settleSealedAsk(summary);
       break;
     case "turn_aborted":
     case "error":
@@ -160,8 +194,11 @@ function readResponseItem(summary, payload, at) {
     setAgent(summary, contentText(payload.content, ["output_text"]), at);
   } else if (payload.type === "function_call") {
     const name = String(payload.name ?? "");
-    if (name === "request_user_input_async") summary.pendingQuestion = questionTitle(payload.arguments) ?? summary.pendingQuestion;
-    else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
+    if (name === "request_user_input_async") {
+      // The ask time lets a PR merged after it close the question.
+      const asked = questionTitle(payload.arguments, summary.lastAgent?.text);
+      if (asked) summary.pendingQuestion = { ...asked, at };
+    } else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
   }
@@ -204,7 +241,9 @@ function sourceIsSubagent(source) {
 function metadataExclusion(row, config) {
   if (Number(row.archived) === 1) return "archived";
   if (AUTOMATION_SOURCES.has(row.thread_source) || sourceIsSubagent(row.source)) return "automation";
-  if (HEARTBEAT_PATTERN.test(String(row.first_user_head ?? ""))) return "automation";
+  if (String(row.source ?? "").trim() === EXEC_SOURCE) return "automation";
+  const head = String(row.first_user_head ?? "");
+  if (HEARTBEAT_PATTERN.test(head) || CHAT_CHECKER_PATTERN.test(head)) return "automation";
   if ((config.selfSessionIds ?? []).includes(String(row.id))) return "self";
   return null;
 }
@@ -243,8 +282,12 @@ function statusFor(summary, mtimeMs, now, limits) {
   if (type === "turn_aborted") return "aborted";
   if (type === "error") return "error";
   if (summary.events === 0 || mtimeMs === null) return "unknown";
-  // No finished turn after the last start: in progress, or killed mid-turn.
-  return now - mtimeMs <= limits.runningWindowMs ? "running" : "stalled";
+  // No finished turn after the last start: in progress, or killed mid-turn
+  // (an app-server restart ends open turns without writing anything). Timed
+  // from the last turn row: opening a dead thread writes settings rows that
+  // bump the file, which must not make it look alive again.
+  const turnMs = Date.parse(summary.lastTurnAt ?? "");
+  return now - (Number.isFinite(turnMs) ? turnMs : mtimeMs) <= limits.runningWindowMs ? "running" : "stalled";
 }
 
 function applyRollout(thread, row, context) {
@@ -265,6 +308,7 @@ function applyRollout(thread, row, context) {
   thread.error = errorFor(summary.lifecycle, now, limits);
   if (summary.lastAgent) {
     thread.lastAgentText = clampTail(redactSecrets(summary.lastAgent.text), limits.excerptMax);
+    thread.lastAgentTail = clampTail(redactSecrets(summary.lastAgent.text), limits.reviewTailMax);
     thread.lastAgentAt = summary.lastAgent.at;
   }
   if (summary.lastUser) {
@@ -277,9 +321,14 @@ function applyRollout(thread, row, context) {
   thread.meta.abortedAt = aborted ? summary.lifecycle.at : null;
   thread.meta.lastSupervisorAt = summary.lastSupervisorAt;
   const pending = summary.pendingQuestion;
+  // A stand-in from the agent's message ends on the ask, so keep its tail.
+  const clampAsk = pending?.sealed ? clampTail : clampText;
   thread.meta.pendingQuestion = pending
-    ? { text: clampText(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)) }
+    ? { text: clampAsk(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pending.at ?? null }
     : null;
+  // The key the raw title gave the ask before it had a stand-in (a hash of
+  // the same clamped text), so a dismissal made then still matches.
+  if (pending?.keyText) thread.meta.pendingQuestion.key = shortHash(clampText(redactSecrets(pending.keyText), limits.bodyMax));
   // A Codex heartbeat automation already drives this thread; nudging it too
   // would double up.
   if (summary.lastInputHeartbeat) {
@@ -289,19 +338,77 @@ function applyRollout(thread, row, context) {
   return summary.prRefs;
 }
 
-// An attachment whose head is the thread's branch comes first, then other
-// attachments (unknown head before a different head), then links the owner
-// typed. Newest first within a tier; same-second ties go to the higher PR.
+// The newest attachment is the thread's PR: a long thread moves on from the
+// PR its catalog branch names (#5442 merged, the ask was about #6453). Links
+// the owner typed come after every attachment. Same-second ties: own branch,
+// then unknown head, then a different head, then the higher PR.
 function refTier(entry, branch) {
-  if (entry.source !== "attachment") return 3;
   if (!entry.headBranch || !branch) return 1;
   return entry.headBranch === branch ? 0 : 2;
 }
 
 function orderPrRefs(entries, branch) {
-  const ranked = entries.map((entry) => ({ ...entry, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0 }));
-  ranked.sort((a, b) => a.tier - b.tier || b.at - a.at || b.number - a.number || a.ref.localeCompare(b.ref));
+  const ranked = entries.map((entry) => ({
+    ...entry, owner: entry.source === "attachment" ? 0 : 1, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0
+  }));
+  ranked.sort((a, b) => a.owner - b.owner || b.at - a.at || a.tier - b.tier || b.number - a.number || a.ref.localeCompare(b.ref));
   return [...new Set(ranked.map((entry) => entry.ref))];
+}
+
+// A first message as the app shows it: the request after the files list,
+// without context blocks (in-app browser, environment), markdown as text.
+function shownFirstMessage(title) {
+  // The same wrapper cleanup as the transcript reader (every known block,
+  // the last request header), then any other paired or stray tag.
+  return cleanCodexUserText(title)
+    .replace(/<([\w-]{1,60})(?:\s[^>]{0,200})?>[\s\S]*?<\/\1>/g, " ")
+    .replace(/<[^>]{0,200}>/g, " ")
+    .replace(/!?\[([^\]]{0,200})\]\([^)\s]{0,500}\)/g, "$1")
+    .replace(/\*\*|__|`/g, "")
+    .replace(/^#{1,6}\s+/gm, "");
+}
+
+function displayTitle(row, limits) {
+  return clampText(redactSecrets(row.name || row.title || `Codex ${String(row.id).slice(0, 8)}`), limits.titleMax);
+}
+
+// The Codex app labels some named threads (page and sidebar) by their first
+// message instead of the name. Null when there is no name or they match, or
+// when the rollout is a continuation segment: the app then shows that
+// segment's first request, which the catalog does not hold.
+function firstMessageTitle(row, limits) {
+  if (!row.name || !row.title) return null;
+  if (/_[0-9a-f]{8}-[0-9a-f-]{27}\.jsonl$/i.test(String(row.rollout_path ?? ""))) return null;
+  const text = clampText(redactSecrets(shownFirstMessage(row.title)), limits.titleMax);
+  const token = identityToken(text);
+  return token && token !== identityToken(displayTitle(row, limits)) ? text : null;
+}
+
+// Title tokens shared by two or more unarchived threads the Codex app shows,
+// across the whole catalog: a same-titled thread outside the lookback or the
+// cap can still be the one open on screen. labels: every name and first
+// message token, with the ids of the threads the app may label with it.
+function readSharedTitles(db, limits) {
+  const present = new Set(db.prepare("PRAGMA table_info(threads)").all().map((column) => column.name));
+  if (!present.has("id")) return { names: new Set(), labels: new Map() };
+  const pick = (name) => (present.has(name) ? name : `NULL AS ${name}`);
+  const where = present.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
+  const counts = new Map();
+  const labels = new Map();
+  const head = present.has("first_user_message") ? "substr(first_user_message, 1, 400) AS first_user_head" : "NULL AS first_user_head";
+  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("rollout_path")}, ${pick("originator")}, ${pick("source")}, ${pick("thread_source")}, ${head} FROM threads${where}`).all()) {
+    if (row.originator === CONDUCTOR_CODEX_ORIGINATOR) continue;
+    // Automation runs, reviews, heartbeats and subagents never show in the
+    // sidebar, so they cannot be mistaken for the thread on screen. The
+    // supervisor's own thread does show.
+    if (metadataExclusion(row, {}) === "automation") continue;
+    const token = identityToken(displayTitle(row, limits));
+    if (token) counts.set(token, (counts.get(token) ?? 0) + 1);
+    for (const label of [token, identityToken(firstMessageTitle(row, limits))]) {
+      if (label) labels.set(label, (labels.get(label) ?? new Set()).add(String(row.id)));
+    }
+  }
+  return { names: new Set([...counts].filter(([, count]) => count > 1).map(([token]) => token)), labels };
 }
 
 function buildThread(row, context) {
@@ -313,7 +420,7 @@ function buildThread(row, context) {
     key: threadKey("codex", id),
     kind: "codex",
     id,
-    title: clampText(redactSecrets(row.name || row.title || `Codex ${id.slice(0, 8)}`), limits.titleMax),
+    title: displayTitle(row, limits),
     cwd: row.cwd ? String(row.cwd) : null,
     repo: repoFromRemote(row.git_origin_url),
     branch: row.git_branch || null,
@@ -322,6 +429,7 @@ function buildThread(row, context) {
     agentStatus: "unknown",
     lastActivityAt: toIso(updatedMs),
     lastAgentText: "",
+    lastAgentTail: "",
     lastAgentAt: null,
     lastUserText: "",
     lastUserAt: null,
@@ -336,6 +444,11 @@ function buildThread(row, context) {
       model: row.model || null,
       provider: row.model_provider || null,
       threadSource: row.thread_source || null,
+      // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
+      originator: row.originator || null,
+      // The name set in the Codex app; title is the first prompt when unset.
+      catalogName: row.name ? clampText(redactSecrets(row.name), limits.titleMax) : null,
+      firstMessageTitle: firstMessageTitle(row, limits),
       file: row.rollout_path || null,
       turnStartedAt: null,
       abortReason: null,
@@ -409,7 +522,7 @@ function readPrAttachments(db, ids) {
 // Lock files are 0-byte flock targets with no pid inside, so the holder
 // comes from one batched lsof. Codex removes them on release; when lsof
 // cannot answer, a present lock file is treated as held.
-async function readWriterLocks(config, ids, { run, isPidAlive }) {
+export async function readWriterLocks(config, ids, { run, isPidAlive }) {
   const dir = path.join(config.paths.codexHome, "thread-writer-locks");
   let names;
   try {
@@ -480,6 +593,17 @@ export async function listCodexThreads(config, options = {}) {
       if (rows.length < pageSize) break;
       after = rows.at(-1);
     }
+    // A failed title scan marks nothing shared; identity checks still see
+    // every thread the supervisor retained.
+    let shared = { names: new Set(), labels: new Map() };
+    try { shared = readSharedTitles(db, limits); } catch { /* older schema */ }
+    for (const thread of built) {
+      // Another thread labelled by its first message can show our name too.
+      const name = identityToken(thread.title);
+      if (shared.names.has(name) || [...(shared.labels.get(name) ?? [])].some((id) => id !== thread.id)) thread.meta.codexTitleShared = true;
+      const alt = identityToken(thread.meta.firstMessageTitle);
+      if (alt && [...(shared.labels.get(alt) ?? [])].some((id) => id !== thread.id)) thread.meta.codexFirstMessageShared = true;
+    }
   } finally {
     try { db.close(); } catch { /* already closed */ }
   }
@@ -508,6 +632,9 @@ function retryThreadId(row) {
 export async function readCodexLbErrors(config, options = {}) {
   const now = options.now ?? Date.now();
   const windowMs = options.windowMs ?? LB_WINDOW_MS;
+  // The policy corroborates a transient error with rows from this window
+  // only; an hour's total would count errors long since recovered from.
+  const freshSec = (now - (config.limits?.lbErrorFreshMs ?? DEFAULTS.lbErrorFreshMs)) / 1000;
   const file = path.join(config.paths.codexHome, "logs_2.sqlite");
   // No log database is no errors; one that exists but cannot be read is
   // unknown, so the LB is never declared recovered on missing evidence.
@@ -524,14 +651,23 @@ export async function readCodexLbErrors(config, options = {}) {
   const groups = new Map();
   for (const row of rows) {
     const kind = classifyLbError(row.feedback_log_body);
-    const group = groups.get(kind) ?? { kind, count: 0, lastAtSec: 0, threadIds: new Set() };
+    const group = groups.get(kind) ?? { kind, count: 0, lastAtSec: 0, threadIds: new Set(), freshCount: 0, freshThreadIds: new Set() };
+    const ts = Number(row.ts) || 0;
     group.count += 1;
-    group.lastAtSec = Math.max(group.lastAtSec, Number(row.ts) || 0);
+    group.lastAtSec = Math.max(group.lastAtSec, ts);
     const id = retryThreadId(row);
     if (id) group.threadIds.add(id);
+    // A row with no readable time cannot be aged out, as in the policy.
+    if (!ts || ts >= freshSec) {
+      group.freshCount += 1;
+      if (id) group.freshThreadIds.add(id);
+    }
     groups.set(kind, group);
   }
   return [...groups.values()]
     .sort((a, b) => b.count - a.count || b.lastAtSec - a.lastAtSec)
-    .map((group) => ({ kind: group.kind, count: group.count, lastAt: group.lastAtSec ? toIso(group.lastAtSec) : null, threadIds: [...group.threadIds] }));
+    .map((group) => ({
+      kind: group.kind, count: group.count, lastAt: group.lastAtSec ? toIso(group.lastAtSec) : null, threadIds: [...group.threadIds],
+      freshCount: group.freshCount, freshThreadIds: [...group.freshThreadIds]
+    }));
 }

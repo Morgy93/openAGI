@@ -4,6 +4,33 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.5.0: three modes, consent once
+
+The glasses home has exactly one setting, chosen on the phone:
+
+| Mode | Tap | Swipe up | Swipe down | Double-tap |
+| --- | --- | --- | --- | --- |
+| Talk | talk to the agent; tap again to send (or review) | Inbox | Recent (shared agent conversation) | exit |
+| Lifelog | talk to the agent; listening resumes after | Inbox | Mark moment / Pause-Resume / Recent | exit |
+| Supervisor | supervisor questions (fixed-choice answers), or status when none | Inbox | thread status; tap there to talk to the supervisor | exit |
+
+A press-and-hold acts like one tap. Ignored gestures show a short notice
+instead of doing nothing, and a microphone that does not open within 8
+seconds fails visibly instead of blocking taps.
+
+Lifelog consent is given once with the phone checkbox and kept (main stores it
+without expiry) until you uncheck it, switch away from Lifelog, or delete
+memory. Leaving the glasses foreground only stops the microphone locally; any
+glasses gesture or foreground return starts it again. The phone screen being
+locked no longer pauses anything. Hold-to-talk, quick-tap highlight, wake
+responses, lock-screen and resume-consent screens are removed; older saved
+settings migrate to Talk, or to Lifelog when it was on.
+
+Talk and Lifelog questions go to the owner's shared agent conversation
+(thread "agent"), Supervisor questions to the supervisor thread. A main
+without shared threads keeps the per-G2 conversation for Talk; talking to the
+supervisor then asks you to update main.
+
 ### Version 0.4.17: native exit confirmation at root
 
 Double-tap on the paired/unpaired home screen, quiet listening root, or
@@ -344,9 +371,9 @@ for status semantics, recovery commands, and persistent-operation instructions.
 
 The work spans three repositories and should be delivered as separate, ordered pull requests:
 
-- `/Users/shooby/Dev/g2`: Even Hub TypeScript plugin.
-- `/Users/shooby/Dev/bbapp`: BuildBetter authentication, APIs, durable media ingestion, Ask adapter, database, workers, and device management.
-- `/Users/shooby/Dev/bb-recorder`: existing claim-bound publisher for no-bot desktop transcript events; the backend now activates its dormant relay contract.
+- `/Users/you/Dev/g2`: Even Hub TypeScript plugin.
+- `/Users/you/Dev/bbapp`: BuildBetter authentication, APIs, durable media ingestion, Ask adapter, database, workers, and device management.
+- `/Users/you/Dev/bb-recorder`: existing claim-bound publisher for no-bot desktop transcript events; the backend now activates its dormant relay contract.
 
 Do not try to make one atomic cross-repository release. The backend contracts land dark first, then the G2 client is distributed against the feature-gated backend. No BB Recorder source change is required for the relay because its publisher and follower were already implemented behind server-advertised capabilities.
 

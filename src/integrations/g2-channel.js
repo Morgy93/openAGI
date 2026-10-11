@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { appendJsonLine, ensureDir } from "../file-utils.js";
 import { resolveDataDir } from "../data-dir.js";
 import { nowIso } from "../utils.js";
+import { sharedSessionId, sharedThreadHistory } from "../shared-conversations.js";
+import { ownerPrincipal } from "../owner-authority.js";
 
 const MAX_WAV_BYTES = 44 + (16_000 * 2 * 30);
 const MIN_WAV_BYTES = 44 + 3_200;
@@ -92,7 +94,8 @@ export class G2Channel {
     }
     const wav = textOnly ? Buffer.alloc(44) : decodeAndValidateWav(body?.audioBase64);
     const conversationId = boundedOptional(body?.conversationId, 200);
-    if (!conversationId) {
+    // A shared device thread has one fixed session, so it needs no G2 id.
+    if (!conversationId && !options.thread) {
       throw new G2ChannelError("invalid_conversation", 400, "A stable G2 conversation id is required.");
     }
     this.nodeRegistry.touchEnrollment?.(nodeId);
@@ -101,7 +104,10 @@ export class G2Channel {
     const question = textOnly ? body.text.trim() : await this.transcribe(wav, body?.language, options.signal);
     options.signal?.throwIfAborted();
     options.onProgress?.({ stage: "transcribed", question });
-    return this.answer(question, wav, conversationId, nodeId, enrollment, options);
+    // Reached only from /nodes/g2/ask and an experience submit, after the
+    // G2's scoped auth, and the G2 client sends those only from a tap: the
+    // owner speaking. The ambient listen path below never gets this.
+    return this.answer(question, wav, conversationId, nodeId, enrollment, { ...options, principal: ownerPrincipal("g2", nodeId) });
   }
 
   async listen(body, nodeId) {
@@ -126,7 +132,8 @@ export class G2Channel {
       return { question, triggered: false, armed: true, reason: "wake_phrase_only" };
     }
     if (body?.transcribeOnly === true) return { question, prompt, triggered: true, armed: false };
-    const result = await this.answer(prompt, wav, conversationId, nodeId, enrollment);
+    // Wake-word speech may be anyone in the room: never owner authority.
+    const result = await this.answer(prompt, wav, conversationId, nodeId, enrollment, { principal: null });
     return { ...result, triggered: true, armed: false };
   }
 
@@ -141,11 +148,14 @@ export class G2Channel {
 
   async answer(question, wav, conversationId, nodeId, enrollment, options = {}) {
     const nodeNamespace = createHash("sha256").update(nodeId, "utf8").digest("base64url");
-    const conversationNamespace = createHash("sha256").update(conversationId, "utf8").digest("base64url");
-    const sessionId = options.continuation ? this.sessionIdFor(nodeId, conversationId, options.continuation)
-      : `node:${nodeNamespace}:${conversationNamespace}:main`;
+    const conversationNamespace = createHash("sha256").update(options.thread ? `thread:${options.thread}` : conversationId, "utf8").digest("base64url");
+    // A shared thread is the devices' fixed session, never a per-G2 one, so it
+    // is not tagged as this G2's own conversation. The channel stays "g2".
+    const sessionId = options.thread ? sharedSessionId(options.thread)
+      : options.continuation ? this.sessionIdFor(nodeId, conversationId, options.continuation)
+        : `node:${nodeNamespace}:${conversationNamespace}:main`;
     const store = this.agentHost.store;
-    if (store?.saveSession) {
+    if (store?.saveSession && !options.thread) {
       const session = store.getSession(sessionId);
       store.saveSession({ ...session, metadata: { ...session.metadata, g2NodeId: nodeId } });
     }
@@ -160,6 +170,7 @@ export class G2Channel {
         ...(options.requestId ? { requestId: options.requestId } : {}),
         nodePlatform: EVEN_G2_PLATFORM,
         nodeName: enrollment.name ?? "Even G2",
+        ...(options.thread ? { sourceName: enrollment.name ?? "Even G2", thread: options.thread } : {}),
         audioDurationSeconds: Number(((wav.length - 44) / 32_000).toFixed(3))
       }
     }, options);
@@ -183,9 +194,14 @@ export class G2Channel {
     return `${prefix}${createHash("sha256").update(conversationId, "utf8").digest("base64url")}:main`;
   }
 
-  history(nodeId, { continuation, offset = 0, query = "" } = {}) {
+  history(nodeId, { continuation, offset = 0, query = "", thread, before, limit } = {}) {
     this.assertEnrolled(nodeId);
     const store = this.agentHost.store;
+    if (thread !== undefined) {
+      if (continuation !== undefined || offset !== 0 || query !== "")
+        throw new G2ChannelError("invalid_history", 400, "A shared thread is read by before and limit only.");
+      return sharedThreadHistory(store, thread, { before, limit });
+    }
     if (!store?.listSessions) throw new G2ChannelError("history_unavailable", 503, "Main history is not configured.");
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1000 || typeof query !== "string" || query.length > 200)
       throw new G2ChannelError("invalid_history", 400, "Invalid history page.");
