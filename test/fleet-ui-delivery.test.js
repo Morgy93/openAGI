@@ -2008,6 +2008,18 @@ test("Codex's 'Approve for me' permission-mode menu is not a permission prompt (
   assert.equal(promptButtons(state), null);
   assert.equal(hasPermissionPrompt(state), false);
   assert.equal(findComposer(state).composer?.id, "2678", "the composer is still found");
+  // Empty: its only inner row is the placeholder.
+  assert.equal(composerEmpty(findComposer(state).composer), true);
+  // Filled, the same composer is not empty, and its text is the value.
+  const filled = stateOf(text.replace(/(\t+)2679 text Do anything/, `$12679 text ${MESSAGE}`).replace("Do anything Do anything\\n", `Do anything ${MESSAGE}`));
+  assert.equal(findComposer(filled).composer.value, MESSAGE);
+  assert.equal(composerEmpty(findComposer(filled).composer), false);
+});
+
+test("a message that says 'Secondary Actions:' is read back whole", () => {
+  const said = `${MESSAGE} Note, Secondary Actions: none`;
+  const state = stateOf(conductorComposer(said));
+  assert.equal(findComposer(state).composer.value, said);
 });
 
 test("a permission card needs two exact choices, one positive, outside menus", () => {

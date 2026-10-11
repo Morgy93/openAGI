@@ -165,8 +165,11 @@ function parseElementLine(depth, id, rest) {
     flags = flagMatch[1].split(",").map((flag) => flag.trim().toLowerCase()).filter(Boolean);
     body = body.slice(flagMatch[0].length);
   }
+  // The text as printed, before any suffix is cut: an editable's inner text
+  // rows carry no OCU suffix, and a message may say "Secondary Actions:".
   const rawText = body;
-  const secondary = body.search(/(?:^|,? )Secondary Actions: /);
+  // OCU appends ", Secondary Actions: …" to a row; only the last one can be it.
+  const secondary = [...body.matchAll(/(?:^|,?\s+)Secondary Actions: /g)].at(-1)?.index ?? -1;
   if (secondary >= 0) body = body.slice(0, secondary);
   const fields = {};
   const markers = [...body.matchAll(FIELD_MARKER)];
@@ -458,11 +461,14 @@ function composerPlaceholder(composer) {
 }
 
 export function composerEmpty(composer) {
-  if (!composer || normalizeUiText(composer.value) || composer.innerText?.length) return false;
+  if (!composer) return false;
   const shown = normalizeUiText(String(composer.label ?? "").replace(/\\n/g, " "));
-  if (!shown) return true;
   const placeholder = composerPlaceholder(composer);
-  return Boolean(placeholder) && (shown === placeholder || shown === `${placeholder} ${placeholder}`);
+  if (shown && !(placeholder && (shown === placeholder || shown === `${placeholder} ${placeholder}`))) return false;
+  // An empty Codex composer keeps its placeholder as an inner text row.
+  const inner = (composer.innerText ?? []).map((part) => normalizeUiText(part)).filter(Boolean);
+  if (inner.length) return Boolean(placeholder) && inner.length === 1 && inner[0] === placeholder;
+  return !normalizeUiText(composer.value);
 }
 
 // Recover only the complete known placeholder followed by exactly our text.
@@ -1527,7 +1533,7 @@ export function createUiDriver({
       await sleep(limits.uiPollMs);
       state = await readState(ctx, signal);
       const composer = composerIn(ctx, state).composer;
-      const empty = composer ? !normalizeUiText(composer.value) : false;
+      const empty = composer ? composerEmpty(composer) || !normalizeUiText(composer.value) : false;
       if (empty && transcriptCount(state, needle, composer) > beforeCount) {
         keep(ctx, "after", state);
         return outcome(ctx, "sent", leftover ? `sent the text an earlier attempt left in ${target.name}` : `typed into ${target.name}`);
