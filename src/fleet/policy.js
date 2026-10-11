@@ -8,7 +8,7 @@ import {
   CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, liveCardItems, msSince, parsePrRef, redactSecrets, shortHash,
   uiTargetFor
 } from "./contracts.js";
-import { deliberateStop } from "./classify.js";
+import { blockedOnSection, deliberateStop } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
 import { requiredChecksFor } from "./sources/github.js";
 
@@ -28,8 +28,9 @@ const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
 const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
-// does nothing for them. "Not all read" is the supervisor's own read gap.
-const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown", "100+ threads, not all read"]);
+// does nothing for them. "100+ threads, not all read" is not one: threads
+// past the first 100 may hold open comments, and the agent can read them.
+const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
 // "CI running", or a required check still running ("BuildBot3 full run pending").
 // A gate GitHub did not finish reading waits for the next read like a running one.
 const ciRunning = (blocker) => blocker === "CI running" || / (?:pending|unread)$/.test(blocker);
@@ -156,7 +157,11 @@ function isManager(ctx) {
 export function decideThread(classified, thread, options = {}) {
   const ctx = makeContext(classified, thread, options);
   if (ctx.mutedKeys.has(thread?.key)) return { ...baseDecision(ctx), reason: "muted by owner" };
-  return resolveIntent(ctx, intentFor(ctx));
+  const decision = resolveIntent(ctx, intentFor(ctx));
+  // A Codex card beside the thread's own decision (a resume, a nudge, a
+  // question): its question is asked too.
+  const card = classified.card ? cardIntent(ctx, classified.card.card) : null;
+  return card?.question ? { ...decision, cardQuestion: card.question } : decision;
 }
 
 function makeContext(classified, thread, options) {
@@ -409,34 +414,41 @@ function escalatedWait(classified, pr, limits, bb3, thread = null, config = null
   return null;
 }
 
-// One owner question per open card item, all at once, so a dismissed item
-// never holds back the next. The card is answered in the app: until the
-// supervisor can click it, "open thread" is the only answer and the choices
-// are listed in the body. A Codex item open past a day is asked once more
-// (a new key), then dropped (liveCardItems).
+// One owner question per card, so an agent that re-asks the same thing
+// (six "May I create the fixture?" items in one turn) pings once. It shows
+// the newest item (a Conductor card: its first) and counts the rest. The
+// card is answered in the app: until the supervisor can click it, "open
+// thread" is the only answer and the choices are listed in the body. Keyed
+// by the oldest open item's id: a reply closes it (and the items asked
+// before it), so a later ask is a new question; a re-ask is not. A Codex
+// card open past a day is asked once more (a new key), then its items are
+// dropped (liveCardItems).
 function cardIntent(ctx, card) {
   const { thread, now, limits } = ctx;
-  const count = Math.max(Number(card.count) || 0, ...card.items.map((item) => item.index + 1));
-  const questions = liveCardItems(card, now).map((item) => {
-    const late = card.app === "codex" && now - Date.parse(item.at ?? "") >= CARD_STALE_MS;
-    const head = clampText(item.header || item.question, 50);
-    const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
-    const extra = item.multiSelect ? " Pick any." : "";
-    const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim()].filter(Boolean).join(" ");
-    const key = `card:${thread.key}:${card.cardId}:${item.index}`;
-    return {
-      ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head} (${item.index + 1}/${count})`, body: stripTags(redactSecrets(body)), options: ["open thread"], dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
-      // The raw labels, for answering in the app later; never sent to an agent.
-      meta: {
-        app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), index: String(item.index), count: String(count),
-        freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
-      },
-      ...(late ? { baseKey: key } : {}),
-      agentAskedAt: item.at ?? null
-    };
-  });
-  if (!questions.length) return { type: "none", reason: "question card: nothing left to ask" };
-  return { type: "ask", reason: "agent asks: question card", question: questions[0], questions };
+  const items = liveCardItems(card, now);
+  if (!items.length) return { type: "none", reason: "question card: nothing left to ask" };
+  const oldest = items[0];
+  const item = card.app === "codex" ? items.at(-1) : items[0];
+  const late = card.app === "codex" && now - Date.parse(oldest.at ?? "") >= CARD_STALE_MS;
+  const head = clampText(item.header || item.question, 50);
+  const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
+  const extra = item.multiSelect ? " Pick any." : "";
+  const others = items.filter((other) => other !== item).map((other) => clampText(other.header || other.question, 60));
+  const also = others.length ? `Also open: ${others.join(" | ")}` : "";
+  const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
+  const key = `card:${thread.key}:${oldest.itemId}`;
+  const count = items.length > 1 ? ` (${items.length} open)` : "";
+  const question = {
+    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: ["open thread"], dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+    // The raw labels, for answering in the app later; never sent to an agent.
+    meta: {
+      app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
+      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
+    },
+    ...(late ? { baseKey: key } : {}),
+    agentAskedAt: item.at ?? null
+  };
+  return { type: "ask", reason: "agent asks: question card", question, card: true };
 }
 
 function agentAskIntent(ctx) {
@@ -468,7 +480,8 @@ function agentAskIntent(ctx) {
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
   // A "Blocked on:" ask brings its own answers ("open thread" at least).
   const options = ask.structured || ask.blocked ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
-  const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
+  // A "Blocked on:" item that points at a list ("the two P1s above") shows it.
+  const excerpt = ownerExcerpt(ask.context ? `${ask.text}: ${ask.context}` : ask.text || thread.lastAgentText, ctx.limits.bodyMax);
   // A sealed Codex ask brings its own key: its shown text is a stand-in.
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
@@ -511,9 +524,7 @@ function resolveIntent(ctx, intent) {
   if (intent.type === "wait") return { ...base, action: "wait", reason: intent.reason, notBefore: intent.notBefore ?? null };
   if (intent.type === "escalate") return resolveEscalation(ctx, intent, base);
   // Typing in the composer does not answer a card: it is asked whatever the owner does.
-  if (intent.type === "ask" && intent.questions) {
-    return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, questions: intent.questions, notBefore: null };
-  }
+  if (intent.type === "ask" && intent.card) return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: null };
   // The owner typing into this thread outranks anything that touches it.
   const ownerUntil = ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
   if (ownerUntil) return { ...base, action: "wait", reason: "owner active in thread", notBefore: ownerUntil };
@@ -529,13 +540,23 @@ function resolveNudge(ctx, intent, base) {
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   if (deliberateStop(thread)) return { ...decision, reason: "owner stopped this turn" };
+  const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.nudgeCooldownMs;
+  const attempts = attemptsWithoutProgress(ledger, ctx.progressMark);
+  const maxAttempts = playbook.maxAttempts ?? limits.maxNudgesWithoutProgress;
+  const vars = { ...ctx.facts, attempts: String(attempts), ...(intent.vars ?? {}) };
+  // A wait on the agent's answer (or on a reply to the same words) lasts
+  // the playbook's whole budget at most; then the owner hears it once.
+  const holdMs = Math.max(cooldownMs * maxAttempts, REPLY_HOLD_MIN_MS);
+  const heldOut = (entry) => now - Date.parse(sentAtOf(entry) ?? "") >= holdMs;
   const reply = replyCheck(ctx, intent.playbook);
-  if (reply.wait) return { ...decision, action: "wait", reason: reply.wait };
+  if (reply.wait) {
+    if (attempts >= maxAttempts || heldOut(reply.last)) return stuckDecision(ctx, playbook, vars, attempts, decision, `answered the ${clock(sentAtOf(reply.last))} nudge; nothing new since`);
+    return { ...decision, action: "wait", reason: reply.wait };
+  }
   if (!intent.immediate) {
     const idleUntil = addMs(latest(thread.lastAgentAt, thread.lastActivityAt), limits.idleBeforeNudgeMs);
     if (idleUntil && Date.parse(idleUntil) > now) return { ...decision, action: "wait", reason: "recently active", notBefore: idleUntil };
   }
-  const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.nudgeCooldownMs;
   const cooledAt = addMs(ledger.lastNudgeAt, cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
   const undelivered = undeliveredStreak(ledger, thread);
@@ -548,9 +569,6 @@ function resolveNudge(ctx, intent, base) {
       return { ...decision, action: "wait", reason: `can't deliver (${undelivered.reason}); retry after backoff`, notBefore: retryAt };
     }
   }
-  const attempts = attemptsWithoutProgress(ledger, ctx.progressMark);
-  const maxAttempts = playbook.maxAttempts ?? limits.maxNudgesWithoutProgress;
-  const vars = { ...ctx.facts, attempts: String(attempts), ...(intent.vars ?? {}) };
   if (attempts >= maxAttempts) return stuckDecision(ctx, playbook, vars, attempts, decision);
   const route = chooseRoute(thread, ctx.mode, ctx.delivery);
   if (!route) {
@@ -568,7 +586,9 @@ function resolveNudge(ctx, intent, base) {
   // The same words twice in a row, with no reply between, is noise.
   const repeat = REPEAT_GUARDED(intent.playbook) ? lastReached(ledger) : null;
   if (repeat?.messageHash === messageHash && !repliedAfter(thread, repeat)) {
-    return { ...decision, action: "wait", reason: `same message sent at ${clock(sentAtOf(repeat))}; no reply since` };
+    const why = `same message sent at ${clock(sentAtOf(repeat))}; no reply since`;
+    if (heldOut(repeat)) return stuckDecision(ctx, playbook, vars, attempts, decision, why);
+    return { ...decision, action: "wait", reason: why };
   }
   return { ...decision, action: "nudge", route, message, messageHash, factsKey: reply.factsKey, facts: reply.facts };
 }
@@ -578,6 +598,7 @@ function resolveNudge(ctx, intent, base) {
 const REPLY_AWARE = new Set(["merge-ready", "ci-finished"]);
 const REPEAT_GUARDED = (playbook) => playbook !== "resume" && playbook !== "status-check";
 const FACTS_KEPT = 8;
+const REPLY_HOLD_MIN_MS = HOUR;
 
 // The agent ended a real turn after the last nudge of this playbook. Same
 // facts: its answer stands, so wait. New facts: lead with what changed.
@@ -589,7 +610,7 @@ function replyCheck(ctx, playbookId) {
   const out = { ...none, factsKey, facts };
   const last = lastSent(ctx.ledger, playbookId);
   if (!last || !repliedAfter(ctx.thread, last)) return out;
-  if (last.factsKey === factsKey) return { ...out, wait: `agent answered the ${clock(sentAtOf(last))} nudge; nothing new` };
+  if (last.factsKey === factsKey) return { ...out, last, wait: `agent answered the ${clock(sentAtOf(last))} nudge; nothing new` };
   // A nudge from before facts were kept: nothing to compare, so no prefix.
   if (!Array.isArray(last.facts)) return out;
   const added = facts.filter((item) => !last.facts.includes(item));
@@ -605,6 +626,9 @@ function nudgeFacts(ctx) {
   const failing = (pr?.ci?.failing ?? []).map((name) => fact(name, 60)).filter(Boolean);
   const out = blockers.filter((blocker) => !passive(blocker) && !(failing.length && /^CI red:/.test(blocker))).map((blocker) => fact(blocker, 80));
   for (const name of failing) out.push(`${name} failing`);
+  // A rerun that fails again on the same head is news.
+  const failedAt = Date.parse(pr?.ci?.failedAt ?? "");
+  if (failing.length && Number.isFinite(failedAt)) out.push(`checks failed at ${new Date(failedAt).toISOString().slice(11, 16)}Z`);
   const head = shortSha(pr?.headOid);
   if (head) out.push(`head ${head}`);
   return [...new Set(out)].sort().slice(0, FACTS_KEPT);
@@ -644,15 +668,28 @@ function clock(iso) {
   return new Date(at).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 }
 
-function stuckDecision(ctx, playbook, vars, attempts, decision) {
-  if (!playbook.ask) return { ...decision, reason: `stopped after ${attempts} nudges; owner not pinged by policy` };
+// held: why the supervisor stopped waiting on the agent ("answered the
+// 03:20 nudge; nothing new since"), when that, not the attempts, ended it.
+// The agent's own "Blocked on:" items are quoted, so the owner sees what it
+// says it waits on.
+function stuckDecision(ctx, playbook, vars, attempts, decision, held = null) {
+  if (!playbook.ask) return { ...decision, reason: `${held ?? `stopped after ${attempts} nudges`}; owner not pinged by policy` };
   const left = ctx.facts.blockers || ctx.classified.reason;
+  const says = blockedOnLine(ctx.thread);
+  const what = held ? `agent ${held}` : `${attempts} nudges, no new head, no thread resolved`;
   return {
-    ...decision, action: "ask-user", reason: `${attempts} nudges without progress`,
+    ...decision, action: "ask-user", reason: held ? `agent ${held}` : `${attempts} nudges without progress`,
     question: question(ctx, renderTemplate(playbook.ask, vars),
-      `${ctx.facts.label}: ${attempts} nudges, no new head, no thread resolved. Left: ${left}.`, ["keep going", "stop"],
+      `${ctx.facts.label}: ${what}.${says ? ` Agent: blocked on ${says}.` : ""} Left: ${left}.`, ["keep going", "stop"],
       `stuck:${ctx.thread.key}:${playbook.id}:${ctx.progressMark.head ?? "none"}`, "stuck")
   };
+}
+
+// The agent's "Blocked on:" items, for the owner (redacted, tag-free, short).
+function blockedOnLine(thread) {
+  const section = blockedOnSection(thread.lastAgentFull || thread.lastAgentText || "");
+  const items = (section?.items ?? []).map((item) => item.text.replace(/[.;,\s]+$/, "")).filter(Boolean);
+  return items.length ? ownerExcerpt(items.join("; "), 120) : "";
 }
 
 // Sends that keep failing back off (5, 10, 20, 40, then 60 min), and after
@@ -1030,18 +1067,21 @@ function lbVars(lb, problems) {
 export function dedupeDecisions(decisions) {
   const sent = new Set();
   const escalated = new Set();
-  return (decisions ?? []).filter((decision) => {
+  const out = [];
+  for (const decision of decisions ?? []) {
     if (decision?.action === "escalate-manager") {
       const key = `${decision.targetKey ?? ""}\u0000${decision.playbook ?? ""}`;
-      if (escalated.has(key)) return false;
+      if (!escalated.has(key)) out.push(decision);
       escalated.add(key);
-      return true;
+    } else if (decision?.action !== "nudge" || !sent.has(decision.threadKey)) {
+      if (decision?.action === "nudge") sent.add(decision.threadKey);
+      out.push(decision);
+    } else if (decision.cardQuestion) {
+      // A dropped duplicate nudge still asks its card.
+      out.push({ ...decision, action: "none", message: null, route: null });
     }
-    if (decision?.action !== "nudge") return true;
-    if (sent.has(decision.threadKey)) return false;
-    sent.add(decision.threadKey);
-    return true;
-  });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

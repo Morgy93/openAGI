@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ROUTES, UI_APPS, clampTail, clampText, isPidAlive, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  ROUTES, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
   repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
@@ -169,4 +169,15 @@ test("background routes are off unless listed, and never include claude-resume; 
   assert.deepEqual(set.backgroundRoutes, ["codex-exec"]);
   assert.deepEqual(set.idleDrain, { enabled: false, pollMs: 5000 });
   assert.deepEqual(resolveFleetConfig({}, { home: "/home/fixture", backgroundRoutes: ["claude-resume", "peer-relay"] }).backgroundRoutes, ["peer-relay"]);
+});
+
+test("a card item that says it needs nothing, or only acknowledges, asks nothing", () => {
+  const item = (question, options = []) => ({ question, options });
+  // 019fe344: a card with no choices that says it needs nothing.
+  assert.equal(isAckItem(item("I'm recovering the staged candidate; no input is needed from you right now.")), true);
+  assert.equal(isAckItem(item("Nothing is needed from you.")), true);
+  assert.equal(isAckItem(item("I will use the native build.", ["Okay"])), true);
+  assert.equal(isAckItem(item("Please sign back into ZeroShot Staging.")), false);
+  assert.equal(isAckItem(item("No input needed? Pick a region.", ["us-east-1", "eu-west-1"])), false);
+  assert.deepEqual(liveCardItems({ app: "codex", items: [item("no action needed"), { ...item("Sign in?"), at: null }] }).map((entry) => entry.question), ["Sign in?"]);
 });

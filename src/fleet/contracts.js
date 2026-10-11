@@ -456,6 +456,9 @@ const CARD_ITEMS_MAX = 20;
 // past a day it is asked once more, and past two it is dropped.
 export const CARD_STALE_MS = 24 * 60 * MIN;
 export const CARD_DROP_MS = 48 * 60 * MIN;
+// Excluded threads whose open cards still reach the owner (never self or
+// archived ones). They are never read for git or PRs.
+export const CARD_EXCLUSIONS = new Set(["automation", "no-repo"]);
 // One-option acknowledgements ("Okay", "Continue") ask nothing.
 const ACK_LABELS = new Set(["ok", "okay", "continue", "got it", "acknowledge", "acknowledged", "understood"]);
 
@@ -743,7 +746,7 @@ export async function openReadOnlyDb(filePath) {
  * @property {string[]} blockers          short readiness blockers
  * @property {{title: string, body: string, options: string[], dedupeKey: string,
  *   kind: "agent-ask"|"agent-card"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
- * @property {Object[]} [questions]      a question card: one question per open item (question is the first)
+ * @property {Object} [cardQuestion]     a Codex question card asked beside this decision (one per card)
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */

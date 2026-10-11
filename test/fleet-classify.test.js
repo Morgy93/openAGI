@@ -556,7 +556,9 @@ test("a markdown Blocked-on list naming the owner's decision asks the owner, rea
 test("the short Blocked-on form asks; nothing, CI, or a third party's approval does not", () => {
   const ask = classify(makeThread({ lastAgentText: "**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head are running" }));
   assert.equal(ask.state, "needs-human");
-  assert.equal(classify(makeThread({ lastAgentText: "Pushed. **Blocked on:** your merge decision." })).state, "needs-human");
+  // A merge call on an open PR is the ready flow's; without a PR it asks.
+  assert.equal(classify(makeThread({ lastAgentText: "Pushed. **Blocked on:** your merge decision." })).state, "ready-needs-human");
+  assert.equal(classify(makeThread({ lastAgentText: "Pushed. **Blocked on:** your merge decision.", prRefs: [] }), { pr: null }).state, "needs-human");
   assert.equal(classify(makeThread({ lastAgentText: "Blocked on: approval from you." })).state, "needs-human");
   for (const text of ["Done.\n\nBlocked on: nothing", "**Blocked on:** none.", "**Blocked on:** CI", "Blocked on: required reviewer approval from Adam/Nikhil"]) {
     const result = classify(makeThread({ lastAgentText: text }), { pr: makePr({ reviewDecision: "REVIEW_REQUIRED", mergeState: "BLOCKED" }) });
@@ -574,4 +576,23 @@ test("an owner Blocked-on item offers the agent's own sub-bullets, then open thr
   assert.deepEqual(result.ask.options, ["keep shared writes", "make fork PRs read-only", "open thread"]);
   // Once the owner replied, the old report asks nothing.
   assert.notEqual(classify(makeThread({ lastAgentText: text, lastUserText: "keep them", lastUserAt: ago(5 * MIN) })).state, "needs-human");
+});
+
+test("a card of acknowledgements hides the tail's structured question too", () => {
+  // ZeroShot 01a12c44: five "Okay"/"Continue" items, and the tail carries the call.
+  const acks = { app: "codex", cardId: "turn-a", count: 2, items: [
+    { index: 0, itemId: "call_ok:0", header: null, question: "I will use the existing native QA build.", options: ["Okay"], multiSelect: false, freeText: true, at: ago(5 * MIN) },
+    { index: 1, itemId: "call_go:0", header: null, question: "I have enough authorization.", options: ["Continue"], multiSelect: false, freeText: true, at: ago(4 * MIN) }
+  ] };
+  const thread = makeThread({ kind: "codex", key: "codex:t1", id: "t1", meta: { pendingCard: acks, pendingQuestion: { text: "I will use the existing native QA build.", options: ["Okay"], at: ago(5 * MIN) } } });
+  assert.notEqual(classify(thread).state, "needs-human");
+});
+
+test("an owner Blocked-on item beats a CI wait the agent wrote, and a merge after it settles it", () => {
+  const text = "CI is still running on the new head.\n\nBlocked on:\n- your decision on the cache default";
+  assert.equal(classify(makeThread({ lastAgentText: text })).state, "needs-human");
+  // Asked 30 min ago; the PR merged 5 min ago.
+  const merged = makePr({ state: "MERGED", mergedAt: ago(5 * MIN), closedAt: ago(5 * MIN) });
+  assert.notEqual(classify(makeThread({ lastAgentText: "Blocked on:\n- your merge decision" }), { pr: merged }).state, "needs-human");
+  assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: merged }).state, "needs-human");
 });

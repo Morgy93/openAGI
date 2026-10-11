@@ -161,6 +161,9 @@ function summarizeChecks(commit, headOid) {
   const rollup = commit.statusCheckRollup;
   const failing = [];
   const pending = [];
+  // When the newest failure finished: a rerun that fails again on the same
+  // head is a new result.
+  let failedMs = 0;
   for (const [name, node] of latest) {
     if (node.__typename === "StatusContext") {
       if (FAILED_STATUSES.has(node.state)) failing.push(name);
@@ -170,8 +173,9 @@ function summarizeChecks(commit, headOid) {
     } else if (FAILED_CONCLUSIONS.has(node.conclusion)) {
       failing.push(name);
     }
+    if (failing.at(-1) === name) failedMs = Math.max(failedMs, Date.parse(node.completedAt ?? node.createdAt ?? "") || 0);
   }
-  return { state: rollup.state ?? null, failing, pending };
+  return { state: rollup.state ?? null, failing, pending, ...(failedMs ? { failedAt: new Date(failedMs).toISOString() } : {}) };
 }
 
 // One check's result: SUCCESS, FAILURE, PENDING, another conclusion

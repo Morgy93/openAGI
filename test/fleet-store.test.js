@@ -671,3 +671,15 @@ test("a nudge keeps when its send started, its message hash and the facts it was
   assert.equal(second.sentAt, undefined);
   assert.equal(second.factsKey, undefined);
 });
+
+test("an 'open thread' tap on a card holds while the card is still asked, past the TTL", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = () => store.upsertQuestion({ dedupeKey: "card:codex:t1:call_x:0", kind: "agent-card", threadKey: "codex:t1", title: "t1: sign in", body: "Please sign in.", options: ["open thread"] });
+  store.answerQuestion(ask().id, "open thread");
+  // Asked every tick for two days: the owner is not pinged again.
+  for (let hour = 0; hour < 48; hour += 1) {
+    now.advance(HOUR);
+    assert.equal(ask().suppressed, true);
+  }
+});

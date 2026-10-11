@@ -1203,26 +1203,21 @@ function cardThread(overrides = {}, card = {}) {
   });
 }
 
-test("a question card raises one owner question per item, labels in the body, only 'open thread' to answer", () => {
+test("a question card raises one owner question, labels in the body, only 'open thread' to answer", () => {
   const { classified, decision } = run(cardThread());
   assert.equal(classified.state, "needs-human");
   assert.equal(decision.action, "ask-user");
-  assert.equal(decision.questions.length, 2);
-  assert.equal(decision.question, decision.questions[0]);
-  const [first, second] = decision.questions;
-  assert.equal(first.title, "app #6522: End-of-day count (1/2)");
-  assert.equal(second.title, "app #6522: Bob's day (2/2)");
-  assert.equal(first.kind, "agent-card");
-  assert.equal(first.dedupeKey, "card:conductor:s1:toolu_card:0");
-  assert.equal(second.dedupeKey, "card:conductor:s1:toolu_card:1");
-  assert.deepEqual(first.options, ["open thread"]);
-  // Each item's own full question, not joined across items.
-  assert.equal(second.body, "What should Bob's end-of-day message cover? 1. Did + doing next (Recommended) 2. Only what he did 3. Only what's next Or your own answer.");
-  assert.doesNotMatch(second.body, /end-of-day count be built/);
-  assert.deepEqual(first.meta.labels, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
-  assert.equal(first.meta.freeText, "1");
-  assert.equal(first.meta.index, "0");
-  assert.equal(first.meta.count, "2");
+  const q = decision.question;
+  assert.equal(q.title, "app #6522: End-of-day count (2 open)");
+  assert.equal(q.kind, "agent-card");
+  // Keyed by the oldest open item, never its place in the card.
+  assert.equal(q.dedupeKey, "card:conductor:s1:toolu_card:0");
+  assert.deepEqual(q.options, ["open thread"]);
+  assert.equal(q.body, "Where should the end-of-day count be built? 1. Chat-analysis worker (Recommended) 2. Sales worker + inbox module 3. Work-queue only Or your own answer. Also open: Bob's day");
+  assert.deepEqual(q.meta.labels, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
+  assert.deepEqual(q.meta.itemIds, ["toolu_card:0", "toolu_card:1"]);
+  assert.equal(q.meta.freeText, "1");
+  assert.equal(q.meta.count, "2");
 });
 
 test("a card is asked while the owner types and after its PR merged", () => {
@@ -1231,7 +1226,7 @@ test("a card is asked while the owner types and after its PR merged", () => {
   const merged = makePr({ state: "MERGED", createdAt: ago(60 * MIN), mergedAt: ago(MIN), closedAt: ago(MIN) });
   const { classified, decision } = run(cardThread({ agentStatus: "idle" }), { pr: merged });
   assert.equal(classified.state, "needs-human");
-  assert.equal(decision.questions.length, 2);
+  assert.equal(decision.question.kind, "agent-card");
 });
 
 test("acknowledgement items never ping; five options and long labels stay whole in meta", () => {
@@ -1243,37 +1238,91 @@ test("acknowledgement items never ping; five options and long labels stay whole 
   ];
   const thread = cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "turn-a", count: 3, items });
   const { decision } = run(thread);
-  assert.equal(decision.questions.length, 1);
-  assert.equal(decision.questions[0].dedupeKey, "card:codex:t1:turn-a:2");
-  assert.match(decision.questions[0].title, /Which region should the QA profile use\? \(3\/3\)$/);
-  assert.deepEqual(decision.questions[0].meta.labels, five);
-  assert.match(decision.questions[0].body, /4\. Confirm deletion of these five tracked threads 5\. ap-south-1/);
+  assert.equal(decision.question.dedupeKey, "card:codex:t1:call_r:0");
+  assert.match(decision.question.title, /Which region should the QA profile use\?$/);
+  assert.deepEqual(decision.question.meta.labels, five);
+  assert.match(decision.question.body, /4\. Confirm deletion of these five tracked threads 5\. ap-south-1/);
   // Acknowledgements only: nothing to ask, so the card does not hide the thread's own state.
   const acks = cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "turn-a", count: 2, items: items.slice(0, 2) });
   assert.notEqual(run(acks).classified.state, "needs-human");
 });
 
-test("a Codex card item open past a day is asked once more under a new key, then dropped", () => {
+test("a Codex card open past a day is asked once more under a new key, then dropped", () => {
   const item = (msAgo) => [{ index: 0, itemId: "call_x:0", header: null, question: "May I delete the posts?", options: ["Confirm", "Leave"], freeText: true, at: ago(msAgo) }];
   const codex = (msAgo) => cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "turn-a", count: 1, items: item(msAgo) });
-  assert.equal(run(codex(60 * MIN)).decision.question.dedupeKey, "card:codex:t1:turn-a:0");
+  assert.equal(run(codex(60 * MIN)).decision.question.dedupeKey, "card:codex:t1:call_x:0");
   const late = run(codex(25 * 60 * MIN)).decision.question;
-  assert.equal(late.dedupeKey, "card:codex:t1:turn-a:0:late");
-  assert.equal(late.baseKey, "card:codex:t1:turn-a:0");
+  assert.equal(late.dedupeKey, "card:codex:t1:call_x:0:late");
+  assert.equal(late.baseKey, "card:codex:t1:call_x:0");
   assert.match(late.title, /^Still open: /);
   assert.notEqual(run(codex(49 * 60 * MIN)).classified.state, "needs-human");
   // A Conductor card holds its turn: it never ages out.
   const conductorOld = cardThread({}, { items: cardThread().meta.pendingCard.items.map((entry) => ({ ...entry, at: ago(49 * 60 * MIN) })) });
-  assert.equal(run(conductorOld).decision.questions.length, 2);
+  assert.equal(run(conductorOld).decision.question.kind, "agent-card");
 });
 
-test("automation threads surface their cards; the supervisor's own and archived ones never do", () => {
-  const auto = cardThread({ excluded: "automation" });
-  assert.equal(run(auto).decision.questions.length, 2);
+test("an agent that re-asks one thing six times pings once, and late once per card", () => {
+  // Recorder 01a10061, turn 01a12c41: six re-asks of one calendar-fixture approval.
+  const asks = [
+    ["call_188f", "May I create one private event for the calendar-linking QA?", ["Approve the private QA event", "Skip calendar; continue other QA"], 30],
+    ["call_a43d", "Calendar QA still needs the private fixture. May I create it?", ["Allow the private QA event", "Leave calendar QA blocked"], 13],
+    ["call_be62", "May I create the private calendar fixture described above?", ["Approve the fixture", "Keep calendar QA blocked"], 12],
+    ["call_7dHB", "For the private calendar fixture, should I proceed?", ["Proceed with the private event", "Leave calendar QA blocked"], 11],
+    ["call_1891", "Calendar QA alone still needs approval for the private fixture; may I create it?", ["Allow the private calendar fixture", "Keep calendar QA blocked"], 10],
+    ["call_c2f8", "The calendar fixture is still awaiting your one-time approval; please answer only one of the duplicate prompts.", ["Approve the private fixture", "Leave calendar QA blocked"], 9]
+  ];
+  const items = (scale) => asks.map(([id, question, options, minAgo], index) => ({ index, itemId: `${id}:0`, header: null, question, options, freeText: true, at: ago(minAgo * scale * MIN) }));
+  const thread = (scale) => cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "01a12c41", count: 6, items: items(scale) });
+  const { decision } = run(thread(1));
+  assert.equal(decision.question.dedupeKey, "card:codex:t1:call_188f:0");
+  assert.match(decision.question.title, /: The calendar fixture is still awaiting your one-t… \(6 open\)$/);
+  assert.match(decision.question.body, /^The calendar fixture is still awaiting/);
+  // A day later, every item is late: one more ask for the card, not six.
+  const late = run(thread(1), { now: NOW + 25 * 60 * MIN }).decision.question;
+  assert.equal(late.dedupeKey, "card:codex:t1:call_188f:0:late");
+});
+
+test("automation and no-repo threads surface their cards; the supervisor's own and archived ones never do", () => {
+  assert.equal(run(cardThread({ excluded: "automation" })).decision.question.kind, "agent-card");
+  assert.equal(run(cardThread({ excluded: "no-repo" })).decision.question.kind, "agent-card");
   assert.equal(run(cardThread({ excluded: "self" })).classified.state, "excluded");
   assert.equal(run(cardThread({ excluded: "archived", archived: true })).classified.state, "excluded");
   assert.equal(run(cardThread({ excluded: "automation", archived: true })).classified.state, "excluded");
-  assert.equal(run(cardThread({ excluded: "no-repo" })).classified.state, "excluded");
+  assert.equal(run(cardThread({ excluded: "stale" })).classified.state, "excluded");
+});
+
+test("a Codex card never holds back a limit resume, a stopped turn or the PR; it is asked beside them", () => {
+  const card = (msAgo) => ({ app: "codex", cardId: "turn-a", count: 1, items: [{ index: 0, itemId: "call_c:0", header: null, question: "Which preview should I keep?", options: ["Old", "New"], freeText: true, at: ago(msAgo) }] });
+  const codex = { kind: "codex", key: "codex:t1", id: "t1", live: null, cwd: "/work/madrid" };
+  // 01a0cae7: "continuing the PR preview repairs meanwhile", then a session limit that has reset.
+  const limited = cardThread({ ...codex, agentStatus: "error", error: { kind: "session-limit", text: "limit", resetAt: ago(10 * MIN) }, lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN) }, card(3 * 60 * MIN));
+  let { classified, decision } = run(limited);
+  assert.equal(classified.state, "infra-blocked");
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.playbook, "resume");
+  assert.equal(decision.cardQuestion.dedupeKey, "card:codex:t1:call_c:0");
+  // Stalled mid-turn.
+  ({ classified, decision } = run(cardThread({ ...codex, agentStatus: "stalled", lastActivityAt: ago(3 * 60 * MIN) }, card(3 * 60 * MIN))));
+  assert.equal(classified.state, "stopped");
+  assert.equal(decision.playbook, "resume");
+  assert.equal(decision.cardQuestion.kind, "agent-card");
+  // Idle with a red PR: the PR nudge goes out too.
+  ({ classified, decision } = run(cardThread({ ...codex, agentStatus: "idle", lastAgentAt: ago(30 * MIN), lastActivityAt: ago(30 * MIN) }, card(60 * MIN)), { pr: makePr({ ci: { state: "FAILURE", failing: ["lint"], pending: [] } }) }));
+  assert.equal(classified.state, "pr-not-ready");
+  assert.equal(decision.playbook, "merge-ready");
+  assert.ok(decision.cardQuestion);
+  // Running with nothing else to do: the card alone.
+  ({ classified, decision } = run(cardThread({ ...codex }, card(5 * MIN))));
+  assert.equal(classified.state, "needs-human");
+  assert.equal(decision.question.kind, "agent-card");
+  assert.equal(decision.cardQuestion, undefined);
+  // A Conductor card blocks its turn: it stays first.
+  assert.equal(run(cardThread({ agentStatus: "stalled", lastActivityAt: ago(3 * 60 * MIN) })).classified.state, "needs-human");
+  // A duplicate nudge dropped for the tick (infra recovery sent one) still asks the card.
+  const kept = dedupeDecisions([{ threadKey: "codex:t1", action: "nudge", playbook: "infra-recovered" }, { threadKey: "codex:t1", action: "nudge", playbook: "resume", cardQuestion: { dedupeKey: "k" } }]);
+  assert.equal(kept.length, 2);
+  assert.equal(kept[1].action, "none");
+  assert.equal(kept[1].cardQuestion.dedupeKey, "k");
 });
 
 // --- Context-aware nudges ----------------------------------------------------
@@ -1301,12 +1350,15 @@ test("the d1dbe71a report asks the owner about their decision, not another merge
   assert.match(decision.question.body, /Your decision on the two P1s/);
 });
 
-test("only the supervisor's own read gaps never nudge", () => {
-  const pr = makePr({ threadsTruncated: true, codexReview: { reviewedHead: false, sha: "bbbbbbb" } });
+test("a PR with 100+ threads, the rest green, still gets the agent to read past the first 100", () => {
+  const pr = makePr({ threadsTruncated: true });
   const { classified, decision } = run(makeThread(), { pr });
-  assert.deepEqual(classified.blockers, ["100+ threads, not all read", "Codex review not on head"]);
-  assert.equal(decision.action, "wait");
-  assert.equal(decision.message, null);
+  assert.deepEqual(classified.blockers, ["100+ threads, not all read"]);
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.playbook, "merge-ready");
+  // GitHub's own lag still waits.
+  const lag = run(makeThread(), { pr: makePr({ codexReview: { reviewedHead: false, sha: "bbbbbbb" } }) }).decision;
+  assert.equal(lag.action, "wait");
 });
 
 test("an agent that answered the last merge-ready nudge is left alone until a fact changes", () => {
@@ -1369,4 +1421,113 @@ test("a resume after a limit reset is never held back by an earlier nudge or rep
   const again = run(replied, { ledger: sentLedger(first, 25 * MIN) }).decision;
   assert.equal(again.action, "nudge");
   assert.equal(again.playbook, "resume");
+});
+
+test("an answered nudge is waited on only so long: then the owner hears it once, with the agent's blocker", () => {
+  // 01a08d37 (#6451): the agent answers each merge-ready nudge without pushing.
+  const reply = "Supervisor warnings are stale.\n\nBlocked on: required reviewer approval from Adam/Nikhil.";
+  const thread = makeThread({ lastAgentText: reply, lastAgentFull: reply, lastAgentAt: ago(30 * MIN), lastAgentFullAt: ago(30 * MIN) });
+  const pr = redPr();
+  const first = run(thread, { pr }).decision;
+  assert.equal(first.playbook, "merge-ready");
+  // Answered 30 min ago, 10 min after the nudge: wait.
+  assert.equal(run(thread, { pr, ledger: sentLedger(first, 40 * MIN) }).decision.action, "wait");
+  // Three days on, the same facts: ask the owner, quoting what the agent says it waits on.
+  const later = makeThread({ ...thread, lastAgentAt: ago(3 * 24 * 60 * MIN - 10 * MIN), lastAgentFullAt: ago(3 * 24 * 60 * MIN - 10 * MIN), lastActivityAt: ago(3 * 24 * 60 * MIN - 10 * MIN) });
+  const stuck = run(later, { pr, ledger: sentLedger(first, 3 * 24 * 60 * MIN) }).decision;
+  assert.equal(stuck.action, "ask-user");
+  assert.equal(stuck.question.kind, "stuck");
+  assert.match(stuck.question.body, /agent answered the \d\d:\d\d nudge; nothing new since\. Agent: blocked on required reviewer approval from Adam\/Nikhil\./);
+  // At the attempt budget it is asked at once.
+  const spent = run(thread, { pr, ledger: sentLedger(first, 40 * MIN, { attemptsWithoutProgress: 3 }) }).decision;
+  assert.equal(spent.action, "ask-user");
+  assert.equal(spent.question.kind, "stuck");
+});
+
+test("a rerun that fails again on the same head is a new fact", () => {
+  const thread = makeThread();
+  const pr = (failedAt) => redPr({ ci: { state: "FAILURE", failing: ["lint"], pending: [], failedAt } });
+  const first = run(thread, { pr: pr("2026-09-26T11:00:00.000Z") }).decision;
+  assert.deepEqual(first.facts, ["checks failed at 11:00Z", `head ${HEAD.slice(0, 10)}`, "lint failing"]);
+  const ledger = sentLedger(first, 40 * MIN);
+  assert.equal(run(thread, { pr: pr("2026-09-26T11:00:00.000Z"), ledger }).decision.action, "wait");
+  const rerun = run(thread, { pr: pr("2026-09-26T11:50:00.000Z"), ledger }).decision;
+  assert.equal(rerun.action, "nudge");
+  assert.match(rerun.message, /^Since your \d\d:\d\d reply: new: checks failed at 11:50Z; cleared: checks failed at 11:00Z\. /);
+});
+
+test("the same message with no reply is refused only so long, then the owner hears it", () => {
+  const first = run(makeThread(), { pr: redPr() }).decision;
+  // Sent 2 h ago; the agent last spoke before it and never answered.
+  const quiet = makeThread({ lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN), lastAgentFullAt: ago(3 * 60 * MIN) });
+  const ledger = sentLedger(first, 2 * 60 * MIN);
+  const decision = run(quiet, { pr: redPr(), ledger }).decision;
+  assert.equal(decision.action, "ask-user");
+  assert.equal(decision.question.kind, "stuck");
+  assert.match(decision.question.body, /same message sent at \d\d:\d\d; no reply since/);
+});
+
+test("'Blocked on: your merge decision' on an open PR is the ready or not-ready flow", () => {
+  // 0056f770 / d7757f20.
+  const text = "PR is green and approved.\n\nBlocked on: your merge decision.";
+  const thread = makeThread({ lastAgentText: text, lastAgentFull: text });
+  const ready = run(thread);
+  assert.equal(ready.classified.state, "ready-needs-human");
+  assert.equal(ready.decision.question.kind, "ready");
+  assert.deepEqual(ready.decision.question.options, ["merged", "later"]);
+  const red = run(thread, { pr: redPr() });
+  assert.equal(red.classified.state, "pr-not-ready");
+  assert.equal(red.decision.playbook, "merge-ready");
+  // Another owner item still asks.
+  const both = "Blocked on:\n- your go to merge\n- your sign-off on the prod migration";
+  const asked = run(makeThread({ lastAgentText: both, lastAgentFull: both }));
+  assert.equal(asked.classified.state, "needs-human");
+  assert.match(asked.decision.question.body, /sign-off on the prod migration/);
+  assert.doesNotMatch(asked.decision.question.body, /go to merge/);
+});
+
+test("'Blocked on' sub-bullets are answers only when they read as alternatives", () => {
+  const details = "Blocked on:\n- Your decision on the two P1s:\n  - P1: migration drops the audit table\n  - P1: token logged in plaintext";
+  const detailAsk = run(makeThread({ lastAgentText: details, lastAgentFull: details })).decision.question;
+  assert.deepEqual(detailAsk.options, ["open thread"]);
+  const choices = "Blocked on:\n- Your call on the cache:\n  - Keep the shared default\n  - Make fork PRs read-only";
+  const choiceAsk = run(makeThread({ lastAgentText: choices, lastAgentFull: choices })).decision.question;
+  assert.deepEqual(choiceAsk.options, ["Keep the shared default", "Make fork PRs read-only", "open thread"]);
+});
+
+test("an owner item that points at a list above shows that list", () => {
+  // d1dbe71a 18:17:11Z, trimmed.
+  const report = [
+    "**Not ready to merge.**", "",
+    "**Open \u22656/10: 2.** Both need your call.",
+    "- **CPU lanes:** `bb-verify` fixes the lane count when a run starts. Fixing it means pinning lanes to a per-slot share, or having the sweep resize lanes.",
+    "- **Cache write default:** PR runs write to the shared cache by default. Making fork PRs read-only needs a fork check.", "",
+    "**Resolved: 12 of 13 P1s.**", "- **Fixed in code:** five.", "",
+    "**Blocked on:**", "- **Your decision** on the two P1s above.", "- **Deploying the shim:** after install."
+  ].join("\n");
+  const thread = makeThread({ lastAgentText: report.slice(-600), lastAgentFull: report });
+  const { classified, decision } = run(thread);
+  assert.equal(classified.state, "needs-human");
+  assert.match(decision.question.body, /^Your decision on the two P1s above: CPU lanes: bb-verify fixes/);
+  assert.match(decision.question.body, /Cache write default/);
+  // Long items are context, not buttons.
+  assert.deepEqual(decision.question.options, ["open thread"]);
+});
+
+test("a long background wait on GitHub's own lag waits; a mid-turn reply is not an answer", () => {
+  const task = { id: "b1", description: "watch the dev server", kind: "local_bash", startedAt: ago(60 * MIN) };
+  const waiting = makeThread({ agentStatus: "waiting", openTasks: [task], lastAgentAt: ago(50 * MIN), lastActivityAt: ago(5 * MIN) });
+  // The required check passed; hosted CI has not reported.
+  const gated = (overrides) => makePr({ ci: { state: null, failing: [], pending: [] }, gates: [{ name: "verify", state: "SUCCESS" }], ...overrides });
+  const lag = run(waiting, { pr: gated({ codexReview: { reviewedHead: false, sha: "bbbbbbb" } }) });
+  assert.equal(lag.classified.state, "waiting-ci");
+  assert.equal(lag.decision.action, "wait");
+  assert.equal(run(waiting, { pr: gated({ threadsTruncated: true }) }).decision.playbook, "merge-ready");
+  // Words from a turn still running answer nothing yet.
+  const first = run(makeThread(), { pr: redPr() }).decision;
+  const ledger = sentLedger(first, 40 * MIN);
+  const busy = makeThread({ agentStatus: "running", lastAgentFullAt: ago(30 * MIN) });
+  const classified = classifyThread(makeThread(), { pr: redPr(), localGit: cleanGit, now: NOW, config });
+  const decision = decideThread(classified, busy, { ledger, playbooks, config, now: NOW, pr: redPr(), mode: "auto", manager });
+  assert.doesNotMatch(decision.reason, /answered/);
 });

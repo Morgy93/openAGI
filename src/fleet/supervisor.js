@@ -8,7 +8,7 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { createNotifier } from "./notify.js";
@@ -1286,10 +1286,10 @@ export class FleetSupervisor {
       .filter((thread) => !thread.excluded)
       .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))
       .slice(0, config.limits.maxThreads);
-    // An automation thread's open question card still needs the owner. It is
-    // decided (asked) with the rest, but never read for git or PRs, and
-    // classify gives it nothing to nudge.
-    const carded = threads.filter((thread) => thread.excluded === "automation" && thread.meta?.pendingCard?.items?.length > 0);
+    // An automation or no-repo thread's open question card still needs the
+    // owner. It is decided (asked) with the rest, but never read for git or
+    // PRs, and classify gives it nothing to nudge.
+    const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && thread.meta?.pendingCard?.items?.length > 0);
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
@@ -1553,9 +1553,11 @@ export class FleetSupervisor {
     // Codex thread it hosts): type into it at most once per tick.
     const typedInto = new Set();
 
-    // A question card raises one question per open item.
-    const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question)
-      .flatMap((decision) => (decision.questions?.length ? decision.questions.map((question) => ({ ...decision, question })) : [decision]));
+    // A Codex question card is asked beside the thread's own decision.
+    const asks = decisions.flatMap((decision) => [
+      ...(decision.action === "ask-user" && decision.question ? [decision] : []),
+      ...(decision.cardQuestion ? [{ ...decision, action: "ask-user", question: decision.cardQuestion, playbook: null }] : [])
+    ]);
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];

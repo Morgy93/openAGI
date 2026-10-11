@@ -3019,16 +3019,16 @@ const carding = (overrides = {}, items = cardItems()) => makeThread({
 });
 const cardQuestions = (supervisor) => supervisor.getState().questions.filter((q) => q.kind === "agent-card");
 
-test("a card on a running thread raises one question per item; 'open thread' relays nothing and picks are refused", async (t) => {
+test("a card on a running thread raises one question; 'open thread' relays nothing and picks are refused", async (t) => {
   const threads = [carding()];
   const { supervisor, delivered } = fixture(t, { threads, mode: "auto", delivery: { mode: "computer-use-first" } });
   await supervisor.tick();
-  const [first, second] = cardQuestions(supervisor).sort((a, b) => a.dedupeKey.localeCompare(b.dedupeKey));
+  const [first] = cardQuestions(supervisor);
+  assert.equal(cardQuestions(supervisor).length, 1);
   assert.equal(first.dedupeKey, "card:conductor:s1:toolu_card:0");
-  assert.equal(second.dedupeKey, "card:conductor:s1:toolu_card:1");
   assert.deepEqual(first.options, ["open thread"]);
   assert.deepEqual(first.meta.labels, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
-  assert.match(second.body, /^What should Bob's end-of-day message cover\? 1\. Did \+ doing next/);
+  assert.match(first.body, /Also open: Bob's day$/);
   // A label is not an answer the supervisor can give yet.
   assert.equal(await supervisor.answerQuestion(first.id, "Chat-analysis worker (Recommended)"), null);
   const opened = await supervisor.answerQuestion(first.id, "open thread");
@@ -3037,11 +3037,11 @@ test("a card on a running thread raises one question per item; 'open thread' rel
   assert.equal(delivered.length, 0);
   // Still running next tick: the card stays asked.
   await supervisor.tick();
-  assert.equal(cardQuestions(supervisor).length, 2);
-  // A dismissed item does not hold back the other.
-  supervisor.dismissQuestion(first.id);
+  assert.equal(cardQuestions(supervisor).length, 1);
+  // Item 0 answered in the app, item 1 still open: a new question.
+  threads[0] = carding({}, cardItems().slice(1));
   await supervisor.tick();
-  assert.deepEqual(cardQuestions(supervisor).map((q) => q.id), [second.id]);
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.dedupeKey), ["card:conductor:s1:toolu_card:1"]);
   // Answered in the app: the card is gone and its questions close.
   threads[0] = carding({ meta: { pendingCard: null } });
   await supervisor.tick();
@@ -3056,8 +3056,7 @@ test("an automation thread's card is asked without reading its git or PR; the su
   const { supervisor } = fixture(t, { threads: [auto, self], deps: { readLocalGit: async (cwd) => { gitReads.push(cwd); return null; } } });
   await supervisor.tick();
   const keys = cardQuestions(supervisor).map((q) => q.threadKey);
-  assert.deepEqual([...new Set(keys)], ["codex:auto"]);
-  assert.equal(keys.length, 2);
+  assert.deepEqual(keys, ["codex:auto"]);
   assert.deepEqual(gitReads, []);
   // The card closes: so do its questions.
   auto.meta = { pendingCard: null };
@@ -3070,7 +3069,19 @@ test("the review never sees or closes a card question", async (t) => {
   const { supervisor } = fixture(t, { threads: [carding()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });
   await supervisor.tick();
   assert.equal(model.calls.length, 0);
-  assert.equal(cardQuestions(supervisor).length, 2);
+  assert.equal(cardQuestions(supervisor).length, 1);
+});
+
+test("a no-repo thread's card is asked; a Codex card is asked beside the thread's resume", async (t) => {
+  const codexCard = (callId, msAgo) => ({ app: "codex", cardId: "turn-a", count: 1, items: [{ index: 0, itemId: `${callId}:0`, header: null, question: "Please sign in to the App Store tab.", options: [], multiSelect: false, freeText: true, at: ago(msAgo) }] });
+  const loose = makeThread({ key: "codex:loose", id: "loose", cwd: null, repo: null, branch: null, prRefs: [], excluded: "no-repo", agentStatus: "idle", meta: { pendingCard: codexCard("call_loose", 10 * MIN) } });
+  // 01a0cae7: a session limit that reset, with a card from before it.
+  const capped = makeThread({ key: "codex:capped", id: "capped", agentStatus: "error", error: { kind: "session-limit", text: "limit", resetAt: ago(10 * MIN) },
+    lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN), meta: { pendingCard: codexCard("call_capped", 3 * 60 * MIN) } });
+  const { supervisor, delivered } = fixture(t, { threads: [loose, capped], mode: "auto" });
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.threadKey).sort(), ["codex:capped", "codex:loose"]);
+  assert.deepEqual(delivered.map((item) => [item.thread?.key ?? item.threadKey, item.playbook]), [["codex:capped", "resume"]]);
 });
 
 test("a sent nudge keeps its hash, facts and start time, and an answered one is not resent", async (t) => {

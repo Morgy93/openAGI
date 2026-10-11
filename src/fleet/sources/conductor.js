@@ -29,16 +29,21 @@ const tailSql = (turnColumn) => `
   SELECT role, content, created_at, sent_at, rowid AS row_id, cancelled_at, sender_session_id, sender_api_key_name, ${turnColumn}
   FROM session_messages WHERE session_id = ? ORDER BY sent_at DESC, rowid DESC LIMIT ?`;
 // A turn with hundreds of subagent rows pushes its AskUserQuestion call out
-// of the tail. Both reads stay inside the current turn (turn_id is indexed).
-const ASK_SQL = `
+// of the tail. Both reads stay inside the current turn: "+session_id" keeps
+// the planner on the turn_id index (it would otherwise walk the whole
+// session by sent_at). Only a tool call named AskUserQuestion matches; rows
+// that merely mention it (file reads, greps) escape the quote.
+export const ASK_SQL = `
   SELECT content, created_at, sent_at, rowid AS row_id FROM session_messages
-  WHERE turn_id = ? AND session_id = ? AND role = 'assistant' AND content LIKE '%AskUserQuestion%'
-  ORDER BY sent_at DESC, rowid DESC LIMIT 5`;
-const ASK_CLOSED_SQL = `
+  WHERE turn_id = ? AND +session_id = ? AND role = 'assistant' AND content LIKE '%"name":"%AskUserQuestion"%'
+  ORDER BY sent_at DESC, rowid DESC LIMIT 50`;
+export const ASK_CLOSED_SQL = `
   SELECT content FROM session_messages
-  WHERE turn_id = ? AND session_id = ? AND role = 'assistant' AND (sent_at > ? OR (sent_at = ? AND rowid > ?))
-    AND (content LIKE ? OR content LIKE '%"subtype":"init"%' OR content LIKE '%"type":"result"%')
-  LIMIT 20`;
+  WHERE turn_id = ? AND +session_id = ? AND role = 'assistant' AND (sent_at > ? OR (sent_at = ? AND rowid > ?))
+    AND (content LIKE ? OR content LIKE '%"subtype":"init"%' OR content LIKE '%"type":"result"%' OR content LIKE '%"type":"error"%')
+  ORDER BY sent_at, rowid LIMIT 50`;
+// A dead or finished session shows no card, whatever its last rows say.
+const CARD_DEAD_STATUSES = new Set(["idle", "error"]);
 const TASKS_SQL = `
   SELECT content, created_at FROM session_messages
   WHERE session_id = ? AND sent_at >= ? AND role = 'assistant'
@@ -79,7 +84,7 @@ function eventText(event) {
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    pendingAsk: null, fullText: "", fullAt: null
+    pendingAsks: new Map(), fullText: "", fullAt: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
@@ -103,12 +108,17 @@ function summarizeTail(rowsNewestFirst) {
     // AskUserQuestion means the agent moved on without the pick.
     if (event.type === "system" && event.subtype === "init") {
       summary.turnStartedAt = at;
-      summary.pendingAsk = null;
+      summary.pendingAsks.clear();
     }
-    else if (event.type === "assistant" && !event.parent_tool_use_id) {
+    else if (event.type === "assistant" && event.parent_tool_use_id) {
+      // A subagent's card shows to the owner too; its own tool_result closes it.
+      const ask = askUserQuestion(event, at);
+      if (ask) summary.pendingAsks.set(ask.id, { ...ask, subagent: true });
+    }
+    else if (event.type === "assistant") {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
       const ask = askUserQuestion(event, at);
-      if (ask) summary.pendingAsk = ask;
+      if (ask) summary.pendingAsks.set(ask.id, ask);
       const text = eventText(event);
       if (text) {
         summary.lastAgentText = text;
@@ -120,6 +130,8 @@ function summarizeTail(rowsNewestFirst) {
         }
       }
     } else if (event.type === "result") {
+      // The turn ended: no card of it is open any more.
+      summary.pendingAsks.clear();
       const errors = Array.isArray(event.errors) ? event.errors.join("; ") : "";
       // Limit errors arrive as subtype "success" with is_error set.
       const isError = event.is_error === true || event.is_error === 1;
@@ -131,9 +143,11 @@ function summarizeTail(rowsNewestFirst) {
         summary.fullAt = at;
       }
     } else if (event.type === "error") {
+      // The process died ("exited with code 143"): its card went with it.
+      summary.pendingAsks.clear();
       summary.lastEnd = { isError: true, text: String(event.content ?? ""), at };
-    } else if (event.type === "user" && summary.pendingAsk && answersTool(event, summary.pendingAsk.id)) {
-      summary.pendingAsk = null;
+    } else if (event.type === "user") {
+      for (const id of summary.pendingAsks.keys()) if (answersTool(event, id)) summary.pendingAsks.delete(id);
     }
   }
   return summary;
@@ -171,26 +185,35 @@ function readRecentMessages(db, sessionId, turnColumn) {
   return db.prepare(tailSql(turnColumn)).all(sessionId, TAIL_ROWS);
 }
 
-// The open AskUserQuestion of the current turn when the tail holds no start
-// or end of that turn (the call fell out of it). A later tool_result, init or
-// result row closes it, as in summarizeTail.
-function readOlderAsk(db, sessionId, rows) {
+// The open AskUserQuestion calls (the agent's or a subagent's) of the
+// current turn when the tail holds no start or end of that turn (the calls
+// fell out of it), oldest first. A later tool_result, init, result or error
+// row closes one, as in summarizeTail.
+function readOlderAsks(db, sessionId, rows) {
   const turnId = rows[0]?.turn_id;
-  if (!turnId) return null;
+  if (!turnId) return [];
+  const open = [];
   for (const row of db.prepare(ASK_SQL).all(turnId, sessionId)) {
     const event = parseEvent(row.content);
-    if (event?.type !== "assistant" || event.parent_tool_use_id) continue;
+    if (event?.type !== "assistant") continue;
     const ask = askUserQuestion(event, dbTimeToIso(row.created_at));
     if (!ask) continue;
     const later = db.prepare(ASK_CLOSED_SQL).all(turnId, sessionId, row.sent_at, row.sent_at, row.row_id, `%${ask.id}%`);
     const closed = later.some((other) => {
       const next = parseEvent(other.content);
       if (!next) return false;
-      return (next.type === "system" && next.subtype === "init") || next.type === "result" || (next.type === "user" && answersTool(next, ask.id));
+      return (next.type === "system" && next.subtype === "init") || next.type === "result" || next.type === "error" || (next.type === "user" && answersTool(next, ask.id));
     });
-    return closed ? null : ask;
+    if (!closed) open.unshift(event.parent_tool_use_id ? { ...ask, subagent: true } : ask);
   }
-  return null;
+  return open;
+}
+
+// Every open call of the turn as one card (a subagent's beside the agent's).
+function cardOf(asks, limits) {
+  if (!asks.length) return null;
+  const items = asks.flatMap((ask) => ask.items).map((item, index) => cleanCardItem({ ...item, index }, limits));
+  return { app: "conductor", cardId: asks[0].id, at: asks[0].at, count: items.length, items };
 }
 
 // Background tasks = task_started with no matching task_notification.
@@ -257,17 +280,15 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   const { limits } = config;
   const rows = readRecentMessages(db, row.id, turnColumn);
   const summary = summarizeTail(rows);
-  // Only a turn still open can hold a card, and only one whose start and end
-  // are both outside the tail can hide it.
-  if (!summary.pendingAsk && !summary.turnStartedAt && !summary.lastEnd && row.status === "working") {
-    summary.pendingAsk = readOlderAsk(db, row.id, rows);
-  }
-  const card = summary.pendingAsk?.items?.length
-    ? {
-      app: "conductor", cardId: summary.pendingAsk.id, at: summary.pendingAsk.at, count: summary.pendingAsk.items.length,
-      items: summary.pendingAsk.items.map((item) => cleanCardItem(item, limits))
-    }
-    : null;
+  // Only a live session can hold a card: an idle or errored one lost it
+  // (its process died, or the turn ended), so it reads as stopped instead.
+  // Only a turn whose start and end are both outside the tail can hide one.
+  const live = !CARD_DEAD_STATUSES.has(row.status);
+  let asks = live ? [...summary.pendingAsks.values()] : [];
+  if (live && !summary.turnStartedAt && !summary.lastEnd) asks = readOlderAsks(db, row.id, rows);
+  const card = cardOf(asks, limits);
+  // The agent's own call first, as before cards (executor and older readers).
+  const pendingAsk = asks.find((ask) => !ask.subagent) ?? asks[0] ?? null;
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
@@ -329,8 +350,8 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
       abortReason,
       abortedAt,
       blockedOnOwner,
-      pendingQuestion: summary.pendingAsk
-        ? { text: clampText(redactSecrets(summary.pendingAsk.text), limits.bodyMax), options: summary.pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: summary.pendingAsk.at }
+      pendingQuestion: pendingAsk
+        ? { text: clampText(redactSecrets(pendingAsk.text), limits.bodyMax), options: pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pendingAsk.at }
         : null,
       pendingCard: card,
       waitingFor: peer?.waitingFor ?? null,
