@@ -65,9 +65,9 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_PUSH` | off | `buzzkit` pushes needs-you items to the phone (uses `~/.claude/buzz/endpoint`). Quiet 22:00-08:00, max 3/hour |
 | `OPENAGI_FLEET_LOOKBACK_HOURS` | `48` | Threads active this recently are in scope |
 | `OPENAGI_FLEET_TICK_MS` | `300000` | Time between scans (5 min) |
-| `OPENAGI_FLEET_BB3_HOST` | `dev@100.99.3.113` | BuildBot3 SSH target (read-only probe, never docker) |
-| `OPENAGI_FLEET_LB_URL` | `http://100.99.3.113:2455` | codex-lb base URL; `/health` is checked |
-| `OPENAGI_FLEET_BB3_MANAGER` | Remote dev setup session | Conductor session id or workspace name that gets BuildBot3 / LB escalations |
+| `OPENAGI_FLEET_BB3_HOST` | unset (probe off) | Build-box SSH target, e.g. `build@192.0.2.10` (read-only probe, never docker). Unset: reported as not configured |
+| `OPENAGI_FLEET_LB_URL` | unset (check off) | codex-lb base URL, e.g. `http://192.0.2.10:2455`; `/health` is checked. Unset: reported as not configured |
+| `OPENAGI_FLEET_BB3_MANAGER` | unset (no escalations) | Conductor session id or workspace name that gets build-box / LB escalations |
 | `OPENAGI_FLEET_RELAY_MODEL` | `claude-haiku-4-5-20251001` | Model for the `claude -p` relay to live Claude/Conductor sessions |
 | `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
