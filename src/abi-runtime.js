@@ -653,9 +653,10 @@ export class AbiRuntime {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
-          // Keep the evidence ahead of routing diagnostics so tier compression
-          // preserves details and exact deduplication can distinguish facts.
-          content: [signal.summary, signal.content, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
+          // Put body evidence first so a long summary cannot consume its
+          // compression budget. Normalization may use the summary as the
+          // body fallback; store that text only once.
+          content: [signal.content, signal.content === signal.summary ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
             .filter((part) => part != null && part !== "")
             .join("\n"),
           tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],
