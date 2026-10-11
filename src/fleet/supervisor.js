@@ -1237,11 +1237,14 @@ export class FleetSupervisor {
     // by a background route instead.
     // The policy's hash and facts, so the next decision can tell a repeat.
     const said = { sentAt, messageHash: action.messageHash ?? null, factsKey: action.factsKey ?? null, facts: action.facts ?? null };
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt, ...said }, action.progressMark);
+    const recorded = this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt, ...said }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
-    // back that one attempt. Owner answers and escalations counted none.
+    // back that one attempt, and its entry (with its message hash) is failed.
+    // Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
-      delivery.done.then((reached) => { if (!reached) this.store.undoAttempt(action.threadKey); }).catch(() => { /* best-effort */ });
+      const entry = recorded?.nudges.at(-1) ?? null;
+      const sent = entry ? { at: entry.at, messageHash: entry.messageHash } : null;
+      delivery.done.then((reached) => { if (!reached) this.store.undoAttempt(action.threadKey, sent); }).catch(() => { /* best-effort */ });
     }
   }
 

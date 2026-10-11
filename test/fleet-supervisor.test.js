@@ -400,6 +400,22 @@ test("thread-level manager escalations record the shared incident key", async (t
   assert.equal(supervisor.store.lastEscalation("infra:bb3"), at);
 });
 
+test("a background nudge that never reached the agent leaves no sent hash behind", async (t) => {
+  const { supervisor } = fixture(t);
+  let reached = null;
+  const done = new Promise((resolve) => { reached = resolve; });
+  supervisor.recordSend({ threadKey: "codex:t1", kind: "nudge", playbook: "merge-ready", route: "codex-exec", messageHash: "abc", progressMark: { head: "h1" } }, { status: "sent", route: "codex-exec", done });
+  // The owner said "keep going" while the child ran, and an owner message landed after it.
+  supervisor.store.resetAttempts("codex:t1");
+  supervisor.store.recordNudge("codex:t1", { playbook: "owner-message", route: "computer-use", status: "owner-answer" });
+  reached(false);
+  await new Promise((resolve) => setImmediate(resolve));
+  const nudges = supervisor.store.ledgerFor("codex:t1").nudges;
+  assert.equal(nudges.find((nudge) => nudge.messageHash === "abc").status, "failed");
+  assert.equal(nudges.at(-1).status, "owner-answer");
+  assert.equal(supervisor.store.ledgerFor("codex:t1").attemptsWithoutProgress, 0);
+});
+
 test("a recent infra escalation holds back a thread-level one to the same manager", async (t) => {
   // Needs decideThread to read escalationLedger (shared interface I3).
   const waiting = makeThread({
