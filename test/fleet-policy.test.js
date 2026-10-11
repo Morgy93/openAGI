@@ -1187,3 +1187,91 @@ test("the no-local-verify nudge names the repo's own merge gate", () => {
   assert.equal(gated.playbook, "no-local-verify");
   assert.match(gated.message, /merge gate is a green BuildBot3 full run \(bb-verify --full --pr\) on the exact head/);
 });
+
+// ---------- question cards ----------
+
+// Real shape (session 587635ca): two questions, three {label, description}
+// options each, read while the session is "working".
+function cardThread(overrides = {}, card = {}) {
+  const items = [
+    { index: 0, itemId: "toolu_card:0", header: "End-of-day count", question: "Where should the end-of-day count be built?", options: ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"], multiSelect: false, freeText: true, at: ago(5 * MIN) },
+    { index: 1, itemId: "toolu_card:1", header: "Bob's day", question: "What should Bob's end-of-day message cover?", options: ["Did + doing next (Recommended)", "Only what he did", "Only what's next"], multiSelect: false, freeText: true, at: ago(5 * MIN) }
+  ];
+  return makeThread({
+    agentStatus: "running", lastActivityAt: ago(MIN), lastAgentAt: ago(5 * MIN), lastAgentText: "Two questions for you:",
+    meta: { pendingCard: { app: "conductor", cardId: "toolu_card", at: ago(5 * MIN), count: 2, items, ...card } }, ...overrides
+  });
+}
+
+test("a question card raises one owner question per item, labels in the body, only 'open thread' to answer", () => {
+  const { classified, decision } = run(cardThread());
+  assert.equal(classified.state, "needs-human");
+  assert.equal(decision.action, "ask-user");
+  assert.equal(decision.questions.length, 2);
+  assert.equal(decision.question, decision.questions[0]);
+  const [first, second] = decision.questions;
+  assert.equal(first.title, "app #6522: End-of-day count (1/2)");
+  assert.equal(second.title, "app #6522: Bob's day (2/2)");
+  assert.equal(first.kind, "agent-card");
+  assert.equal(first.dedupeKey, "card:conductor:s1:toolu_card:0");
+  assert.equal(second.dedupeKey, "card:conductor:s1:toolu_card:1");
+  assert.deepEqual(first.options, ["open thread"]);
+  // Each item's own full question, not joined across items.
+  assert.equal(second.body, "What should Bob's end-of-day message cover? 1. Did + doing next (Recommended) 2. Only what he did 3. Only what's next Or your own answer.");
+  assert.doesNotMatch(second.body, /end-of-day count be built/);
+  assert.deepEqual(first.meta.labels, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
+  assert.equal(first.meta.freeText, "1");
+  assert.equal(first.meta.index, "0");
+  assert.equal(first.meta.count, "2");
+});
+
+test("a card is asked while the owner types and after its PR merged", () => {
+  const typing = cardThread({ lastUserText: "also check the logs", lastUserAt: ago(MIN) });
+  assert.equal(run(typing).decision.action, "ask-user");
+  const merged = makePr({ state: "MERGED", createdAt: ago(60 * MIN), mergedAt: ago(MIN), closedAt: ago(MIN) });
+  const { classified, decision } = run(cardThread({ agentStatus: "idle" }), { pr: merged });
+  assert.equal(classified.state, "needs-human");
+  assert.equal(decision.questions.length, 2);
+});
+
+test("acknowledgement items never ping; five options and long labels stay whole in meta", () => {
+  const five = ["us-east-1", "us-west-2", "eu-west-1", "Confirm deletion of these five tracked threads", "ap-south-1"];
+  const items = [
+    { index: 0, itemId: "call_ok:0", header: null, question: "I will use the existing native QA build.", options: ["Okay"], freeText: true, at: ago(5 * MIN) },
+    { index: 1, itemId: "call_go:0", header: null, question: "I have enough authorization.", options: ["Continue"], freeText: true, at: ago(5 * MIN) },
+    { index: 2, itemId: "call_r:0", header: null, question: "Which region should the QA profile use?", options: five, freeText: true, at: ago(5 * MIN) }
+  ];
+  const thread = cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "turn-a", count: 3, items });
+  const { decision } = run(thread);
+  assert.equal(decision.questions.length, 1);
+  assert.equal(decision.questions[0].dedupeKey, "card:codex:t1:turn-a:2");
+  assert.match(decision.questions[0].title, /Which region should the QA profile use\? \(3\/3\)$/);
+  assert.deepEqual(decision.questions[0].meta.labels, five);
+  assert.match(decision.questions[0].body, /4\. Confirm deletion of these five tracked threads 5\. ap-south-1/);
+  // Acknowledgements only: nothing to ask, so the card does not hide the thread's own state.
+  const acks = cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "turn-a", count: 2, items: items.slice(0, 2) });
+  assert.notEqual(run(acks).classified.state, "needs-human");
+});
+
+test("a Codex card item open past a day is asked once more under a new key, then dropped", () => {
+  const item = (msAgo) => [{ index: 0, itemId: "call_x:0", header: null, question: "May I delete the posts?", options: ["Confirm", "Leave"], freeText: true, at: ago(msAgo) }];
+  const codex = (msAgo) => cardThread({ kind: "codex", key: "codex:t1", id: "t1" }, { app: "codex", cardId: "turn-a", count: 1, items: item(msAgo) });
+  assert.equal(run(codex(60 * MIN)).decision.question.dedupeKey, "card:codex:t1:turn-a:0");
+  const late = run(codex(25 * 60 * MIN)).decision.question;
+  assert.equal(late.dedupeKey, "card:codex:t1:turn-a:0:late");
+  assert.equal(late.baseKey, "card:codex:t1:turn-a:0");
+  assert.match(late.title, /^Still open: /);
+  assert.notEqual(run(codex(49 * 60 * MIN)).classified.state, "needs-human");
+  // A Conductor card holds its turn: it never ages out.
+  const conductorOld = cardThread({}, { items: cardThread().meta.pendingCard.items.map((entry) => ({ ...entry, at: ago(49 * 60 * MIN) })) });
+  assert.equal(run(conductorOld).decision.questions.length, 2);
+});
+
+test("automation threads surface their cards; the supervisor's own and archived ones never do", () => {
+  const auto = cardThread({ excluded: "automation" });
+  assert.equal(run(auto).decision.questions.length, 2);
+  assert.equal(run(cardThread({ excluded: "self" })).classified.state, "excluded");
+  assert.equal(run(cardThread({ excluded: "archived", archived: true })).classified.state, "excluded");
+  assert.equal(run(cardThread({ excluded: "automation", archived: true })).classified.state, "excluded");
+  assert.equal(run(cardThread({ excluded: "no-repo" })).classified.state, "excluded");
+});

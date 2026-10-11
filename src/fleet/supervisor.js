@@ -99,7 +99,9 @@ const GROUPED_KINDS = Object.freeze({
   // while the set of failing threads changes under it.
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
-const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused", "storage"]);
+// A question card item is the agent's own words, read from the card itself:
+// the review never closes or rewrites one either.
+const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused", "storage", "agent-card"]);
 // The owner's Scan now reviews at most this many batches (15 questions each).
 const FORCED_REVIEW_ROUNDS = 4;
 const GROUP_MAX = 50;
@@ -743,7 +745,7 @@ export class FleetSupervisor {
       // fixed a blocker is sent even though the blocker is no longer asked,
       // unless the agent has spoken since (it recovered, or asks something new).
       const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
-      const stale = question.kind === "agent-ask" ? !asked.has(question.dedupeKey) : agentSince;
+      const stale = question.kind === "agent-ask" || question.kind === "agent-card" ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
@@ -1071,6 +1073,10 @@ export class FleetSupervisor {
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
+    // A question card is answered in the app itself. Until the supervisor
+    // can click it there, "open thread" is the only answer and it relays
+    // nothing; anything else is refused.
+    if (question.kind === "agent-card" && answer !== "open thread") return null;
     this.answering.add(id);
     try {
       let delivery = null;
@@ -1276,6 +1282,10 @@ export class FleetSupervisor {
       .filter((thread) => !thread.excluded)
       .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))
       .slice(0, config.limits.maxThreads);
+    // An automation thread's open question card still needs the owner. It is
+    // decided (asked) with the rest, but never read for git or PRs, and
+    // classify gives it nothing to nudge.
+    const carded = threads.filter((thread) => thread.excluded === "automation" && thread.meta?.pendingCard?.items?.length > 0);
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
@@ -1318,10 +1328,11 @@ export class FleetSupervisor {
       if (card) thread.meta = { ...thread.meta, blockedOnOwner: true, prompt: card };
     }
     const items = [];
-    for (const thread of inScope) {
+    for (const thread of [...inScope, ...carded]) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
       // No result for a worktree means git timed out or threw: unknown, not clean.
-      const git = localGit.get(thread.cwd) ?? (thread.cwd ? { unreadable: true } : null);
+      // An excluded thread (only asked about its card) was never read.
+      const git = localGit.get(thread.cwd) ?? (thread.cwd && !thread.excluded ? { unreadable: true } : null);
       const gitUnreadable = Boolean(git?.unreadable);
       // A linked PR GitHub could not answer (gh failed or timed out) is unknown, not gone.
       const prUnreadable = !pr && unreadPrs.has(thread.prRefs?.[0]);
@@ -1538,7 +1549,9 @@ export class FleetSupervisor {
     // Codex thread it hosts): type into it at most once per tick.
     const typedInto = new Set();
 
-    const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
+    // A question card raises one question per open item.
+    const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question)
+      .flatMap((decision) => (decision.questions?.length ? decision.questions.map((question) => ({ ...decision, question })) : [decision]));
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];

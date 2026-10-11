@@ -6,6 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DEFAULTS, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
 import { findManagerSession, listConductorThreads } from "../src/fleet/sources/conductor.js";
+import { classifyThread } from "../src/fleet/classify.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
 const MIN = 60_000;
@@ -42,10 +43,10 @@ function createDb(file) {
 let messageSeq = 0;
 function addMessage(db, sessionId, role, content, at, extra = {}) {
   messageSeq += 1;
-  db.prepare(`INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, cancelled_at, sender_session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+  db.prepare(`INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, cancelled_at, sender_session_id, turn_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     `m-${messageSeq}`, sessionId, role, typeof content === "string" ? content : JSON.stringify(content),
-    at, at, extra.cancelledAt ?? null, extra.senderSessionId ?? null
+    at, at, extra.cancelledAt ?? null, extra.senderSessionId ?? null, extra.turnId ?? null
   );
 }
 
@@ -424,4 +425,99 @@ test("a pending AskUserQuestion is the owner's question; its answer clears it", 
   moved.close();
   threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
   assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+});
+
+// Real shape (session 587635ca, 2026-10-11 17:46:39): the card blocks the
+// tool call, so the session reads "working" and background subagent rows
+// keep arriving for 17 minutes, none of them a new turn.
+const CARD_TURN = "760c3717-c66f-475f-a149-3784389cafa8";
+const cardCall = (id) => ({
+  type: "assistant", uuid: "8d52a022", parent_tool_use_id: null, session_id: "s-run",
+  message: { role: "assistant", model: "claude-opus-5-5", content: [{
+    type: "tool_use", id, name: "mcp__conductor__AskUserQuestion", input: { questions: [
+      { header: "End-of-day count", question: "As a rep, I want the end-of-day message to show how many items still need me, so it matches the inbox. Where should that count be built?", multiSelect: false, options: [
+        { label: "Chat-analysis worker (Recommended)", description: "Build it where the inbox already runs." },
+        { label: "Sales worker + inbox module", description: "Add the inbox module to the sales worker." },
+        { label: "Work-queue only", description: "Count only the work queue." }
+      ] },
+      { header: "Bob's day", question: "What should Bob's end-of-day message cover?", multiSelect: false, options: [
+        { label: "Did + doing next (Recommended)", description: "Both halves." },
+        { label: "Only what he did", description: "A recap." },
+        { label: "Only what's next", description: "A plan." }
+      ] }
+    ] }
+  }] }
+});
+const subagentRow = (i) => ({ ...sdk.text("s-run", `subagent step ${i}`, "toolu_bg"), parent_tool_use_id: "toolu_bg" });
+
+function seedCard(home, { subagentRows = 60 } = {}) {
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-run", "user", "build M3", iso(1.99 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "init", session_id: "s-run" }, iso(1.98 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", sdk.text("s-run", "M3 is built through 3.9. Two questions for you:"), iso(1.97 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", cardCall("toolu_card"), iso(1.96 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < subagentRows; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 1.9 * MIN + i * 100).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  return file;
+}
+
+test("an open Conductor question card is read item by item while the session works", async (t) => {
+  const home = makeHome(t);
+  const file = seedCard(home);
+  const config = makeConfig(home);
+  let threads = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }));
+  const thread = threads["s-run"];
+  assert.equal(thread.agentStatus, "running");
+  const card = thread.meta.pendingCard;
+  assert.equal(card.app, "conductor");
+  assert.equal(card.cardId, "toolu_card");
+  assert.equal(card.at, iso(1.96 * MIN));
+  assert.deepEqual(card.items.map((item) => item.header), ["End-of-day count", "Bob's day"]);
+  assert.deepEqual(card.items[0].options, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
+  assert.deepEqual(card.items[1].options, ["Did + doing next (Recommended)", "Only what he did", "Only what's next"]);
+  assert.equal(card.items[1].question, "What should Bob's end-of-day message cover?");
+  assert.deepEqual(card.items.map((item) => [item.index, item.freeText, item.multiSelect]), [[0, true, false], [1, true, false]]);
+  // Item 0 alone stays the back-compat pendingQuestion.
+  assert.match(thread.meta.pendingQuestion.text, /^As a rep.*\(Chat-analysis worker \(Recommended\) \/ Sales worker/);
+  assert.doesNotMatch(thread.meta.pendingQuestion.text, /Bob/);
+  // A working session with a card waits on the owner, not "running".
+  const classified = classifyThread(thread, { now: NOW, config });
+  assert.equal(classified.state, "needs-human");
+  assert.equal(classified.ask.card.cardId, "toolu_card");
+
+  // The owner's pick lands as the tool_result: the card is gone.
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", { type: "user", parent_tool_use_id: null, session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_card", content: [{ type: "text", text: "User responses:\n1. put this in a loop (free text)\n2. Did + doing next (Recommended)" }] }] } }, iso(0.1 * MIN), { turnId: CARD_TURN });
+  db.close();
+  threads = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-run"].meta.pendingCard, null);
+  assert.equal(threads["s-run"].meta.pendingQuestion, null);
+});
+
+test("a card pushed out of the tail by subagent rows is still read, until its answer or a new turn", async (t) => {
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 450 });
+  const config = makeConfig(home);
+  let thread = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard?.cardId, "toolu_card");
+  assert.equal(thread.meta.pendingCard.items.length, 2);
+
+  // Aborted: the next turn's init closes it, though the tool_result never came.
+  let db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "init", session_id: "s-run" }, iso(0.5 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 0.4 * MIN + i).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  thread = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard, null);
+
+  // Answered out of the tail.
+  const other = makeHome(t);
+  const answered = seedCard(other, { subagentRows: 450 });
+  db = new DatabaseSync(answered);
+  addMessage(db, "s-run", "assistant", { type: "user", parent_tool_use_id: null, session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_card", content: "ok" }] } }, iso(1.1 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - MIN + i).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  thread = byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard, null);
 });

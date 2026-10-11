@@ -3006,3 +3006,69 @@ test("a presence-blocked app send arms the idle watcher; a watcher scan skips th
   await supervisor.tick({ reason: "interval" });
   assert.equal(reviewed, 1);
 });
+
+// ---------- question cards ----------
+
+const cardItems = () => [
+  { index: 0, itemId: "toolu_card:0", header: "End-of-day count", question: "Where should the end-of-day count be built?", options: ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"], multiSelect: false, freeText: true, at: ago(5 * MIN) },
+  { index: 1, itemId: "toolu_card:1", header: "Bob's day", question: "What should Bob's end-of-day message cover?", options: ["Did + doing next (Recommended)", "Only what he did", "Only what's next"], multiSelect: false, freeText: true, at: ago(5 * MIN) }
+];
+const carding = (overrides = {}, items = cardItems()) => makeThread({
+  key: "conductor:s1", kind: "conductor", id: "s1", workspace: "montevideo", agentStatus: "running", lastActivityAt: ago(MIN),
+  meta: { pendingCard: { app: "conductor", cardId: "toolu_card", at: ago(5 * MIN), count: 2, items } }, ...overrides
+});
+const cardQuestions = (supervisor) => supervisor.getState().questions.filter((q) => q.kind === "agent-card");
+
+test("a card on a running thread raises one question per item; 'open thread' relays nothing and picks are refused", async (t) => {
+  const threads = [carding()];
+  const { supervisor, delivered } = fixture(t, { threads, mode: "auto", delivery: { mode: "computer-use-first" } });
+  await supervisor.tick();
+  const [first, second] = cardQuestions(supervisor).sort((a, b) => a.dedupeKey.localeCompare(b.dedupeKey));
+  assert.equal(first.dedupeKey, "card:conductor:s1:toolu_card:0");
+  assert.equal(second.dedupeKey, "card:conductor:s1:toolu_card:1");
+  assert.deepEqual(first.options, ["open thread"]);
+  assert.deepEqual(first.meta.labels, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
+  assert.match(second.body, /^What should Bob's end-of-day message cover\? 1\. Did \+ doing next/);
+  // A label is not an answer the supervisor can give yet.
+  assert.equal(await supervisor.answerQuestion(first.id, "Chat-analysis worker (Recommended)"), null);
+  const opened = await supervisor.answerQuestion(first.id, "open thread");
+  assert.equal(opened.question.status, "open");
+  assert.equal(opened.delivery.status, "blocked");
+  assert.equal(delivered.length, 0);
+  // Still running next tick: the card stays asked.
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 2);
+  // A dismissed item does not hold back the other.
+  supervisor.dismissQuestion(first.id);
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.id), [second.id]);
+  // Answered in the app: the card is gone and its questions close.
+  threads[0] = carding({ meta: { pendingCard: null } });
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 0);
+  assert.equal(delivered.length, 0);
+});
+
+test("an automation thread's card is asked without reading its git or PR; the supervisor's own never", async (t) => {
+  const gitReads = [];
+  const auto = carding({ key: "codex:auto", kind: "codex", id: "auto", cwd: "/work/auto", excluded: "automation", prRefs: [] });
+  const self = carding({ key: "codex:self", kind: "codex", id: "self", cwd: "/work/self", excluded: "self", prRefs: [] });
+  const { supervisor } = fixture(t, { threads: [auto, self], deps: { readLocalGit: async (cwd) => { gitReads.push(cwd); return null; } } });
+  await supervisor.tick();
+  const keys = cardQuestions(supervisor).map((q) => q.threadKey);
+  assert.deepEqual([...new Set(keys)], ["codex:auto"]);
+  assert.equal(keys.length, 2);
+  assert.deepEqual(gitReads, []);
+  // The card closes: so do its questions.
+  auto.meta = { pendingCard: null };
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 0);
+});
+
+test("the review never sees or closes a card question", async (t) => {
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "looks done" })));
+  const { supervisor } = fixture(t, { threads: [carding()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick();
+  assert.equal(model.calls.length, 0);
+  assert.equal(cardQuestions(supervisor).length, 2);
+});

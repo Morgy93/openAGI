@@ -632,3 +632,25 @@ test("app restart records, the last restart time and question meta survive a rel
   reloaded.setAppRestart("conductor", null);
   assert.equal(new FleetStore({ dir, now }).appRestart("conductor"), null);
 });
+
+test("a card item keeps its raw labels, a long body, and a dismissal holds its later re-ask", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const labels = ["us-east-1", "us-west-2", "eu-west-1", "Confirm deletion of these five tracked threads", "ap-south-1"];
+  const body = `${"Which region should the QA profile use? ".repeat(8)}1. us-east-1`;
+  const base = store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-a:0", kind: "agent-card", threadKey: "codex:t1", title: "t1: region (1/1)", body, options: ["open thread"], meta: { labels, freeText: "1" } });
+  assert.deepEqual(base.meta.labels, labels);
+  assert.equal(base.body.length, body.length);
+  store.dismissQuestion(base.id);
+  // Asked every tick until the item turns a day old, then under its late key.
+  now.advance(23 * HOUR);
+  assert.equal(store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-a:0", kind: "agent-card", threadKey: "codex:t1", title: "t1: region (1/1)", body, options: ["open thread"] }).suppressed, true);
+  now.advance(HOUR);
+  const late = store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-a:0:late", baseKey: "card:codex:t1:turn-a:0", kind: "agent-card", threadKey: "codex:t1", title: "Still open: t1: region (1/1)", body, options: ["open thread"] });
+  assert.equal(late.suppressed, true);
+  assert.equal(store.openQuestions().length, 0);
+  // Never dismissed: the late ask is a new question.
+  const other = store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-b:0:late", baseKey: "card:codex:t1:turn-b:0", kind: "agent-card", threadKey: "codex:t1", title: "Still open", body: "q", options: ["open thread"] });
+  assert.equal(other.suppressed, undefined);
+  assert.equal(other.status, "open");
+});

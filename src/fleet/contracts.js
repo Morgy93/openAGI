@@ -76,6 +76,8 @@ export const DEFAULTS = Object.freeze({
   pushPerHour: 3,
   titleMax: 100,
   bodyMax: 220,
+  // A question card item's full question and its numbered choices.
+  cardBodyMax: 900,
   excerptMax: 600,
   // The self-review reads this much of each thread's last agent message.
   reviewTailMax: 1500,
@@ -444,6 +446,56 @@ export function runCommand(cmd, args = [], options = {}) {
   });
 }
 
+// ---------- question cards ----------
+
+const CARD_LABEL_MAX = 200;
+const CARD_ITEMS_MAX = 20;
+// The app's Skip is local, so an item nobody answers may stay open for good:
+// past a day it is asked once more, and past two it is dropped.
+export const CARD_STALE_MS = 24 * 60 * MIN;
+export const CARD_DROP_MS = 48 * 60 * MIN;
+// One-option acknowledgements ("Okay", "Continue") ask nothing.
+const ACK_LABELS = new Set(["ok", "okay", "continue", "got it", "acknowledge", "acknowledged", "understood"]);
+
+// A note with no choices that says it needs nothing ("No input is needed
+// from you right now") is one too.
+const NOTHING_NEEDED = /\bno (?:input|action|response|reply|decision)\b[^.?!]{0,30}\b(?:needed|required)\b|\bnothing (?:is )?needed from you\b/i;
+
+export function isAckItem(item) {
+  const options = Array.isArray(item?.options) ? item.options : [];
+  if (!options.length) return NOTHING_NEEDED.test(String(item?.question ?? ""));
+  return options.length === 1 && ACK_LABELS.has(String(options[0]).trim().toLowerCase().replace(/[.!]+$/, ""));
+}
+
+// The items of an open card the owner is asked about now. Only Codex items
+// age out: a Conductor card holds its turn until it is answered.
+export function liveCardItems(card, now = Date.now()) {
+  const items = Array.isArray(card?.items) ? card.items : [];
+  return items.filter((item) => {
+    if (isAckItem(item)) return false;
+    if (card.app !== "codex") return true;
+    const at = Date.parse(item.at ?? "");
+    return !Number.isFinite(at) || now - at < CARD_DROP_MS;
+  });
+}
+
+// Agent text, redacted and bounded; labels stay whole up to CARD_LABEL_MAX.
+export function cleanCardItem(item, limits) {
+  const max = limits?.cardBodyMax ?? DEFAULTS.cardBodyMax;
+  const header = clampText(redactSecrets(item.header ?? ""), limits?.titleMax ?? DEFAULTS.titleMax);
+  return {
+    index: Number(item.index) || 0,
+    itemId: String(item.itemId ?? item.index ?? ""),
+    header: header || null,
+    question: clampText(redactSecrets(item.question ?? ""), max),
+    options: (Array.isArray(item.options) ? item.options : [])
+      .map((option) => clampText(redactSecrets(option), CARD_LABEL_MAX)).filter(Boolean).slice(0, CARD_ITEMS_MAX),
+    multiSelect: item.multiSelect === true,
+    freeText: item.freeText !== false,
+    at: item.at ?? null
+  };
+}
+
 // Collapse whitespace and cut to max chars with an ellipsis.
 export function clampText(value, max) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
@@ -605,8 +657,18 @@ export async function openReadOnlyDb(filePath) {
  * @property {boolean} archived
  * @property {string|null} excluded       reason, or null when in scope
  * @property {Object} meta               source extras: model, file, turnStartedAt, abortReason, heartbeat,
- *   lastSupervisorAt, pendingQuestion, provider, threadSource, conductorHosted, entrypoint, waitingFor,
+ *   lastSupervisorAt, pendingQuestion, pendingCard, provider, threadSource, conductorHosted, entrypoint, waitingFor,
  *   peerStatus, derivedStatus, dbRemote
+ */
+
+/**
+ * @typedef {Object} QuestionCard          an open question card (meta.pendingCard)
+ * @property {"conductor"|"codex"} app
+ * @property {string} cardId              Conductor: the AskUserQuestion tool_use id. Codex: the ask turn id.
+ * @property {string|null} at             ISO; the first open item's ask time
+ * @property {number} count               items the card asked, answered ones included
+ * @property {{index: number, itemId: string, header: string|null, question: string, options: string[],
+ *   multiSelect: boolean, freeText: boolean, at: string|null}[]} items   the open ones; index is stable within the card
  */
 
 /**
@@ -667,7 +729,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {string} reason              short human-readable why
  * @property {string[]} blockers          short readiness blockers
  * @property {{title: string, body: string, options: string[], dedupeKey: string,
- *   kind: "agent-ask"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
+ *   kind: "agent-ask"|"agent-card"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
+ * @property {Object[]} [questions]      a question card: one question per open item (question is the first)
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */

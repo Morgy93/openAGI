@@ -2,7 +2,7 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, msSince } from "./contracts.js";
+import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, liveCardItems, msSince } from "./contracts.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -254,13 +254,21 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   });
 
   const excluded = exclusionReason(thread, { pr, localGit, config });
+  // An open question card waits on the owner whatever else is true: the turn
+  // runs on (or blocks) while it is open, and a merge does not answer it.
+  // Automation threads ask the owner too; never the supervisor's own or an
+  // archived one.
+  const card = cardAsk(thread, excluded, config, now);
+  if (card) return result("needs-human", "agent asks: question card", { ask: card });
   if (excluded) return result("excluded", excluded);
   if (isRunning(thread, now, limits)) return result("running", "turn in progress");
   // A live session on a permission prompt or dialog waits on the owner's
   // click. A nudge cannot clear it.
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
   // Codex request_user_input: the real question is structured, not in the text.
-  if (thread.meta?.pendingQuestion && !prSettledAfter(pr, Date.parse(thread.meta.pendingQuestion.at ?? ""), structuredAskAt(thread))) {
+  // A card of acknowledgements ("Okay") only asks nothing.
+  const cardOpen = thread.meta?.pendingCard?.items?.length > 0;
+  if (thread.meta?.pendingQuestion && !cardOpen && !prSettledAfter(pr, Date.parse(thread.meta.pendingQuestion.at ?? ""), structuredAskAt(thread))) {
     const pending = thread.meta.pendingQuestion;
     return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"], key: pending.key ?? null } });
   }
@@ -309,6 +317,15 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   const idle = text && prKnown && thread.agentStatus !== "error" ? { promised: promisedWork(text) } : null;
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
+}
+
+function cardAsk(thread, excluded, config, now) {
+  const card = thread.meta?.pendingCard;
+  if (!liveCardItems(card, now).length) return null;
+  if (excluded && excluded !== "automation") return null;
+  const self = config?.selfSessionIds ?? [];
+  if (thread.archived || self.includes(thread.id) || (thread.claudeSessionId && self.includes(thread.claudeSessionId))) return null;
+  return { topic: "decision", card };
 }
 
 // A PR merged or closed after the agent asked has answered the ask, but only

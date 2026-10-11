@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
   CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
 import { asksOwner } from "../classify.js";
@@ -111,23 +111,51 @@ function isCiphertext(value) {
   return value.length >= 200 || (/[+=]/.test(value) && !value.includes("/"));
 }
 
-function readUserInput(summary, raw, at) {
+// Who wrote a user message: a reply from a question card, the supervisor
+// (Desktop may wrap its text), a heartbeat automation, injected context, or
+// the owner.
+function userInputKind(raw) {
+  const text = String(raw ?? "");
+  if (parseCardReply(text)) return "reply";
+  if (text.trimStart().startsWith(SUPERVISOR_PREFIX)) return "supervisor";
+  if (HEARTBEAT_PATTERN.test(text)) return "heartbeat";
+  const cleaned = cleanCodexUserText(text);
+  if (cleaned.startsWith(SUPERVISOR_PREFIX)) return "supervisor";
+  return cleaned ? "owner" : "context";
+}
+
+function readUserInput(summary, raw, at, turnId = null) {
   const text = String(raw ?? "");
   if (!text.trim()) return;
-  summary.pendingQuestion = null;
-  if (text.trimStart().startsWith(SUPERVISOR_PREFIX)) {
+  const kind = userInputKind(text);
+  // The supervisor's own words never answer an ask.
+  if (kind === "supervisor") {
     summary.lastSupervisorAt = at;
     return;
   }
-  if (HEARTBEAT_PATTERN.test(text)) {
+  if (kind === "reply") {
+    // Only the items it names are answered. It is still the owner at work.
+    const ids = new Set(parseCardReply(text));
+    for (const id of ids) summary.cardAnswered.add(id);
+    if (summary.pendingQuestion && ids.has(`${summary.pendingQuestion.callId}:0`)) summary.pendingQuestion = null;
+    summary.lastUser = { text: "Answered a question card.", at };
+    return;
+  }
+  summary.pendingQuestion = null;
+  if (kind === "heartbeat") {
     summary.lastInputHeartbeat = true;
     return;
   }
   summary.lastInputHeartbeat = false;
+  if (kind === "context") return;
+  // The owner typed a new turn instead of answering: asks of earlier turns
+  // are closed (a steer inside the ask's own turn leaves them open).
+  const turn = turnId ?? summary.turnId;
+  summary.cardAsks = summary.cardAsks.filter((ask) => turn && ask.turnId === turn);
   // Links inside the browser/IDE wrappers are ambient context, not the owner's words.
   const cleaned = cleanCodexUserText(text);
   addPrRefs(summary, cleaned, at, "owner");
-  if (cleaned) summary.lastUser = { text: cleaned, at };
+  summary.lastUser = { text: cleaned, at };
 }
 
 // fallback: the agent's last words, shown when the title is ciphertext.
@@ -151,10 +179,13 @@ function questionTitle(args, fallback) {
   }
 }
 
-function readItem(summary, item, at) {
+function readItem(summary, item, at, turnId = null) {
   if (!item || typeof item !== "object") return;
-  if (item.type === "AgentMessage") setAgent(summary, contentText(item.content, ["Text", "text"]), at);
-  else if (item.type === "UserMessage") readUserInput(summary, contentText(item.content, ["text", "Text"]), at);
+  // An async card's item repeats the ask; it is not the agent's last words
+  // (a card ending "- Continue" must not read as an in-scope ask).
+  if (item.type === "AgentMessage" && item.delivery === "async") addCardAsk(summary, item.id, item, at, turnId);
+  else if (item.type === "AgentMessage") setAgent(summary, contentText(item.content, ["Text", "text"]), at);
+  else if (item.type === "UserMessage") readUserInput(summary, contentText(item.content, ["text", "Text"]), at, turnId);
   else if (item.type === "McpToolCall" && item.tool === "attach_artifact") addPrRefs(summary, item.arguments?.url, at, "attachment");
 }
 
@@ -163,6 +194,7 @@ function readEvent(summary, payload, at) {
     case "task_started":
       summary.lifecycle = { type: "task_started", payload, at };
       summary.turnStartedAt = toIso(payload.started_at) ?? at;
+      summary.turnId = payload.turn_id ?? payload.turn_attribution?.turn_id ?? null;
       break;
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
@@ -180,7 +212,7 @@ function readEvent(summary, payload, at) {
       readUserInput(summary, payload.message, at);
       break;
     case "item_completed":
-      readItem(summary, payload.item, at);
+      readItem(summary, payload.item, at, payload.turn_id ?? null);
       break;
     default:
       break;
@@ -197,7 +229,8 @@ function readResponseItem(summary, payload, at) {
     if (name === "request_user_input_async") {
       // The ask time lets a PR merged after it close the question.
       const asked = questionTitle(payload.arguments, summary.lastAgent?.text);
-      if (asked) summary.pendingQuestion = { ...asked, at };
+      if (asked) summary.pendingQuestion = { ...asked, at, callId: payload.call_id ?? null };
+      addCardAsk(summary, payload.call_id, parseArgs(payload.arguments), at, payload.internal_chat_message_metadata_passthrough?.turn_id ?? null);
     } else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
@@ -206,8 +239,9 @@ function readResponseItem(summary, payload, at) {
 
 export function parseRolloutTail(text) {
   const summary = {
-    events: 0, lifecycle: null, turnStartedAt: null, lastAgent: null, lastUser: null,
-    lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null
+    events: 0, lifecycle: null, turnStartedAt: null, turnId: null, lastAgent: null, lastUser: null,
+    lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null,
+    cardAsks: [], cardAnswered: new Set()
   };
   for (const row of parseJsonLines(text)) {
     const payload = row?.payload;
@@ -223,7 +257,150 @@ export function parseRolloutTail(text) {
       if (at) summary.lastTurnAt = at;
     }
   }
+  const { pendingQuestion } = summary;
+  if (pendingQuestion) delete pendingQuestion.callId;
   return summary;
+}
+
+// ---------- question cards ----------
+
+// The tagged list the Codex app sends when the owner answers card items:
+// <send_user_message_question_reply>[{"questionItemId":
+// "[\"request_user_input_async\",\"call_x\",0]", ...}]</send_user_message_question_reply>.
+// Item ids ("call_x:0"), or null when the text is not one: the app only
+// counts a message that is the tagged list and nothing else.
+const REPLY_PATTERN = /^\s*<send_user_message_question_reply>([\s\S]*)<\/send_user_message_question_reply>\s*$/;
+
+export function parseCardReply(text) {
+  const match = REPLY_PATTERN.exec(String(text ?? ""));
+  if (!match) return null;
+  let list;
+  try { list = JSON.parse(match[1]); } catch { return []; }
+  const ids = [];
+  for (const entry of Array.isArray(list) ? list : []) {
+    try {
+      const [kind, callId, index] = JSON.parse(entry?.questionItemId);
+      if (kind === "request_user_input_async" && callId) ids.push(`${callId}:${Number(index) || 0}`);
+    } catch { /* not an item id */ }
+  }
+  return ids;
+}
+
+function parseArgs(args) {
+  try {
+    return typeof args === "string" ? JSON.parse(args) : args ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// The function call and the card item carry the same ask; the first one counts.
+function addCardAsk(summary, callId, payload, at, turnId) {
+  if (!callId || summary.cardAsks.some((ask) => ask.callId === callId)) return;
+  summary.cardAsks.push({ callId: String(callId), turnId: turnId ?? summary.turnId ?? null, payload, at });
+}
+
+// One ask's items. A call with no questions asks its own text, free text only.
+function askItems(ask) {
+  const questions = Array.isArray(ask.payload?.questions) && ask.payload.questions.length ? ask.payload.questions : [{ title: ask.payload?.text }];
+  return questions.map((question, index) => {
+    const raw = String(question?.title ?? question?.question ?? "").trim();
+    const options = (Array.isArray(question?.options) ? question.options : [])
+      .map((option) => (typeof option === "string" ? option : option?.label))
+      .filter((option) => typeof option === "string" && option.trim());
+    return {
+      itemId: `${ask.callId}:${index}`, header: null, question: raw && !isCiphertext(raw) ? raw : SEALED_QUESTION,
+      options, multiSelect: false, freeText: true, at: ask.at
+    };
+  });
+}
+
+// The open card: the newest ask turn's items that no reply named. Its id is
+// that turn, so one card keeps one id while the agent adds to it.
+function buildCard(asks, answered, limits) {
+  if (!asks.length) return null;
+  const turnId = asks.at(-1).turnId;
+  const turnAsks = asks.filter((ask) => ask.turnId === turnId);
+  const all = turnAsks.flatMap(askItems).map((item, index) => ({ ...item, index }));
+  const items = all.filter((item) => !answered.has(item.itemId));
+  if (!items.length) return null;
+  return {
+    app: "codex", cardId: String(turnId ?? turnAsks[0].callId), at: items[0].at, count: all.length,
+    items: items.map((item) => cleanCardItem(item, limits))
+  };
+}
+
+const HISTORY_TABLES = {
+  thread_items: ["thread_id", "turn_id", "item_id", "rollout_ordinal", "created_at_ms", "item_json", "item_type"],
+  thread_turns: ["thread_id", "turn_id", "rollout_ordinal"],
+  thread_history_projection_state: ["thread_id", "next_rollout_byte_offset"]
+};
+const CARD_USER_ROWS = 60;
+const CARD_ASK_ROWS = 60;
+
+// Codex Desktop's own index of every thread item (thread_history_1.sqlite).
+// It holds every card and reply however big the rollout grows. Null when it
+// is missing, unreadable, or not the shape this reader knows.
+export async function openThreadHistory(codexHome) {
+  const db = await openReadOnlyDb(path.join(codexHome, "thread_history_1.sqlite"));
+  if (!db) return null;
+  try {
+    for (const [table, columns] of Object.entries(HISTORY_TABLES)) {
+      const present = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+      if (!columns.every((name) => present.has(name))) throw new Error(`thread history: no ${table}`);
+    }
+    return {
+      db,
+      projection: db.prepare("SELECT next_rollout_byte_offset AS offset FROM thread_history_projection_state WHERE thread_id = ?"),
+      users: db.prepare(`SELECT turn_id, rollout_ordinal, item_json FROM thread_items
+        WHERE thread_id = ? AND item_type = 'userMessage' ORDER BY rollout_ordinal DESC LIMIT ${CARD_USER_ROWS}`),
+      turnStart: db.prepare("SELECT rollout_ordinal FROM thread_turns WHERE thread_id = ? AND turn_id = ?"),
+      asks: db.prepare(`SELECT turn_id, item_id, item_json, rollout_ordinal, created_at_ms FROM thread_items
+        WHERE thread_id = ? AND rollout_ordinal >= ? AND item_type = 'agentMessage' AND item_json LIKE '%"delivery":"async"%'
+        ORDER BY rollout_ordinal DESC LIMIT ${CARD_ASK_ROWS}`)
+    };
+  } catch {
+    try { db.close(); } catch { /* already closed */ }
+    return null;
+  }
+}
+
+function itemText(json) {
+  const item = parseArgs(json);
+  return contentText(item?.content, ["text", "Text"]);
+}
+
+// A thread's open card from the history index, null when none, or undefined
+// when the index cannot say (no projection of this thread, or one past the
+// end of its rollout file): the rollout tail decides then. Only rows from the
+// owner's newest typed turn on are read.
+export function readHistoryCard(history, id, rolloutBytes, limits) {
+  try {
+    const state = history.projection.get(id);
+    if (!state || (Number.isFinite(rolloutBytes) && Number(state.offset) > rolloutBytes)) return undefined;
+    const answered = new Set();
+    let owner = null;
+    const users = history.users.all(id);
+    for (const row of users) {
+      const text = itemText(row.item_json);
+      const kind = userInputKind(text);
+      if (kind === "reply") for (const itemId of parseCardReply(text)) answered.add(itemId);
+      else if (kind === "owner" && !owner) owner = row;
+    }
+    // No owner turn among the rows read: older asks are long settled.
+    const from = owner
+      ? Number(history.turnStart.get(id, owner.turn_id)?.rollout_ordinal ?? owner.rollout_ordinal)
+      : users.length >= CARD_USER_ROWS ? Number(users.at(-1).rollout_ordinal) : 0;
+    const asks = [];
+    for (const row of history.asks.all(id, from)) {
+      const item = parseArgs(row.item_json);
+      if (item?.delivery !== "async") continue;
+      asks.unshift({ callId: String(row.item_id), turnId: row.turn_id, payload: item, at: toIso(Number(row.created_at_ms)) });
+    }
+    return buildCard(asks, answered, limits);
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------- thread assembly ----------
@@ -294,12 +471,14 @@ function applyRollout(thread, row, context) {
   const { config, now, tailBytes } = context;
   const limits = config.limits;
   let mtimeMs = null;
+  let size = null;
   try {
-    mtimeMs = fs.statSync(row.rollout_path).mtimeMs;
+    ({ mtimeMs, size } = fs.statSync(row.rollout_path));
   } catch {
     return [];
   }
   const summary = parseRolloutTail(readTail(row.rollout_path, tailBytes));
+  thread.meta.pendingCard = readCard(row, context, size, summary);
   const updatedMs = Date.parse(thread.lastActivityAt ?? "");
   // Settings writes bump the file and catalog times without a turn, so
   // those are only a fallback when the tail holds no turn row.
@@ -336,6 +515,21 @@ function applyRollout(thread, row, context) {
     thread.meta.heartbeat = true;
   }
   return summary.prRefs;
+}
+
+// The thread's open question card: from the history index when it covers
+// this thread, else from the rollout tail (parsed here when not given).
+function readCard(row, context, size = undefined, summary = null) {
+  const limits = context.config.limits;
+  let bytes = size;
+  if (bytes === undefined) {
+    try { bytes = fs.statSync(row.rollout_path).size; } catch { bytes = null; }
+  }
+  const indexed = context.history ? readHistoryCard(context.history, String(row.id), bytes, limits) : undefined;
+  if (indexed !== undefined) return indexed;
+  if (bytes === null) return null;
+  const tail = summary ?? parseRolloutTail(readTail(row.rollout_path, context.tailBytes));
+  return buildCard(tail.cardAsks, tail.cardAnswered, limits);
 }
 
 // The newest attachment is the thread's PR: a long thread moves on from the
@@ -455,11 +649,16 @@ function buildThread(row, context) {
       abortedAt: null,
       lastSupervisorAt: null,
       pendingQuestion: null,
+      pendingCard: null,
       heartbeat: false
     }
   };
-  // Excluded-by-metadata threads (mostly guardian reviews) skip the tail read.
-  const rolloutRefs = thread.excluded ? [] : applyRollout(thread, row, context);
+  // Excluded-by-metadata threads (mostly guardian reviews) skip the tail
+  // read. Automation threads still get their question cards read: those wait
+  // on the owner like any other.
+  const skipped = thread.excluded;
+  const rolloutRefs = skipped ? [] : applyRollout(thread, row, context);
+  if (skipped === "automation") thread.meta.pendingCard = readCard(row, context);
   thread.prRefs = orderPrRefs([...(attachments.get(id) ?? []), ...rolloutRefs], thread.branch);
   if (!thread.repo && thread.prRefs.length > 0) thread.repo = parsePrRef(thread.prRefs[0])?.repo ?? null;
   if (!thread.excluded) thread.excluded = scopeExclusion(thread);
@@ -554,10 +753,13 @@ export async function readWriterLocks(config, ids, { run, isPidAlive }) {
   return locked;
 }
 
+// An automation thread with an open card counts as in scope here: the cap
+// must not drop a question the owner has not seen.
 function capThreads(threads, max) {
-  const inScope = threads.filter((thread) => !thread.excluded).slice(0, max);
+  const carded = (thread) => thread.excluded === "automation" && thread.meta?.pendingCard?.items?.length > 0;
+  const inScope = threads.filter((thread) => !thread.excluded || carded(thread)).slice(0, max);
   const room = Math.max(0, max - inScope.length);
-  const keep = new Set([...inScope, ...threads.filter((thread) => thread.excluded).slice(0, room)]);
+  const keep = new Set([...inScope, ...threads.filter((thread) => !inScope.includes(thread)).slice(0, room)]);
   return threads.filter((thread) => keep.has(thread));
 }
 
@@ -575,6 +777,8 @@ export async function listCodexThreads(config, options = {}) {
   const cutoff = now - config.lookbackHours * HOUR;
   const pageSize = limits.maxThreads * 5;
   const built = [];
+  // A history index that will not open leaves every card to the tails.
+  const history = options.history === undefined ? await openThreadHistory(config.paths.codexHome) : options.history;
   try {
     // Guardian reviews, automation, and settings-only rows fill pages too,
     // so read on until maxThreads in-scope threads are found or the
@@ -582,7 +786,7 @@ export async function listCodexThreads(config, options = {}) {
     for (let after = null, inScope = 0; inScope < limits.maxThreads;) {
       const rows = readThreadRows(db, cutoff, pageSize, after);
       const attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
-      const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
+      const context = { config, now, attachments, history, tailBytes: options.tailBytes ?? TAIL_BYTES };
       for (const row of rows) {
         const thread = buildThread(row, context);
         // The catalog query lets settings-only writes through; the last turn decides.
@@ -606,6 +810,7 @@ export async function listCodexThreads(config, options = {}) {
     }
   } finally {
     try { db.close(); } catch { /* already closed */ }
+    if (options.history === undefined) try { history?.db.close(); } catch { /* already closed */ }
   }
   const threads = capThreads(built, limits.maxThreads);
   const locked = await readWriterLocks(config, threads.map((thread) => thread.id), { run, isPidAlive });

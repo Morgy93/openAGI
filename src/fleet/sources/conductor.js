@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
+  SUPERVISOR_PREFIX, clampTail, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
   threadKey, toIso
 } from "../contracts.js";
 import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
@@ -25,9 +25,20 @@ const SESSIONS_SQL = `
   WHERE COALESCE(s.is_hidden, 0) = 0 AND COALESCE(w.state, '') != 'archived'`;
 
 // (session_id, sent_at) is indexed, so these never scan a whole session.
-const TAIL_SQL = `
-  SELECT role, content, created_at, cancelled_at, sender_session_id, sender_api_key_name
+const tailSql = (turnColumn) => `
+  SELECT role, content, created_at, sent_at, rowid AS row_id, cancelled_at, sender_session_id, sender_api_key_name, ${turnColumn}
   FROM session_messages WHERE session_id = ? ORDER BY sent_at DESC, rowid DESC LIMIT ?`;
+// A turn with hundreds of subagent rows pushes its AskUserQuestion call out
+// of the tail. Both reads stay inside the current turn (turn_id is indexed).
+const ASK_SQL = `
+  SELECT content, created_at, sent_at, rowid AS row_id FROM session_messages
+  WHERE turn_id = ? AND session_id = ? AND role = 'assistant' AND content LIKE '%AskUserQuestion%'
+  ORDER BY sent_at DESC, rowid DESC LIMIT 5`;
+const ASK_CLOSED_SQL = `
+  SELECT content FROM session_messages
+  WHERE turn_id = ? AND session_id = ? AND role = 'assistant' AND (sent_at > ? OR (sent_at = ? AND rowid > ?))
+    AND (content LIKE ? OR content LIKE '%"subtype":"init"%' OR content LIKE '%"type":"result"%')
+  LIMIT 20`;
 const TASKS_SQL = `
   SELECT content, created_at FROM session_messages
   WHERE session_id = ? AND sent_at >= ? AND role = 'assistant'
@@ -121,20 +132,27 @@ function summarizeTail(rowsNewestFirst) {
   return summary;
 }
 
-// Conductor's AskUserQuestion: the turn waits on the owner's pick while the
-// session reads "idle", and the question is in the tool call, not the text.
+// Conductor's AskUserQuestion: the tool call blocks the turn on the owner's
+// pick, so the session reads "working" the whole time, and the questions are
+// in the call, not the text.
 function askUserQuestion(event, at) {
   const content = Array.isArray(event.message?.content) ? event.message.content : [];
   const call = content.find((block) => block?.type === "tool_use" && /AskUserQuestion$/.test(String(block.name ?? "")));
   const questions = Array.isArray(call?.input?.questions) ? call.input.questions.filter((q) => q && typeof q.question === "string") : [];
   if (!call?.id || !questions.length) return null;
-  // The pick is a widget in Conductor: typed text does not answer it, so the
-  // choices ride in the text and the owner answers in the app.
   const choices = (q) => (Array.isArray(q.options) ? q.options : [])
     .map((option) => (typeof option === "string" ? option : option?.label))
     .filter((option) => typeof option === "string" && option.trim());
-  const text = questions.map((q) => (choices(q).length ? `${q.question.trim()} (${choices(q).join(" / ")})` : q.question.trim())).join(" / ");
-  return { id: String(call.id), at, text, options: [] };
+  // The card is a widget: typed text does not answer it. Every question is
+  // one item, with its full labels; Conductor always offers "Other" too.
+  const items = questions.map((q, index) => ({
+    index, itemId: `${call.id}:${index}`, header: typeof q.header === "string" ? q.header : null, question: q.question.trim(),
+    options: choices(q), multiSelect: q.multiSelect === true, freeText: true, at
+  }));
+  // The first question alone, as before cards (executor and older readers).
+  const first = items[0];
+  const text = first.options.length ? `${first.question} (${first.options.join(" / ")})` : first.question;
+  return { id: String(call.id), at, text, options: [], items };
 }
 
 function answersTool(event, id) {
@@ -142,8 +160,30 @@ function answersTool(event, id) {
   return content.some((block) => block?.type === "tool_result" && String(block.tool_use_id ?? "") === id);
 }
 
-function readRecentMessages(db, sessionId) {
-  return db.prepare(TAIL_SQL).all(sessionId, TAIL_ROWS);
+function readRecentMessages(db, sessionId, turnColumn) {
+  return db.prepare(tailSql(turnColumn)).all(sessionId, TAIL_ROWS);
+}
+
+// The open AskUserQuestion of the current turn when the tail holds no start
+// or end of that turn (the call fell out of it). A later tool_result, init or
+// result row closes it, as in summarizeTail.
+function readOlderAsk(db, sessionId, rows) {
+  const turnId = rows[0]?.turn_id;
+  if (!turnId) return null;
+  for (const row of db.prepare(ASK_SQL).all(turnId, sessionId)) {
+    const event = parseEvent(row.content);
+    if (event?.type !== "assistant" || event.parent_tool_use_id) continue;
+    const ask = askUserQuestion(event, dbTimeToIso(row.created_at));
+    if (!ask) continue;
+    const later = db.prepare(ASK_CLOSED_SQL).all(turnId, sessionId, row.sent_at, row.sent_at, row.row_id, `%${ask.id}%`);
+    const closed = later.some((other) => {
+      const next = parseEvent(other.content);
+      if (!next) return false;
+      return (next.type === "system" && next.subtype === "init") || next.type === "result" || (next.type === "user" && answersTool(next, ask.id));
+    });
+    return closed ? null : ask;
+  }
+  return null;
 }
 
 // Background tasks = task_started with no matching task_notification.
@@ -206,9 +246,21 @@ function workspaceTabs(rows) {
   return out;
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null }) {
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id" }) {
   const { limits } = config;
-  const summary = summarizeTail(readRecentMessages(db, row.id));
+  const rows = readRecentMessages(db, row.id, turnColumn);
+  const summary = summarizeTail(rows);
+  // Only a turn still open can hold a card, and only one whose start and end
+  // are both outside the tail can hide it.
+  if (!summary.pendingAsk && !summary.turnStartedAt && !summary.lastEnd && row.status === "working") {
+    summary.pendingAsk = readOlderAsk(db, row.id, rows);
+  }
+  const card = summary.pendingAsk?.items?.length
+    ? {
+      app: "conductor", cardId: summary.pendingAsk.id, at: summary.pendingAsk.at, count: summary.pendingAsk.items.length,
+      items: summary.pendingAsk.items.map((item) => cleanCardItem(item, limits))
+    }
+    : null;
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
@@ -271,6 +323,7 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
       pendingQuestion: summary.pendingAsk
         ? { text: clampText(redactSecrets(summary.pendingAsk.text), limits.bodyMax), options: summary.pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: summary.pendingAsk.at }
         : null,
+      pendingCard: card,
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,
@@ -323,12 +376,14 @@ export async function listConductorThreads(config, options = {}) {
       .slice(0, MAX_STALE_MANAGER_ROWS);
     const peers = options.peers ?? readLivePeers(config, { isPidAlive });
     const tabs = workspaceTabs(rows);
+    // Older Conductor builds have no turn_id; the tail then stands alone.
+    const turnColumn = db.prepare("PRAGMA table_info(session_messages)").all().some((column) => column.name === "turn_id") ? "turn_id" : "NULL AS turn_id";
     const threads = [];
     for (const [list, stale] of [[recent, false], [manager, true]]) {
       for (const { row } of list) {
         // A query failure means the source is unknown this tick. Returning a
         // partial catalog would close questions from sessions we failed to read.
-        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null }));
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn }));
       }
     }
     return threads;

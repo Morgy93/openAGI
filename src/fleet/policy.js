@@ -4,7 +4,10 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import {
+  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, liveCardItems, msSince, parsePrRef, redactSecrets, shortHash,
+  uiTargetFor
+} from "./contracts.js";
 import { deliberateStop } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
 import { requiredChecksFor } from "./sources/github.js";
@@ -406,9 +409,40 @@ function escalatedWait(classified, pr, limits, bb3, thread = null, config = null
   return null;
 }
 
+// One owner question per open card item, all at once, so a dismissed item
+// never holds back the next. The card is answered in the app: until the
+// supervisor can click it, "open thread" is the only answer and the choices
+// are listed in the body. A Codex item open past a day is asked once more
+// (a new key), then dropped (liveCardItems).
+function cardIntent(ctx, card) {
+  const { thread, now, limits } = ctx;
+  const count = Math.max(Number(card.count) || 0, ...card.items.map((item) => item.index + 1));
+  const questions = liveCardItems(card, now).map((item) => {
+    const late = card.app === "codex" && now - Date.parse(item.at ?? "") >= CARD_STALE_MS;
+    const head = clampText(item.header || item.question, 50);
+    const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
+    const extra = item.multiSelect ? " Pick any." : "";
+    const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim()].filter(Boolean).join(" ");
+    const key = `card:${thread.key}:${card.cardId}:${item.index}`;
+    return {
+      ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head} (${item.index + 1}/${count})`, body: stripTags(redactSecrets(body)), options: ["open thread"], dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+      // The raw labels, for answering in the app later; never sent to an agent.
+      meta: {
+        app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), index: String(item.index), count: String(count),
+        freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
+      },
+      ...(late ? { baseKey: key } : {}),
+      agentAskedAt: item.at ?? null
+    };
+  });
+  if (!questions.length) return { type: "none", reason: "question card: nothing left to ask" };
+  return { type: "ask", reason: "agent asks: question card", question: questions[0], questions };
+}
+
 function agentAskIntent(ctx) {
   const { classified, thread } = ctx;
   const ask = classified.ask ?? {};
+  if (ask.card) return cardIntent(ctx, ask.card);
   if (thread.meta?.blockedOnOwner === true) {
     // A card the supervisor read on screen: its own buttons are the options,
     // and a tap clicks that button (supervisor.answerQuestion). A new card is
@@ -475,6 +509,10 @@ function resolveIntent(ctx, intent) {
   if (intent.type === "none") return { ...base, reason: intent.reason ?? base.reason };
   if (intent.type === "wait") return { ...base, action: "wait", reason: intent.reason, notBefore: intent.notBefore ?? null };
   if (intent.type === "escalate") return resolveEscalation(ctx, intent, base);
+  // Typing in the composer does not answer a card: it is asked whatever the owner does.
+  if (intent.type === "ask" && intent.questions) {
+    return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, questions: intent.questions, notBefore: null };
+  }
   // The owner typing into this thread outranks anything that touches it.
   const ownerUntil = ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
   if (ownerUntil) return { ...base, action: "wait", reason: "owner active in thread", notBefore: ownerUntil };
