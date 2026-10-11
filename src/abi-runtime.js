@@ -653,7 +653,11 @@ export class AbiRuntime {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
-          content: `${signal.summary}\nDecision: ${scrutiny.action}\nReasons: ${scrutiny.reasons.join(" ")}`,
+          // Keep the evidence ahead of routing diagnostics so tier compression
+          // preserves details and exact deduplication can distinguish facts.
+          content: [signal.summary, signal.content, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
+            .filter((part) => part != null && part !== "")
+            .join("\n"),
           tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],
           novelty: signal.novelty,
           risk: signal.risk,
