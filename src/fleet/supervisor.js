@@ -8,7 +8,7 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { createNotifier } from "./notify.js";
@@ -99,7 +99,9 @@ const GROUPED_KINDS = Object.freeze({
   // while the set of failing threads changes under it.
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
-const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused", "storage"]);
+// A question card item is the agent's own words, read from the card itself:
+// the review never closes or rewrites one either.
+const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused", "storage", "agent-card"]);
 // The owner's Scan now reviews at most this many batches (15 questions each).
 const FORCED_REVIEW_ROUNDS = 4;
 const GROUP_MAX = 50;
@@ -743,7 +745,7 @@ export class FleetSupervisor {
       // fixed a blocker is sent even though the blocker is no longer asked,
       // unless the agent has spoken since (it recovered, or asks something new).
       const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
-      const stale = question.kind === "agent-ask" ? !asked.has(question.dedupeKey) : agentSince;
+      const stale = question.kind === "agent-ask" || question.kind === "agent-card" ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
@@ -1071,6 +1073,10 @@ export class FleetSupervisor {
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
+    // A question card is answered in the app itself. Until the supervisor
+    // can click it there, "open thread" is the only answer and it relays
+    // nothing; anything else is refused.
+    if (question.kind === "agent-card" && answer !== "open thread") return null;
     this.answering.add(id);
     try {
       let delivery = null;
@@ -1209,13 +1215,15 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
+    const sentAt = new Date(this.now()).toISOString();
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
     if ((delivery.route ?? action.route) === "computer-use") this.noteUiResult(thread, delivery);
-    this.recordSend(action, delivery);
+    this.recordSend(action, delivery, sentAt);
     return { action: this.store.action(actionId), delivery };
   }
 
-  recordSend(action, delivery) {
+  // sentAt: when the send started. A reply can land before delivery returns.
+  recordSend(action, delivery, sentAt = null) {
     const at = new Date(this.now()).toISOString();
     const incident = incidentKey(action);
     if (incident && ESCALATION_STATUSES.has(delivery.status)) this.store.recordEscalation(incident, at);
@@ -1227,11 +1235,16 @@ export class FleetSupervisor {
     const threadActivityAt = thread ? (thread.lastAgentAt && Date.parse(thread.lastAgentAt) > Date.parse(thread.lastActivityAt ?? "") ? thread.lastAgentAt : thread.lastActivityAt) : null;
     // The route that actually ran: a presence-blocked app send may have gone
     // by a background route instead.
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
+    // The policy's hash and facts, so the next decision can tell a repeat.
+    const said = { sentAt, messageHash: action.messageHash ?? null, factsKey: action.factsKey ?? null, facts: action.facts ?? null };
+    const recorded = this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt, ...said }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
-    // back that one attempt. Owner answers and escalations counted none.
+    // back that one attempt, and its entry (with its message hash) is failed.
+    // Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
-      delivery.done.then((reached) => { if (!reached) this.store.undoAttempt(action.threadKey); }).catch(() => { /* best-effort */ });
+      const entry = recorded?.nudges.at(-1) ?? null;
+      const sent = entry ? { at: entry.at, messageHash: entry.messageHash } : null;
+      delivery.done.then((reached) => { if (!reached) this.store.undoAttempt(action.threadKey, sent); }).catch(() => { /* best-effort */ });
     }
   }
 
@@ -1256,9 +1269,11 @@ export class FleetSupervisor {
     let peers = new Map();
     try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
 
+    // The Codex keys whose open card this tick's scan settled (see act).
+    const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
     const [codexThreads, claudeThreads, conductorThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
-      guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run }), []),
+      guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
       guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
       guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
       guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
@@ -1272,10 +1287,17 @@ export class FleetSupervisor {
     // Conductor-hosted Codex threads learn which Conductor session shows them.
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [] }));
     const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
-    const inScope = threads
+    const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
+    const ranked = threads
       .filter((thread) => !thread.excluded)
-      .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))
-      .slice(0, config.limits.maxThreads);
+      .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
+    // An older thread past the cap still has its open card asked: the Codex
+    // source kept it for that card alone.
+    const inScope = [...ranked.slice(0, config.limits.maxThreads), ...ranked.slice(config.limits.maxThreads).filter(hasCard)];
+    // An automation or no-repo thread's open question card still needs the
+    // owner. It is decided (asked) with the rest, but never read for git or
+    // PRs, and classify gives it nothing to nudge.
+    const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && hasCard(thread));
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
@@ -1318,10 +1340,11 @@ export class FleetSupervisor {
       if (card) thread.meta = { ...thread.meta, blockedOnOwner: true, prompt: card };
     }
     const items = [];
-    for (const thread of inScope) {
+    for (const thread of [...inScope, ...carded]) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
       // No result for a worktree means git timed out or threw: unknown, not clean.
-      const git = localGit.get(thread.cwd) ?? (thread.cwd ? { unreadable: true } : null);
+      // An excluded thread (only asked about its card) was never read.
+      const git = localGit.get(thread.cwd) ?? (thread.cwd && !thread.excluded ? { unreadable: true } : null);
       const gitUnreadable = Boolean(git?.unreadable);
       // A linked PR GitHub could not answer (gh failed or timed out) is unknown, not gone.
       const prUnreadable = !pr && unreadPrs.has(thread.prRefs?.[0]);
@@ -1372,7 +1395,7 @@ export class FleetSupervisor {
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away", storageUnknown });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1516,7 +1539,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1538,7 +1561,11 @@ export class FleetSupervisor {
     // Codex thread it hosts): type into it at most once per tick.
     const typedInto = new Set();
 
-    const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
+    // A Codex question card is asked beside the thread's own decision.
+    const asks = decisions.flatMap((decision) => [
+      ...(decision.action === "ask-user" && decision.question ? [decision] : []),
+      ...(decision.cardQuestion ? [{ ...decision, action: "ask-user", question: decision.cardQuestion, playbook: null }] : [])
+    ]);
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
@@ -1618,7 +1645,8 @@ export class FleetSupervisor {
       const target = targetKey ? byKey.get(targetKey) : null;
       const record = {
         threadKey: decision.threadKey, targetKey, playbook: decision.playbook, route: decision.route,
-        message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action
+        message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
+        ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
       if (existing) seenActions.add(existing.id);
@@ -1648,13 +1676,14 @@ export class FleetSupervisor {
       if (uiKey) typedInto.add(uiKey);
       tries += 1;
       attempted.add(decision.threadKey);
+      const sentAt = new Date(this.now()).toISOString();
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
       if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
       if (delivery.status !== "blocked") sends += 1;
       if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
       else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
-      this.recordSend(record, delivery);
+      this.recordSend(record, delivery, sentAt);
     }
 
     // A planned/proposed action the policy no longer wants is stale.
@@ -1673,9 +1702,11 @@ export class FleetSupervisor {
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
-      // source that hit its cap only proves absence for excluded threads.
+      // source that hit its cap only proves absence for excluded threads,
+      // and for a card its complete card scan settled (no card open now).
       const known = question.threadKey ? byKey.get(question.threadKey) : null;
-      const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
+      const cardSettled = question.kind === "agent-card" && cardScanned.has(question.threadKey);
+      const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]) && !cardSettled;
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       // A group member a capped scan left out may still be failing.
       if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;

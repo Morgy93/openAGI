@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, parseJsonLines, parsePrRef, prRefKey, readTail,
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, isPidAlive as defaultIsPidAlive, parseJsonLines, parsePrRef, prRefKey, readTail,
   redactSecrets, threadKey, toIso
 } from "../contracts.js";
 
@@ -155,7 +155,7 @@ function emptySummary() {
     cwd: null, branch: null, entrypoint: null, sidechain: false,
     customTitle: null, aiTitle: null, agentName: null,
     prRefs: [], textTurns: 0, phase: null, model: null,
-    lastAgentText: "", lastAgentAt: null, lastUserText: "", lastUserAt: null, turnStartedAt: null,
+    lastAgentText: "", lastAgentAt: null, lastUserText: "", lastUserAt: null, turnStartedAt: null, lastSupervisorAt: null,
     lastTurnAt: null, abortedAt: null, apiError: null, retryError: null,
     toolDescriptions: new Map(), tasks: new Map()
   };
@@ -200,6 +200,8 @@ function onUser(summary, row) {
   if (isOwnerText(row, text)) {
     summary.lastUserText = text;
     summary.lastUserAt = toIso(row.timestamp);
+  } else if (text.startsWith(SUPERVISOR_PREFIX)) {
+    summary.lastSupervisorAt = toIso(row.timestamp);
   }
 }
 
@@ -330,6 +332,9 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     lastActivityAt: summary.lastTurnAt ?? toIso(mtimeMs),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
+    // API error rows never reach lastAgentText, so this is a real reply.
+    lastAgentFull: clampTailLines(redactSecrets(summary.lastAgentText), limits.fullTextMax),
+    lastAgentFullAt: summary.lastAgentAt,
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,
@@ -346,6 +351,7 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
       turnStartedAt: summary.turnStartedAt,
       abortReason: agentStatus === "aborted" ? "interrupted" : null,
       abortedAt: agentStatus === "aborted" ? summary.abortedAt : null,
+      lastSupervisorAt: summary.lastSupervisorAt,
       entrypoint: summary.entrypoint,
       conductorHosted: Boolean(cwd && (cwd.includes("/conductor/workspaces/") || cwd.includes("/.conductor/")))
         || summary.entrypoint === "sdk-ts",

@@ -400,6 +400,24 @@ test("thread-level manager escalations record the shared incident key", async (t
   assert.equal(supervisor.store.lastEscalation("infra:bb3"), at);
 });
 
+test("a background nudge that never reached the agent leaves no sent hash behind", async (t) => {
+  const { supervisor } = fixture(t);
+  let reached = null;
+  const done = new Promise((resolve) => { reached = resolve; });
+  supervisor.recordSend({ threadKey: "codex:t1", kind: "nudge", playbook: "merge-ready", route: "codex-exec", messageHash: "abc", progressMark: { head: "h1" } }, { status: "sent", route: "codex-exec", done });
+  // The owner said "keep going" while the child ran, and an owner message landed after it.
+  supervisor.store.resetAttempts("codex:t1");
+  supervisor.store.recordNudge("codex:t1", { playbook: "owner-message", route: "computer-use", status: "owner-answer" });
+  reached(false);
+  await new Promise((resolve) => setImmediate(resolve));
+  const nudges = supervisor.store.ledgerFor("codex:t1").nudges;
+  assert.equal(nudges.find((nudge) => nudge.messageHash === "abc").status, "failed");
+  assert.equal(nudges.at(-1).status, "owner-answer");
+  assert.equal(supervisor.store.ledgerFor("codex:t1").attemptsWithoutProgress, 0);
+  // It also lifts the policy's hold on an answered nudge.
+  assert.ok(Number.isFinite(Date.parse(supervisor.store.ledgerFor("codex:t1").keepGoingAt)));
+});
+
 test("a recent infra escalation holds back a thread-level one to the same manager", async (t) => {
   // Needs decideThread to read escalationLedger (shared interface I3).
   const waiting = makeThread({
@@ -3005,4 +3023,141 @@ test("a presence-blocked app send arms the idle watcher; a watcher scan skips th
   assert.ok(Number.isFinite(supervisor.awayLeadMs));
   await supervisor.tick({ reason: "interval" });
   assert.equal(reviewed, 1);
+});
+
+// ---------- question cards ----------
+
+const cardItems = () => [
+  { index: 0, itemId: "toolu_card:0", header: "End-of-day count", question: "Where should the end-of-day count be built?", options: ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"], multiSelect: false, freeText: true, at: ago(5 * MIN) },
+  { index: 1, itemId: "toolu_card:1", header: "Bob's day", question: "What should Bob's end-of-day message cover?", options: ["Did + doing next (Recommended)", "Only what he did", "Only what's next"], multiSelect: false, freeText: true, at: ago(5 * MIN) }
+];
+const carding = (overrides = {}, items = cardItems()) => makeThread({
+  key: "conductor:s1", kind: "conductor", id: "s1", workspace: "montevideo", agentStatus: "running", lastActivityAt: ago(MIN),
+  meta: { pendingCard: { app: "conductor", cardId: "toolu_card", at: ago(5 * MIN), count: 2, items } }, ...overrides
+});
+const cardQuestions = (supervisor) => supervisor.getState().questions.filter((q) => q.kind === "agent-card");
+
+test("a card on a running thread raises one question; 'open thread' relays nothing and picks are refused", async (t) => {
+  const threads = [carding()];
+  const { supervisor, delivered } = fixture(t, { threads, mode: "auto", delivery: { mode: "computer-use-first" } });
+  await supervisor.tick();
+  const [first] = cardQuestions(supervisor);
+  assert.equal(cardQuestions(supervisor).length, 1);
+  assert.equal(first.dedupeKey, "card:conductor:s1:toolu_card:0");
+  assert.deepEqual(first.options, ["open thread"]);
+  assert.deepEqual(first.meta.labels, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
+  assert.match(first.body, /Also open: Bob's day$/);
+  // A label is not an answer the supervisor can give yet.
+  assert.equal(await supervisor.answerQuestion(first.id, "Chat-analysis worker (Recommended)"), null);
+  const opened = await supervisor.answerQuestion(first.id, "open thread");
+  assert.equal(opened.question.status, "open");
+  assert.equal(opened.delivery.status, "blocked");
+  assert.equal(delivered.length, 0);
+  // Still running next tick: the card stays asked.
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 1);
+  // Item 0 answered in the app, item 1 still open: a new question.
+  threads[0] = carding({}, cardItems().slice(1));
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.dedupeKey), ["card:conductor:s1:toolu_card:1"]);
+  // Answered in the app: the card is gone and its questions close.
+  threads[0] = carding({ meta: { pendingCard: null } });
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 0);
+  assert.equal(delivered.length, 0);
+});
+
+test("an automation thread's card is asked without reading its git or PR; the supervisor's own never", async (t) => {
+  const gitReads = [];
+  const auto = carding({ key: "codex:auto", kind: "codex", id: "auto", cwd: "/work/auto", excluded: "automation", prRefs: [] });
+  const self = carding({ key: "codex:self", kind: "codex", id: "self", cwd: "/work/self", excluded: "self", prRefs: [] });
+  const { supervisor } = fixture(t, { threads: [auto, self], deps: { readLocalGit: async (cwd) => { gitReads.push(cwd); return null; } } });
+  await supervisor.tick();
+  const keys = cardQuestions(supervisor).map((q) => q.threadKey);
+  assert.deepEqual(keys, ["codex:auto"]);
+  assert.deepEqual(gitReads, []);
+  // The card closes: so do its questions.
+  auto.meta = { pendingCard: null };
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 0);
+});
+
+test("a card past a capped Codex scan closes once that card scan no longer finds it", async (t) => {
+  // maxThreads 1: one in-scope thread fills the cap, so Codex reads capped.
+  const busy = makeThread({ key: "codex:busy", id: "busy", agentStatus: "running", lastActivityAt: ago(MIN) });
+  const auto = carding({ key: "codex:auto", kind: "codex", id: "auto", cwd: "/work/auto", excluded: "automation", prRefs: [] });
+  let listed = [busy, auto];
+  let scanned = ["codex:busy", "codex:auto"];
+  const listCodexThreads = async (config, options) => {
+    for (const key of scanned) options.cardScanned?.add(key);
+    return listed;
+  };
+  const { supervisor } = fixture(t, { threads: [], limits: { maxThreads: 1 }, deps: { listCodexThreads } });
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.threadKey), ["codex:auto"]);
+  // Answered: the source no longer keeps the thread, and the card scan did
+  // not read it this time. Capped, so its absence proves nothing yet.
+  listed = [busy];
+  scanned = ["codex:busy"];
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 1);
+  // The complete card scan read it and found no card open: the question closes.
+  scanned = ["codex:busy", "codex:auto"];
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 0);
+});
+
+test("an in-scope thread past the supervisor's cap still has its card asked", async (t) => {
+  // maxThreads 1: a newer thread fills the cap; the older one is kept only for its card.
+  const busy = makeThread({ key: "codex:busy", id: "busy", agentStatus: "running", lastActivityAt: ago(MIN) });
+  const older = carding({ key: "codex:older", kind: "codex", id: "older", cwd: "/work/older", lastActivityAt: ago(60 * MIN) });
+  const quiet = makeThread({ key: "codex:quiet", id: "quiet", cwd: "/work/quiet", agentStatus: "idle", lastActivityAt: ago(90 * MIN) });
+  const { supervisor } = fixture(t, { threads: [busy, older, quiet], limits: { maxThreads: 1 } });
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.threadKey), ["codex:older"]);
+  // A thread past the cap with no card is still left out.
+  assert.equal(supervisor.getState().snapshot.counts.inScope, 2);
+});
+
+test("the review never sees or closes a card question", async (t) => {
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "looks done" })));
+  const { supervisor } = fixture(t, { threads: [carding()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick();
+  assert.equal(model.calls.length, 0);
+  assert.equal(cardQuestions(supervisor).length, 1);
+});
+
+test("a no-repo thread's card is asked; a Codex card is asked beside the thread's resume", async (t) => {
+  const codexCard = (callId, msAgo) => ({ app: "codex", cardId: "turn-a", count: 1, items: [{ index: 0, itemId: `${callId}:0`, header: null, question: "Please sign in to the App Store tab.", options: [], multiSelect: false, freeText: true, at: ago(msAgo) }] });
+  const loose = makeThread({ key: "codex:loose", id: "loose", cwd: null, repo: null, branch: null, prRefs: [], excluded: "no-repo", agentStatus: "idle", meta: { pendingCard: codexCard("call_loose", 10 * MIN) } });
+  // 01a0cae7: a session limit that reset, with a card from before it.
+  const capped = makeThread({ key: "codex:capped", id: "capped", agentStatus: "error", error: { kind: "session-limit", text: "limit", resetAt: ago(10 * MIN) },
+    lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN), meta: { pendingCard: codexCard("call_capped", 3 * 60 * MIN) } });
+  const { supervisor, delivered } = fixture(t, { threads: [loose, capped], mode: "auto" });
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.threadKey).sort(), ["codex:capped", "codex:loose"]);
+  assert.deepEqual(delivered.map((item) => [item.thread?.key ?? item.threadKey, item.playbook]), [["codex:capped", "resume"]]);
+});
+
+test("a sent nudge keeps its hash, facts and start time, and an answered one is not resent", async (t) => {
+  let clock = NOW;
+  const thread = makeThread();
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].playbook, "merge-ready");
+  const entry = supervisor.store.ledgerFor("codex:t1").nudges[0];
+  assert.equal(entry.status, "sent");
+  assert.equal(entry.sentAt, new Date(NOW).toISOString());
+  assert.match(entry.messageHash, /^[0-9a-f]{16}$/);
+  assert.match(entry.factsKey, /^[0-9a-f]{16}$/);
+  assert.deepEqual(entry.facts, ["2 open threads", `head ${HEAD.slice(0, 10)}`, "verification failing"]);
+  // The agent answered at +5 min; at +40 nothing has changed.
+  thread.lastAgentAt = new Date(NOW + 5 * MIN).toISOString();
+  thread.lastActivityAt = thread.lastAgentAt;
+  clock = NOW + 40 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  const decision = supervisor.getState().snapshot.threads.find((item) => item.key === "codex:t1").decision;
+  assert.match(decision.reason, /^agent answered the \d\d:\d\d nudge; nothing new$/);
 });

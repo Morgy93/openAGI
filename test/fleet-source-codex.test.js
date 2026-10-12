@@ -7,8 +7,9 @@ import { DatabaseSync } from "node:sqlite";
 import { uiIdentity } from "../src/fleet/ui-delivery.js";
 import { clampText, linkUiHosts, resolveFleetConfig, shortHash, uiTargetFor } from "../src/fleet/contracts.js";
 import {
-  classifyLbError, cleanCodexUserText, listCodexThreads, parseRolloutTail, readCodexLbErrors
+  classifyLbError, cleanCodexUserText, listCodexThreads, parseCardReply, parseRolloutTail, readCodexLbErrors
 } from "../src/fleet/sources/codex.js";
+import { classifyThread } from "../src/fleet/classify.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
 const MIN = 60_000;
@@ -784,4 +785,520 @@ test("first-message labels are read as the app shows them, and a name another th
   assert.equal(map["t-cont"].meta.firstMessageTitle, null, "a continuation segment's label is not in the catalog");
   assert.equal(map["t-named"].meta.codexTitleShared, true);
   assert.equal(uiIdentity(map["t-named"], uiTargetFor(map["t-named"]), [map["t-named"]]).shared, true);
+});
+
+// ---------- question cards (thread_history_1.sqlite) ----------
+
+// The real thread_history_1.sqlite tables the card reader uses (verified
+// with `.schema`), trimmed of other tables and indexes.
+const HISTORY_SQL = `
+  CREATE TABLE thread_turns (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL, status TEXT NOT NULL,
+    error_json TEXT, started_at INTEGER, completed_at INTEGER, duration_ms INTEGER, first_user_item_id TEXT, final_agent_item_id TEXT,
+    rollout_byte_offset INTEGER, rollout_end_ordinal INTEGER, rollout_end_byte_offset INTEGER, root_turn_id TEXT, PRIMARY KEY (thread_id, turn_id));
+  CREATE TABLE thread_items (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL, item_json TEXT NOT NULL, item_type TEXT NOT NULL DEFAULT '', updated_at_ordinal INTEGER NOT NULL DEFAULT 0,
+    started_at_ms INTEGER, completed_at_ms INTEGER, PRIMARY KEY (thread_id, turn_id, item_id));
+  CREATE UNIQUE INDEX idx_thread_items_page ON thread_items(thread_id, rollout_ordinal);
+  CREATE INDEX idx_thread_items_user_messages ON thread_items(thread_id, rollout_ordinal) WHERE item_type = 'userMessage';
+  CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER NOT NULL, next_rollout_ordinal INTEGER NOT NULL);`;
+
+function makeHistory(ctx) {
+  const db = new DatabaseSync(path.join(ctx.codexHome, "thread_history_1.sqlite"));
+  db.exec(HISTORY_SQL);
+  let ordinal = 0;
+  const h = {
+    db,
+    // The projection caught up with the rollout file.
+    project: (id, rollout, { offset = fs.statSync(rollout).size, ahead = 0 } = {}) => db.prepare("INSERT INTO thread_history_projection_state VALUES (?, ?, ?)").run(id, offset, ordinal + 1 + ahead),
+    turn: (id, turnId) => {
+      ordinal += 1;
+      db.prepare("INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status) VALUES (?, ?, ?, 'inProgress')").run(id, turnId, ordinal);
+    },
+    user: (id, turnId, text, msAgo) => {
+      ordinal += 1;
+      const item = { type: "userMessage", id: `u${ordinal}`, content: [{ type: "text", text, text_elements: [] }] };
+      db.prepare("INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json, item_type) VALUES (?, ?, ?, ?, ?, ?, 'userMessage')")
+        .run(id, turnId, item.id, ordinal, NOW - msAgo, JSON.stringify(item));
+    },
+    // An async card item, as Codex Desktop records request_user_input_async.
+    ask: (id, turnId, callId, questions, msAgo, text = questions.map((q) => q.title).join("\n")) => {
+      ordinal += 1;
+      const item = { type: "agentMessage", id: callId, text, phase: "final_answer", memoryCitation: null, delivery: "async", questions };
+      db.prepare("INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json, item_type) VALUES (?, ?, ?, ?, ?, ?, 'agentMessage')")
+        .run(id, turnId, callId, ordinal, NOW - msAgo, JSON.stringify(item));
+    },
+    agent: (id, turnId, text, msAgo) => {
+      ordinal += 1;
+      const item = { type: "agentMessage", id: `a${ordinal}`, text, phase: "commentary" };
+      db.prepare("INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json, item_type) VALUES (?, ?, ?, ?, ?, ?, 'agentMessage')")
+        .run(id, turnId, item.id, ordinal, NOW - msAgo, JSON.stringify(item));
+    }
+  };
+  return h;
+}
+
+// The app's reply: every answered item of a card in one tagged list.
+const cardReply = (answers) => `<send_user_message_question_reply>\n${JSON.stringify(answers.map(([callId, index, answer]) => ({
+  questionItemId: JSON.stringify(["request_user_input_async", callId, index]), question: "q", answer
+})))}\n</send_user_message_question_reply>\n`;
+// Codex Desktop wraps typed text, the supervisor's too (ZeroShot line 4499).
+const wrappedSupervisor = "\n<in-app-browser-context source=\"ambient-ui-state\">\n# In app browser:\n- Current URL: https://github.com/acme/app/pull/7549\n</in-app-browser-context>\n\n## My request:\n[OpenAGI supervisor] continue — get this across the finish line to merge.\n";
+const FIVE = ["us-east-1", "us-west-2", "eu-west-1", "Confirm deletion of these five tracked threads", "ap-south-1"];
+
+test("history cards: two calls in one turn, a multi-question call, five options, a reply that skipped an item", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // Running: the agent keeps working while the card is open.
+  const rollout = addThread(ctx, { id: "t-card", mtimeAgo: MIN, lines: [ev.started("turn-a", 12 * MIN), ev.assistant("QA running", MIN)] });
+  h.turn("t-card", "turn-a");
+  h.user("t-card", "turn-a", "get PR #7549 merge ready and fully QA'd", 12 * MIN);
+  h.ask("t-card", "turn-a", "call_one", [
+    { title: "PR #7549 has no approval yet. Which reviewer should receive the review request?", options: ["Adam", "Nikhil"] },
+    { title: "Anything else for the release notes?", options: null }
+  ], 10 * MIN);
+  h.agent("t-card", "turn-a", "Continuing QA meanwhile.", 9 * MIN);
+  // The owner answered the first question and skipped the second (Skip is
+  // local only): the reply closes both.
+  h.user("t-card", "turn-a", cardReply([["call_one", 0, "Adam"]]), 8 * MIN);
+  h.ask("t-card", "turn-a", "call_two", [{ title: "Which region should the QA profile use?", options: FIVE }], 6 * MIN);
+  // A supervisor nudge, wrapped by Desktop: never an answer.
+  h.turn("t-card", "turn-b");
+  h.user("t-card", "turn-b", wrappedSupervisor, 4 * MIN);
+  h.project("t-card", rollout);
+  h.db.close();
+
+  const thread = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }))["t-card"];
+  assert.equal(thread.agentStatus, "running");
+  const card = thread.meta.pendingCard;
+  assert.equal(card.app, "codex");
+  assert.equal(card.cardId, "turn-a");
+  assert.equal(card.count, 3);
+  assert.deepEqual(card.items.map((item) => [item.index, item.itemId]), [[2, "call_two:0"]]);
+  // Five options, the 46-character one whole.
+  assert.deepEqual(card.items[0].options, FIVE);
+  assert.equal(card.items[0].at, iso(6 * MIN));
+  // Running, yet the card is the owner's.
+  const classified = classifyThread(thread, { now: NOW, config: ctx.config });
+  assert.equal(classified.state, "needs-human");
+  assert.equal(classified.ask.card.cardId, "turn-a");
+});
+
+test("history cards: a new turn the owner typed closes the card; replies and supervisor turns do not", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const moved = addThread(ctx, { id: "t-moved", lines: [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")] });
+  h.turn("t-moved", "turn-a");
+  h.user("t-moved", "turn-a", "start", 40 * MIN);
+  h.ask("t-moved", "turn-a", "call_x", [{ title: "Use the staging credential?", options: ["Yes", "No"] }], 35 * MIN);
+  h.turn("t-moved", "turn-b");
+  h.user("t-moved", "turn-b", "\n<in-app-browser-context source=\"ambient-ui-state\">\nctx\n</in-app-browser-context>\n\n## My request:\nforget that, fix the header instead\n", 30 * MIN);
+  h.project("t-moved", moved);
+  // A card asked by a turn a reply started stays open across a supervisor turn.
+  const kept = addThread(ctx, { id: "t-kept", lines: [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")] });
+  h.turn("t-kept", "turn-r");
+  h.user("t-kept", "turn-r", cardReply([["call_old", 0, "fine"]]), 40 * MIN);
+  h.ask("t-kept", "turn-r", "call_y", [{ title: "Which reviewer?", options: ["Adam", "Nikhil"] }], 35 * MIN);
+  h.turn("t-kept", "turn-s");
+  h.user("t-kept", "turn-s", "[OpenAGI supervisor] continue", 30 * MIN);
+  h.project("t-kept", kept);
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["t-moved"].meta.pendingCard, null);
+  assert.deepEqual(map["t-kept"].meta.pendingCard.items.map((item) => item.itemId), ["call_y:0"]);
+});
+
+test("history cards: an automation thread's card is read; acknowledgements and asks with no questions are items too", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const auto = addThread(ctx, { id: "t-auto", threadSource: "automation", lines: [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")] });
+  h.turn("t-auto", "turn-a");
+  h.user("t-auto", "turn-a", "Run the SkillRank twice-daily gate.", 40 * MIN);
+  h.ask("t-auto", "turn-a", "call_del", [{ title: "May I permanently delete the tracked SkillRank posts?", options: ["Confirm qualifying tracked deletions", "Leave posts live"] }], 35 * MIN);
+  h.project("t-auto", auto);
+  const acks = addThread(ctx, { id: "t-acks", lines: [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")] });
+  h.turn("t-acks", "turn-a");
+  h.user("t-acks", "turn-a", "QA it", 40 * MIN);
+  h.ask("t-acks", "turn-a", "call_ok", [{ title: "I will use the existing native QA build.", options: ["Okay"] }], 35 * MIN);
+  h.ask("t-acks", "turn-a", "call_cont", [{ title: "I have enough authorization for the scoped QA work.", options: ["Continue"] }], 34 * MIN);
+  h.project("t-acks", acks);
+  const bare = addThread(ctx, { id: "t-bare", lines: [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")] });
+  h.turn("t-bare", "turn-a");
+  h.user("t-bare", "turn-a", "verify staging", 40 * MIN);
+  h.ask("t-bare", "turn-a", "call_signin", [], 35 * MIN, "The local Staging token has expired. Please sign back into ZeroShot Staging.");
+  h.project("t-bare", bare);
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["t-auto"].excluded, "automation");
+  assert.deepEqual(map["t-auto"].meta.pendingCard.items[0].options, ["Confirm qualifying tracked deletions", "Leave posts live"]);
+  assert.equal(classifyThread(map["t-auto"], { now: NOW, config: ctx.config }).state, "needs-human");
+  // Acknowledgements are read but ask nothing.
+  assert.equal(map["t-acks"].meta.pendingCard.items.length, 2);
+  assert.notEqual(classifyThread(map["t-acks"], { now: NOW, config: ctx.config }).state, "needs-human");
+  assert.deepEqual(map["t-bare"].meta.pendingCard.items.map((item) => [item.itemId, item.question, item.options.length]),
+    [["call_signin:0", "The local Staging token has expired. Please sign back into ZeroShot Staging.", 0]]);
+});
+
+test("cards fall back to the rollout tail without a projection or a readable history", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const cardItem = (callId, title, options, msAgo) => ({ timestamp: iso(msAgo), type: "event_msg", payload: { type: "item_completed", turn_id: "turn-a", item: {
+    type: "AgentMessage", id: callId, content: [{ type: "Text", text: `${title}\n- ${options.join("\n- ")}` }], phase: "final_answer", delivery: "async", questions: [{ title, options }]
+  } } });
+  const call = (callId, title, options, msAgo) => ({ timestamp: iso(msAgo), type: "response_item", payload: {
+    type: "function_call", name: "request_user_input_async", call_id: callId, arguments: JSON.stringify({ questions: [{ title, options }] }),
+    internal_chat_message_metadata_passthrough: { turn_id: "turn-a" }
+  } });
+  const lines = [
+    { timestamp: iso(20 * MIN), type: "event_msg", payload: { type: "task_started", turn_id: "turn-a" } },
+    ev.userItem("check the build", 20 * MIN),
+    call("call_q", "Should I keep the cache warm?", ["Keep it", "Drop it"], 15 * MIN),
+    cardItem("call_q", "Should I keep the cache warm?", ["Keep it", "Drop it"], 15 * MIN),
+    ev.assistant("Still building.", 14 * MIN),
+    ev.user(wrappedSupervisor, 10 * MIN),
+    ev.assistant("Build passed; waiting on your pick.", 5 * MIN)
+  ];
+  // No projection row: this thread's index cannot say.
+  addThread(ctx, { id: "t-tail", lines });
+  h.db.close();
+  let thread = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }))["t-tail"];
+  assert.deepEqual(thread.meta.pendingCard.items.map((item) => [item.itemId, item.options]), [["call_q:0", ["Keep it", "Drop it"]]]);
+  assert.equal(thread.meta.pendingCard.cardId, "turn-a");
+  // The supervisor's wrapped "continue" neither answered nor counts as the owner.
+  assert.equal(thread.meta.pendingQuestion?.text, "Should I keep the cache warm?");
+  assert.equal(thread.lastUserText, "check the build");
+  assert.ok(thread.meta.lastSupervisorAt);
+  // The card's own text never stands in for the agent's words.
+  assert.equal(thread.lastAgentText, "Build passed; waiting on your pick.");
+
+  // An unreadable history file: every card comes from the tails.
+  fs.writeFileSync(path.join(ctx.codexHome, "thread_history_1.sqlite"), "not a database");
+  thread = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }))["t-tail"];
+  assert.equal(thread.meta.pendingCard.items[0].itemId, "call_q:0");
+
+  // The tail reads the reply the same way: named items only.
+  const answered = parseRolloutTail([...lines, ev.userItem(cardReply([["call_q", 0, "Keep it"]]), 2 * MIN)].map((line) => JSON.stringify(line)).join("\n"));
+  assert.equal(answered.cardReplies[0].ids.has("call_q:0"), true);
+  assert.equal(answered.pendingQuestion, null);
+  assert.equal(answered.lastUser.text, "Answered a question card.");
+});
+
+test("parseCardReply reads only a message that is the tagged list", () => {
+  assert.deepEqual(parseCardReply(cardReply([["call_a", 0, "x"], ["call_b", 1, "y"]])), ["call_a:0", "call_b:1"]);
+  assert.equal(parseCardReply(`please see ${cardReply([["call_a", 0, "x"]])}`), null);
+  assert.equal(parseCardReply("continue"), null);
+  assert.deepEqual(parseCardReply("<send_user_message_question_reply>oops</send_user_message_question_reply>"), []);
+});
+
+// Tail rows of an async card: the call, then the card item (newer rollouts).
+const tailCall = (callId, title, options, msAgo, turnId = "turn-a") => ({ timestamp: iso(msAgo), type: "response_item", payload: {
+  type: "function_call", name: "request_user_input_async", call_id: callId, arguments: JSON.stringify({ questions: [{ title, options }] }),
+  internal_chat_message_metadata_passthrough: { turn_id: turnId }
+} });
+const tailCardItem = (callId, title, options, msAgo, turnId = "turn-a") => ({ timestamp: iso(msAgo), type: "event_msg", payload: { type: "item_completed", turn_id: turnId, item: {
+  type: "AgentMessage", id: callId, content: [{ type: "Text", text: `${title}\n- ${options.join("\n- ")}` }], phase: "final_answer", delivery: "async", questions: [{ title, options }]
+} } });
+const turnStart = (turnId, msAgo) => ({ timestamp: iso(msAgo), type: "event_msg", payload: { type: "task_started", turn_id: turnId } });
+const noLocks = async () => ({ code: 1, stdout: "" });
+const SEGMENT = "01a09c1f-5462-7000-8000-000000000001";
+
+test("history cards: a lagging or overrun projection leaves the card to the tail; a segment is read under its own id", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const ask = "App Privacy is blocked by web sign-in. Please sign into that Safari tab with an Admin account.";
+  // A rollout far past its projection (01a08c47: 88.9 MB of 747 MB indexed).
+  const pad = ev.assistant("x".repeat(100_000), 40 * MIN);
+  const tail = [pad, turnStart("turn-a", 20 * MIN), ev.userItem("ship the app", 20 * MIN), tailCall("call_sign", ask, [], 10 * MIN), tailCardItem("call_sign", ask, [], 10 * MIN)];
+  const lagging = addThread(ctx, { id: "t-lag", lines: tail });
+  h.turn("t-lag", "turn-old");
+  h.user("t-lag", "turn-old", "older work", 60 * MIN);
+  h.project("t-lag", lagging, { offset: 2_000 });
+  // A projection past the end of the file (01a07d07: 1.2 GB on a 391 MB file).
+  const overrun = addThread(ctx, { id: "t-over", lines: tail });
+  h.project("t-over", overrun, { offset: fs.statSync(overrun).size + 1_000_000 });
+  // A continuation segment: the thread's own projection stopped with the
+  // older file, the segment's own is current and holds the ask.
+  const segment = addThread(ctx, { id: "t-seg", segment: SEGMENT, lines: [pad, turnStart("turn-s", 20 * MIN), ev.assistant("Working.", 5 * MIN)] });
+  h.project("t-seg", segment, { offset: 3_000 });
+  h.turn(SEGMENT, "turn-s");
+  h.user(SEGMENT, "turn-s", "check the app privacy page", 20 * MIN);
+  h.ask(SEGMENT, "turn-s", "call_seg", [{ title: "Which Apple team should own it?", options: ["BuildBetter", "Personal"] }], 10 * MIN);
+  h.project(SEGMENT, segment);
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.deepEqual(map["t-lag"].meta.pendingCard?.items.map((item) => item.question), [ask]);
+  assert.deepEqual(map["t-over"].meta.pendingCard?.items.map((item) => item.question), [ask]);
+  assert.deepEqual(map["t-seg"].meta.pendingCard?.items.map((item) => item.itemId), ["call_seg:0"]);
+});
+
+test("history cards: a reply or an ask the projection has not reached yet is read from the tail", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.userItem("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  // Answered a moment ago: the reply is in the rollout, a few bytes past the projection.
+  const answered = addThread(ctx, { id: "t-answered", lines: asked });
+  const indexedAt = fs.statSync(answered).size;
+  fs.appendFileSync(answered, `${JSON.stringify(ev.userItem(cardReply([["call_q", 0, "Keep it"]]), MIN))}\n`);
+  // Unrelated agent rows past the projection leave the history card standing.
+  const working = addThread(ctx, { id: "t-working", lines: asked });
+  const workingAt = fs.statSync(working).size;
+  fs.appendFileSync(working, `${JSON.stringify(ev.assistant("Still checking.", MIN))}\n`);
+  for (const [id, rollout, offset] of [["t-answered", answered, indexedAt], ["t-working", working, workingAt]]) {
+    h.turn(id, "turn-a");
+    h.user(id, "turn-a", "QA it", 30 * MIN);
+    h.ask(id, "turn-a", "call_q", [{ title: "Keep the cache warm? (indexed)", options: ["Keep it", "Drop it"] }], 20 * MIN);
+    h.project(id, rollout, { offset });
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-answered"].meta.pendingCard, null);
+  assert.equal(map["t-working"].meta.pendingCard?.items[0].question, "Keep the cache warm? (indexed)");
+});
+
+test("tail cards: an owner's new turn closes them, a steer inside the ask's turn does not", async (t) => {
+  const ctx = makeHome(t);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.userItem("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  addThread(ctx, { id: "t-steer", lines: [...asked, { ...ev.userItem("also check the logs", 10 * MIN), payload: { type: "item_completed", turn_id: "turn-a", item: { type: "UserMessage", id: "u2", content: [{ type: "text", text: "also check the logs" }] } } }] });
+  addThread(ctx, { id: "t-new", lines: [...asked, turnStart("turn-b", 10 * MIN), { timestamp: iso(10 * MIN), type: "event_msg", payload: { type: "item_completed", turn_id: "turn-b", item: { type: "UserMessage", id: "u3", content: [{ type: "text", text: "forget that, fix the header" }] } } }] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.deepEqual(map["t-steer"].meta.pendingCard?.items.map((item) => item.itemId), ["call_q:0"]);
+  assert.equal(map["t-new"].meta.pendingCard, null);
+});
+
+test("tail cards: an owner message with no turn id after the ask's turn ended closes them", async (t) => {
+  // Older rollouts write the owner's words as a user_message event, no turn id.
+  const ctx = makeHome(t);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.user("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  addThread(ctx, { id: "t-steer-old", lines: [...asked, ev.user("also check the logs", 15 * MIN)] });
+  addThread(ctx, { id: "t-moved-on", lines: [...asked, ev.complete("turn-a", 15 * MIN, "Waiting on your pick."), ev.user("forget that, fix the header", 10 * MIN)] });
+  addThread(ctx, { id: "t-aborted", lines: [...asked, ev.aborted("turn-a", 15 * MIN), ev.user("forget that, fix the header", 10 * MIN)] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.deepEqual(map["t-steer-old"].meta.pendingCard?.items.map((item) => item.itemId), ["call_q:0"]);
+  assert.equal(map["t-moved-on"].meta.pendingCard, null);
+  assert.equal(map["t-aborted"].meta.pendingCard, null);
+});
+
+test("history cards: a steer in the ask's own turn keeps the card; a reply closes items asked before it", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const rollout = addThread(ctx, { id: "t-hs", lines: [turnStart("turn-a", 30 * MIN), ev.assistant("QA running", MIN)] });
+  h.turn("t-hs", "turn-a");
+  h.user("t-hs", "turn-a", "QA it", 30 * MIN);
+  h.ask("t-hs", "turn-a", "call_a", [{ title: "Keep the cache warm?", options: ["Keep it", "Drop it"] }], 20 * MIN);
+  h.user("t-hs", "turn-a", "also check the logs", 10 * MIN);
+  h.project("t-hs", rollout);
+  // ZeroShot 01a126e5: the reply names call_60cdf103 only; call_5401b520,
+  // asked earlier in the same card, was skipped.
+  const skipped = addThread(ctx, { id: "t-skip", lines: [turnStart("turn-z", 30 * MIN), ev.assistant("Working", MIN)] });
+  h.turn("t-skip", "turn-z");
+  h.user("t-skip", "turn-z", "triage the inbox", 3 * 60 * MIN);
+  h.ask("t-skip", "turn-z", "call_5401b520", [{ title: "ignore", options: ["Ignore", "Keep"] }], 140 * MIN);
+  h.ask("t-skip", "turn-z", "call_60cdf103", [{ title: "Approve the fix?", options: ["Yes", "No"] }], 20 * MIN);
+  h.user("t-skip", "turn-z", cardReply([["call_60cdf103", 0, "Yes"]]), 10 * MIN);
+  h.project("t-skip", skipped);
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.deepEqual(map["t-hs"].meta.pendingCard?.items.map((item) => item.itemId), ["call_a:0"]);
+  assert.equal(map["t-skip"].meta.pendingCard, null);
+});
+
+test("history cards: the ask scan stops two days back and a bounded number of items back", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // No owner turn read: the scan would start at the thread's first item.
+  const old = addThread(ctx, { id: "t-old", lines: [turnStart("turn-a", 30 * MIN), ev.assistant("Working", MIN)] });
+  h.turn("t-old", "turn-a");
+  h.ask("t-old", "turn-a", "call_old", [{ title: "Rotate the key?", options: ["Yes", "No"] }], 50 * 60 * MIN);
+  h.project("t-old", old);
+  const far = addThread(ctx, { id: "t-far", lines: [turnStart("turn-a", 30 * MIN), ev.assistant("Working", MIN)] });
+  h.turn("t-far", "turn-a");
+  h.ask("t-far", "turn-a", "call_far", [{ title: "Rotate the key?", options: ["Yes", "No"] }], 60 * MIN);
+  // Thousands of items came after it.
+  h.project("t-far", far, { ahead: 5_000 });
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-old"].meta.pendingCard, null);
+  assert.equal(map["t-far"].meta.pendingCard, null);
+});
+
+test("tail cards: a card is never the agent's last words, in either rollout format", async (t) => {
+  const ctx = makeHome(t);
+  addThread(ctx, { id: "t-last", lines: [turnStart("turn-a", 30 * MIN), ev.assistant("Build passed.", 20 * MIN),
+    tailCall("call_p", "Should I push the fix?", ["Push", "Hold"], 10 * MIN), tailCardItem("call_p", "Should I push the fix?", ["Push", "Hold"], 10 * MIN)] });
+  // Older rollouts (019fe344) write the card as an async agent_message event.
+  addThread(ctx, { id: "t-older", lines: [turnStart("turn-a", 30 * MIN), ev.assistant("Build passed.", 20 * MIN),
+    tailCall("call_o", "Should I push the fix?", ["Push", "Hold"], 10 * MIN),
+    { timestamp: iso(10 * MIN), type: "event_msg", payload: { type: "agent_message", message: "Should I push the fix?\n- Push\n- Continue", phase: "final_answer", delivery: "async", questions: [{ title: "Should I push the fix?", options: ["Push", "Hold"] }] } }] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  for (const id of ["t-last", "t-older"]) {
+    assert.equal(map[id].lastAgentText, "Build passed.");
+    assert.equal(map[id].lastAgentAt, iso(20 * MIN));
+    assert.equal(map[id].meta.pendingCard.items.length, 1);
+  }
+});
+
+test("carded automation and no-repo threads on pages past the in-scope stop are still read", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // maxThreads 2 reads pages of 10 rows: the first page fills the cap.
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 12; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  for (const [id, spec] of [["t-auto", { threadSource: "automation" }], ["t-norepo", { cwd: path.join(ctx.home, "gone") }], ["t-quiet", { threadSource: "automation" }]]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, ...spec });
+    h.turn(id, "turn-a");
+    if (id !== "t-quiet") h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_t-auto:0");
+  assert.equal(map["t-norepo"]?.excluded, "no-repo");
+  assert.equal(map["t-norepo"].meta.pendingCard?.items[0].itemId, "call_t-norepo:0");
+  assert.equal(map["t-quiet"], undefined, "a thread with no card past the stop is not built");
+});
+
+test("cards on automation and no-repo threads survive the cap; guardian reviews are never read for one", async (t) => {
+  const ctx = makeHome(t);
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  const card = (callId) => [turnStart("turn-a", 100 * MIN), tailCall(callId, "May I delete the posts?", ["Confirm", "Leave"], 90 * MIN)];
+  for (const id of ["t-1", "t-2", "t-3"]) addThread(ctx, { id, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+  // Older than every in-scope thread.
+  addThread(ctx, { id: "t-auto", threadSource: "automation", mtimeAgo: 90 * MIN, lines: card("call_auto") });
+  addThread(ctx, { id: "t-norepo", cwd: path.join(ctx.home, "gone"), mtimeAgo: 90 * MIN, lines: card("call_norepo") });
+  addThread(ctx, { id: "t-guard", threadSource: "guardian_review", mtimeAgo: 90 * MIN, lines: card("call_guard") });
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, history: null }));
+  assert.ok(map["t-auto"], "carded automation thread kept");
+  assert.ok(map["t-norepo"], "carded no-repo thread kept");
+  assert.equal(map["t-norepo"].excluded, "no-repo");
+  assert.equal(classifyThread(map["t-norepo"], { now: NOW, config }).state, "needs-human");
+  const all = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks, history: null }));
+  assert.equal(all["t-guard"].excluded, "automation");
+  assert.equal(all["t-guard"].meta.pendingCard, null);
+  assert.equal(all["t-auto"].meta.pendingCard.items[0].itemId, "call_auto:0");
+});
+
+test("cards are found every page past the in-scope stop, down to the lookback, and the final page is not read twice", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // maxThreads 2 reads pages of 10 rows: the first page fills the cap and
+  // three more full pages of in-scope rows sit between it and the cards.
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 40; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: (10 + i) * MIN, lines: [ev.complete("x", (10 + i) * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  for (const [id, spec] of [["t-auto", { threadSource: "automation" }], ["t-repo", {}]]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, ...spec });
+    h.turn(id, "turn-a");
+    h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const threads = await listCodexThreads(config, { now: NOW, run: noLocks });
+  const map = byId(threads);
+  assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_t-auto:0");
+  assert.equal(map["t-repo"]?.excluded, null);
+  assert.equal(map["t-repo"].meta.pendingCard?.items[0].itemId, "call_t-repo:0");
+  assert.equal(threads.filter((thread) => thread.id === "t-repo").length, 1);
+});
+
+test("an in-scope thread with an open card survives the cap", async (t) => {
+  const ctx = makeHome(t);
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (const id of ["t-1", "t-2", "t-3"]) addThread(ctx, { id, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+  addThread(ctx, { id: "t-carded", mtimeAgo: 90 * MIN, lines: [turnStart("turn-a", 100 * MIN), tailCall("call_q", "Which region?", ["us-east-1", "eu-west-1"], 90 * MIN)] });
+  addThread(ctx, { id: "t-plain", mtimeAgo: 90 * MIN, lines: [ev.complete("x", 90 * MIN, "done")] });
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, history: null }));
+  assert.equal(map["t-carded"]?.excluded, null);
+  assert.equal(map["t-carded"].meta.pendingCard?.items[0].itemId, "call_q:0");
+  assert.equal(map["t-plain"], undefined, "an in-scope thread with no card is still capped");
+  assert.equal(map["t-1"], undefined);
+});
+
+test("the card scan past the in-scope stop reports which threads it settled", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 10; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: (10 + i) * MIN, lines: [ev.complete("x", (10 + i) * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  // t-open still asks; t-answered's card was answered in the app; the
+  // history index never projected t-unindexed, so its card is unknown.
+  for (const id of ["t-open", "t-answered", "t-unindexed"]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, threadSource: "automation" });
+    if (id === "t-unindexed") continue;
+    h.turn(id, "turn-a");
+    h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    if (id === "t-answered") h.user(id, "turn-a", cardReply([[`call_${id}`, 0, "Leave"]]), 80 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const cardScanned = new Set();
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, cardScanned }));
+  assert.equal(map["t-open"]?.meta.pendingCard?.items[0].itemId, "call_t-open:0");
+  assert.equal(map["t-answered"], undefined);
+  assert.ok(cardScanned.has("codex:t-open"));
+  assert.ok(cardScanned.has("codex:t-answered"), "no card open: a card question on it may close");
+  assert.ok(!cardScanned.has("codex:t-unindexed"), "a card the index cannot read stays unknown");
+  assert.ok(cardScanned.has("codex:t-00"), "rows read before the stop are settled too");
+});
+
+test("history cards: supervisor rows filling the newest user rows never hide an older open ask", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const rollout = addThread(ctx, { id: "t-busy", lines: [turnStart("turn-a", 300 * MIN), ev.assistant("Working", MIN)] });
+  h.turn("t-busy", "turn-a");
+  h.user("t-busy", "turn-a", "ship it", 300 * MIN);
+  h.ask("t-busy", "turn-a", "call_done", [{ title: "Use staging?", options: ["Yes", "No"] }], 290 * MIN);
+  h.user("t-busy", "turn-a", cardReply([["call_done", 0, "Yes"]]), 285 * MIN);
+  h.ask("t-busy", "turn-a", "call_open", [{ title: "Which reviewer?", options: ["Adam", "Nikhil"] }], 280 * MIN);
+  // Sixty supervisor turns since: none closes the ask, none is the owner's.
+  for (let i = 0; i < 60; i += 1) {
+    h.turn("t-busy", `turn-s${i}`);
+    h.user("t-busy", `turn-s${i}`, "[OpenAGI supervisor] continue", (270 - i * 4) * MIN);
+  }
+  h.project("t-busy", rollout);
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  // The answered ask stays closed: its reply is read across the scan too.
+  assert.deepEqual(map["t-busy"].meta.pendingCard?.items.map((item) => item.itemId), ["call_open:0"]);
+});
+
+test("history cards: an ask left open across a supervisor turn stays on the card beside a newer turn's", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  for (const id of ["t-both", "t-later-answered"]) {
+    const rollout = addThread(ctx, { id, lines: [turnStart("turn-s", 20 * MIN), ev.assistant("Working", MIN)] });
+    h.turn(id, "turn-a");
+    h.user(id, "turn-a", "QA it", 40 * MIN);
+    h.ask(id, "turn-a", "call_a", [{ title: "Keep the cache warm?", options: ["Keep it", "Drop it"] }], 35 * MIN);
+    h.turn(id, "turn-s");
+    h.user(id, "turn-s", "[OpenAGI supervisor] continue", 20 * MIN);
+    h.ask(id, "turn-s", "call_b", [{ title: "Which region?", options: ["us-east-1", "eu-west-1"] }], 15 * MIN);
+    if (id === "t-later-answered") h.user(id, "turn-s", cardReply([["call_b", 0, "us-east-1"]]), 10 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  const both = map["t-both"].meta.pendingCard;
+  assert.equal(both.cardId, "turn-s");
+  assert.deepEqual(both.items.map((item) => item.itemId), ["call_a:0", "call_b:0"]);
+  // Answering the newer turn's card leaves the older turn's ask open.
+  assert.deepEqual(map["t-later-answered"].meta.pendingCard?.items.map((item) => item.itemId), ["call_a:0"]);
+});
+
+test("cards past the in-scope stop are read from the rollout tail when the history index cannot say", async (t) => {
+  for (const withHistory of [false, true]) {
+    const ctx = makeHome(t);
+    // With an index that never projected t-auto, or with none at all.
+    if (withHistory) makeHistory(ctx).db.close();
+    const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+    for (let i = 0; i < 12; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+    addThread(ctx, { id: "t-auto", threadSource: "automation", mtimeAgo: 90 * MIN, lines: [turnStart("turn-a", 100 * MIN),
+      tailCall("call_auto", "May I delete the posts?", ["Confirm", "Leave"], 90 * MIN), tailCardItem("call_auto", "May I delete the posts?", ["Confirm", "Leave"], 90 * MIN)] });
+    addThread(ctx, { id: "t-quiet", threadSource: "automation", mtimeAgo: 90 * MIN, lines: [turnStart("turn-a", 100 * MIN), ev.assistant("Done.", 90 * MIN)] });
+    const cardScanned = new Set();
+    const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, cardScanned }));
+    assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_auto:0", `history: ${withHistory}`);
+    assert.equal(map["t-quiet"], undefined);
+    // A tail read never settles a card the index could not.
+    assert.ok(!cardScanned.has("codex:t-auto"));
+  }
 });

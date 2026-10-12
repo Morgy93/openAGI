@@ -632,3 +632,54 @@ test("app restart records, the last restart time and question meta survive a rel
   reloaded.setAppRestart("conductor", null);
   assert.equal(new FleetStore({ dir, now }).appRestart("conductor"), null);
 });
+
+test("a card item keeps its raw labels, a long body, and a dismissal holds its later re-ask", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const labels = ["us-east-1", "us-west-2", "eu-west-1", "Confirm deletion of these five tracked threads", "ap-south-1"];
+  const body = `${"Which region should the QA profile use? ".repeat(8)}1. us-east-1`;
+  const base = store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-a:0", kind: "agent-card", threadKey: "codex:t1", title: "t1: region (1/1)", body, options: ["open thread"], meta: { labels, freeText: "1" } });
+  assert.deepEqual(base.meta.labels, labels);
+  assert.equal(base.body.length, body.length);
+  store.dismissQuestion(base.id);
+  // Asked every tick until the item turns a day old, then under its late key.
+  now.advance(23 * HOUR);
+  assert.equal(store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-a:0", kind: "agent-card", threadKey: "codex:t1", title: "t1: region (1/1)", body, options: ["open thread"] }).suppressed, true);
+  now.advance(HOUR);
+  const late = store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-a:0:late", baseKey: "card:codex:t1:turn-a:0", kind: "agent-card", threadKey: "codex:t1", title: "Still open: t1: region (1/1)", body, options: ["open thread"] });
+  assert.equal(late.suppressed, true);
+  assert.equal(store.openQuestions().length, 0);
+  // Never dismissed: the late ask is a new question.
+  const other = store.upsertQuestion({ dedupeKey: "card:codex:t1:turn-b:0:late", baseKey: "card:codex:t1:turn-b:0", kind: "agent-card", threadKey: "codex:t1", title: "Still open", body: "q", options: ["open thread"] });
+  assert.equal(other.suppressed, undefined);
+  assert.equal(other.status, "open");
+});
+
+test("a nudge keeps when its send started, its message hash and the facts it was about", (t) => {
+  const store = new FleetStore({ dir: tempDir(t), now: clock() });
+  store.recordNudge("codex:a", {
+    at: "2026-09-26T12:00:02.000Z", sentAt: "2026-09-26T12:00:00.000Z", playbook: "merge-ready", route: "codex-exec", status: "sent",
+    messageHash: "abc", factsKey: "k1", facts: ["head 1234567890", "lint failing", ...Array.from({ length: 10 }, (_, i) => `f${i}`)]
+  });
+  store.recordNudge("codex:a", { at: "2026-09-26T12:20:00.000Z", playbook: "resume", status: "sent" });
+  const [first, second] = store.ledgerFor("codex:a").nudges;
+  assert.equal(first.sentAt, "2026-09-26T12:00:00.000Z");
+  assert.equal(first.messageHash, "abc");
+  assert.equal(first.factsKey, "k1");
+  assert.equal(first.facts.length, 8);
+  assert.deepEqual(first.facts.slice(0, 2), ["head 1234567890", "lint failing"]);
+  assert.equal(second.sentAt, undefined);
+  assert.equal(second.factsKey, undefined);
+});
+
+test("an 'open thread' tap on a card holds while the card is still asked, past the TTL", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = () => store.upsertQuestion({ dedupeKey: "card:codex:t1:call_x:0", kind: "agent-card", threadKey: "codex:t1", title: "t1: sign in", body: "Please sign in.", options: ["open thread"] });
+  store.answerQuestion(ask().id, "open thread");
+  // Asked every tick for two days: the owner is not pinged again.
+  for (let hour = 0; hour < 48; hour += 1) {
+    now.advance(HOUR);
+    assert.equal(ask().suppressed, true);
+  }
+});

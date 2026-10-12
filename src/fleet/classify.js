@@ -2,7 +2,7 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, msSince } from "./contracts.js";
+import { CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -110,9 +110,10 @@ export const PROMISED_WORK_PATTERNS = Object.freeze([
 const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b/i;
 const CHOICE_WORDS = /\bwhich\b|\bpick\b|\bchoose\b|\boption\b|\bor\b/i;
 
+// A tool named for the box ("bb3-watch", "bb3-doctor") is not the box.
 const BB3_DOWN_PATTERNS = [
-  /\b(?:buildbot ?3|bb3|100\.99\.3\.113)\b[^.?!\n]{0,60}\b(?:down|unreachable|not reachable|unavailable|frozen|rebooting|jammed)\b/i,
-  /\bblocked on (?:buildbot ?3|bb3)\b/i
+  /\b(?:buildbot ?3|bb3|100\.99\.3\.113)\b(?!-\w)[^.?!\n]{0,60}\b(?:down|unreachable|not reachable|unavailable|frozen|rebooting|jammed)\b/i,
+  /\bblocked on (?:buildbot ?3|bb3)\b(?!-\w)/i
 ];
 
 const BLOCKED_ON_OWNER_ASK = Object.freeze({ topic: "approval", text: "Blocked on a permission prompt or dialog.", options: Object.freeze(["opened", "later"]) });
@@ -162,6 +163,12 @@ function foldClaudeInto(target, claude) {
     target.lastAgentText = claude.lastAgentText ?? "";
     target.lastAgentTail = claude.lastAgentTail ?? "";
     target.lastAgentAt = claude.lastAgentAt ?? target.lastAgentAt ?? null;
+  }
+  // A Conductor tail that kept only a synthetic limit notice has an excerpt
+  // but no real report; the transcript still holds the earlier reply.
+  if (!target.lastAgentFull && claude.lastAgentFull) {
+    target.lastAgentFull = claude.lastAgentFull;
+    target.lastAgentFullAt = claude.lastAgentFullAt ?? null;
   }
   target.cwd = target.cwd || claude.cwd || null;
   target.branch = target.branch || claude.branch || null;
@@ -254,13 +261,34 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   });
 
   const excluded = exclusionReason(thread, { pr, localGit, config });
+  // An open question card waits on the owner, and a merge does not answer
+  // it. Automation and no-repo threads ask the owner too; never the
+  // supervisor's own or an archived one. A Conductor card blocks its turn,
+  // so nothing else moves until it is answered.
+  const card = cardAsk(thread, excluded, config, now);
+  if (card && card.card.app !== "codex") return result("needs-human", "agent asks: question card", { ask: card });
+  const state = classifyRest(thread, { pr, infra, now, config, limits, readiness, result, excluded });
+  if (!card) return state;
+  // A Codex card does not block the turn ("continuing meanwhile"): a limit
+  // reset, a stop, an outage or the PR is handled as ever, and the card is
+  // asked beside it. A thread with nothing else to do asks the card alone.
+  if (CARD_ALONE.has(state.state) && !state.idle?.promised) return result("needs-human", "agent asks: question card", { ask: card });
+  return { ...state, card };
+}
+
+// States a Codex card replaces: nothing else would happen on them.
+const CARD_ALONE = new Set(["running", "excluded", "idle-no-pr", "done"]);
+
+function classifyRest(thread, { pr, infra, now, config, limits, readiness, result, excluded }) {
   if (excluded) return result("excluded", excluded);
   if (isRunning(thread, now, limits)) return result("running", "turn in progress");
   // A live session on a permission prompt or dialog waits on the owner's
   // click. A nudge cannot clear it.
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
   // Codex request_user_input: the real question is structured, not in the text.
-  if (thread.meta?.pendingQuestion && !prSettledAfter(pr, Date.parse(thread.meta.pendingQuestion.at ?? ""), structuredAskAt(thread))) {
+  // A card of acknowledgements ("Okay") only asks nothing.
+  const cardOpen = thread.meta?.pendingCard?.items?.length > 0;
+  if (thread.meta?.pendingQuestion && !cardOpen && !prSettledAfter(pr, Date.parse(thread.meta.pendingQuestion.at ?? ""), structuredAskAt(thread))) {
     const pending = thread.meta.pendingQuestion;
     return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"], key: pending.key ?? null } });
   }
@@ -283,9 +311,21 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // violation, not a CI wait, so it must not be swallowed by waiting-ci.
   const localVerify = matchLocalVerify(thread, infra);
   let wait = localVerify ? null : waitSignal(thread, text, now);
+  const settled = prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? ""));
+  // The whole report, not the tail: its "Blocked on:" list is often above
+  // the last 600 characters.
+  const full = thread.lastAgentFull || text;
+  // The whole report has its own time: a later synthetic notice moves only lastAgentAt.
+  const fullSettled = thread.lastAgentFull ? prSettledAfter(pr, Date.parse(thread.lastAgentFullAt ?? thread.lastAgentAt ?? "")) : settled;
+  const section = text && !fullSettled ? blockedOnSection(full) : null;
+  // "Blocked on: your merge decision" on an open PR is the ready / not-ready
+  // flow's question (merge it, or get it ready), not a call of its own.
+  const blocked = section && pr?.state === "OPEN" ? withoutMergeCalls(section) : section;
+  const listed = blocked?.mergeCalls.length ? dropLines(text, blocked.lines) : text;
+  const askText = pr?.state === "OPEN" ? dropInlineMergeCalls(listed) : listed;
   // "CI is pending. Blocked on your approval.": an explicit owner ask beats
   // a wait the agent only wrote down.
-  if (wait?.source === "text" && detectAsk(text)?.kind === "needs-human" && !prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? ""))) wait = null;
+  if (wait?.source === "text" && (detectAsk(askText)?.kind === "needs-human" || blocked?.owner.length) && !settled) wait = null;
   if (wait) return result("waiting-ci", wait.reason, { wait, infraKind: wait.taskKind ? "bb3" : null });
   if (localVerify) {
     return result("local-verify", "heavy verification on the laptop", {
@@ -293,7 +333,13 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     });
   }
 
-  const ask = prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? "")) ? null : detectAsk(text);
+  const ask = settled ? null : detectAsk(askText);
+  // "Blocked on: your decision": the owner's, whatever else the list holds.
+  // Its own answers beat a plain "your call" read from the same words; a
+  // named topic (a merge, prod, creds) keeps the ask it came with.
+  if (blocked?.owner.length && (ask?.kind !== "needs-human" || ask.topic === "decision")) {
+    return result("needs-human", "agent asks: blocked on the owner", { ask: blockedAsk(blocked, full) });
+  }
   if (ask?.kind === "needs-human") return result("needs-human", `agent asks: ${ask.topic}`, { ask });
   if (ask?.kind === "in-scope") return result("asked-in-scope", "agent asked to do an in-scope step", { ask });
 
@@ -309,6 +355,15 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   const idle = text && prKnown && thread.agentStatus !== "error" ? { promised: promisedWork(text) } : null;
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
+}
+
+function cardAsk(thread, excluded, config, now) {
+  const card = thread.meta?.pendingCard;
+  if (!liveCardItems(card, now).length) return null;
+  if (excluded && !CARD_EXCLUSIONS.has(excluded)) return null;
+  const self = config?.selfSessionIds ?? [];
+  if (thread.archived || self.includes(thread.id) || (thread.claudeSessionId && self.includes(thread.claudeSessionId))) return null;
+  return { topic: "decision", card };
 }
 
 // A PR merged or closed after the agent asked has answered the ask, but only
@@ -343,9 +398,10 @@ function exclusionReason(thread, { pr, localGit, config }) {
 }
 
 // The owner pressed stop: their message came within a minute before the
-// abort. A supervisor message is never the owner's.
+// abort, or the turn was one the supervisor started (ownerStoppedNudge).
 export function deliberateStop(thread) {
   if (thread.agentStatus !== "aborted") return false;
+  if (ownerStoppedNudge(thread)) return true;
   if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
   const userAt = Date.parse(thread.lastUserAt ?? "");
   // Later metadata writes bump lastActivityAt; the source's abort time does not move.
@@ -353,6 +409,24 @@ export function deliberateStop(thread) {
   if (!Number.isFinite(userAt) || !Number.isFinite(abortAt)) return false;
   const gap = abortAt - userAt;
   return gap >= 0 && gap <= DELIBERATE_STOP_MS;
+}
+
+// Only the owner aborts a turn: Conductor writes "aborted by user", Claude and
+// Codex "interrupted". An app restart writes no abort; that turn is stalled.
+const OWNER_ABORT = /^(aborted by user|interrupted)$/i;
+
+// The owner stopped a turn the supervisor started, at any point in it: a no
+// to that nudge. Nothing goes to the thread until a new turn starts. Readers
+// keep supervisor messages out of lastUserText and stamp meta.lastSupervisorAt
+// instead, so the stopped turn is the supervisor's when that is the newest
+// message; an older reader may still pass the message itself through.
+export function ownerStoppedNudge(thread) {
+  if (thread.agentStatus !== "aborted") return false;
+  if (!OWNER_ABORT.test(String(thread.meta?.abortReason ?? "").trim())) return false;
+  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return true;
+  const supervisorAt = Date.parse(thread.meta?.lastSupervisorAt ?? "");
+  if (!Number.isFinite(supervisorAt)) return false;
+  return !(Date.parse(thread.lastUserAt ?? "") > supervisorAt);
 }
 
 function isRunning(thread, now, limits) {
@@ -463,8 +537,10 @@ function verifyKind(task) {
   return null;
 }
 
-function detectAsk(text) {
-  if (!text) return null;
+function detectAsk(raw) {
+  if (!raw) return null;
+  // "**Blocked on:** your call" reads as "Blocked on: your call".
+  const text = stripMarkdown(raw);
   const sentences = splitSentences(text);
   const askIndexes = sentences.map((sentence, index) => (isAsk(sentence) ? index : -1)).filter((index) => index >= 0);
   if (!askIndexes.length) return null;
@@ -498,6 +574,163 @@ function detectAsk(text) {
   // Every permission ask must name a routine PR step; the default is the owner.
   if (permission.every((index) => isRoutineStep(stepText(sentences, index)))) return { kind: "in-scope", topic: "in-scope", options, text: askText };
   return { kind: "needs-human", topic: "permission", options, text: askText };
+}
+
+function stripMarkdown(text) {
+  return String(text ?? "").replace(/\*\*|__|`/g, "");
+}
+
+// A "Blocked on:" item only the owner can clear: their decision, call,
+// approval, merge, review, pick or go-ahead. "Approval from Adam" names
+// someone else, so only an approval from the owner counts.
+const OWNER_BLOCKER = /\b(?:your|you|owner)\b[^.\n]{0,40}\b(?:decision|call|approv\w*|merge|review|sign-?off|pick|choice|go-?ahead)\b|\bmerge decision\b|\b(?:approval|review|sign-?off|decision|go-?ahead) from (?:you|the owner|spencer)\b|\bsudo\b/i;
+// Items GitHub or time clears: checks running, a review not in yet.
+const PASSIVE_BLOCKER = /\b(?:running|pending|queued|in progress|not (?:yet )?(?:reviewed|started|finished)|has(?:n't| not) reviewed|waiting (?:on|for))\b|^(?:CI|checks?|tests?|builds?)\W*$/i;
+const NO_BLOCKER = /^(?:nothing|none|n\/a|nope|no(?:thing)? (?:blockers?|else))\b/i;
+const BLOCKED_HEADER = /^[\s>#*_\-•]*blocked on\b[\s*_]*:?[\s*_]*(.*)$/i;
+const BULLET = /^(\s*)(?:[-*•+]|\d+[.)]|[a-c][.)])\s+(.*)$/i;
+
+// The agent's "Blocked on:" section: the header (any markdown) with what
+// follows it on its line, then its bullets up to a blank line or the next
+// header. Each item is tagged owner, passive or other; sub-bullets under an
+// item are its options. "Blocked on: nothing" holds no items. The last
+// header wins: an earlier one is often a quoted, older status.
+export function blockedOnSection(text) {
+  const lines = plainLines(text);
+  const start = lines.findLastIndex((line) => BLOCKED_HEADER.test(line));
+  if (start < 0) return null;
+  const items = [];
+  const inline = BLOCKED_HEADER.exec(lines[start])[1].trim();
+  if (inline) items.push({ text: inline, options: [] });
+  let indent = null;
+  let end = start + 1;
+  for (; end < lines.length; end += 1) {
+    const line = lines[end];
+    if (!line.trim()) {
+      // A blank line between the header and its first bullet is allowed.
+      if (items.length || indent !== null) break;
+      continue;
+    }
+    const bullet = BULLET.exec(line);
+    if (!bullet) {
+      // An indented line goes on with the item above it; anything else is the next block.
+      if (/^\s{2,}\S/.test(line) && items.length) { items.at(-1).text += ` ${line.trim()}`; continue; }
+      break;
+    }
+    const depth = bullet[1].replace(/\t/g, "  ").length;
+    if (indent === null) indent = depth;
+    if (depth > indent && items.length) items.at(-1).options.push(bullet[2].trim());
+    else items.push({ text: bullet[2].trim(), options: [] });
+  }
+  const tagged = items.filter((item) => item.text && !NO_BLOCKER.test(item.text))
+    .map((item) => ({ ...item, tag: OWNER_BLOCKER.test(item.text) ? "owner" : PASSIVE_BLOCKER.test(item.text) ? "passive" : "other" }));
+  const of = (tag) => tagged.filter((item) => item.tag === tag);
+  return {
+    items: tagged, owner: of("owner"), passive: of("passive"), other: of("other"), mergeCalls: [], start,
+    // The section's own lines, for reading the rest of the message without it.
+    lines: lines.slice(start, end).map((line) => line.trim()).filter(Boolean)
+  };
+}
+
+function plainLines(text) {
+  return stripMarkdown(text).replace(/[\u2018\u2019]/g, "'").split("\n");
+}
+
+// "Your merge decision", "your go to merge": only the merge itself.
+const MERGE_CALL = /^(?:on\s+)?(?:your|the owner'?s?|owner)\s+(?:merge(?:\s+(?:decision|call|approval|go-?ahead|click|ok))?|(?:go(?:-?ahead)?|ok(?:ay)?|approval|decision|call|sign-?off|click)\s+(?:to|on|for)\s+(?:the\s+)?merg\w*)\b(.*)$/i;
+const MORE_THAN_MERGE = /\b(?:and|also|plus|prod\w*|releas\w*|deploy\w*|sudo|decision|call|approv\w*|sign-?off|review)\b/i;
+
+function isMergeCall(text) {
+  const match = MERGE_CALL.exec(text);
+  return Boolean(match) && !MORE_THAN_MERGE.test(match[1]);
+}
+
+function withoutMergeCalls(section) {
+  const mergeCalls = section.owner.filter((item) => isMergeCall(item.text));
+  if (!mergeCalls.length) return section;
+  return { ...section, owner: section.owner.filter((item) => !mergeCalls.includes(item)), mergeCalls };
+}
+
+// "Pushed. Blocked on: your merge decision." written inline, dropped.
+function dropInlineMergeCalls(text) {
+  return stripMarkdown(text).replace(/\bblocked on\W{0,3}([^.;\n]*)[.;]?/gi, (all, item) => (isMergeCall(item.trim()) ? " " : all));
+}
+
+// The text (whitespace collapsed, as the tail is) without these lines.
+function dropLines(text, lines) {
+  let out = stripMarkdown(text).replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, " ");
+  for (const line of lines) {
+    const plain = line.replace(/\s+/g, " ").trim();
+    if (plain) out = out.split(plain).join(" ");
+  }
+  return out;
+}
+
+// Sub-bullets are answers only when they read as alternatives: two or
+// three short ones, each a step ("Merge now", "Keep it"), an option
+// ("Option A", "B)") or an "or". Details ("P1: migration drops the audit
+// table") are not, and a tap would be relayed to the agent as a pick.
+const CHOICE_LEAD = /^(?:option\s+\w+\b|[a-c][.):]\s|or\b|(?:merge|ship|keep|drop|fix|skip|wait|use|revert|split|defer|land|close|pin|let|make|add|remove|go|hold|accept|reject|approve|run|retry|rebase|leave|allow|deny|delete|stop|continue|proceed|cancel|switch|move|rename|push|pick|take|do|don't|ignore)\b)/i;
+
+function alternatives(options) {
+  const labels = [...new Set(options.map((option) => String(option).trim()).filter(Boolean))];
+  if (labels.length < 2 || labels.length > 3) return [];
+  return labels.every((label) => label.length <= 40 && CHOICE_LEAD.test(label)) ? labels : [];
+}
+
+// "Both need your call." over a list elsewhere in the report.
+const CALL_HEADER = /\byour (?:call|decision|pick|choice)\b|\bneeds? (?:you|your)\b|\bfor you to (?:decide|pick)\b/i;
+
+// The bulleted blocks outside the Blocked-on section whose lead line asks
+// for the owner's call: { at, bullets }.
+function callSections(text, blockedStart) {
+  const lines = plainLines(text);
+  const out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (i === blockedStart || !CALL_HEADER.test(lines[i]) || BULLET.test(lines[i])) continue;
+    const bullets = [];
+    let indent = null;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const bullet = BULLET.exec(lines[j]);
+      if (!bullet) {
+        if (!lines[j].trim() && !bullets.length) continue;
+        break;
+      }
+      const depth = bullet[1].replace(/\t/g, "  ").length;
+      if (indent === null) indent = depth;
+      if (depth <= indent) bullets.push(bullet[2].trim());
+    }
+    if (bullets.length) out.push({ at: i, bullets });
+  }
+  return out;
+}
+
+// The block an owner item points at: the nearest one in the direction it
+// names ("the two P1s above"), else the only one in the report.
+function pointedSection(owner, text, blockedStart) {
+  const sections = callSections(text, blockedStart);
+  const words = owner.map((item) => item.text).join(" ");
+  if (/\babove\b/i.test(words)) return sections.filter((section) => section.at < blockedStart).at(-1) ?? null;
+  if (/\bbelow\b/i.test(words)) return sections.find((section) => section.at > blockedStart) ?? null;
+  return sections.length === 1 ? sections[0] : null;
+}
+
+// The owner items as one question. Answers come from the agent's own
+// sub-bullets (one item), or the block it points at, only when they are
+// alternatives; that block is shown as context either way. "open thread"
+// always stays, and never a "later" that would be relayed as an answer.
+function blockedAsk(blocked, full = "") {
+  const owner = blocked.owner;
+  const pointed = pointedSection(owner, full, blocked.start);
+  const own = owner.length === 1 ? alternatives(owner[0].options) : [];
+  const labels = (own.length ? own : alternatives(pointed?.bullets ?? [])).map((option) => clampText(option, 40));
+  const text = owner.map((item) => item.text.replace(/[.;,\s]+$/, "")).join(" / ");
+  const context = pointed ? pointed.bullets.slice(0, 3).map((bullet) => clampText(bullet, 90)).join(" | ") : "";
+  // The choices are part of the ask: the same generic blocker over other
+  // P1s or other sub-bullets is a new decision, not the one answered.
+  const choices = [...owner.flatMap((item) => item.options ?? []), ...(pointed?.bullets ?? [])].map((choice) => String(choice).replace(/\s+/g, " ").trim()).filter(Boolean);
+  const key = shortHash(choices.length ? [text, ...choices].join("\n") : text);
+  return { topic: "decision", blocked: true, text, context, options: [...labels, "open thread"], key };
 }
 
 function isRoutineStep(text) {

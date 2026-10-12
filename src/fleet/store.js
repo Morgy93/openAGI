@@ -14,6 +14,7 @@ const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
 const REOPEN_MS = 60 * 60 * 1000;
 const PUSH_KEEP_MS = 24 * 60 * 60 * 1000;
 const NUDGES_KEPT = 20;
+const FACTS_KEPT = 8;
 const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
@@ -25,6 +26,8 @@ const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 const REVIEW_HOLD_MS = 6 * 60 * 60 * 1000;
 // The agent message an ask came from, for the review.
 const ASK_CONTEXT_MAX = 600;
+// An agent's own question: one it wrote, or an item of its question card.
+const AGENT_KINDS = new Set(["agent-ask", "agent-card"]);
 
 // Only a delivered nudge spends the no-progress budget. A failed send still
 // starts the cooldown so a broken route is not retried every tick; dry-runs,
@@ -109,7 +112,7 @@ function isReviewClosed(question) {
 // ("later", "keep going", "opened", "retry") leave the condition to the
 // owner, so the ask returns a TTL after the answer.
 function holdsWhileAsked(question) {
-  return question.status === "dismissed" || question.kind === "agent-ask" || isReviewClosed(question);
+  return question.status === "dismissed" || AGENT_KINDS.has(question.kind) || isReviewClosed(question);
 }
 
 // A group the review closed that now covers another thread is a new ask.
@@ -225,7 +228,10 @@ export class FleetStore {
       playbook: entry.playbook ?? null,
       route: entry.route ?? null,
       status,
-      messageHash: entry.messageHash ?? null
+      messageHash: entry.messageHash ?? null,
+      // When the send started, and the facts the nudge was about.
+      ...(entry.sentAt ? { sentAt: iso(toMs(entry.sentAt, toMs(at, this.now()))) } : {}),
+      ...(entry.factsKey ? { factsKey: String(entry.factsKey), facts: (Array.isArray(entry.facts) ? entry.facts : []).slice(0, FACTS_KEPT).map((item) => clampText(item, 80)) } : {})
     });
     if (ledger.nudges.length > NUDGES_KEPT) ledger.nudges.splice(0, ledger.nudges.length - NUDGES_KEPT);
     if (progressMark !== undefined && markKey(progressMark) !== markKey(ledger.lastProgressMark)) {
@@ -254,7 +260,9 @@ export class FleetStore {
 
   // meta: small facts the supervisor acts on when the owner answers (a
   // permission card's stateId, an app and the chats running in it).
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null } = {}) {
+  // baseKey: an owner close of that ask holds this one too (a card item
+  // asked once more under a new key).
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
@@ -264,7 +272,8 @@ export class FleetStore {
       threadKey: threadKey ?? null,
       prRef: prRef ?? null,
       title: clampText(redactSecrets(title), this.limits.titleMax) || "(untitled)",
-      body: clampText(redactSecrets(body), this.limits.bodyMax),
+      // A card item's body is its whole question and its choices.
+      body: clampText(redactSecrets(body), kind === "agent-card" ? this.limits.cardBodyMax : this.limits.bodyMax),
       options: normalizeOptions(options),
       playbook: playbook ?? null,
       kind: kind ?? null,
@@ -293,7 +302,7 @@ export class FleetStore {
     // A delivery-failure answer holds on each thread's failure streak (see
     // ackUndelivered), so the group question itself never holds: a thread
     // that starts failing later is asked about, one already answered is not.
-    const closed = fields.kind === "deliver" ? null : this._ownerClosed(key, now, fields);
+    const closed = fields.kind === "deliver" ? null : this._ownerClosed(key, now, fields) ?? (baseKey ? this._ownerClosed(String(baseKey), now, fields) : null);
     if (closed) {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
@@ -670,12 +679,19 @@ export class FleetStore {
   // ─── owner overrides ────────────────────────────────────────────────────
 
   // A counted send that failed in the background gives its attempt back.
-  undoAttempt(key) {
+  // sent: that send's entry ({ at, messageHash }), else the newest one. Its
+  // words never reached the agent, so it is failed whatever the budget says:
+  // a "sent" hash would refuse the next identical nudge as a repeat.
+  undoAttempt(key, sent = null) {
     const ledger = this.state.ledger[key];
-    if (!ledger || !(ledger.attemptsWithoutProgress > 0)) return null;
-    ledger.attemptsWithoutProgress -= 1;
-    const last = ledger.nudges.at(-1);
-    if (last?.status === "sent") last.status = "failed";
+    if (!ledger) return null;
+    const entry = sent
+      ? ledger.nudges.findLast((nudge) => nudge.status === "sent" && nudge.at === sent.at && nudge.messageHash === (sent.messageHash ?? null))
+      : ledger.nudges.at(-1);
+    const failed = entry?.status === "sent";
+    if (failed) entry.status = "failed";
+    if (!failed && !(ledger.attemptsWithoutProgress > 0)) return null;
+    if (ledger.attemptsWithoutProgress > 0) ledger.attemptsWithoutProgress -= 1;
     this._save();
     return structuredClone(ledger);
   }
@@ -685,6 +701,8 @@ export class FleetStore {
     const ledger = this.state.ledger[key];
     if (!ledger) return null;
     ledger.attemptsWithoutProgress = 0;
+    // Lifts the policy's hold on an answered nudge (resolveNudge).
+    ledger.keepGoingAt = iso(this.now());
     this._save();
     return structuredClone(ledger);
   }

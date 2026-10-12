@@ -314,6 +314,7 @@ details.thread>summary{padding:0}
       });
       buttons.push(button('Dismiss', 'btn ghost', opts, function () { return decide(q, { dismiss: true }, buttons); }));
       if (q.kind === 'agent-ask') el('p', 'note', 'Your answer goes to the agent.', card);
+      if (q.kind === 'agent-card') el('p', 'note', 'Answer this card in the app. Nothing is sent from here.', card);
     });
   }
 

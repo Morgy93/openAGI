@@ -49,6 +49,9 @@ export const DEFAULTS = Object.freeze({
   maxSendsPerTick: 4,
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
+  // No playbook nudge this long after the owner's own message in a thread:
+  // they are driving it, often on something other than its PR.
+  ownerDrivenMs: 3 * 60 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
   // A run holding a verification slot is slow only past this: normal runs
   // finish well inside it, and the verifier kills one at 90 min. The 30-min
@@ -76,7 +79,11 @@ export const DEFAULTS = Object.freeze({
   pushPerHour: 3,
   titleMax: 100,
   bodyMax: 220,
+  // A question card item's full question and its numbered choices.
+  cardBodyMax: 900,
   excerptMax: 600,
+  // The agent's whole final message, lines kept, for reading its report.
+  fullTextMax: 8000,
   // The self-review reads this much of each thread's last agent message.
   reviewTailMax: 1500,
   maxThreads: 150,
@@ -444,6 +451,61 @@ export function runCommand(cmd, args = [], options = {}) {
   });
 }
 
+// ---------- question cards ----------
+
+const CARD_LABEL_MAX = 200;
+const CARD_ITEMS_MAX = 20;
+// The app's Skip is local, so an item nobody answers may stay open for good:
+// past a day it is asked once more, and past two it is dropped.
+export const CARD_STALE_MS = 24 * 60 * MIN;
+export const CARD_DROP_MS = 48 * 60 * MIN;
+// Excluded threads whose open cards still reach the owner (never self or
+// archived ones). They are never read for git or PRs.
+export const CARD_EXCLUSIONS = new Set(["automation", "no-repo"]);
+// One-option acknowledgements ("Okay", "Continue") ask nothing.
+const ACK_LABELS = new Set(["ok", "okay", "continue", "got it", "acknowledge", "acknowledged", "understood"]);
+
+// A note with no choices that says it needs nothing ("No input is needed
+// from you right now") is one too.
+const NOTHING_NEEDED = /\bno (?:input|action|response|reply|decision)\b[^.?!]{0,30}\b(?:needed|required)\b|\bnothing (?:is )?needed from you\b/i;
+
+export function isAckItem(item) {
+  const options = Array.isArray(item?.options) ? item.options : [];
+  if (!options.length) return NOTHING_NEEDED.test(String(item?.question ?? ""));
+  // "Continue (Recommended)": the app's recommendation suffix is not the label.
+  const label = String(options[0]).trim().toLowerCase().replace(/\s*\(recommended\)$/, "").replace(/[.!]+$/, "");
+  return options.length === 1 && ACK_LABELS.has(label);
+}
+
+// The items of an open card the owner is asked about now. Only Codex items
+// age out: a Conductor card holds its turn until it is answered.
+export function liveCardItems(card, now = Date.now()) {
+  const items = Array.isArray(card?.items) ? card.items : [];
+  return items.filter((item) => {
+    if (isAckItem(item)) return false;
+    if (card.app !== "codex") return true;
+    const at = Date.parse(item.at ?? "");
+    return !Number.isFinite(at) || now - at < CARD_DROP_MS;
+  });
+}
+
+// Agent text, redacted and bounded; labels stay whole up to CARD_LABEL_MAX.
+export function cleanCardItem(item, limits) {
+  const max = limits?.cardBodyMax ?? DEFAULTS.cardBodyMax;
+  const header = clampText(redactSecrets(item.header ?? ""), limits?.titleMax ?? DEFAULTS.titleMax);
+  return {
+    index: Number(item.index) || 0,
+    itemId: String(item.itemId ?? item.index ?? ""),
+    header: header || null,
+    question: clampText(redactSecrets(item.question ?? ""), max),
+    options: (Array.isArray(item.options) ? item.options : [])
+      .map((option) => clampText(redactSecrets(option), CARD_LABEL_MAX)).filter(Boolean).slice(0, CARD_ITEMS_MAX),
+    multiSelect: item.multiSelect === true,
+    freeText: item.freeText !== false,
+    at: item.at ?? null
+  };
+}
+
 // Collapse whitespace and cut to max chars with an ellipsis.
 export function clampText(value, max) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
@@ -463,6 +525,15 @@ const SECRET_PATTERNS = [
 // Keeps the END of a message: agents put their question or wait notice last.
 export function clampTail(value, max) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!max || text.length <= max) return text;
+  return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
+}
+
+// clampTail with the lines kept: spaces collapse, newlines (and one blank
+// line between blocks) stay, so lists and sections can still be read.
+export function clampTailLines(value, max) {
+  const text = String(value ?? "").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ")
+    .replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   if (!max || text.length <= max) return text;
   return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
 }
@@ -594,6 +665,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {string|null} lastActivityAt ISO
  * @property {string} lastAgentText       untrusted, redacted, <= excerptMax
  * @property {string} lastAgentTail       the same message, <= reviewTailMax (self-review only)
+ * @property {string} [lastAgentFull]     the last real (not synthetic) agent message, lines kept, <= fullTextMax
+ * @property {string|null} [lastAgentFullAt] when that message was written
  * @property {string|null} lastAgentAt
  * @property {string} lastUserText
  * @property {string|null} lastUserAt
@@ -605,8 +678,18 @@ export async function openReadOnlyDb(filePath) {
  * @property {boolean} archived
  * @property {string|null} excluded       reason, or null when in scope
  * @property {Object} meta               source extras: model, file, turnStartedAt, abortReason, heartbeat,
- *   lastSupervisorAt, pendingQuestion, provider, threadSource, conductorHosted, entrypoint, waitingFor,
+ *   lastSupervisorAt, pendingQuestion, pendingCard, provider, threadSource, conductorHosted, entrypoint, waitingFor,
  *   peerStatus, derivedStatus, dbRemote
+ */
+
+/**
+ * @typedef {Object} QuestionCard          an open question card (meta.pendingCard)
+ * @property {"conductor"|"codex"} app
+ * @property {string} cardId              Conductor: the AskUserQuestion tool_use id. Codex: the ask turn id.
+ * @property {string|null} at             ISO; the first open item's ask time
+ * @property {number} count               items the card asked, answered ones included
+ * @property {{index: number, itemId: string, header: string|null, question: string, options: string[],
+ *   multiSelect: boolean, freeText: boolean, at: string|null}[]} items   the open ones; index is stable within the card
  */
 
 /**
@@ -667,7 +750,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {string} reason              short human-readable why
  * @property {string[]} blockers          short readiness blockers
  * @property {{title: string, body: string, options: string[], dedupeKey: string,
- *   kind: "agent-ask"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
+ *   kind: "agent-ask"|"agent-card"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
+ * @property {Object} [cardQuestion]     a Codex question card asked beside this decision (one per card)
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */

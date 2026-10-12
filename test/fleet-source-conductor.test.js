@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DEFAULTS, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
-import { findManagerSession, listConductorThreads } from "../src/fleet/sources/conductor.js";
+import { ASK_CLOSED_SQL, ASK_SQL, findManagerSession, listConductorThreads } from "../src/fleet/sources/conductor.js";
+import { classifyThread } from "../src/fleet/classify.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
 const MIN = 60_000;
@@ -42,10 +43,10 @@ function createDb(file) {
 let messageSeq = 0;
 function addMessage(db, sessionId, role, content, at, extra = {}) {
   messageSeq += 1;
-  db.prepare(`INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, cancelled_at, sender_session_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+  db.prepare(`INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, cancelled_at, sender_session_id, turn_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
     `m-${messageSeq}`, sessionId, role, typeof content === "string" ? content : JSON.stringify(content),
-    at, at, extra.cancelledAt ?? null, extra.senderSessionId ?? null
+    at, at, extra.cancelledAt ?? null, extra.senderSessionId ?? null, extra.turnId ?? null
   );
 }
 
@@ -201,6 +202,8 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.equal(idle.lastAgentAt, iso(20 * MIN));
   assert.equal(idle.lastUserText, "get it green");
   assert.equal(idle.lastUserAt, iso(30 * MIN));
+  // The supervisor's message is not the owner's; it is stamped on its own.
+  assert.equal(idle.meta.lastSupervisorAt, iso(16 * MIN));
   assert.equal(idle.meta.turnStartedAt, iso(29 * MIN));
   assert.deepEqual(idle.openTasks, []);
 
@@ -212,6 +215,7 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   const aborted = threads["s-abort"];
   assert.equal(aborted.agentStatus, "aborted");
   assert.equal(aborted.meta.abortReason, "aborted by user");
+  assert.equal(aborted.meta.lastSupervisorAt, null);
   assert.equal(aborted.error, null);
 
   assert.equal(threads["s-self"].excluded, "self");
@@ -402,6 +406,8 @@ test("a pending AskUserQuestion is the owner's question; its answer clears it", 
       { type: "tool_use", id, name: "mcp__conductor__AskUserQuestion", input: { questions: [{ header: "Split plan", question: "Split into two PRs. Go?", options: ["Go", { label: "Change it" }] }] } }
     ] }
   });
+  // The card blocks the turn: the session reads "working".
+  db.prepare("UPDATE sessions SET status = 'working' WHERE id = 's-idle'").run();
   addMessage(db, "s-idle", "assistant", ask("toolu_ask1"), iso(5 * MIN));
   db.close();
   let threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
@@ -424,4 +430,297 @@ test("a pending AskUserQuestion is the owner's question; its answer clears it", 
   moved.close();
   threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
   assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+
+  // An idle session's last row is an unanswered ask and no process is alive
+  // (600a2afc): the card died with its process, so the session reads stopped.
+  const idle = new DatabaseSync(file);
+  addMessage(idle, "s-idle", "assistant", ask("toolu_ask3"), iso(0.5 * MIN));
+  idle.prepare("UPDATE sessions SET status = 'idle' WHERE id = 's-idle'").run();
+  idle.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+  // A nudge resumes it; no owner card asks for a pick nobody can make.
+  assert.equal(classifyThread(threads["s-idle"], { now: NOW, config: makeConfig(home) }).state, "idle-no-pr");
+  // A process restarted after the call is not the one that asked.
+  const restarted = new Map([["s-idle", { peerName: "cairo", pid: 901, status: "idle", waitingFor: null, startedAt: iso(0.4 * MIN) }]]);
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: restarted }));
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+
+  // Older Conductor reports an AskUserQuestion wait as idle: while the
+  // process that asked lives, the unanswered call still holds the card.
+  writePeer(home, { pid: 901, sessionId: "s-idle", name: "cairo", status: "idle", updatedAt: NOW, startedAt: NOW - 10 * MIN });
+  const alive = { now: NOW, isPidAlive: (pid) => pid === 901 };
+  threads = byId(await listConductorThreads(makeConfig(home), alive));
+  assert.equal(threads["s-idle"].meta.pendingCard?.cardId, "toolu_ask3");
+  assert.equal(threads["s-idle"].meta.pendingQuestion?.text, "Split into two PRs. Go? (Go / Change it)");
+  assert.equal(classifyThread(threads["s-idle"], { now: NOW, config: makeConfig(home) }).state, "needs-human");
+  // Its answer closes it, idle or not.
+  const answered = new DatabaseSync(file);
+  addMessage(answered, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ask3", content: "Go" }] } }, iso(0.2 * MIN));
+  answered.close();
+  threads = byId(await listConductorThreads(makeConfig(home), alive));
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+  // An errored session lost its card, whatever its rows say.
+  const errored = new DatabaseSync(file);
+  addMessage(errored, "s-idle", "assistant", ask("toolu_ask4"), iso(0.1 * MIN));
+  errored.prepare("UPDATE sessions SET status = 'error' WHERE id = 's-idle'").run();
+  errored.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+});
+
+// Real shape (session 587635ca, 2026-10-11 17:46:39): the card blocks the
+// tool call, so the session reads "working" and background subagent rows
+// keep arriving for 17 minutes, none of them a new turn.
+const CARD_TURN = "760c3717-c66f-475f-a149-3784389cafa8";
+const cardCall = (id) => ({
+  type: "assistant", uuid: "8d52a022", parent_tool_use_id: null, session_id: "s-run",
+  message: { role: "assistant", model: "claude-opus-5-5", content: [{
+    type: "tool_use", id, name: "mcp__conductor__AskUserQuestion", input: { questions: [
+      { header: "End-of-day count", question: "As a rep, I want the end-of-day message to show how many items still need me, so it matches the inbox. Where should that count be built?", multiSelect: false, options: [
+        { label: "Chat-analysis worker (Recommended)", description: "Build it where the inbox already runs." },
+        { label: "Sales worker + inbox module", description: "Add the inbox module to the sales worker." },
+        { label: "Work-queue only", description: "Count only the work queue." }
+      ] },
+      { header: "Bob's day", question: "What should Bob's end-of-day message cover?", multiSelect: false, options: [
+        { label: "Did + doing next (Recommended)", description: "Both halves." },
+        { label: "Only what he did", description: "A recap." },
+        { label: "Only what's next", description: "A plan." }
+      ] }
+    ] }
+  }] }
+});
+const subagentRow = (i) => ({ ...sdk.text("s-run", `subagent step ${i}`, "toolu_bg"), parent_tool_use_id: "toolu_bg" });
+
+function seedCard(home, { subagentRows = 60 } = {}) {
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-run", "user", "build M3", iso(1.99 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "init", session_id: "s-run" }, iso(1.98 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", sdk.text("s-run", "M3 is built through 3.9. Two questions for you:"), iso(1.97 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", cardCall("toolu_card"), iso(1.96 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < subagentRows; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 1.9 * MIN + i * 100).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  return file;
+}
+
+test("an open Conductor question card is read item by item while the session works", async (t) => {
+  const home = makeHome(t);
+  const file = seedCard(home);
+  const config = makeConfig(home);
+  let threads = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }));
+  const thread = threads["s-run"];
+  assert.equal(thread.agentStatus, "running");
+  const card = thread.meta.pendingCard;
+  assert.equal(card.app, "conductor");
+  assert.equal(card.cardId, "toolu_card");
+  assert.equal(card.at, iso(1.96 * MIN));
+  assert.deepEqual(card.items.map((item) => item.header), ["End-of-day count", "Bob's day"]);
+  assert.deepEqual(card.items[0].options, ["Chat-analysis worker (Recommended)", "Sales worker + inbox module", "Work-queue only"]);
+  assert.deepEqual(card.items[1].options, ["Did + doing next (Recommended)", "Only what he did", "Only what's next"]);
+  assert.equal(card.items[1].question, "What should Bob's end-of-day message cover?");
+  assert.deepEqual(card.items.map((item) => [item.index, item.freeText, item.multiSelect]), [[0, true, false], [1, true, false]]);
+  // Item 0 alone stays the back-compat pendingQuestion.
+  assert.match(thread.meta.pendingQuestion.text, /^As a rep.*\(Chat-analysis worker \(Recommended\) \/ Sales worker/);
+  assert.doesNotMatch(thread.meta.pendingQuestion.text, /Bob/);
+  // A working session with a card waits on the owner, not "running".
+  const classified = classifyThread(thread, { now: NOW, config });
+  assert.equal(classified.state, "needs-human");
+  assert.equal(classified.ask.card.cardId, "toolu_card");
+
+  // The owner's pick lands as the tool_result: the card is gone.
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", { type: "user", parent_tool_use_id: null, session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_card", content: [{ type: "text", text: "User responses:\n1. put this in a loop (free text)\n2. Did + doing next (Recommended)" }] }] } }, iso(0.1 * MIN), { turnId: CARD_TURN });
+  db.close();
+  threads = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-run"].meta.pendingCard, null);
+  assert.equal(threads["s-run"].meta.pendingQuestion, null);
+});
+
+test("a card pushed out of the tail by subagent rows is still read, until its answer or a new turn", async (t) => {
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 450 });
+  const config = makeConfig(home);
+  let thread = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard?.cardId, "toolu_card");
+  assert.equal(thread.meta.pendingCard.items.length, 2);
+
+  // Aborted: the next turn's init closes it, though the tool_result never came.
+  let db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "init", session_id: "s-run" }, iso(0.5 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 0.4 * MIN + i).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  thread = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard, null);
+
+  // Answered out of the tail.
+  const other = makeHome(t);
+  const answered = seedCard(other, { subagentRows: 450 });
+  db = new DatabaseSync(answered);
+  addMessage(db, "s-run", "assistant", { type: "user", parent_tool_use_id: null, session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_card", content: "ok" }] } }, iso(1.1 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - MIN + i).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  thread = byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard, null);
+});
+
+test("the agent's whole last message is kept with its lines; a synthetic limit row is not its reply", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  const report = `${"Earlier notes. ".repeat(60)}\n\n**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head`;
+  addMessage(db, "s-idle", "assistant", sdk.text("s-idle", report), iso(15 * MIN));
+  const limit = sdk.text("s-idle", "You've hit your session limit · resets 2:30pm");
+  limit.message.model = "<synthetic>";
+  addMessage(db, "s-idle", "assistant", limit, iso(14 * MIN));
+  db.close();
+  const thread = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
+  assert.match(thread.lastAgentText, /session limit/);
+  assert.ok(thread.lastAgentText.length <= DEFAULTS.excerptMax);
+  assert.ok(thread.lastAgentFull.length > DEFAULTS.excerptMax);
+  assert.ok(thread.lastAgentFull.endsWith("Earlier notes.\n\n**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head"));
+  assert.equal(thread.lastAgentFullAt, iso(15 * MIN));
+  assert.equal(thread.lastAgentAt, iso(14 * MIN));
+});
+
+// A subagent's AskUserQuestion (342281f9, 2026-10-07 03:27:31): the card
+// shows to the owner like the agent's own.
+const subagentAsk = (id) => ({ ...cardCall(id), parent_tool_use_id: "toolu_bg" });
+const subagentAnswer = (id) => ({ type: "user", parent_tool_use_id: "toolu_bg", session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "User responses:\n1. Yes, merge the whole stack" }] } });
+
+test("a subagent's question card is surfaced until its own answer", async (t) => {
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 3 });
+  let db = new DatabaseSync(file);
+  // The agent's card was answered; then a subagent asks.
+  addMessage(db, "s-run", "assistant", { type: "user", parent_tool_use_id: null, session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_card", content: "ok" }] } }, iso(1.5 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", subagentAsk("toolu_sub"), iso(1.4 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", subagentRow(99), iso(1.3 * MIN), { turnId: CARD_TURN });
+  db.close();
+  const config = makeConfig(home);
+  let thread = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard?.cardId, "toolu_sub");
+  assert.deepEqual(thread.meta.pendingCard.items.map((item) => item.itemId), ["toolu_sub:0", "toolu_sub:1"]);
+  assert.equal(classifyThread(thread, { now: NOW, config }).state, "needs-human");
+  db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", subagentAnswer("toolu_sub"), iso(1.2 * MIN), { turnId: CARD_TURN });
+  db.close();
+  thread = byId(await listConductorThreads(config, { now: NOW, peers: new Map() }))["s-run"];
+  assert.equal(thread.meta.pendingCard, null);
+});
+
+test("an error row closes the card, in the tail and out of it", async (t) => {
+  // d7757f20: the card, then "Claude Code process exited with code 143".
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 3 });
+  let db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", sdk.error("Claude Code process exited with code 143"), iso(1 * MIN), { turnId: CARD_TURN });
+  db.close();
+  assert.equal(byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard, null);
+  // The card out of the tail, its error row too.
+  const other = makeHome(t);
+  const deep = seedCard(other, { subagentRows: 450 });
+  db = new DatabaseSync(deep);
+  addMessage(db, "s-run", "assistant", sdk.error("Claude Code process exited with code 143"), iso(1.5 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 1.4 * MIN + i).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  assert.equal(byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard, null);
+});
+
+test("a result row closes a card out of the tail; a subagent card out of the tail is found", async (t) => {
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 450 });
+  let db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", sdk.result("s-run", "Stopped."), iso(1.5 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 1.4 * MIN + i).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  assert.equal(byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard, null);
+
+  const other = makeHome(t);
+  const sub = seedCard(other, { subagentRows: 0 });
+  db = new DatabaseSync(sub);
+  addMessage(db, "s-run", "assistant", { type: "user", parent_tool_use_id: null, session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_card", content: "ok" }] } }, iso(1.95 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", subagentAsk("toolu_sub"), iso(1.94 * MIN), { turnId: CARD_TURN });
+  for (let i = 0; i < 450; i += 1) addMessage(db, "s-run", "assistant", subagentRow(i), new Date(NOW - 1.9 * MIN + i * 100).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  assert.equal(byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard?.cardId, "toolu_sub");
+});
+
+test("a trailing row with no turn_id or an ambient broadcast never hides or drops an open card", async (t) => {
+  // The turn's init aged out of the tail; a subagent card is in the tail, the
+  // agent's own card is not, and the newest rows are a commands_changed
+  // broadcast (its own turn id) and a row with no turn_id at all.
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 450 });
+  let db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", subagentAsk("toolu_sub"), iso(0.2 * MIN), { turnId: CARD_TURN });
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "commands_changed", session_id: "s-run" }, iso(0.15 * MIN), { turnId: "ambient-turn" });
+  addMessage(db, "s-run", "assistant", { type: "system", subtype: "commands_changed", session_id: "s-run" }, iso(0.1 * MIN));
+  db.close();
+  let card = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard;
+  assert.deepEqual(card?.items.map((item) => item.itemId), ["toolu_card:0", "toolu_card:1", "toolu_sub:0", "toolu_sub:1"]);
+
+  // An older Conductor with no turn_id column: the tail card stands alone.
+  const other = makeHome(t);
+  const old = seedCard(other, { subagentRows: 450 });
+  db = new DatabaseSync(old);
+  addMessage(db, "s-run", "assistant", subagentAsk("toolu_sub"), iso(0.2 * MIN));
+  db.exec("ALTER TABLE session_messages DROP COLUMN turn_id");
+  db.close();
+  card = byId(await listConductorThreads(makeConfig(other), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard;
+  assert.equal(card?.cardId, "toolu_sub");
+});
+
+test("rows that only mention AskUserQuestion never hide the real call out of the tail", async (t) => {
+  // 221fbf69: subagents read conductor.js and its tests while a card is open.
+  const home = makeHome(t);
+  const file = seedCard(home, { subagentRows: 0 });
+  const db = new DatabaseSync(file);
+  const mention = (i) => ({ type: "user", parent_tool_use_id: "toolu_bg", session_id: "s-run", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_read${i}`,
+    content: `const call = content.find((block) => /AskUserQuestion$/.test(block.name)); name: "mcp__conductor__AskUserQuestion" ${i}` }] } });
+  for (let i = 0; i < 450; i += 1) addMessage(db, "s-run", "assistant", i % 70 === 0 ? mention(i) : subagentRow(i), new Date(NOW - 1.9 * MIN + i * 100).toISOString(), { turnId: CARD_TURN });
+  db.close();
+  assert.equal(byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-run"].meta.pendingCard?.cardId, "toolu_card");
+});
+
+test("the out-of-tail card reads use the turn_id index, never a walk of the session", () => {
+  const db = new DatabaseSync(":memory:");
+  // conductor.db's real session_messages indexes (2026-10-11 .schema).
+  db.exec(`CREATE TABLE session_messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      sent_at TEXT, full_message TEXT, cancelled_at TEXT, model TEXT, sdk_message_id TEXT, last_assistant_message_id TEXT, turn_id TEXT,
+      is_resumable_message INTEGER, queue_order INTEGER, sender_id TEXT, sender_session_id TEXT, sender_api_key_name TEXT, sender_source TEXT);
+    CREATE INDEX idx_session_messages_sent_at ON session_messages(session_id, sent_at);
+    CREATE INDEX idx_session_messages_cancelled_at ON session_messages(session_id, cancelled_at);
+    CREATE INDEX idx_session_messages_turn_id ON session_messages(turn_id);
+    CREATE INDEX idx_session_messages_queued_session_id ON session_messages(session_id) WHERE sent_at IS NULL AND cancelled_at IS NULL;
+    CREATE INDEX idx_session_messages_sdk_message_id ON session_messages(session_id, sdk_message_id) WHERE sdk_message_id IS NOT NULL;
+    CREATE INDEX idx_session_messages_user_turns ON session_messages(session_id, role, turn_id, id, sent_at, cancelled_at) WHERE role = 'user';`);
+  for (const [sql, params] of [[ASK_SQL, ["t", "s"]], [ASK_CLOSED_SQL, ["t", "s", "x", "x", 1, "%id%"]]]) {
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params).map((row) => row.detail).join("\n");
+    assert.match(plan, /USING INDEX idx_session_messages_turn_id \(turn_id=\?\)/);
+    assert.doesNotMatch(plan, /idx_session_messages_sent_at/);
+  }
+  db.close();
+});
+
+test("a working session's card dies with its process: a peer started after the call, or none once the turn went silent", async (t) => {
+  const home = makeHome(t);
+  seedCard(home);
+  const config = makeConfig(home);
+  const later = NOW + DEFAULTS.silentTurnMs;
+  // Silent with no process: no card, and the stopped turn reads stalled.
+  let threads = byId(await listConductorThreads(config, { now: later, peers: new Map() }));
+  assert.equal(threads["s-run"].meta.pendingCard, null);
+  assert.equal(threads["s-run"].meta.pendingQuestion, null);
+  assert.equal(threads["s-run"].agentStatus, "stalled");
+  assert.notEqual(classifyThread(threads["s-run"], { now: later, config }).state, "needs-human");
+  // A process restarted after the call is not the one that asked.
+  const restarted = new Map([["s-run", { peerName: "madrid", pid: 902, status: "idle", waitingFor: null, startedAt: iso(MIN) }]]);
+  threads = byId(await listConductorThreads(config, { now: NOW, peers: restarted }));
+  assert.equal(threads["s-run"].meta.pendingCard, null);
+  // The process that asked still lives: the card stays however long it waits.
+  const asker = new Map([["s-run", { peerName: "madrid", pid: 902, status: "idle", waitingFor: null, startedAt: iso(10 * MIN) }]]);
+  threads = byId(await listConductorThreads(config, { now: later, peers: asker }));
+  assert.equal(threads["s-run"].meta.pendingCard?.cardId, "toolu_card");
 });

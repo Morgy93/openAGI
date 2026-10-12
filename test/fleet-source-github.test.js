@@ -156,7 +156,7 @@ test("fetchPrStates normalizes the captured GraphQL response", async () => {
   assert.equal(pr.mergeState, "UNSTABLE");
   assert.equal(pr.mergeable, "MERGEABLE");
   assert.equal(pr.reviewDecision, null);
-  assert.deepEqual(pr.ci, { state: "FAILURE", failing: ["verification"], pending: [] });
+  assert.deepEqual(pr.ci, { state: "FAILURE", failing: ["verification"], pending: [], failedAt: "2026-09-26T07:41:01.000Z" });
   assert.equal(pr.unresolvedThreads, 12);
   assert.deepEqual(pr.codexReview, { reviewedHead: true, sha: "95720cc" });
   assert.deepEqual(pr.qa, { required: true, freshOnHead: false, sha: null });
@@ -255,7 +255,8 @@ test("CI summary picks the latest run per check and lists pending checks", async
   ] } };
   const { run } = fakeRun(() => ok(response));
   const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run })).get(`${BBAPP}#6878`);
-  assert.deepEqual(pr.ci, { state: "PENDING", failing: ["lint", "ci/legacy"], pending: ["verification", "ci/pending"] });
+  // When the newest failure finished: a rerun failing again is news.
+  assert.deepEqual(pr.ci, { state: "PENDING", failing: ["lint", "ci/legacy"], pending: ["verification", "ci/pending"], failedAt: "2026-09-26T07:48:29.000Z" });
 });
 
 test("CI is unknown when the last commit is not the PR head or has no checks", async () => {
