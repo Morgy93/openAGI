@@ -3465,6 +3465,33 @@ test("a verdict read before the owner answered is dropped, not sent", async (t) 
   assert.equal(judgeRow(supervisor).reason, "owner answered meanwhile; no nudge");
 });
 
+test("a verdict read before the owner messaged the thread from OpenAGI is dropped, not sent", async (t) => {
+  let clock = NOW;
+  const thread = makeThread();
+  let supervisor;
+  let messageDuringCall = false;
+  const judge = fakeJudge(() => ({ action: "wait", reason: "fine", message: null, question: null }));
+  judge.judge = async () => {
+    judge.calls.push(1);
+    if (!messageDuringCall) return { action: "wait", reason: "agent is on it", message: null, question: null };
+    await supervisor.sendOwnerMessage(thread.key, "Hold the merge, I am testing.");
+    return { action: "send", reason: "CI red", message: "verification is red. Fix it." };
+  };
+  judge.calls = [];
+  ({ supervisor } = fixture(t, { mode: "auto", threads: [thread], now: () => clock, deps: { judge } }));
+  // A first scan knows the thread, as the live supervisor always does.
+  await supervisor.tick({ reason: "test" });
+  thread.lastAgentFull = "Still on it.";
+  thread.lastAgentFullAt = new Date(clock).toISOString();
+  messageDuringCall = true;
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 2);
+  const nudges = supervisor.store.actions(50).filter((a) => a.kind === "nudge" && a.status === "sent" && a.playbook !== "owner-message");
+  assert.equal(nudges.length, 0, "the stale judged nudge never followed the owner's own message");
+  assert.equal(judgeRow(supervisor).reason, "owner answered meanwhile; no nudge");
+});
+
 test("each judge call gets only the scan's time left; one the cap cuts off is no failure", async (t) => {
   const threads = Array.from({ length: 4 }, (_, n) => makeThread({ key: `codex:b${n}`, id: `b${n}`, cwd: `/work/b${n}` }));
   let clock = NOW;

@@ -481,9 +481,17 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
     if (result?.timedOut || result?.error || result?.code !== 0) {
       throw new Error(`tool lockdown unconfirmed: features list ${result?.timedOut ? "timed out" : line(result?.error || lastLine(result?.stderr), 120) || `exit ${result?.code}`}`);
     }
-    const shell = parseFeaturesList(result.stdout).get("shell_tool");
+    const features = parseFeaturesList(result.stdout);
+    const shell = features.get("shell_tool");
     if (shell === undefined) throw new Error("tool lockdown unconfirmed: no shell_tool in codex features list");
     if (shell) throw new Error("tool lockdown failed: codex keeps shell_tool on");
+    // A system or managed layer outranks the judge's own config: every tool
+    // feature this codex knows must show off too. unified_exec is the shell
+    // tool's backend and stays on in codex 0.162 whatever the config says;
+    // with shell_tool off it offers no tool (checked live), so it is the one
+    // exception.
+    const on = JUDGE_FEATURES_OFF.filter((name) => name !== "unified_exec" && features.get(name) === true);
+    if (on.length) throw new Error(`tool lockdown failed: codex keeps ${on.join(", ")} on`);
     // CODEX_HOME replaces only the user layer: a system or managed layer
     // (/etc/codex/config.toml) can still bring MCP servers, which are tools.
     // codex itself, with the call's home and env, must list none.

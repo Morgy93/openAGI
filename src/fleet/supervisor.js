@@ -1280,6 +1280,9 @@ export class FleetSupervisor {
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
+    // The owner is speaking to this thread: a judged or planned nudge in
+    // flight for it is dropped, as for an owner answer.
+    this.ownerAnsweredAt.set(thread.key, this.now());
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });

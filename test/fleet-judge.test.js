@@ -233,6 +233,8 @@ test("the judge fails closed unless codex itself shows the shell off", async (t)
   const cases = [
     [{ code: 0, stdout: FEATURES.replace(/shell_tool(\s+)stable(\s+)false/, "shell_tool$1stable$2true"), stderr: "" }, /shell_tool on/],
     [{ code: 0, stdout: FEATURES.replace(/^shell_tool.*$/m, ""), stderr: "" }, /no shell_tool/],
+    // A higher layer turns a tool feature back on.
+    [{ code: 0, stdout: FEATURES.replace(/^apps(\s+)stable(\s+)false/m, "apps$1stable$2true") + "\ncomputer_use                             stable             true", stderr: "" }, /lockdown failed: codex keeps apps, computer_use on/],
     [{ code: 2, stdout: "", stderr: "error: unrecognized subcommand 'features'" }, /lockdown unconfirmed: features list error: unrecognized/],
     [{ code: null, stdout: "", stderr: "", timedOut: true }, /lockdown unconfirmed: features list timed out/]
   ];
