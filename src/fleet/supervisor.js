@@ -149,12 +149,23 @@ function judgeable(decision, thread) {
   return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
 }
 
-// The PR and supervisor facts the judge reads (judge.js prLines).
-function judgeFacts(pr, classified) {
+// Elapsed times ("waiting 34m", "full verify 12m") change every scan by
+// themselves; masked, so only a change in the facts reads the chat again
+// (the cache still expires after JUDGE_CACHE_MS).
+function withoutElapsed(text) {
+  return String(text ?? "").replace(/\b\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "#");
+}
+
+// Every fact the judge's prompt shows besides the chat (judge.js prLines and
+// buildJudgePrompt): the PR, the supervisor's state, reason and blockers,
+// and the planned nudge's reason and words.
+function judgeFacts(pr, classified, decision = null) {
   const gates = (pr?.gates ?? []).map((gate) => [gate.label || gate.name, gate.state ?? null]);
+  const blockers = (classified?.blockers?.length ? classified.blockers : classified?.readiness?.blockers) ?? [];
   return JSON.stringify([
-    pr?.headOid ?? null, pr?.state ?? null, Boolean(pr?.isDraft), pr?.ci?.state ?? null, pr?.ci?.failing ?? [], pr?.ci?.pending ?? [],
-    gates, pr?.unresolvedThreads ?? null, pr?.reviewDecision ?? null, classified?.state ?? null
+    pr?.ref ?? null, pr?.headOid ?? null, pr?.state ?? null, Boolean(pr?.isDraft), pr?.ci?.state ?? null, pr?.ci?.failing ?? [], pr?.ci?.pending ?? [],
+    gates, pr?.unresolvedThreads ?? null, pr?.reviewDecision ?? null, classified?.state ?? null, withoutElapsed(classified?.reason),
+    blockers.map(withoutElapsed), withoutElapsed(decision?.reason), withoutElapsed(decision?.message)
   ]);
 }
 
@@ -162,15 +173,23 @@ function judgeFacts(pr, classified) {
 // facts: same verdict. Every judged playbook keys on the PR facts too, so a
 // CI run that went red is read again.
 export function judgeCacheKey(thread, decision, pr = null, classified = null) {
-  const reply = agentReply(thread);
-  return [thread.key, shortHash(`${reply.at ?? ""}\n${reply.text}`), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified))].join("|");
+  return [thread.key, replyMark(thread), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision))].join("|");
 }
 
-// The judge's question as asked (title, body and options), so a new question
-// under an old title is not taken for the one the owner already answered.
-function judgeAskKey(threadKey, question) {
+// Which agent message a verdict was read from.
+function replyMark(thread) {
+  const reply = agentReply(thread);
+  return shortHash(`${reply.at ?? ""}\n${reply.text}`);
+}
+
+// The judge's question: its title and choices, for the agent message it
+// was read from. Not the free-text body, which a re-read words differently:
+// the same ask for the same reply stays one question (and an answer to it
+// keeps it quiet), while a new reply may ask anew.
+export function judgeAskKey(thread, question) {
   const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
-  return `judge:${threadKey}:${shortHash([norm(question.title), norm(question.body), (question.options ?? []).map(norm).join("|")].join("\n"))}`;
+  const options = (question.options ?? []).map(norm).sort();
+  return `judge:${thread.key}:${shortHash([norm(question.title), options.join("|"), replyMark(thread)].join("\n"))}`;
 }
 
 // pending: the judge has not read the chat (a failure, the per-scan cap), so
@@ -1502,7 +1521,7 @@ export class FleetSupervisor {
       else due.push({ item, key });
     }
     if (!due.length) return;
-    if (this.judgeDownUntil > started) {
+    if (this.judgeDownUntil > this.now()) {
       for (const { item } of due) item.decision = judgeWait(item.decision, `judge unavailable: ${this.judgeError ?? "paused"}`);
       return;
     }
@@ -1556,7 +1575,8 @@ export class FleetSupervisor {
       item.decision = this.applyJudgeVerdict(item, verdict);
     });
     // Only calls that ran count: one the time cap cut off is no failure.
-    if (ran && failed === ran) this.judgeDownUntil = started + JUDGE_DOWN_MS;
+    // The pause runs from when the failures finished, not the scan's start.
+    if (ran && failed === ran) this.judgeDownUntil = this.now() + JUDGE_DOWN_MS;
     else if (ran) this.judgeError = null;
   }
 
@@ -1581,7 +1601,8 @@ export class FleetSupervisor {
       // The same words as the last send, with no reply since, is noise.
       const repeat = repeatsLastSend(thread, item.ledger, messageHash);
       if (repeat) return judgeWait(decision, `judge: same message sent at ${repeat.clock}; no reply since`, false);
-      return { ...decision, message: verdict.message, messageHash, reason: `${decision.reason}; judge: ${verdict.reason}` };
+      // judged: read in this scan, so act() may send it in Auto.
+      return { ...decision, message: verdict.message, messageHash, judged: true, reason: `${decision.reason}; judge: ${verdict.reason}` };
     }
     const reply = agentReply(thread);
     const pr = Number(/#(\d+)$/.exec(thread.prRefs?.[0] ?? "")?.[1]);
@@ -1593,7 +1614,7 @@ export class FleetSupervisor {
         title: clampText(`${label}: ${verdict.question.title}`, limits.titleMax),
         body: verdict.question.body || clampText(verdict.reason, limits.bodyMax),
         options: verdict.question.options,
-        dedupeKey: judgeAskKey(thread.key, verdict.question),
+        dedupeKey: judgeAskKey(thread, verdict.question),
         kind: "agent-ask",
         askContext: clampTail(redactSecrets(reply.text), limits.excerptMax),
         agentAskedAt: reply.at ?? null
@@ -1844,6 +1865,7 @@ export class FleetSupervisor {
     // A computer-use send that timed out or lost Open Computer Use leaves
     // the app agent busy or restarting: the rest of the tick's typing waits.
     let uiStalled = answeredNow.uiStalled === true;
+    const judgeOn = Boolean(this.nudgeJudge?.enabled) && typeof this.nudgeJudge?.judge === "function";
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
@@ -1876,6 +1898,20 @@ export class FleetSupervisor {
       }
       if (deferUi && decision.route === "computer-use") {
         decision.reason = `${decision.reason}; deferred: remote scan`;
+        continue;
+      }
+      // The judge reads every automatic nudge first: one this scan did not
+      // judge (the owner switched to Auto after judgeNudges ran) waits for
+      // the next scan instead of going out unread.
+      if (judgeOn && !decision.judged && judgeable(decision, target)) {
+        decision.reason = `${decision.reason}; held: not judged this scan`;
+        continue;
+      }
+      // An owner answer that started after the judge read (during the
+      // review, the notifications, the kept answers or an earlier send)
+      // goes first: checked again right before each send.
+      if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
+        decision.reason = `${decision.reason}; held: owner answered`;
         continue;
       }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;

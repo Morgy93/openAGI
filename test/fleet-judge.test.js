@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
-import { JUDGE_FEATURES_OFF, JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFirstJson, validateVerdict, judgeCodexConfig } from "../src/fleet/judge.js";
+import { JUDGE_FEATURES_OFF, JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFeaturesList, parseFirstJson, validateVerdict, judgeCodexConfig } from "../src/fleet/judge.js";
 
 const NOW = Date.parse("2026-10-11T12:00:00.000Z");
 
@@ -16,16 +16,28 @@ function thread(overrides = {}) {
   };
 }
 
-// A run that writes out as codex -o would, and records its call.
-function fakeRun(out, result = { code: 0, stdout: "", stderr: "", timedOut: false, error: null }) {
+// codex features list as codex 0.162 prints it, with the shell off.
+const FEATURES = [
+  "apps                                     stable             false",
+  "shell_snapshot                           stable             true",
+  "shell_tool                               stable             false",
+  "unified_exec                             stable             true",
+  "web_search_cached                        deprecated         false"
+].join("\n");
+
+// A run that answers codex features list, writes out as codex -o would, and
+// records its exec calls (probes: the features list calls).
+function fakeRun(out, result = { code: 0, stdout: "", stderr: "", timedOut: false, error: null }, features = { code: 0, stdout: FEATURES, stderr: "", timedOut: false, error: null }) {
   const calls = [];
+  const probes = [];
   const run = async (cmd, args, options) => {
+    if (args[0] === "features") { probes.push({ cmd, args, options }); return features; }
     calls.push({ cmd, args, options });
     const at = args.indexOf("-o");
     if (out !== null) fs.writeFileSync(args[at + 1], typeof out === "string" ? out : JSON.stringify(out));
     return result;
   };
-  return { run, calls };
+  return { run, calls, probes };
 }
 
 const OWNER_CODEX_CONFIG = [
@@ -126,10 +138,11 @@ test("judge runs codex exec read-only with the LB key and parses the doubled fil
   assert.deepEqual(args.slice(0, 7), ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", "gpt-6.1-sol"]);
   assert.ok(args.includes("--output-schema"));
   assert.equal(options.input, undefined, "stdin closed, no input");
-  assert.equal(options.timeoutMs, 40_000);
+  assert.ok(options.timeoutMs <= 40_000 && options.timeoutMs > 39_000, "the lockdown read comes out of the call's time");
   // Its own Codex home: the owner's provider and model catalog only, no MCP
   // servers, no notify hook, no other tables.
   assert.match(options.env.CODEX_HOME, /codex-home$/);
+  assert.equal(options.env.HOME, options.cwd, "HOME is the call's temp dir, not the owner's");
   assert.equal(options.env.CODEX_LB_API_KEY, "lb-key-1");
   assert.equal(options.env.OPENAI_API_KEY, undefined);
   assert.equal(options.env.OTHER_SECRET, undefined);
@@ -197,7 +210,106 @@ test("the judge child gets only what codex needs, and a shorter cap when asked",
   await judge.judge({ ...INPUT, timeoutMs: 12_000 });
   const { options } = calls[0];
   assert.deepEqual(Object.keys(options.env).sort(), ["CODEX_HOME", "CODEX_LB_API_KEY", "HOME", "LANG", "LC_ALL", "PATH", "TMPDIR"]);
-  assert.equal(options.timeoutMs, 12_000);
+  assert.equal(options.env.HOME, options.cwd);
+  assert.ok(options.timeoutMs <= 12_000 && options.timeoutMs > 11_000);
+  // The lockdown was read once; the next call goes straight to exec.
   await judge.judge({ ...INPUT, timeoutMs: 90_000 });
   assert.equal(calls[1].options.timeoutMs, 40_000, "never past its own timeout");
+});
+
+test("parseFeaturesList reads codex features list rows", () => {
+  const rows = parseFeaturesList(`${FEATURES}\nnoise line\nguardianv2.thread_context                removed            false\n`);
+  assert.equal(rows.get("shell_tool"), false);
+  assert.equal(rows.get("unified_exec"), true);
+  assert.equal(rows.get("guardianv2.thread_context"), false);
+  assert.equal(rows.has("noise"), false);
+});
+
+test("the judge fails closed unless codex itself shows the shell off", async (t) => {
+  const cfg = config(t);
+  const verdict = { action: "send", reason: "r", message: "m", question: null };
+  const cases = [
+    [{ code: 0, stdout: FEATURES.replace(/shell_tool(\s+)stable(\s+)false/, "shell_tool$1stable$2true"), stderr: "" }, /shell_tool on/],
+    [{ code: 0, stdout: FEATURES.replace(/^shell_tool.*$/m, ""), stderr: "" }, /no shell_tool/],
+    [{ code: 2, stdout: "", stderr: "error: unrecognized subcommand 'features'" }, /lockdown unconfirmed: features list error: unrecognized/],
+    [{ code: null, stdout: "", stderr: "", timedOut: true }, /lockdown unconfirmed: features list timed out/]
+  ];
+  for (const [features, error] of cases) {
+    const { run, calls, probes } = fakeRun(verdict, undefined, features);
+    await assert.rejects(createNudgeJudge({ config: cfg, run }).judge(INPUT), error);
+    assert.equal(probes.length, 1);
+    assert.equal(calls.length, 0, "no judge turn runs without a confirmed lockdown");
+  }
+  // The probe runs with the very home and env the judge turn gets.
+  const { run, calls, probes } = fakeRun(verdict);
+  await createNudgeJudge({ config: cfg, run }).judge(INPUT);
+  assert.deepEqual(probes[0].args, ["features", "list"]);
+  assert.match(probes[0].options.env.CODEX_HOME, /codex-home$/);
+  assert.equal(probes[0].options.env.HOME, probes[0].options.cwd);
+  assert.deepEqual(Object.keys(probes[0].options.env).sort(), Object.keys(calls[0].options.env).sort());
+});
+
+test("the lockdown is read again when the codex binary changes, and after a while", async (t) => {
+  const cfg = config(t);
+  const bin = path.join(path.dirname(cfg.paths.codexHome), "codex-bin");
+  fs.writeFileSync(bin, "#!/bin/sh\n");
+  cfg.bins = { ...cfg.bins, codex: bin };
+  let clock = 1_000_000;
+  const { run, calls, probes } = fakeRun({ action: "wait", reason: "queued", message: null, question: null });
+  const judge = createNudgeJudge({ config: cfg, run, now: () => clock });
+  await judge.judge(INPUT);
+  await judge.judge(INPUT);
+  assert.equal(probes.length, 1, "read once while nothing changed");
+  fs.utimesSync(bin, new Date(), new Date(Date.now() + 60_000));
+  await judge.judge(INPUT);
+  assert.equal(probes.length, 2, "a new binary is read again");
+  clock += 31 * 60_000;
+  await judge.judge(INPUT);
+  assert.equal(probes.length, 3, "and again after 30 minutes");
+  assert.equal(calls.length, 4);
+});
+
+test("the LB key never leaves in a verdict or an error, plain or encoded", async (t) => {
+  const cfg = config(t);
+  const key = "lb-key-1";
+  fs.writeFileSync(cfg.paths.codexLbEnvFile, `CODEX_LB_API_KEY=${key}-long-secret\n`);
+  const full = `${key}-long-secret`;
+  const b64 = Buffer.from(full).toString("base64");
+  const verdict = { action: "send", reason: `found ${full}`, message: `key is ${full} or ${b64}`, question: null };
+  const out = await createNudgeJudge({ config: cfg, run: fakeRun(verdict).run }).judge(INPUT);
+  assert.doesNotMatch(JSON.stringify(out), new RegExp(`${full}|${b64.replace(/[+/=]/g, ".")}`));
+  assert.match(out.message, /\[redacted\]/);
+  const failing = fakeRun(null, { code: 1, stdout: "", stderr: `ERROR: bad key ${full}`, timedOut: false, error: null });
+  await assert.rejects(createNudgeJudge({ config: cfg, run: failing.run }).judge(INPUT), (error) => !error.message.includes(full) && /\[redacted\]/.test(error.message));
+});
+
+test("judge options never carry a supervisor control", () => {
+  const ask = validateVerdict({ action: "ask-owner", reason: "r", question: { title: "t", body: "b", options: ["dismiss", "Dismiss", "LATER", "merge", "Open Thread"] } });
+  assert.deepEqual(ask.question.options, ["merge", "open thread"]);
+  const only = validateVerdict({ action: "ask-owner", reason: "r", question: { title: "t", body: "b", options: ["dismiss"] } });
+  assert.deepEqual(only.question.options, ["open thread"]);
+});
+
+test("the judge's Codex config reads every valid way to name the provider", () => {
+  const variants = [
+    ["model_provider = 'codex-lb'", "[model_providers.codex-lb]"],
+    ['model_provider = "codex-lb"   # the LB', '[model_providers."codex-lb"]'],
+    ["model_provider='codex-lb'", "[ model_providers . 'codex-lb' ]   # comment"],
+    ['"model_provider" = "codex-lb"', '[model_providers.codex-lb] # trailing']
+  ];
+  for (const [top, header] of variants) {
+    const text = [top, "model_catalog_json = '/h/cat.json' # catalog", "", "[mcp_servers.x]", 'url = "u"', "", header, 'base_url = "http://lb"', 'env_key = "CODEX_LB_API_KEY"', "", "[model_providers.codex-lb.http_headers]", 'X-Team = "a"', "", "[model_providers.other]", 'base_url = "http://other"'].join("\n");
+    const minimal = judgeCodexConfig(text);
+    assert.ok(minimal, `${top} / ${header}`);
+    assert.match(minimal, /^model_provider = "codex-lb"$/m);
+    assert.match(minimal, /^model_catalog_json = "\/h\/cat\.json"$/m);
+    assert.match(minimal, /^\[model_providers\.codex-lb\]$/m);
+    assert.match(minimal, /base_url = "http:\/\/lb"/);
+    assert.match(minimal, /^\[model_providers\.codex-lb\.http_headers\]$/m);
+    assert.doesNotMatch(minimal, /other|mcp_servers/);
+  }
+  // A provider name that needs quotes is written back quoted.
+  const dotted = judgeCodexConfig(['model_provider = "lb.v2"', "", '[model_providers."lb.v2"]', 'base_url = "http://lb"'].join("\n"));
+  assert.match(dotted, /^\[model_providers\."lb\.v2"\]$/m);
+  assert.equal(judgeCodexConfig("model_provider = \"codex-lb\"\n[model_providers.other]\nx = 1\n"), null, "no table for the named provider");
 });

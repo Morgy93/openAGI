@@ -2,9 +2,10 @@
 // the chat and says what to do. Send one short message that names what is
 // still missing, wait (the agent already answered, or it waits on something
 // passive), or ask the owner (it needs a decision only the owner can make).
-// It runs codex exec through the owner's codex-lb, read-only, in a temp dir,
-// with its shell, web search and other tools switched off in its own Codex
-// config (judgeCodexConfig). The model only returns a verdict; the
+// It runs codex exec through the owner's codex-lb, read-only, in a temp dir
+// that is also its HOME, with its shell, web search and other tools switched
+// off in its own Codex config (judgeCodexConfig), and only once codex itself
+// reports the shell off (fail closed). The model only returns a verdict; the
 // supervisor applies it.
 
 import fs from "node:fs";
@@ -27,7 +28,18 @@ const AGENT_CHARS = 6000;
 const NUDGE_CHARS = 200;
 const NUDGES_SHOWN = 3;
 const OUTPUT_MAX_BYTES = 1024 * 1024;
-const JUDGE_ENV_KEYS = ["PATH", "HOME", "TMPDIR", "LANG"];
+// HOME is the call's temp dir, never the owner's; CCODEX_HOME lets the
+// ccodex shim (which finds itself under $HOME by default) still start.
+const JUDGE_ENV_KEYS = ["PATH", "TMPDIR", "LANG"];
+// Labels the supervisor itself acts on: "dismiss" closes the card on every
+// surface, "later" is never relayed. An agent choice spelled like one could
+// never reach the agent, so the judge may not offer it ("open thread" is
+// the way to answer those in the chat).
+const RESERVED_OPTIONS = new Set(["dismiss", "later"]);
+// The tool lockdown (codex features list) is read again when the codex
+// binary changes, and at least this often (a shim can update in place).
+const LOCKDOWN_RECHECK_MS = 30 * 60_000;
+const LOCKDOWN_PROBE_MS = 15_000;
 
 export const JUDGE_SCHEMA = Object.freeze({
   type: "object",
@@ -208,8 +220,10 @@ export function validateVerdict(raw, limits = DEFAULTS) {
   const seen = new Set();
   const options = [];
   for (const option of Array.isArray(q.options) ? q.options : []) {
-    const label = line(option, OPTION_MAX);
-    if (!label || /^later$/i.test(label) || seen.has(label.toLowerCase())) continue;
+    // "Open thread" in any case is the control, so it never gets relayed.
+    const raw = line(option, OPTION_MAX);
+    const label = raw.toLowerCase() === "open thread" ? "open thread" : raw;
+    if (!label || RESERVED_OPTIONS.has(label.toLowerCase()) || seen.has(label.toLowerCase())) continue;
     seen.add(label.toLowerCase());
     options.push(label);
     if (options.length >= OPTIONS_MAX) break;
@@ -220,11 +234,93 @@ export function validateVerdict(raw, limits = DEFAULTS) {
 // Codex features the judge turns off: it reads untrusted chat text, so no
 // shell (printenv, the LB env file), apps, plugins, browser or hooks. Set in
 // config.toml, not with --disable: codex exits on a flag its version lacks,
-// while it ignores a key it does not know.
+// while it ignores a key it does not know. So the judge also reads codex
+// features list before it runs, and refuses to run unless shell_tool shows
+// off (checkLockdown in createNudgeJudge).
 export const JUDGE_FEATURES_OFF = Object.freeze([
   "shell_tool", "unified_exec", "apps", "plugins", "browser_use", "computer_use",
   "in_app_browser", "image_generation", "view_image", "hooks"
 ]);
+
+// Just enough TOML for the lines judgeCodexConfig reads: basic ("...") and
+// literal ('...') strings, dotted keys with bare or quoted parts, table
+// headers, trailing comments. No TOML dependency for four line shapes.
+
+// One TOML string at the start of text: { value, rest }, or null.
+function tomlString(text) {
+  const s = String(text);
+  if (s[0] === "'") {
+    const end = s.indexOf("'", 1);
+    return end < 0 ? null : { value: s.slice(1, end), rest: s.slice(end + 1) };
+  }
+  if (s[0] !== "\"") return null;
+  const escapes = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", "\"": "\"", "\\": "\\" };
+  let out = "";
+  for (let i = 1; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === "\"") return { value: out, rest: s.slice(i + 1) };
+    if (ch !== "\\") { out += ch; continue; }
+    const next = s[i + 1];
+    if (escapes[next] !== undefined) { out += escapes[next]; i += 1; continue; }
+    const size = next === "u" ? 4 : next === "U" ? 8 : 0;
+    const code = s.slice(i + 2, i + 2 + size);
+    if (!size || !new RegExp(`^[0-9a-fA-F]{${size}}$`).test(code)) return null;
+    try { out += String.fromCodePoint(parseInt(code, 16)); } catch { return null; }
+    i += 1 + size;
+  }
+  return null;
+}
+
+// Only blanks and an optional comment left.
+function tomlLineEnds(rest) {
+  return /^\s*(?:#.*)?$/.test(rest);
+}
+
+// A dotted key at the start of text (a.b, a."b c", 'a' . b): { parts, rest }.
+function tomlKey(text) {
+  const parts = [];
+  let s = String(text).trimStart();
+  for (;;) {
+    if (s[0] === "\"" || s[0] === "'") {
+      const quoted = tomlString(s);
+      if (!quoted) return null;
+      parts.push(quoted.value);
+      s = quoted.rest;
+    } else {
+      const bare = /^[A-Za-z0-9_-]+/.exec(s);
+      if (!bare) return null;
+      parts.push(bare[0]);
+      s = s.slice(bare[0].length);
+    }
+    s = s.trimStart();
+    if (s[0] !== ".") return { parts, rest: s };
+    s = s.slice(1).trimStart();
+  }
+}
+
+// A table header ([a.b] or [[a.b]], a comment after it allowed): its key
+// parts, else null.
+function tomlHeader(raw) {
+  const s = String(raw).trim();
+  if (s[0] !== "[") return null;
+  const close = s.startsWith("[[") ? "]]" : "]";
+  const key = tomlKey(s.slice(close.length));
+  if (!key || !key.rest.startsWith(close) || !tomlLineEnds(key.rest.slice(close.length))) return null;
+  return key.parts;
+}
+
+// A top-level `key = "string"` line: { name, value }, else null.
+function tomlStringEntry(raw) {
+  const key = tomlKey(raw);
+  if (!key || key.parts.length !== 1 || key.rest[0] !== "=") return null;
+  const value = tomlString(key.rest.slice(1).trimStart());
+  return value && tomlLineEnds(value.rest) ? { name: key.parts[0], value: value.value } : null;
+}
+
+// A key part written back: bare when it can be, else a basic string.
+function tomlKeyPart(part) {
+  return /^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part);
+}
 
 // A Codex home with only the owner's model provider (and its model catalog):
 // the judge runs no MCP servers, no notify hook and no plugins from the
@@ -232,21 +328,27 @@ export const JUDGE_FEATURES_OFF = Object.freeze([
 // off it reads untrusted chat text with no tools at hand.
 // Built from <codexHome>/config.toml; null when it names no provider.
 export function judgeCodexConfig(text) {
-  const lines = String(text ?? "").split("\n");
+  const lines = String(text ?? "").split(/\r?\n/);
   const top = [];
   let provider = null;
   for (const raw of lines) {
-    if (/^\s*\[/.test(raw)) break;
-    if (/^\s*(?:model_provider|model_catalog_json)\s*=/.test(raw)) top.push(raw.trim());
-    const named = /^\s*model_provider\s*=\s*"([^"]+)"/.exec(raw);
-    if (named) provider = named[1];
+    if (tomlHeader(raw)) break;
+    const entry = tomlStringEntry(raw);
+    if (entry?.name === "model_provider") provider = entry.value;
+    if (entry?.name === "model_provider" || entry?.name === "model_catalog_json") top.push(`${entry.name} = ${JSON.stringify(entry.value)}`);
   }
   if (!provider) return null;
+  // The provider's table and any of its sub-tables (http_headers), headers
+  // written back in one plain form.
   const block = [];
   let inside = false;
   for (const raw of lines) {
-    const header = /^\s*\[([^\]]+)\]\s*$/.exec(raw);
-    if (header) { inside = header[1].trim() === `model_providers.${provider}`; if (inside) block.push(raw.trim()); continue; }
+    const header = tomlHeader(raw);
+    if (header) {
+      inside = header.length >= 2 && header[0] === "model_providers" && header[1] === provider && !raw.trim().startsWith("[[");
+      if (inside) block.push("", `[${header.map(tomlKeyPart).join(".")}]`);
+      continue;
+    }
     if (inside) block.push(raw);
   }
   if (!block.length) return null;
@@ -256,24 +358,58 @@ export function judgeCodexConfig(text) {
   return `${top.join("\n")}\n\n${block.join("\n").trim()}\n\n${features.join("\n")}\n`;
 }
 
+// `codex features list` rows ("shell_tool   stable   false"): name -> on.
+export function parseFeaturesList(text) {
+  const out = new Map();
+  for (const row of String(text ?? "").split(/\r?\n/)) {
+    const match = /^([A-Za-z0-9_.-]+)\s+.*?\b(true|false)\s*$/.exec(row.trim());
+    if (match) out.set(match[1], match[2] === "true");
+  }
+  return out;
+}
+
+// Every place the LB key could show up in judge output, written plain or
+// base64: a turn that read it is caught before its words go anywhere.
+function keyScrubber(secret) {
+  const key = String(secret ?? "");
+  if (key.length < 8) return (text) => redactSecrets(text);
+  const forms = [...new Set([key, Buffer.from(key).toString("base64"), Buffer.from(key).toString("base64").replace(/=+$/, ""), encodeURIComponent(key)])];
+  return (text) => {
+    let out = String(text ?? "");
+    for (const form of forms) out = out.split(form).join("[redacted]");
+    return redactSecrets(out);
+  };
+}
+
 // config.judge: { enabled, model, timeoutMs }. run: runCommand-like.
-export function createNudgeJudge({ config, run = runCommand, env = process.env } = {}) {
+export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now } = {}) {
   const settings = config?.judge ?? {};
   const model = String(settings.model ?? "").trim();
   const enabled = Boolean(settings.enabled) && Boolean(model);
   const timeoutMs = settings.timeoutMs ?? DEFAULT_JUDGE_TIMEOUT_MS;
   const limits = { ...DEFAULTS, ...(config?.limits ?? {}) };
+  const bin = config?.bins?.codex ?? "codex";
+  // The binary the last good lockdown read was for, and when.
+  let lockedDown = null;
 
-  // The codex child gets only what codex needs (PATH, HOME, TMPDIR, the
-  // locale) from the fleet's allowlisted env, plus the LB key the way the
-  // executor's codex-exec route reads it. CODEX_HOME is set per call.
-  const childEnv = () => {
-    const base = Object.fromEntries(Object.entries(fleetChildEnv(env, { bins: config?.bins }))
-      .filter(([key]) => JUDGE_ENV_KEYS.includes(key) || key.startsWith("LC_")));
+  // The LB key, read the way the executor's codex-exec route reads it.
+  const lbKey = () => {
     let text = "";
     try { text = fs.readFileSync(config?.paths?.codexLbEnvFile ?? "", "utf8"); } catch { /* no LB env on this machine */ }
-    const lbKey = parseEnvText(text).CODEX_LB_API_KEY ?? env?.CODEX_LB_API_KEY;
-    return lbKey ? { ...base, CODEX_LB_API_KEY: lbKey } : base;
+    return parseEnvText(text).CODEX_LB_API_KEY ?? env?.CODEX_LB_API_KEY ?? null;
+  };
+
+  // The codex child gets only what codex needs (PATH, TMPDIR, the locale)
+  // from the fleet's allowlisted env, the call's temp dir as HOME, the
+  // ccodex shim's own home, and the LB key only because the provider reads
+  // it (env_key). CODEX_HOME is the call's minimal one.
+  const childEnv = (dir, key) => {
+    const base = Object.fromEntries(Object.entries(fleetChildEnv(env, { bins: config?.bins }))
+      .filter(([name]) => JUDGE_ENV_KEYS.includes(name) || name.startsWith("LC_")));
+    const ccodex = env?.CCODEX_HOME || path.join(env?.HOME || os.homedir(), ".ccodex");
+    let shim = false;
+    try { shim = fs.statSync(ccodex).isDirectory(); } catch { /* no ccodex here */ }
+    return { ...base, HOME: dir, ...(shim ? { CCODEX_HOME: ccodex } : {}), ...(key ? { CODEX_LB_API_KEY: key } : {}) };
   };
 
   // The minimal Codex home, written once per call into the call's temp dir.
@@ -288,31 +424,72 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env }
     return home;
   };
 
+  // Which codex binary this is: its real path and when it last changed.
+  const binaryMark = () => {
+    try {
+      const real = fs.realpathSync(bin);
+      return `${real}|${fs.statSync(real).mtimeMs}`;
+    } catch {
+      return `${bin}|?`;
+    }
+  };
+
+  // Fail closed: codex skips a [features] key its version lacks, so the
+  // judge never runs on the config's say-so alone. codex features list, with
+  // the call's own home and env, must show shell_tool there and off; read
+  // again when the binary changes, and every LOCKDOWN_RECHECK_MS.
+  async function checkLockdown(options) {
+    const mark = binaryMark();
+    if (lockedDown?.mark === mark && now() - lockedDown.at < LOCKDOWN_RECHECK_MS) return 0;
+    const began = now();
+    lockedDown = null;
+    let result;
+    try {
+      result = await run(bin, ["features", "list"], { ...options, timeoutMs: Math.min(LOCKDOWN_PROBE_MS, options.timeoutMs), maxBytes: OUTPUT_MAX_BYTES });
+    } catch (error) {
+      result = { code: null, stdout: "", stderr: "", error: error?.message ?? String(error) };
+    }
+    if (result?.timedOut || result?.error || result?.code !== 0) {
+      throw new Error(`tool lockdown unconfirmed: features list ${result?.timedOut ? "timed out" : line(result?.error || lastLine(result?.stderr), 120) || `exit ${result?.code}`}`);
+    }
+    const shell = parseFeaturesList(result.stdout).get("shell_tool");
+    if (shell === undefined) throw new Error("tool lockdown unconfirmed: no shell_tool in codex features list");
+    if (shell) throw new Error("tool lockdown failed: codex keeps shell_tool on");
+    lockedDown = { mark, at: now() };
+    return now() - began;
+  }
+
   // input.timeoutMs: a shorter cap for this call (the scan's time left).
   async function judge(input) {
     if (!enabled) throw new Error("judge off");
     const limitMs = Math.min(timeoutMs, Number.isFinite(input?.timeoutMs) ? input.timeoutMs : Infinity);
     const prompt = buildJudgePrompt(input);
+    const key = lbKey();
+    const scrub = keyScrubber(key);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-judge-"));
     try {
       const schemaPath = path.join(dir, "schema.json");
       const outPath = path.join(dir, "out.json");
       fs.writeFileSync(schemaPath, JSON.stringify(JUDGE_SCHEMA));
+      const options = { cwd: dir, env: { ...childEnv(dir, key), CODEX_HOME: codexHome(dir) }, timeoutMs: limitMs };
+      // A lockdown read comes out of this call's time.
+      const execMs = Math.max(1_000, limitMs - await checkLockdown(options));
       const args = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", model, "--output-schema", schemaPath, "-o", outPath, prompt];
       let result;
       try {
         // No input: runCommand closes stdin, which codex exec needs.
-        result = await run(config?.bins?.codex ?? "codex", args, { cwd: dir, env: { ...childEnv(), CODEX_HOME: codexHome(dir) }, timeoutMs: limitMs, maxBytes: OUTPUT_MAX_BYTES });
+        result = await run(bin, args, { ...options, timeoutMs: execMs, maxBytes: OUTPUT_MAX_BYTES });
       } catch (error) {
         result = { code: null, stdout: "", stderr: "", timedOut: false, error: error?.message ?? String(error) };
       }
-      if (result?.timedOut) throw new Error(`timed out after ${Math.round(limitMs / 1000)}s`);
+      if (result?.timedOut) throw new Error(`timed out after ${Math.round(execMs / 1000)}s`);
       let out = "";
       try { out = fs.readFileSync(outPath, "utf8"); } catch { /* checked below */ }
-      const parsed = parseFirstJson(out);
+      // The key never leaves in a verdict or an error, plain or encoded.
+      const parsed = parseFirstJson(scrub(out));
       if (result?.error || result?.code !== 0 || !parsed) {
-        const why = summariseExecFailure(`${result?.stdout ?? ""}\n${result?.stderr ?? ""}`)
-          || line(result?.error || lastLine(result?.stderr), 160)
+        const why = summariseExecFailure(scrub(`${result?.stdout ?? ""}\n${result?.stderr ?? ""}`))
+          || line(scrub(result?.error || lastLine(result?.stderr)), 160)
           || (result?.code === 0 ? "output was not JSON" : `exit ${result?.code}`);
         throw new Error(why);
       }
