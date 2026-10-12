@@ -629,9 +629,9 @@ function nudgeFacts(ctx) {
   const failing = (pr?.ci?.failing ?? []).map((name) => fact(name, 60)).filter(Boolean);
   const out = blockers.filter((blocker) => !passiveAmong(blockers)(blocker) && !(failing.length && /^CI red:/.test(blocker))).map((blocker) => fact(blocker, 80));
   for (const name of failing) out.push(`${name} failing`);
-  // A rerun that fails again on the same head is news.
+  // A rerun that fails again on the same head is news, even within a minute.
   const failedAt = Date.parse(pr?.ci?.failedAt ?? "");
-  if (failing.length && Number.isFinite(failedAt)) out.push(`checks failed at ${new Date(failedAt).toISOString().slice(11, 16)}Z`);
+  if (failing.length && Number.isFinite(failedAt)) out.push(`checks failed at ${new Date(failedAt).toISOString().slice(11, 19)}Z`);
   // The head always counts: a push is news however many checks fail.
   const head = shortSha(pr?.headOid);
   const kept = [...new Set(out)].sort().slice(0, head ? FACTS_KEPT - 1 : FACTS_KEPT);

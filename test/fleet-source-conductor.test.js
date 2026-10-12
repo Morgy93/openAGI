@@ -428,14 +428,27 @@ test("a pending AskUserQuestion is the owner's question; its answer clears it", 
   threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
   assert.equal(threads["s-idle"].meta.pendingQuestion, null);
 
-  // An idle session's last row is an unanswered ask (600a2afc): the card
-  // died with its process, so the session reads stopped instead.
-  const dead = new DatabaseSync(file);
-  addMessage(dead, "s-idle", "assistant", ask("toolu_ask3"), iso(0.5 * MIN));
-  dead.prepare("UPDATE sessions SET status = 'idle' WHERE id = 's-idle'").run();
-  dead.close();
+  // Older Conductor reports an AskUserQuestion wait as idle: the unanswered
+  // call still holds the card. Its answer closes it, idle or not.
+  const idle = new DatabaseSync(file);
+  addMessage(idle, "s-idle", "assistant", ask("toolu_ask3"), iso(0.5 * MIN));
+  idle.prepare("UPDATE sessions SET status = 'idle' WHERE id = 's-idle'").run();
+  idle.close();
   threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
-  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+  assert.equal(threads["s-idle"].meta.pendingCard?.cardId, "toolu_ask3");
+  assert.equal(threads["s-idle"].meta.pendingQuestion?.text, "Split into two PRs. Go? (Go / Change it)");
+  assert.equal(classifyThread(threads["s-idle"], { now: NOW, config: makeConfig(home) }).state, "needs-human");
+  const answered = new DatabaseSync(file);
+  addMessage(answered, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ask3", content: "Go" }] } }, iso(0.2 * MIN));
+  answered.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+  // An errored session lost its card, whatever its rows say.
+  const errored = new DatabaseSync(file);
+  addMessage(errored, "s-idle", "assistant", ask("toolu_ask4"), iso(0.1 * MIN));
+  errored.prepare("UPDATE sessions SET status = 'error' WHERE id = 's-idle'").run();
+  errored.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
   assert.equal(threads["s-idle"].meta.pendingCard, null);
 });
 

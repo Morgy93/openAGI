@@ -580,6 +580,15 @@ test("the short Blocked-on form asks; nothing, CI, or a third party's approval d
   assert.equal(blockedOnSection("Not blocked."), null);
 });
 
+test("the latest Blocked-on section wins over an earlier quoted one", () => {
+  const text = "Earlier I wrote:\n\n> **Blocked on:**\n> - **Your decision** on the cache default\n\nYou picked shared writes; that is pushed.\n\n**Blocked on:** nothing";
+  assert.equal(blockedOnSection(text).items.length, 0);
+  assert.notEqual(classify(makeThread({ lastAgentText: text })).state, "needs-human");
+  const reopened = "> Blocked on: nothing\n\nA new question came up.\n\nBlocked on:\n- your decision on the cache default";
+  assert.equal(blockedOnSection(reopened).owner.length, 1);
+  assert.equal(classify(makeThread({ lastAgentText: reopened })).state, "needs-human");
+});
+
 test("an owner Blocked-on item offers the agent's own sub-bullets, then open thread", () => {
   const text = "Ready except one thing.\n\n### Blocked on\n\n- **Your call** on cache writes:\n  - keep shared writes\n  - make fork PRs read-only\n- CI running\n\nI'll wait.";
   const result = classify(makeThread({ lastAgentText: text }));

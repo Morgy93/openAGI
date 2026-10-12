@@ -1176,3 +1176,39 @@ test("cards on automation and no-repo threads survive the cap; guardian reviews 
   assert.equal(all["t-guard"].meta.pendingCard, null);
   assert.equal(all["t-auto"].meta.pendingCard.items[0].itemId, "call_auto:0");
 });
+
+test("cards are found every page past the in-scope stop, down to the lookback, and the final page is not read twice", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // maxThreads 2 reads pages of 10 rows: the first page fills the cap and
+  // three more full pages of in-scope rows sit between it and the cards.
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 40; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: (10 + i) * MIN, lines: [ev.complete("x", (10 + i) * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  for (const [id, spec] of [["t-auto", { threadSource: "automation" }], ["t-repo", {}]]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, ...spec });
+    h.turn(id, "turn-a");
+    h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const threads = await listCodexThreads(config, { now: NOW, run: noLocks });
+  const map = byId(threads);
+  assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_t-auto:0");
+  assert.equal(map["t-repo"]?.excluded, null);
+  assert.equal(map["t-repo"].meta.pendingCard?.items[0].itemId, "call_t-repo:0");
+  assert.equal(threads.filter((thread) => thread.id === "t-repo").length, 1);
+});
+
+test("an in-scope thread with an open card survives the cap", async (t) => {
+  const ctx = makeHome(t);
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (const id of ["t-1", "t-2", "t-3"]) addThread(ctx, { id, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+  addThread(ctx, { id: "t-carded", mtimeAgo: 90 * MIN, lines: [turnStart("turn-a", 100 * MIN), tailCall("call_q", "Which region?", ["us-east-1", "eu-west-1"], 90 * MIN)] });
+  addThread(ctx, { id: "t-plain", mtimeAgo: 90 * MIN, lines: [ev.complete("x", 90 * MIN, "done")] });
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, history: null }));
+  assert.equal(map["t-carded"]?.excluded, null);
+  assert.equal(map["t-carded"].meta.pendingCard?.items[0].itemId, "call_q:0");
+  assert.equal(map["t-plain"], undefined, "an in-scope thread with no card is still capped");
+  assert.equal(map["t-1"], undefined);
+});

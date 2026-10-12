@@ -570,10 +570,11 @@ const BULLET = /^(\s*)(?:[-*•+]|\d+[.)]|[a-c][.)])\s+(.*)$/i;
 // The agent's "Blocked on:" section: the header (any markdown) with what
 // follows it on its line, then its bullets up to a blank line or the next
 // header. Each item is tagged owner, passive or other; sub-bullets under an
-// item are its options. "Blocked on: nothing" holds no items.
+// item are its options. "Blocked on: nothing" holds no items. The last
+// header wins: an earlier one is often a quoted, older status.
 export function blockedOnSection(text) {
   const lines = plainLines(text);
-  const start = lines.findIndex((line) => BLOCKED_HEADER.test(line));
+  const start = lines.findLastIndex((line) => BLOCKED_HEADER.test(line));
   if (start < 0) return null;
   const items = [];
   const inline = BLOCKED_HEADER.exec(lines[start])[1].trim();

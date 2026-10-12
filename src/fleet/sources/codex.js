@@ -363,6 +363,8 @@ const CARD_SCAN_ROWS = 4000;
 // A projection this close to the rollout's size is caught up; one further
 // behind (or past the end) leaves the newest asks and replies to the tail.
 const PROJECTION_SLACK_BYTES = 64 * 1024;
+// Pages past the in-scope stop scanned for open cards, down to the lookback.
+const CARD_SCAN_PAGES = 20;
 const UNINDEXED_CARD_ROWS = /request_user_input_async|"delivery":"async"|"type":"user_message"|"type":"UserMessage"/;
 // A continuation segment (<id>_<segment id>.jsonl) is indexed under the
 // segment's id; the thread's own projection stopped with the older file.
@@ -802,10 +804,10 @@ export async function readWriterLocks(config, ids, { run, isPidAlive }) {
   return locked;
 }
 
-// An automation or no-repo thread with an open card is kept past the cap:
-// it must not drop a question the owner has not seen.
+// Any thread with an open card (in scope, automation, or no-repo) is kept
+// past the cap: it must not drop a question the owner has not seen.
 function capThreads(threads, max) {
-  const carded = (thread) => CARD_EXCLUSIONS.has(thread.excluded) && thread.meta?.pendingCard?.items?.length > 0;
+  const carded = (thread) => (!thread.excluded || CARD_EXCLUSIONS.has(thread.excluded)) && thread.meta?.pendingCard?.items?.length > 0;
   const inScope = threads.filter((thread) => !thread.excluded).slice(0, max);
   const room = Math.max(0, max - inScope.length);
   const rest = threads.filter((thread) => thread.excluded && !carded(thread)).slice(0, room);
@@ -813,14 +815,20 @@ function capThreads(threads, max) {
   return threads.filter((thread) => keep.has(thread));
 }
 
-// Threads past the paging stop whose history index holds an open card.
+// Threads past the paging stop whose history index holds an open card,
+// paged to the lookback boundary (at most CARD_SCAN_PAGES pages).
 function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes }) {
-  const carded = readThreadRows(db, cutoff, pageSize, after).filter((row) => {
-    if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) return false;
-    let bytes = null;
-    try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
-    return readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now })?.items?.length > 0;
-  });
+  const carded = [];
+  for (let page = 0; after && page < CARD_SCAN_PAGES; page += 1) {
+    const rows = readThreadRows(db, cutoff, pageSize, after);
+    carded.push(...rows.filter((row) => {
+      if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) return false;
+      let bytes = null;
+      try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
+      return readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now })?.items?.length > 0;
+    }));
+    after = rows.length < pageSize ? null : rows.at(-1);
+  }
   const attachments = readPrAttachments(db, carded.map((row) => String(row.id)));
   return carded.map((row) => buildThread(row, { config, now, attachments, history, tailBytes }))
     .filter((thread) => Date.parse(thread.lastActivityAt ?? "") >= cutoff);
@@ -847,7 +855,7 @@ export async function listCodexThreads(config, options = {}) {
     // so read on until maxThreads in-scope threads are found or the
     // lookback window runs out; no fixed row cap hides an older real thread.
     let unread = null;
-    for (let after = null, inScope = 0; inScope < limits.maxThreads;) {
+    for (let after = null, inScope = 0; ;) {
       const rows = readThreadRows(db, cutoff, pageSize, after);
       const attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
       const context = { config, now, attachments, history, tailBytes: options.tailBytes ?? TAIL_BYTES };
@@ -860,11 +868,15 @@ export async function listCodexThreads(config, options = {}) {
       }
       if (rows.length < pageSize) break;
       after = rows.at(-1);
-      unread = after;
+      // Stopped by the cap with rows left: those are scanned for cards below.
+      if (inScope >= limits.maxThreads) {
+        unread = after;
+        break;
+      }
     }
-    // capThreads keeps an automation or no-repo thread with an open card, so
-    // the older rows the loop stopped before are checked for one too: one
-    // more page, in the history index only (no tail reads).
+    // capThreads keeps any thread with an open card, so the older rows the
+    // loop stopped before are checked for one too, page by page to the
+    // lookback, in the history index only (no tail reads).
     if (unread && history) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES }));
     // A failed title scan marks nothing shared; identity checks still see
     // every thread the supervisor retained.
