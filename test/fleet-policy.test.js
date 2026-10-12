@@ -1399,6 +1399,11 @@ test("CI done still reaches a thread the owner took over: the agent is waiting o
   assert.equal(decision.action, "nudge");
   assert.equal(decision.playbook, "ci-finished");
   assert.notEqual(decision.reason, "owner is driving this thread");
+  // The owner spoke after the wait began ("stop that PR; switch tasks"): their word holds.
+  const switched = makeThread({ ...thread, lastUserText: "stop that PR; switch tasks", lastUserAt: ago(20 * MIN) });
+  const held = run(switched, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }), ledger }).decision;
+  assert.equal(held.action, "wait");
+  assert.equal(held.reason, "owner is driving this thread");
 });
 
 test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no, not a crash to resume", () => {
