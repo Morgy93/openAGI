@@ -803,10 +803,13 @@ function baseDecision(ctx) {
 // task the owner starts (no nudge before it) is still followed through. A
 // turn that died mid-work still gets its resume after the short owner-active
 // window, and the laptop-verify guard is the owner's own rule, so both go.
+// So does anything about a CI or BuildBot3 run the agent is waiting on: the
+// run is the thread's current work, and "CI done" is what wakes the agent.
 const CARRY_ON = /^(continue|keep going|go( on| ahead)?|yes|yep|ok(ay)?|proceed|do it|finish( it| up)?|merge( it)?|ship it|get (it|this) (merged|done|across the finish line))\b[\s.!]*$/i;
+const THROUGH_OWNER_HOLD = new Set(["no-local-verify", "ci-finished"]);
 function ownerDrivenUntil(ctx, intent) {
   const { thread, limits, now, classified, ledger } = ctx;
-  if (classified.state === "stopped" || intent.playbook === "no-local-verify") return null;
+  if (classified.state === "stopped" || classified.state === "waiting-ci" || THROUGH_OWNER_HOLD.has(intent.playbook)) return null;
   const text = String(thread.lastUserText ?? "").trim();
   if (text.startsWith(SUPERVISOR_PREFIX) || CARRY_ON.test(text)) return null;
   const at = Date.parse(thread.lastUserAt ?? "");

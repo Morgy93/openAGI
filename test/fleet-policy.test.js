@@ -1385,6 +1385,22 @@ test("d1dbe71a, 2026-10-12: the owner took the thread over for other work, so it
   assert.notEqual(run(carryOn, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN) }).decision.reason, "owner is driving this thread");
 });
 
+test("CI done still reaches a thread the owner took over: the agent is waiting on that run", () => {
+  // The owner wrote in the thread after a nudge ("run the full verify and
+  // merge when green"), then the agent started BuildBot3 and waited.
+  const thread = makeThread({
+    lastUserText: "run the full verify and merge when green", lastUserAt: ago(40 * MIN),
+    lastAgentText: "Full BuildBot3 run started on aaaaaaaaaa. I'll report the verdict when it lands.", lastAgentAt: ago(35 * MIN)
+  });
+  const red = run(thread, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }) }).decision;
+  assert.equal(red.playbook, "ci-finished");
+  const ledger = sentLedger({ ...red, playbook: "merge-ready" }, 5 * 60 * MIN);
+  const decision = run(thread, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }), ledger }).decision;
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.playbook, "ci-finished");
+  assert.notEqual(decision.reason, "owner is driving this thread");
+});
+
 test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no, not a crash to resume", () => {
   // As the readers report it: the supervisor's message is kept out of
   // lastUserText (still the owner's 16:22 message) and stamped as
