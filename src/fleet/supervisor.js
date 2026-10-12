@@ -71,9 +71,12 @@ const JUDGE_CONCURRENCY = 3;
 const JUDGE_CACHE_MS = 2 * 60 * MIN;
 const JUDGE_DOWN_MS = 5 * MIN;
 const JUDGE_CALL_MS = 45_000;
-// All judge calls in one scan end by then (a call reads in ~10-20 s); the
-// rest wait for the next scan, so owner answers and sends are not held.
+// All judge calls in one scan end by then (a call reads in ~10-20 s): each
+// call gets only the time left, none starts with less than JUDGE_MIN_CALL_MS
+// left, and the rest wait for the next scan, so owner answers and sends are
+// not held.
 const JUDGE_TICK_MS = 60_000;
+const JUDGE_MIN_CALL_MS = 10_000;
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -146,11 +149,28 @@ function judgeable(decision, thread) {
   return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
 }
 
+// The PR and supervisor facts the judge reads (judge.js prLines).
+function judgeFacts(pr, classified) {
+  const gates = (pr?.gates ?? []).map((gate) => [gate.label || gate.name, gate.state ?? null]);
+  return JSON.stringify([
+    pr?.headOid ?? null, pr?.state ?? null, Boolean(pr?.isDraft), pr?.ci?.state ?? null, pr?.ci?.failing ?? [], pr?.ci?.pending ?? [],
+    gates, pr?.unresolvedThreads ?? null, pr?.reviewDecision ?? null, classified?.state ?? null
+  ]);
+}
+
 // Same chat (the agent's last real message and when), same playbook, same
-// facts: same verdict.
-function judgeCacheKey(thread, decision) {
+// facts: same verdict. Every judged playbook keys on the PR facts too, so a
+// CI run that went red is read again.
+export function judgeCacheKey(thread, decision, pr = null, classified = null) {
   const reply = agentReply(thread);
-  return [thread.key, shortHash(`${reply.at ?? ""}\n${reply.text}`), decision.playbook, decision.factsKey ?? ""].join("|");
+  return [thread.key, shortHash(`${reply.at ?? ""}\n${reply.text}`), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified))].join("|");
+}
+
+// The judge's question as asked (title, body and options), so a new question
+// under an old title is not taken for the one the owner already answered.
+function judgeAskKey(threadKey, question) {
+  const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  return `judge:${threadKey}:${shortHash([norm(question.title), norm(question.body), (question.options ?? []).map(norm).join("|")].join("\n"))}`;
 }
 
 // pending: the judge has not read the chat (a failure, the per-scan cap), so
@@ -345,6 +365,8 @@ export class FleetSupervisor {
     this.judgeCache = new Map();
     this.judgeDownUntil = 0;
     this.judgeError = null;
+    // threadKey -> when the owner last answered one of its questions.
+    this.ownerAnsweredAt = new Map();
   }
 
   now() {
@@ -789,7 +811,10 @@ export class FleetSupervisor {
       // fixed a blocker is sent even though the blocker is no longer asked,
       // unless the agent has spoken since (it recovered, or asks something new).
       const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
-      const stale = question.kind === "agent-ask" || question.kind === "agent-card" ? !asked.has(question.dedupeKey) : agentSince;
+      // The judge does not read a thread whose answer waits (judgeNudges),
+      // so its ask is not asked again: it stands until the agent speaks.
+      const judgeAsk = String(question.dedupeKey ?? "").startsWith("judge:");
+      const stale = (question.kind === "agent-ask" || question.kind === "agent-card") && !judgeAsk ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
@@ -1122,6 +1147,7 @@ export class FleetSupervisor {
     // nothing; anything else is refused.
     if (question.kind === "agent-card" && answer !== "open thread") return null;
     this.answering.add(id);
+    if (question.threadKey) this.ownerAnsweredAt.set(question.threadKey, this.now());
     try {
       let delivery = null;
       const settling = [];
@@ -1456,14 +1482,19 @@ export class FleetSupervisor {
     const judge = this.nudgeJudge;
     if (!judge?.enabled || typeof judge.judge !== "function" || this.mode !== "auto") return;
     for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
-    // A thread getting the owner's answer this tick gets no nudge anyway.
-    const answering = new Set(this.store.queuedAnswers().map((question) => question.threadKey));
+    // Only answers given since this scan began count (ownerAnswerThreads).
+    for (const [key, at] of this.ownerAnsweredAt) if (at < started) this.ownerAnsweredAt.delete(key);
+    // A thread the owner answered, or whose answer waits to be typed or is
+    // being sent, gets no automatic nudge: the answer goes first
+    // (deliverQueuedAnswers), never a playbook nudge beside or over it.
+    const answering = this.ownerAnswerThreads(started);
     const due = [];
     for (const item of items) {
       const { decision, thread } = item;
-      if (!judgeable(decision, thread) || answering.has(thread.key)) continue;
+      if (!judgeable(decision, thread)) continue;
+      if (answering.has(thread.key)) { item.decision = judgeWait(decision, "owner answer goes first; no nudge"); continue; }
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
-      const key = judgeCacheKey(thread, decision);
+      const key = judgeCacheKey(thread, decision, item.pr, item.classified);
       const cached = this.judgeCache.get(key);
       if (cached) item.decision = this.applyJudgeVerdict(item, cached.verdict);
       else due.push({ item, key });
@@ -1480,22 +1511,34 @@ export class FleetSupervisor {
     for (const { item } of due.slice(JUDGE_MAX_PER_TICK)) item.decision = judgeWait(item.decision, "judge: read next scan (per-scan cap)");
     const history = this.nudgeHistory(new Set(now.map(({ item }) => item.thread.key)));
     const judgeStart = this.now();
+    // A call the judge's own timeout would end is a failure; one the scan's
+    // time left ends sooner is only read next scan.
+    const fullMs = Math.min(JUDGE_CALL_MS, this.config.judge?.timeoutMs ?? JUDGE_CALL_MS);
     const results = await mapLimit(now, JUDGE_CONCURRENCY, async ({ item }) => {
-      if (this.now() - judgeStart >= JUDGE_TICK_MS) return { later: true };
+      const left = JUDGE_TICK_MS - (this.now() - judgeStart);
+      if (left < JUDGE_MIN_CALL_MS) return { later: true };
+      const capMs = Math.min(JUDGE_CALL_MS, left);
       try {
         const verdict = await withTimeout(Promise.resolve(judge.judge({
-          thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started
-        })), JUDGE_CALL_MS, "judge");
+          thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started, timeoutMs: capMs
+        })), capMs, "judge");
         return { verdict };
       } catch (error) {
-        return { error: clampText(redactSecrets(error?.message ?? String(error)), 120) || "failed" };
+        const message = error?.message ?? String(error);
+        if (capMs < fullMs && /timed out/i.test(message)) return { later: true };
+        return { error: clampText(redactSecrets(message), 120) || "failed" };
       }
     });
+    // The owner may have answered while the calls ran: that answer wins over
+    // a verdict read from the chat before it.
+    const answeredMeanwhile = this.ownerAnswerThreads(started);
     let failed = 0;
+    let ran = 0;
     now.forEach(({ item, key }, index) => {
       const result = results[index] ?? { error: "failed" };
       const { decision, thread } = item;
       if (result.later) { item.decision = judgeWait(decision, "judge: read next scan (time cap)"); return; }
+      ran += 1;
       if (result.error) {
         failed += 1;
         this.judgeError = result.error;
@@ -1503,14 +1546,28 @@ export class FleetSupervisor {
         item.decision = judgeWait(decision, `judge unavailable: ${result.error}`);
         return;
       }
+      if (answeredMeanwhile.has(thread.key)) { item.decision = judgeWait(decision, "owner answered meanwhile; no nudge"); return; }
       const { verdict } = result;
       this.judgeCache.set(key, { verdict, at: started });
       const said = verdict.action === "send" ? { message: verdict.message } : verdict.action === "ask-owner" ? { message: verdict.question.title } : {};
       this.store.recordAction({ kind: "judge", threadKey: thread.key, playbook: decision.playbook, verdict: verdict.action, status: "done", reason: verdict.reason, ...said });
       item.decision = this.applyJudgeVerdict(item, verdict);
     });
-    if (failed === now.length) this.judgeDownUntil = started + JUDGE_DOWN_MS;
-    else this.judgeError = null;
+    // Only calls that ran count: one the time cap cut off is no failure.
+    if (ran && failed === ran) this.judgeDownUntil = started + JUDGE_DOWN_MS;
+    else if (ran) this.judgeError = null;
+  }
+
+  // Threads with an owner answer that waits to be typed, is being sent, or
+  // came in since `since` (or is being answered right now).
+  ownerAnswerThreads(since) {
+    const keys = new Set(this.store.queuedAnswers().map((question) => question.threadKey));
+    for (const id of this.answering) {
+      const threadKey = this.store.question(id)?.threadKey;
+      if (threadKey) keys.add(threadKey);
+    }
+    for (const [key, at] of this.ownerAnsweredAt) if (at >= since) keys.add(key);
+    return keys;
   }
 
   // A verdict turned into the thread's decision.
@@ -1534,7 +1591,7 @@ export class FleetSupervisor {
         title: clampText(`${label}: ${verdict.question.title}`, limits.titleMax),
         body: verdict.question.body || clampText(verdict.reason, limits.bodyMax),
         options: verdict.question.options,
-        dedupeKey: `judge:${thread.key}:${shortHash(verdict.question.title)}`,
+        dedupeKey: judgeAskKey(thread.key, verdict.question),
         kind: "agent-ask",
         askContext: clampTail(redactSecrets(reply.text), limits.excerptMax),
         agentAskedAt: reply.at ?? null
