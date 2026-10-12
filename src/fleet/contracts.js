@@ -476,7 +476,9 @@ const NOTHING_NEEDED = /\bno (?:input|action|response|reply|decision)\b[^.?!]{0,
 export function isAckItem(item) {
   const options = Array.isArray(item?.options) ? item.options : [];
   if (!options.length) return NOTHING_NEEDED.test(String(item?.question ?? ""));
-  return options.length === 1 && ACK_LABELS.has(String(options[0]).trim().toLowerCase().replace(/[.!]+$/, ""));
+  // "Continue (Recommended)": the app's recommendation suffix is not the label.
+  const label = String(options[0]).trim().toLowerCase().replace(/\s*\(recommended\)$/, "").replace(/[.!]+$/, "");
+  return options.length === 1 && ACK_LABELS.has(label);
 }
 
 // The items of an open card the owner is asked about now. Only Codex items

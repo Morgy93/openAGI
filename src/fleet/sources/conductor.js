@@ -190,7 +190,7 @@ function readRecentMessages(db, sessionId, turnColumn) {
 // fell out of it), oldest first. A later tool_result, init, result or error
 // row closes one, as in summarizeTail.
 function readOlderAsks(db, sessionId, rows) {
-  const turnId = rows[0]?.turn_id;
+  const turnId = currentTurnId(rows);
   if (!turnId) return [];
   const open = [];
   for (const row of db.prepare(ASK_SQL).all(turnId, sessionId)) {
@@ -207,6 +207,21 @@ function readOlderAsks(db, sessionId, rows) {
     if (!closed) open.unshift(event.parent_tool_use_id ? { ...ask, subagent: true } : ask);
   }
   return open;
+}
+
+// The turn of the newest row that has one. A trailing row with no turn_id
+// (an older build, a queued user row) or an ambient broadcast (system rows
+// such as commands_changed, which land on idle tabs too) does not name it.
+function currentTurnId(rowsNewestFirst) {
+  for (const row of rowsNewestFirst) {
+    if (!row.turn_id || row.cancelled_at) continue;
+    if (row.role !== "user") {
+      const event = parseEvent(row.content);
+      if (event?.type === "system" && event.subtype !== "init") continue;
+    }
+    return row.turn_id;
+  }
+  return null;
 }
 
 // Every open call of the turn as one card (a subagent's beside the agent's).
@@ -285,7 +300,11 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   // Only a turn whose start and end are both outside the tail can hide one.
   const live = !CARD_DEAD_STATUSES.has(row.status);
   let asks = live ? [...summary.pendingAsks.values()] : [];
-  if (live && !summary.turnStartedAt && !summary.lastEnd) asks = readOlderAsks(db, row.id, rows);
+  if (live && !summary.turnStartedAt && !summary.lastEnd) {
+    // Older calls of the turn join the ones the tail found; a tail card is never dropped.
+    const inTail = new Set(asks.map((ask) => ask.id));
+    asks = [...readOlderAsks(db, row.id, rows).filter((ask) => !inTail.has(ask.id)), ...asks];
+  }
   const card = cardOf(asks, limits);
   // The agent's own call first, as before cards (executor and older readers).
   const pendingAsk = asks.find((ask) => !ask.subagent) ?? asks[0] ?? null;

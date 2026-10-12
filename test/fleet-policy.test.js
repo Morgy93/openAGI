@@ -1323,6 +1323,15 @@ test("a Codex card never holds back a limit resume, a stopped turn or the PR; it
   assert.equal(kept.length, 2);
   assert.equal(kept[1].action, "none");
   assert.equal(kept[1].cardQuestion.dedupeKey, "k");
+  // So does a duplicate escalation of the same jam.
+  const escalations = dedupeDecisions([
+    { threadKey: "infra", action: "escalate-manager", targetKey: "conductor:mgr", playbook: "bb3-jam", message: "jam" },
+    { threadKey: "codex:t2", action: "escalate-manager", targetKey: "conductor:mgr", playbook: "bb3-jam", message: "jam", cardQuestion: { dedupeKey: "k2" } }
+  ]);
+  assert.equal(escalations.length, 2);
+  assert.equal(escalations[1].action, "none");
+  assert.equal(escalations[1].message, null);
+  assert.equal(escalations[1].cardQuestion.dedupeKey, "k2");
 });
 
 // --- Context-aware nudges ----------------------------------------------------
@@ -1449,6 +1458,18 @@ test("an answered nudge is waited on only so long: then the owner hears it once,
   const spent = run(thread, { pr, ledger: sentLedger(first, 40 * MIN, { attemptsWithoutProgress: 3 }) }).decision;
   assert.equal(spent.action, "ask-user");
   assert.equal(spent.question.kind, "stuck");
+});
+
+test("a new head is a new fact however many checks fail", () => {
+  const thread = makeThread();
+  const failing = ["a", "b", "c", "d", "e", "f", "g", "h"];
+  const first = run(thread, { pr: redPr({ ci: { state: "FAILURE", failing, pending: [] } }) }).decision;
+  assert.equal(first.facts.length, 8);
+  assert.ok(first.facts.includes(`head ${HEAD.slice(0, 10)}`));
+  const newHead = "b".repeat(40);
+  const pushed = run(thread, { pr: redPr({ headOid: newHead, ci: { state: "FAILURE", failing, pending: [] } }), localGit: { ...cleanGit, head: newHead }, ledger: sentLedger(first, 40 * MIN) }).decision;
+  assert.equal(pushed.action, "nudge");
+  assert.match(pushed.message, /new: head bbbbbbbbbb/);
 });
 
 test("a rerun that fails again on the same head is a new fact", () => {

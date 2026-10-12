@@ -311,7 +311,9 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
   // The whole report, not the tail: its "Blocked on:" list is often above
   // the last 600 characters.
   const full = thread.lastAgentFull || text;
-  const section = text && !settled ? blockedOnSection(full) : null;
+  // The whole report has its own time: a later synthetic notice moves only lastAgentAt.
+  const fullSettled = thread.lastAgentFull ? prSettledAfter(pr, Date.parse(thread.lastAgentFullAt ?? thread.lastAgentAt ?? "")) : settled;
+  const section = text && !fullSettled ? blockedOnSection(full) : null;
   // "Blocked on: your merge decision" on an open PR is the ready / not-ready
   // flow's question (merge it, or get it ready), not a call of its own.
   const blocked = section && pr?.state === "OPEN" ? withoutMergeCalls(section) : section;

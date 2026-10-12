@@ -152,7 +152,9 @@ function readUserInput(summary, raw, at, turnId = null) {
   if (kind === "context") return;
   // The owner typed a new turn instead of answering: asks of earlier turns
   // are closed (a steer inside the ask's own turn leaves them open).
-  const turn = turnId ?? summary.turnId;
+  // Older rollouts carry no turn id on the message: one typed after the
+  // last turn ended starts the next turn, whatever turn the tail last saw.
+  const turn = turnId ?? (summary.turnEnded ? null : summary.turnId);
   summary.cardAsks = summary.cardAsks.filter((ask) => turn && ask.turnId === turn);
   // Links inside the browser/IDE wrappers are ambient context, not the owner's words.
   const cleaned = cleanCodexUserText(text);
@@ -197,15 +199,18 @@ function readEvent(summary, payload, at) {
       summary.lifecycle = { type: "task_started", payload, at };
       summary.turnStartedAt = toIso(payload.started_at) ?? at;
       summary.turnId = payload.turn_id ?? payload.turn_attribution?.turn_id ?? null;
+      summary.turnEnded = false;
       break;
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
+      summary.turnEnded = true;
       setAgent(summary, payload.last_agent_message, at);
       settleSealedAsk(summary);
       break;
     case "turn_aborted":
     case "error":
       summary.lifecycle = { type: payload.type, payload, at };
+      if (payload.type === "turn_aborted") summary.turnEnded = true;
       break;
     case "agent_message":
       // Older rollouts write the async card as this event: it is the card,
@@ -244,7 +249,7 @@ function readResponseItem(summary, payload, at) {
 
 export function parseRolloutTail(text) {
   const summary = {
-    events: 0, lifecycle: null, turnStartedAt: null, turnId: null, lastAgent: null, lastUser: null,
+    events: 0, lifecycle: null, turnStartedAt: null, turnId: null, turnEnded: false, lastAgent: null, lastUser: null,
     lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null,
     cardAsks: [], cardReplies: [], rows: 0
   };
@@ -358,6 +363,7 @@ const CARD_SCAN_ROWS = 4000;
 // A projection this close to the rollout's size is caught up; one further
 // behind (or past the end) leaves the newest asks and replies to the tail.
 const PROJECTION_SLACK_BYTES = 64 * 1024;
+const UNINDEXED_CARD_ROWS = /request_user_input_async|"delivery":"async"|"type":"user_message"|"type":"UserMessage"/;
 // A continuation segment (<id>_<segment id>.jsonl) is indexed under the
 // segment's id; the thread's own projection stopped with the older file.
 const SEGMENT_PATTERN = /_([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/i;
@@ -404,6 +410,10 @@ export function readHistoryCard(history, id, { bytes = null, rolloutPath = null,
     const indexed = SEGMENT_PATTERN.exec(String(rolloutPath ?? ""))?.[1] ?? id;
     const state = history.projection.get(indexed);
     if (!state || (Number.isFinite(bytes) && Math.abs(bytes - Number(state.offset)) > PROJECTION_SLACK_BYTES)) return undefined;
+    // Rows the projection has not reached yet that add an ask, answer one,
+    // or start an owner turn leave the card to the tail.
+    const lag = Number.isFinite(bytes) ? bytes - Number(state.offset) : 0;
+    if (lag > 0 && UNINDEXED_CARD_ROWS.test(readTail(rolloutPath, lag + 1))) return undefined;
     const replies = [];
     let owner = null;
     const users = history.users.all(indexed);
@@ -803,6 +813,19 @@ function capThreads(threads, max) {
   return threads.filter((thread) => keep.has(thread));
 }
 
+// Threads past the paging stop whose history index holds an open card.
+function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes }) {
+  const carded = readThreadRows(db, cutoff, pageSize, after).filter((row) => {
+    if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) return false;
+    let bytes = null;
+    try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
+    return readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now })?.items?.length > 0;
+  });
+  const attachments = readPrAttachments(db, carded.map((row) => String(row.id)));
+  return carded.map((row) => buildThread(row, { config, now, attachments, history, tailBytes }))
+    .filter((thread) => Date.parse(thread.lastActivityAt ?? "") >= cutoff);
+}
+
 export async function listCodexThreads(config, options = {}) {
   const now = options.now ?? Date.now();
   const run = options.run ?? runCommand;
@@ -823,6 +846,7 @@ export async function listCodexThreads(config, options = {}) {
     // Guardian reviews, automation, and settings-only rows fill pages too,
     // so read on until maxThreads in-scope threads are found or the
     // lookback window runs out; no fixed row cap hides an older real thread.
+    let unread = null;
     for (let after = null, inScope = 0; inScope < limits.maxThreads;) {
       const rows = readThreadRows(db, cutoff, pageSize, after);
       const attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
@@ -836,7 +860,12 @@ export async function listCodexThreads(config, options = {}) {
       }
       if (rows.length < pageSize) break;
       after = rows.at(-1);
+      unread = after;
     }
+    // capThreads keeps an automation or no-repo thread with an open card, so
+    // the older rows the loop stopped before are checked for one too: one
+    // more page, in the history index only (no tail reads).
+    if (unread && history) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES }));
     // A failed title scan marks nothing shared; identity checks still see
     // every thread the supervisor retained.
     let shared = { names: new Set(), labels: new Map() };

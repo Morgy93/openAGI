@@ -1030,6 +1030,30 @@ test("history cards: a lagging or overrun projection leaves the card to the tail
   assert.deepEqual(map["t-seg"].meta.pendingCard?.items.map((item) => item.itemId), ["call_seg:0"]);
 });
 
+test("history cards: a reply or an ask the projection has not reached yet is read from the tail", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.userItem("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  // Answered a moment ago: the reply is in the rollout, a few bytes past the projection.
+  const answered = addThread(ctx, { id: "t-answered", lines: asked });
+  const indexedAt = fs.statSync(answered).size;
+  fs.appendFileSync(answered, `${JSON.stringify(ev.userItem(cardReply([["call_q", 0, "Keep it"]]), MIN))}\n`);
+  // Unrelated agent rows past the projection leave the history card standing.
+  const working = addThread(ctx, { id: "t-working", lines: asked });
+  const workingAt = fs.statSync(working).size;
+  fs.appendFileSync(working, `${JSON.stringify(ev.assistant("Still checking.", MIN))}\n`);
+  for (const [id, rollout, offset] of [["t-answered", answered, indexedAt], ["t-working", working, workingAt]]) {
+    h.turn(id, "turn-a");
+    h.user(id, "turn-a", "QA it", 30 * MIN);
+    h.ask(id, "turn-a", "call_q", [{ title: "Keep the cache warm? (indexed)", options: ["Keep it", "Drop it"] }], 20 * MIN);
+    h.project(id, rollout, { offset });
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-answered"].meta.pendingCard, null);
+  assert.equal(map["t-working"].meta.pendingCard?.items[0].question, "Keep the cache warm? (indexed)");
+});
+
 test("tail cards: an owner's new turn closes them, a steer inside the ask's turn does not", async (t) => {
   const ctx = makeHome(t);
   const asked = [turnStart("turn-a", 30 * MIN), ev.userItem("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
@@ -1038,6 +1062,19 @@ test("tail cards: an owner's new turn closes them, a steer inside the ask's turn
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
   assert.deepEqual(map["t-steer"].meta.pendingCard?.items.map((item) => item.itemId), ["call_q:0"]);
   assert.equal(map["t-new"].meta.pendingCard, null);
+});
+
+test("tail cards: an owner message with no turn id after the ask's turn ended closes them", async (t) => {
+  // Older rollouts write the owner's words as a user_message event, no turn id.
+  const ctx = makeHome(t);
+  const asked = [turnStart("turn-a", 30 * MIN), ev.user("QA it", 30 * MIN), tailCall("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN), tailCardItem("call_q", "Keep the cache warm?", ["Keep it", "Drop it"], 20 * MIN)];
+  addThread(ctx, { id: "t-steer-old", lines: [...asked, ev.user("also check the logs", 15 * MIN)] });
+  addThread(ctx, { id: "t-moved-on", lines: [...asked, ev.complete("turn-a", 15 * MIN, "Waiting on your pick."), ev.user("forget that, fix the header", 10 * MIN)] });
+  addThread(ctx, { id: "t-aborted", lines: [...asked, ev.aborted("turn-a", 15 * MIN), ev.user("forget that, fix the header", 10 * MIN)] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  assert.deepEqual(map["t-steer-old"].meta.pendingCard?.items.map((item) => item.itemId), ["call_q:0"]);
+  assert.equal(map["t-moved-on"].meta.pendingCard, null);
+  assert.equal(map["t-aborted"].meta.pendingCard, null);
 });
 
 test("history cards: a steer in the ask's own turn keeps the card; a reply closes items asked before it", async (t) => {
@@ -1097,6 +1134,27 @@ test("tail cards: a card is never the agent's last words, in either rollout form
     assert.equal(map[id].lastAgentAt, iso(20 * MIN));
     assert.equal(map[id].meta.pendingCard.items.length, 1);
   }
+});
+
+test("carded automation and no-repo threads on pages past the in-scope stop are still read", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  // maxThreads 2 reads pages of 10 rows: the first page fills the cap.
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 12; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  for (const [id, spec] of [["t-auto", { threadSource: "automation" }], ["t-norepo", { cwd: path.join(ctx.home, "gone") }], ["t-quiet", { threadSource: "automation" }]]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, ...spec });
+    h.turn(id, "turn-a");
+    if (id !== "t-quiet") h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks }));
+  assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_t-auto:0");
+  assert.equal(map["t-norepo"]?.excluded, "no-repo");
+  assert.equal(map["t-norepo"].meta.pendingCard?.items[0].itemId, "call_t-norepo:0");
+  assert.equal(map["t-quiet"], undefined, "a thread with no card past the stop is not built");
 });
 
 test("cards on automation and no-repo threads survive the cap; guardian reviews are never read for one", async (t) => {

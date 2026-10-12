@@ -679,12 +679,19 @@ export class FleetStore {
   // ─── owner overrides ────────────────────────────────────────────────────
 
   // A counted send that failed in the background gives its attempt back.
-  undoAttempt(key) {
+  // sent: that send's entry ({ at, messageHash }), else the newest one. Its
+  // words never reached the agent, so it is failed whatever the budget says:
+  // a "sent" hash would refuse the next identical nudge as a repeat.
+  undoAttempt(key, sent = null) {
     const ledger = this.state.ledger[key];
-    if (!ledger || !(ledger.attemptsWithoutProgress > 0)) return null;
-    ledger.attemptsWithoutProgress -= 1;
-    const last = ledger.nudges.at(-1);
-    if (last?.status === "sent") last.status = "failed";
+    if (!ledger) return null;
+    const entry = sent
+      ? ledger.nudges.findLast((nudge) => nudge.status === "sent" && nudge.at === sent.at && nudge.messageHash === (sent.messageHash ?? null))
+      : ledger.nudges.at(-1);
+    const failed = entry?.status === "sent";
+    if (failed) entry.status = "failed";
+    if (!failed && !(ledger.attemptsWithoutProgress > 0)) return null;
+    if (ledger.attemptsWithoutProgress > 0) ledger.attemptsWithoutProgress -= 1;
     this._save();
     return structuredClone(ledger);
   }

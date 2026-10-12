@@ -177,6 +177,9 @@ test("a card item that says it needs nothing, or only acknowledges, asks nothing
   assert.equal(isAckItem(item("I'm recovering the staged candidate; no input is needed from you right now.")), true);
   assert.equal(isAckItem(item("Nothing is needed from you.")), true);
   assert.equal(isAckItem(item("I will use the native build.", ["Okay"])), true);
+  assert.equal(isAckItem(item("I will use the native build.", ["Continue (Recommended)"])), true);
+  assert.equal(isAckItem(item("I will use the native build.", ["Okay (recommended)"])), true);
+  assert.equal(isAckItem(item("Ship it?", ["Ship it (Recommended)"])), false);
   assert.equal(isAckItem(item("Please sign back into ZeroShot Staging.")), false);
   assert.equal(isAckItem(item("No input needed? Pick a region.", ["us-east-1", "eu-west-1"])), false);
   assert.deepEqual(liveCardItems({ app: "codex", items: [item("no action needed"), { ...item("Sign in?"), at: null }] }).map((entry) => entry.question), ["Sign in?"]);
