@@ -669,6 +669,9 @@ test("watchOf: the owner's view of what each thread is watched for, and since wh
   assert.equal(asked.group, "you");
   assert.equal(asked.waitingOn, "your answer");
   assert.equal(asked.since, ago(7 * MIN));
+  // An owner ask still held for review (no visible question) is not blamed on the owner.
+  assert.equal(watchOf(makeThread(), { state: "needs-human" }, { now: NOW }).group, "push");
+  assert.equal(watchOf(makeThread(), { state: "needs-human" }, { now: NOW, askedAt: ago(3 * MIN) }).group, "you");
   // Out of scope is not watched; every group is a known one.
   assert.equal(watchOf(makeThread(), { state: "excluded" }, { now: NOW }), null);
   for (const state of STATES) {

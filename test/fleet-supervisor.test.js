@@ -3697,6 +3697,21 @@ test("the snapshot says what each thread is watched for, and keeps when it start
   assert.equal(row.watch.since, askedAt);
 });
 
+test("a new turn in the same watch group restarts its clock", async (t) => {
+  let clock = NOW;
+  const thread = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(30 * MIN) } });
+  const { supervisor } = fixture(t, { threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.getState().snapshot.threads[0].watch.since, ago(30 * MIN));
+  // Turn A ended and turn B began between two scans: still "working", from B.
+  clock += 10 * MIN;
+  Object.assign(thread, { lastActivityAt: new Date(clock).toISOString(), meta: { turnStartedAt: new Date(clock - 2 * MIN).toISOString() } });
+  await supervisor.tick({ reason: "test" });
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "working");
+  assert.equal(row.watch.since, new Date(clock - 2 * MIN).toISOString());
+});
+
 test("a thread moved into a group with no clock of its own starts there at the move", async (t) => {
   let clock = NOW;
   const thread = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(5 * MIN) } });

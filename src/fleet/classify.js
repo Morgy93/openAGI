@@ -158,7 +158,10 @@ function waitLabel(wait) {
 export function watchOf(thread, classified, { now = Date.now(), askedAt = null } = {}) {
   const state = classified?.state;
   if (!state || state === "excluded") return null;
-  const group = askedAt ? "you" : (WATCH_BY_STATE[state] ?? "quiet");
+  // Waiting on you only with a question the owner can see; one still held
+  // for review leaves the thread with the supervisor for now.
+  const byState = WATCH_BY_STATE[state] ?? "quiet";
+  const group = askedAt ? "you" : byState === "you" ? "push" : byState;
   const wait = classified.wait ?? null;
   const waitSince = Number.isFinite(wait?.ageMs) ? new Date(now - wait.ageMs).toISOString() : null;
   const busy = thread.agentStatus === "running" || thread.agentStatus === "waiting";

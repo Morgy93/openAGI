@@ -2097,8 +2097,11 @@ export class FleetSupervisor {
     const prev = this.watchSince.get(key);
     const guess = Date.parse(watch.since ?? "");
     let since = Number.isFinite(guess) && guess <= now ? guess : now;
+    // A timed group's own clock is exact (the ask, the task, the turn): a new
+    // question, run or turn in the same group restarts it.
+    const exact = TIMED_WATCH.has(watch.group) && Number.isFinite(guess) && guess <= now;
     if (prev && prev.group !== watch.group && !TIMED_WATCH.has(watch.group)) since = now;
-    if (prev?.group === watch.group) since = Math.min(prev.since, since);
+    if (prev?.group === watch.group && !exact) since = Math.min(prev.since, since);
     this.watchSince.set(key, { group: watch.group, since });
     return { ...watch, since: new Date(since).toISOString() };
   }
