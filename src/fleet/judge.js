@@ -484,6 +484,22 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
     const shell = parseFeaturesList(result.stdout).get("shell_tool");
     if (shell === undefined) throw new Error("tool lockdown unconfirmed: no shell_tool in codex features list");
     if (shell) throw new Error("tool lockdown failed: codex keeps shell_tool on");
+    // CODEX_HOME replaces only the user layer: a system or managed layer
+    // (/etc/codex/config.toml) can still bring MCP servers, which are tools.
+    // codex itself, with the call's home and env, must list none.
+    let mcp;
+    try {
+      mcp = await run(bin, ["mcp", "list", "--json"], { ...options, timeoutMs: Math.min(LOCKDOWN_PROBE_MS, options.timeoutMs), maxBytes: OUTPUT_MAX_BYTES });
+    } catch (error) {
+      mcp = { code: null, stdout: "", stderr: "", error: error?.message ?? String(error) };
+    }
+    if (mcp?.timedOut || mcp?.error || mcp?.code !== 0) {
+      throw new Error(`tool lockdown unconfirmed: mcp list ${mcp?.timedOut ? "timed out" : line(mcp?.error || lastLine(mcp?.stderr), 120) || `exit ${mcp?.code}`}`);
+    }
+    let servers;
+    try { servers = JSON.parse(mcp.stdout); } catch { servers = null; }
+    if (!Array.isArray(servers)) throw new Error("tool lockdown unconfirmed: mcp list is not a list");
+    if (servers.length) throw new Error(`tool lockdown failed: codex loads MCP servers (${servers.map((s) => line(s?.name, 40)).join(", ")})`);
     lockedDown = { mark, at: now() };
     return now() - began;
   }

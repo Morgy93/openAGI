@@ -27,17 +27,19 @@ const FEATURES = [
 
 // A run that answers codex features list, writes out as codex -o would, and
 // records its exec calls (probes: the features list calls).
-function fakeRun(out, result = { code: 0, stdout: "", stderr: "", timedOut: false, error: null }, features = { code: 0, stdout: FEATURES, stderr: "", timedOut: false, error: null }) {
+function fakeRun(out, result = { code: 0, stdout: "", stderr: "", timedOut: false, error: null }, features = { code: 0, stdout: FEATURES, stderr: "", timedOut: false, error: null }, mcp = { code: 0, stdout: "[]", stderr: "", timedOut: false, error: null }) {
   const calls = [];
   const probes = [];
+  const mcpProbes = [];
   const run = async (cmd, args, options) => {
     if (args[0] === "features") { probes.push({ cmd, args, options }); return features; }
+    if (args[0] === "mcp") { mcpProbes.push({ cmd, args, options }); return mcp; }
     calls.push({ cmd, args, options });
     const at = args.indexOf("-o");
     if (out !== null) fs.writeFileSync(args[at + 1], typeof out === "string" ? out : JSON.stringify(out));
     return result;
   };
-  return { run, calls, probes };
+  return { run, calls, probes, mcpProbes };
 }
 
 const OWNER_CODEX_CONFIG = [
@@ -247,6 +249,30 @@ test("the judge fails closed unless codex itself shows the shell off", async (t)
   assert.match(probes[0].options.env.CODEX_HOME, /codex-home$/);
   assert.equal(probes[0].options.env.HOME, probes[0].options.cwd);
   assert.deepEqual(Object.keys(probes[0].options.env).sort(), Object.keys(calls[0].options.env).sort());
+});
+
+test("the judge fails closed if any Codex config layer brings MCP servers", async (t) => {
+  const cfg = config(t);
+  const verdict = { action: "send", reason: "r", message: "m", question: null };
+  const ok = { code: 0, stdout: FEATURES, stderr: "", timedOut: false, error: null };
+  const cases = [
+    // /etc/codex/config.toml or a managed layer adds a server the temp home does not.
+    [{ code: 0, stdout: JSON.stringify([{ name: "fs", enabled: true }]), stderr: "" }, /lockdown failed: codex loads MCP servers \(fs\)/],
+    [{ code: 2, stdout: "", stderr: "error: unexpected argument '--json'" }, /lockdown unconfirmed: mcp list error: unexpected argument/],
+    [{ code: 0, stdout: "No MCP servers configured yet.", stderr: "" }, /mcp list is not a list/],
+    [{ code: null, stdout: "", stderr: "", timedOut: true }, /lockdown unconfirmed: mcp list timed out/]
+  ];
+  for (const [mcp, error] of cases) {
+    const { run, calls, mcpProbes } = fakeRun(verdict, undefined, ok, mcp);
+    await assert.rejects(createNudgeJudge({ config: cfg, run }).judge(INPUT), error);
+    assert.equal(mcpProbes.length, 1);
+    assert.equal(calls.length, 0, "no judge turn runs while MCP servers could load");
+  }
+  const { run, calls, probes, mcpProbes } = fakeRun(verdict);
+  await createNudgeJudge({ config: cfg, run }).judge(INPUT);
+  assert.deepEqual(mcpProbes[0].args, ["mcp", "list", "--json"]);
+  assert.deepEqual(mcpProbes[0].options.env, probes[0].options.env);
+  assert.equal(calls.length, 1);
 });
 
 test("the lockdown is read again when the codex binary changes, and after a while", async (t) => {
