@@ -161,9 +161,10 @@ export function decideThread(classified, thread, options = {}) {
   const ctx = makeContext(classified, thread, options);
   if (ctx.mutedKeys.has(thread?.key)) return { ...baseDecision(ctx), reason: "muted by owner" };
   // No nudge, resume or stuck question about a thread whose owner just
-  // stopped the supervisor's own turn there.
-  if (ownerStoppedNudge(thread)) return { ...baseDecision(ctx), reason: "owner stopped the supervisor's turn" };
-  const decision = resolveIntent(ctx, intentFor(ctx));
+  // stopped the supervisor's own turn there. An open card is still asked.
+  const decision = ownerStoppedNudge(thread)
+    ? { ...baseDecision(ctx), reason: "owner stopped the supervisor's turn" }
+    : resolveIntent(ctx, intentFor(ctx));
   // A Codex card beside the thread's own decision (a resume, a nudge, a
   // question): its question is asked too.
   const card = classified.card ? cardIntent(ctx, classified.card.card) : null;
@@ -810,9 +811,17 @@ function ownerDrivenUntil(ctx, intent) {
   if (text.startsWith(SUPERVISOR_PREFIX) || CARRY_ON.test(text)) return null;
   const at = Date.parse(thread.lastUserAt ?? "");
   if (!Number.isFinite(at)) return null;
-  if (!(Date.parse(ledger?.lastNudgeAt ?? "") < at)) return null;
+  if (!(lastNudgeStart(ledger) < at)) return null;
   const until = at + limits.ownerDrivenMs;
   return until > now ? new Date(until).toISOString() : null;
+}
+
+// When the last nudge (or owner answer) set out, not when its delivery
+// returned: an owner reply can land in between.
+const NUDGE_STATUSES = new Set(["sent", "failed", "owner-answer"]);
+function lastNudgeStart(ledger) {
+  const last = [...(ledger?.nudges ?? [])].reverse().find((entry) => NUDGE_STATUSES.has(entry?.status));
+  return Date.parse(sentAtOf(last) ?? ledger?.lastNudgeAt ?? "");
 }
 
 function ownerActiveUntil(thread, limits, now) {

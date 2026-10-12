@@ -326,6 +326,7 @@ test("peer, meta, and command rows are not owner text", async (t) => {
   assert.equal(thread.lastUserAt, iso(50 * MIN));
   assert.equal(thread.lastAgentText, "Not yet.");
   assert.equal(thread.meta.turnStartedAt, iso(16 * MIN));
+  assert.equal(thread.meta.lastSupervisorAt, iso(16 * MIN));
 });
 
 test("exclusions: sidechain, relay, tmp, self, too-short, no-repo", async (t) => {

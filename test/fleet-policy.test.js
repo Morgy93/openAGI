@@ -1375,16 +1375,24 @@ test("d1dbe71a, 2026-10-12: the owner took the thread over for other work, so it
   // Three hours after the owner's message the PR is fair game again.
   const later = run(thread, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN), now: NOW + DEFAULTS.ownerDrivenMs }).decision;
   assert.notEqual(later.reason, "owner is driving this thread");
+  // The owner's message landed while the nudge's delivery was still returning:
+  // the nudge set out first, so it is still a takeover.
+  const racing = sentLedger(fresh, 49 * MIN);
+  racing.lastNudgeAt = ago(47 * MIN);
+  assert.equal(run(thread, { pr, ledger: racing }).decision.reason, "owner is driving this thread");
   // "continue" after a nudge carries the supervisor's agenda on; no hold.
   const carryOn = makeThread({ ...thread, lastUserText: "continue" });
   assert.notEqual(run(carryOn, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN) }).decision.reason, "owner is driving this thread");
 });
 
 test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no, not a crash to resume", () => {
-  const nudgeText = "[OpenAGI supervisor] Ready to merge? If not, get it ready.";
-  const stopped = (meta) => makeThread({
-    agentStatus: "aborted", lastUserText: nudgeText, lastUserAt: ago(22 * MIN),
-    lastActivityAt: ago(22 * MIN - 2_000), meta: { abortReason: "aborted by user", abortedAt: ago(22 * MIN - 2_000), ...meta }
+  // As the readers report it: the supervisor's message is kept out of
+  // lastUserText (still the owner's 16:22 message) and stamped as
+  // meta.lastSupervisorAt; the owner's Stop came 2 s after it.
+  const stopped = (meta = {}, extra = {}) => makeThread({
+    agentStatus: "aborted", lastUserText: "lets figure out how to get chatgpt", lastUserAt: ago(70 * MIN),
+    lastActivityAt: ago(22 * MIN - 2_000),
+    meta: { abortReason: "aborted by user", abortedAt: ago(22 * MIN - 2_000), lastSupervisorAt: ago(22 * MIN), ...meta }, ...extra
   });
   const { classified, decision } = run(stopped(), { pr: redPr() });
   assert.notEqual(classified.state, "stopped");
@@ -1393,10 +1401,16 @@ test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no
   assert.equal(decision.reason, "owner stopped the supervisor's turn");
   // Claude and Codex record the owner's stop as "interrupted".
   assert.equal(run(stopped({ abortReason: "interrupted" }), { pr: redPr() }).decision.action, "none");
+  // An older reader that passes the supervisor message through as lastUserText.
+  const passthrough = stopped({ lastSupervisorAt: null }, { lastUserText: "[OpenAGI supervisor] Ready to merge? If not, get it ready.", lastUserAt: ago(22 * MIN) });
+  assert.equal(run(passthrough, { pr: redPr() }).decision.reason, "owner stopped the supervisor's turn");
   // An abort that is not the owner's still resumes.
   const other = run(stopped({ abortReason: "replaced" }), { pr: redPr() });
   assert.equal(other.classified.state, "stopped");
   assert.equal(other.decision.playbook, "resume");
+  // The owner wrote after the supervisor's message: that stop is about their own turn.
+  const ownTurn = stopped({}, { lastUserText: "do the other thing", lastUserAt: ago(22 * MIN - 1_000) });
+  assert.notEqual(run(ownTurn, { pr: redPr() }).decision.reason, "owner stopped the supervisor's turn");
 });
 
 test("the supervisor's own read limits are no reason to nudge: 100+ threads, a certificate the pending full run publishes", () => {
