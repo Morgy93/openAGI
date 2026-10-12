@@ -1476,12 +1476,17 @@ test("a rerun that fails again on the same head is a new fact", () => {
   const thread = makeThread();
   const pr = (failedAt) => redPr({ ci: { state: "FAILURE", failing: ["lint"], pending: [], failedAt } });
   const first = run(thread, { pr: pr("2026-09-26T11:00:00.000Z") }).decision;
-  assert.deepEqual(first.facts, ["checks failed at 11:00Z", `head ${HEAD.slice(0, 10)}`, "lint failing"]);
+  assert.deepEqual(first.facts, ["checks failed at 11:00:00Z", `head ${HEAD.slice(0, 10)}`, "lint failing"]);
   const ledger = sentLedger(first, 40 * MIN);
   assert.equal(run(thread, { pr: pr("2026-09-26T11:00:00.000Z"), ledger }).decision.action, "wait");
   const rerun = run(thread, { pr: pr("2026-09-26T11:50:00.000Z"), ledger }).decision;
   assert.equal(rerun.action, "nudge");
-  assert.match(rerun.message, /^Since your \d\d:\d\d reply: new: checks failed at 11:50Z; cleared: checks failed at 11:00Z\. /);
+  assert.match(rerun.message, /^Since your \d\d:\d\d reply: new: checks failed at 11:50:00Z; cleared: checks failed at 11:00:00Z\. /);
+  // A rerun that fails again within the same minute is still news.
+  const quick = run(thread, { pr: pr("2026-09-26T11:00:42.000Z"), ledger }).decision;
+  assert.equal(quick.action, "nudge");
+  assert.notEqual(quick.factsKey, first.factsKey);
+  assert.match(quick.message, /new: checks failed at 11:00:42Z; cleared: checks failed at 11:00:00Z\. /);
 });
 
 test("the same message with no reply is refused only so long, then the owner hears it", () => {
