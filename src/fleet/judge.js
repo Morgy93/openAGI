@@ -339,18 +339,32 @@ export function judgeCodexConfig(text) {
   }
   if (!provider) return null;
   // The provider's table and any of its sub-tables (http_headers), headers
-  // written back in one plain form.
+  // written back in one plain form. A provider set with dotted keys
+  // (model_providers.p.base_url = ...) or an inline table (p = { ... }),
+  // at the top or under [model_providers], is written back under one
+  // [model_providers] table, one line per key.
   const block = [];
+  const dotted = [];
   let inside = false;
+  let table = [];
   for (const raw of lines) {
     const header = tomlHeader(raw);
     if (header) {
-      inside = header.length >= 2 && header[0] === "model_providers" && header[1] === provider && !raw.trim().startsWith("[[");
+      const array = raw.trim().startsWith("[[");
+      inside = header.length >= 2 && header[0] === "model_providers" && header[1] === provider && !array;
+      table = array ? null : header;
       if (inside) block.push("", `[${header.map(tomlKeyPart).join(".")}]`);
       continue;
     }
-    if (inside) block.push(raw);
+    if (inside) { block.push(raw); continue; }
+    const key = table && tomlKey(raw);
+    if (!key || key.rest[0] !== "=") continue;
+    const full = [...table, ...key.parts];
+    if (full.length >= 2 && full[0] === "model_providers" && full[1] === provider) {
+      dotted.push(`${full.slice(1).map(tomlKeyPart).join(".")} = ${key.rest.slice(1).trim()}`);
+    }
   }
+  if (dotted.length) block.unshift("[model_providers]", ...dotted);
   if (!block.length) return null;
   // Top-level keys go before the first [table], or TOML puts them inside it.
   top.push('web_search = "disabled"');
@@ -424,10 +438,25 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
     return home;
   };
 
+  // A bare command ("codex") is the one the child's PATH finds, as spawn
+  // finds it; a path is itself.
+  const resolveBin = (pathVar) => {
+    if (bin.includes("/") || bin.includes(path.sep)) return bin;
+    for (const dir of String(pathVar ?? "").split(path.delimiter)) {
+      if (!dir) continue;
+      const candidate = path.join(dir, bin);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch { /* not here */ }
+    }
+    return bin;
+  };
+
   // Which codex binary this is: its real path and when it last changed.
-  const binaryMark = () => {
+  const binaryMark = (pathVar) => {
     try {
-      const real = fs.realpathSync(bin);
+      const real = fs.realpathSync(resolveBin(pathVar));
       return `${real}|${fs.statSync(real).mtimeMs}`;
     } catch {
       return `${bin}|?`;
@@ -439,7 +468,7 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
   // the call's own home and env, must show shell_tool there and off; read
   // again when the binary changes, and every LOCKDOWN_RECHECK_MS.
   async function checkLockdown(options) {
-    const mark = binaryMark();
+    const mark = binaryMark(options.env?.PATH);
     if (lockedDown?.mark === mark && now() - lockedDown.at < LOCKDOWN_RECHECK_MS) return 0;
     const began = now();
     lockedDown = null;

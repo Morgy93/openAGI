@@ -170,10 +170,12 @@ function judgeFacts(pr, classified, decision = null) {
 }
 
 // Same chat (the agent's last real message and when), same playbook, same
-// facts: same verdict. Every judged playbook keys on the PR facts too, so a
-// CI run that went red is read again.
-export function judgeCacheKey(thread, decision, pr = null, classified = null) {
-  return [thread.key, replyMark(thread), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision))].join("|");
+// facts, same earlier nudges: same verdict. Every judged playbook keys on the
+// PR facts too, so a CI run that went red is read again. nudges: the earlier
+// nudges the prompt shows (nudgeHistory), so a nudge sent since is read again.
+export function judgeCacheKey(thread, decision, pr = null, classified = null, nudges = []) {
+  const shown = (nudges ?? []).map((nudge) => [nudge.at ?? null, nudge.playbook ?? null, nudge.message ?? null]);
+  return [thread.key, replyMark(thread), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision)), shortHash(JSON.stringify(shown))].join("|");
 }
 
 // Which agent message a verdict was read from.
@@ -384,6 +386,9 @@ export class FleetSupervisor {
     this.judgeCache = new Map();
     this.judgeDownUntil = 0;
     this.judgeError = null;
+    // threadKey -> when the judge last read it (a verdict or a failure), so
+    // the per-scan cap rotates past threads that keep failing.
+    this.judgeTriedAt = new Map();
     // threadKey -> when the owner last answered one of its questions.
     this.ownerAnsweredAt = new Map();
   }
@@ -1506,19 +1511,21 @@ export class FleetSupervisor {
     const judge = this.nudgeJudge;
     if (!judge?.enabled || typeof judge.judge !== "function" || this.mode !== "auto") return;
     for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
+    for (const [key, at] of this.judgeTriedAt) if (started - at >= JUDGE_CACHE_MS) this.judgeTriedAt.delete(key);
     // Only answers given since this scan began count (ownerAnswerThreads).
     for (const [key, at] of this.ownerAnsweredAt) if (at < started) this.ownerAnsweredAt.delete(key);
     // A thread the owner answered, or whose answer waits to be typed or is
     // being sent, gets no automatic nudge: the answer goes first
     // (deliverQueuedAnswers), never a playbook nudge beside or over it.
     const answering = this.ownerAnswerThreads(started);
+    const history = this.nudgeHistory(new Set(items.filter((item) => judgeable(item.decision, item.thread)).map((item) => item.thread.key)));
     const due = [];
     for (const item of items) {
       const { decision, thread } = item;
       if (!judgeable(decision, thread)) continue;
       if (answering.has(thread.key)) { item.decision = judgeWait(decision, "owner answer goes first; no nudge"); continue; }
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
-      const key = judgeCacheKey(thread, decision, item.pr, item.classified);
+      const key = judgeCacheKey(thread, decision, item.pr, item.classified, history.get(thread.key) ?? []);
       const cached = this.judgeCache.get(key);
       if (cached) item.decision = this.applyJudgeVerdict(item, cached.verdict);
       else due.push({ item, key });
@@ -1528,12 +1535,12 @@ export class FleetSupervisor {
       for (const { item } of due) item.decision = judgeWait(item.decision, `judge unavailable: ${this.judgeError ?? "paused"}`);
       return;
     }
-    // Resumes first, then the thread nudged longest ago (the send order).
-    const lastTried = ({ item }) => Date.parse(item.ledger?.nudges?.at(-1)?.at ?? "") || 0;
+    // Resumes first, then the thread nudged or judged longest ago (the send
+    // order), so threads the judge keeps failing on cannot hold the cap.
+    const lastTried = ({ item }) => Math.max(Date.parse(item.ledger?.nudges?.at(-1)?.at ?? "") || 0, this.judgeTriedAt.get(item.thread.key) ?? 0);
     due.sort((a, b) => (a.item.decision.playbook === "resume" ? 0 : 1) - (b.item.decision.playbook === "resume" ? 0 : 1) || lastTried(a) - lastTried(b));
     const now = due.slice(0, JUDGE_MAX_PER_TICK);
     for (const { item } of due.slice(JUDGE_MAX_PER_TICK)) item.decision = judgeWait(item.decision, "judge: read next scan (per-scan cap)");
-    const history = this.nudgeHistory(new Set(now.map(({ item }) => item.thread.key)));
     const judgeStart = this.now();
     // A call the judge's own timeout would end is a failure; one the scan's
     // time left ends sooner is only read next scan.
@@ -1563,6 +1570,7 @@ export class FleetSupervisor {
       const { decision, thread } = item;
       if (result.later) { item.decision = judgeWait(decision, "judge: read next scan (time cap)"); return; }
       ran += 1;
+      this.judgeTriedAt.set(thread.key, started);
       if (result.error) {
         failed += 1;
         this.judgeError = result.error;

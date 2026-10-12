@@ -269,6 +269,24 @@ test("the lockdown is read again when the codex binary changes, and after a whil
   assert.equal(calls.length, 4);
 });
 
+test("a bare codex command is the one on PATH: replacing it reads the lockdown again", async (t) => {
+  const cfg = config(t);
+  const dir = path.join(path.dirname(cfg.paths.codexHome), "path-bin");
+  fs.mkdirSync(dir);
+  const bin = path.join(dir, "codex");
+  fs.writeFileSync(bin, "#!/bin/sh\n");
+  fs.chmodSync(bin, 0o755);
+  cfg.bins = { ...cfg.bins, codex: "codex" };
+  const { run, probes } = fakeRun({ action: "wait", reason: "queued", message: null, question: null });
+  const judge = createNudgeJudge({ config: cfg, run, env: { PATH: dir } });
+  await judge.judge(INPUT);
+  await judge.judge(INPUT);
+  assert.equal(probes.length, 1, "read once while nothing changed");
+  fs.utimesSync(bin, new Date(), new Date(Date.now() + 60_000));
+  await judge.judge(INPUT);
+  assert.equal(probes.length, 2, "an upgraded PATH codex is read again");
+});
+
 test("the LB key never leaves in a verdict or an error, plain or encoded", async (t) => {
   const cfg = config(t);
   const key = "lb-key-1";
@@ -312,4 +330,26 @@ test("the judge's Codex config reads every valid way to name the provider", () =
   const dotted = judgeCodexConfig(['model_provider = "lb.v2"', "", '[model_providers."lb.v2"]', 'base_url = "http://lb"'].join("\n"));
   assert.match(dotted, /^\[model_providers\."lb\.v2"\]$/m);
   assert.equal(judgeCodexConfig("model_provider = \"codex-lb\"\n[model_providers.other]\nx = 1\n"), null, "no table for the named provider");
+});
+
+test("the judge's Codex config keeps a provider set with dotted keys or an inline table", () => {
+  const head = ['model_provider = "codex-lb"', "", "[mcp_servers.x]", 'url = "u"', ""];
+  const forms = {
+    "top-level dotted keys": ['model_provider = "codex-lb"', 'model_providers.codex-lb.base_url = "http://lb"', 'model_providers.codex-lb.env_key = "CODEX_LB_API_KEY"', 'model_providers.other.base_url = "http://other"', "", "[mcp_servers.x]", 'url = "u"'],
+    "top-level inline table": ['model_provider = "codex-lb"', 'model_providers.codex-lb = { base_url = "http://lb", env_key = "CODEX_LB_API_KEY" }', 'model_providers.other = { base_url = "http://other" }', "", "[mcp_servers.x]", 'url = "u"'],
+    "inline table under [model_providers]": [...head, "[model_providers]", 'codex-lb = { base_url = "http://lb", env_key = "CODEX_LB_API_KEY" }', 'other = { base_url = "http://other" }'],
+    "dotted keys under [model_providers]": [...head, "[model_providers]", 'codex-lb.base_url = "http://lb"', 'codex-lb.env_key = "CODEX_LB_API_KEY"', 'other.base_url = "http://other"']
+  };
+  for (const [name, lines] of Object.entries(forms)) {
+    const minimal = judgeCodexConfig(lines.join("\n"));
+    assert.ok(minimal, name);
+    assert.match(minimal, /^model_provider = "codex-lb"$/m, name);
+    assert.match(minimal, /^\[model_providers\]$/m, name);
+    assert.match(minimal, /^codex-lb[ .=]/m, name);
+    assert.match(minimal, /base_url = "http:\/\/lb"/, name);
+    assert.match(minimal, /env_key = "CODEX_LB_API_KEY"/, name);
+    assert.doesNotMatch(minimal, /other|mcp_servers/, name);
+    // Top-level keys stay before the first table.
+    assert.ok(minimal.indexOf("web_search") < minimal.indexOf("[model_providers]"), name);
+  }
 });

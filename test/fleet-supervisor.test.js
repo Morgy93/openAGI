@@ -3300,10 +3300,17 @@ test("a cached send is held by the same-message guard until the agent replies", 
   const { supervisor, delivered } = fixture(t, { mode: "auto", now: () => clock, deps: { judge } });
   await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 1);
-  // Past the cooldown, no reply, same chat: the cached verdict is not resent.
+  // Past the cooldown, no reply, same chat: the send is now an earlier
+  // nudge, so the chat is read again, and the same words are not resent.
   clock += 30 * MIN;
   await supervisor.tick({ reason: "test" });
-  assert.equal(judge.calls.length, 1);
+  assert.equal(judge.calls.length, 2);
+  assert.equal(delivered.length, 1);
+  assert.match(judgeRow(supervisor).reason, /^judge: same message sent at \d\d:\d\d; no reply since$/);
+  // Nothing new since: the cached verdict is held the same way.
+  clock += 30 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 2);
   assert.equal(delivered.length, 1);
   assert.match(judgeRow(supervisor).reason, /^judge: same message sent at \d\d:\d\d; no reply since$/);
 });
@@ -3334,6 +3341,24 @@ test("at most 6 judge calls per scan; the rest wait for the next", async (t) => 
   await supervisor.tick({ reason: "test" });
   assert.equal(judge.calls.length, 8);
   assert.equal(delivered.length, 0);
+});
+
+test("threads the judge keeps failing on do not hold the per-scan cap", async (t) => {
+  const threads = Array.from({ length: 8 }, (_, n) => makeThread({ key: `codex:t${n}`, id: `t${n}`, cwd: `/work/t${n}` }));
+  let clock = NOW;
+  const judge = { enabled: true, calls: [], judge: async (input) => { judge.calls.push(input.thread.key); throw new Error("bad input"); } };
+  const { supervisor } = fixture(t, { mode: "auto", threads, now: () => clock, limits: { maxThreads: 20 }, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 6);
+  const first = new Set(judge.calls);
+  // Past the failure pause: the two never read go first.
+  clock += 6 * MIN;
+  await supervisor.tick({ reason: "test" });
+  const second = judge.calls.slice(6);
+  assert.equal(second.length, 6);
+  for (const key of ["codex:t0", "codex:t1", "codex:t2", "codex:t3", "codex:t4", "codex:t5", "codex:t6", "codex:t7"].filter((key) => !first.has(key))) {
+    assert.ok(second.includes(key), `${key} read on the second scan`);
+  }
 });
 
 test("a judge question stays open while the judge cannot read the chat, and closes on its wait", async (t) => {
@@ -3564,6 +3589,18 @@ test("the verdict cache key holds every fact the prompt shows, but not the clock
   assert.notEqual(judgeCacheKey(thread, { ...decision, message: "A custom playbook line." }, pr, classified), key);
   // Only the elapsed time moved: same key.
   assert.equal(judgeCacheKey(thread, { ...decision, reason: "waiting 35m; not ready: CI red" }, pr, classified), key);
+});
+
+test("the judge cache key changes with the earlier nudges the prompt shows", () => {
+  const thread = makeThread();
+  const decision = { playbook: "merge-ready", reason: "r", message: "m" };
+  const nudgeA = { playbook: "merge-ready", at: "2026-10-11T11:00:00.000Z", message: "A" };
+  const nudgeB = { playbook: "infra-recovered", at: "2026-10-11T11:30:00.000Z", message: "B" };
+  const key = judgeCacheKey(thread, decision, null, null, [nudgeA]);
+  assert.equal(judgeCacheKey(thread, decision, null, null, [{ ...nudgeA }]), key);
+  assert.notEqual(judgeCacheKey(thread, decision, null, null, [nudgeA, nudgeB]), key);
+  assert.notEqual(judgeCacheKey(thread, decision, null, null, []), key);
+  assert.notEqual(judgeCacheKey(thread, decision, null, null, [{ ...nudgeA, message: "A2" }]), key);
 });
 
 test("a re-read of the same reply worded differently is the same judge question", async (t) => {
