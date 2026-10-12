@@ -19,6 +19,8 @@ struct OverlayView: View {
   var onCollapse: () -> Void = {}
   var onExpand: () -> Void = {}
   var onContentChange: () -> Void = {}
+  var onDragBegan: () -> Void = {}
+  var onDragEnded: (NSPoint) -> Void = { _ in }
 
   // Keep the resize watcher chains short: the release compiler times out on
   // a single chain of sixteen generic .onChange overloads. Opaque helper
@@ -182,34 +184,49 @@ struct OverlayView: View {
     return state.briefContext == nil ? "Ask about what you're looking at…" : "Ask about this item…"
   }
 
+  // The pill is drawn by SwiftUI but handled by OverlayDragView on top: a
+  // SwiftUI Button here took the mouse-down, so the pill could never be
+  // dragged. The handle clicks (expand), drags, hovers, and is the VoiceOver
+  // button. It covers the whole 44pt panel and sits outside scaleEffect, so
+  // the hover scale never changes the hit area.
   private var pill: some View {
-    Button(action: {
-      withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = true }
-      onExpand()
-    }) {
-      ZStack {
-        Circle().fill(Color.accentColor).frame(width: 18, height: 18)
-        if pillBadgeCount > 0 {
-          Text("\(pillBadgeCount)")
-            .font(.system(size: 9, weight: .bold)).foregroundColor(.white)
-        }
+    ZStack {
+      Circle().fill(Color.accentColor).frame(width: 18, height: 18)
+      if pillBadgeCount > 0 {
+        Text("\(pillBadgeCount)")
+          .font(.system(size: 9, weight: .bold)).foregroundColor(.white)
       }
-      .padding(9)
-      .contentShape(Circle())
     }
-    .buttonStyle(.plain)
+    .padding(9)
     .background(.ultraThinMaterial, in: Circle())
     .overlay(Circle().strokeBorder(.white.opacity(pillHovered ? 0.25 : 0.1), lineWidth: 1))
     .scaleEffect(pillHovered ? 1.08 : 1.0)
     .animation(.easeOut(duration: 0.12), value: pillHovered)
-    .onHover { pillHovered = $0 }
-    .help("Quick Ask (⌥Space)")
+    .allowsHitTesting(false)
+    .accessibilityHidden(true)
+    .frame(width: 44, height: 44)
+    .overlay {
+      OverlayDragHandle(
+        onClick: expandPill,
+        onHover: { pillHovered = $0 },
+        onDragBegan: onDragBegan,
+        onDragEnded: onDragEnded,
+        toolTip: "Quick Ask (⌥Space) · drag to move",
+        accessibilityButtonLabel: pillBadgeCount > 0 ? "Quick Ask, \(pillBadgeCount) waiting" : "Quick Ask")
+    }
+  }
+
+  private func expandPill() {
+    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = true }
+    onExpand()
   }
 
   private var expandedPanel: some View {
     VStack(alignment: .leading, spacing: 8) {
       HStack {
+        // Not hit-testable, so a press on the title reaches the drag handle.
         Text("Ask OpenAGI").font(.caption).foregroundStyle(.secondary)
+          .allowsHitTesting(false)
         if fleet.available {
           Picker("View", selection: Binding(get: { state.tab }, set: { state.selectTab($0) })) {
             Text("Tasks").tag(OverlayTab.tasks)
@@ -231,6 +248,11 @@ struct OverlayView: View {
         }
         .buttonStyle(.plain)
         .help("Collapse (Esc)")
+      }
+      // Drag the panel by its header. As a background, the Picker and the
+      // close button stay on top and keep their clicks.
+      .background {
+        OverlayDragHandle(onDragBegan: onDragBegan, onDragEnded: onDragEnded, toolTip: "Drag to move")
       }
       if app.status == .down {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
