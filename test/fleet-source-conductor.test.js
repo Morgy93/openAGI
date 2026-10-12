@@ -428,20 +428,35 @@ test("a pending AskUserQuestion is the owner's question; its answer clears it", 
   threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
   assert.equal(threads["s-idle"].meta.pendingQuestion, null);
 
-  // Older Conductor reports an AskUserQuestion wait as idle: the unanswered
-  // call still holds the card. Its answer closes it, idle or not.
+  // An idle session's last row is an unanswered ask and no process is alive
+  // (600a2afc): the card died with its process, so the session reads stopped.
   const idle = new DatabaseSync(file);
   addMessage(idle, "s-idle", "assistant", ask("toolu_ask3"), iso(0.5 * MIN));
   idle.prepare("UPDATE sessions SET status = 'idle' WHERE id = 's-idle'").run();
   idle.close();
-  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+  // A nudge resumes it; no owner card asks for a pick nobody can make.
+  assert.equal(classifyThread(threads["s-idle"], { now: NOW, config: makeConfig(home) }).state, "idle-no-pr");
+  // A process restarted after the call is not the one that asked.
+  const restarted = new Map([["s-idle", { peerName: "cairo", pid: 901, status: "idle", waitingFor: null, startedAt: iso(0.4 * MIN) }]]);
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: restarted }));
+  assert.equal(threads["s-idle"].meta.pendingCard, null);
+
+  // Older Conductor reports an AskUserQuestion wait as idle: while the
+  // process that asked lives, the unanswered call still holds the card.
+  writePeer(home, { pid: 901, sessionId: "s-idle", name: "cairo", status: "idle", updatedAt: NOW, startedAt: NOW - 10 * MIN });
+  const alive = { now: NOW, isPidAlive: (pid) => pid === 901 };
+  threads = byId(await listConductorThreads(makeConfig(home), alive));
   assert.equal(threads["s-idle"].meta.pendingCard?.cardId, "toolu_ask3");
   assert.equal(threads["s-idle"].meta.pendingQuestion?.text, "Split into two PRs. Go? (Go / Change it)");
   assert.equal(classifyThread(threads["s-idle"], { now: NOW, config: makeConfig(home) }).state, "needs-human");
+  // Its answer closes it, idle or not.
   const answered = new DatabaseSync(file);
   addMessage(answered, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ask3", content: "Go" }] } }, iso(0.2 * MIN));
   answered.close();
-  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  threads = byId(await listConductorThreads(makeConfig(home), alive));
   assert.equal(threads["s-idle"].meta.pendingCard, null);
   // An errored session lost its card, whatever its rows say.
   const errored = new DatabaseSync(file);

@@ -816,16 +816,24 @@ function capThreads(threads, max) {
 }
 
 // Threads past the paging stop whose history index holds an open card,
-// paged to the lookback boundary (at most CARD_SCAN_PAGES pages).
-function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes }) {
+// paged to the lookback boundary (at most CARD_SCAN_PAGES pages). Every row
+// whose card was settled (read, or one that never asks) joins cardScanned.
+function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes, cardScanned }) {
   const carded = [];
   for (let page = 0; after && page < CARD_SCAN_PAGES; page += 1) {
     const rows = readThreadRows(db, cutoff, pageSize, after);
     carded.push(...rows.filter((row) => {
-      if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) return false;
+      const key = threadKey("codex", String(row.id));
+      if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) {
+        cardScanned?.add(key);
+        return false;
+      }
       let bytes = null;
       try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
-      return readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now })?.items?.length > 0;
+      // A history index that does not cover the rollout (undefined) leaves the card unknown.
+      const card = readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now });
+      if (card !== undefined) cardScanned?.add(key);
+      return card?.items?.length > 0;
     }));
     after = rows.length < pageSize ? null : rows.at(-1);
   }
@@ -848,6 +856,9 @@ export async function listCodexThreads(config, options = {}) {
   const cutoff = now - config.lookbackHours * HOUR;
   const pageSize = limits.maxThreads * 5;
   const built = [];
+  // options.cardScanned (a Set): the keys of threads whose open card this
+  // scan settled. One missing from the capped result has no card open.
+  const cardScanned = options.cardScanned instanceof Set ? options.cardScanned : null;
   // A history index that will not open leaves every card to the tails.
   const history = options.history === undefined ? await openThreadHistory(config.paths.codexHome) : options.history;
   try {
@@ -864,6 +875,7 @@ export async function listCodexThreads(config, options = {}) {
         // The catalog query lets settings-only writes through; the last turn decides.
         if (Date.parse(thread.lastActivityAt ?? "") < cutoff) continue;
         built.push(thread);
+        cardScanned?.add(thread.key);
         if (!thread.excluded) inScope += 1;
       }
       if (rows.length < pageSize) break;
@@ -877,7 +889,7 @@ export async function listCodexThreads(config, options = {}) {
     // capThreads keeps any thread with an open card, so the older rows the
     // loop stopped before are checked for one too, page by page to the
     // lookback, in the history index only (no tail reads).
-    if (unread && history) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES }));
+    if (unread && history) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES, cardScanned }));
     // A failed title scan marks nothing shared; identity checks still see
     // every thread the supervisor retained.
     let shared = { names: new Set(), labels: new Map() };

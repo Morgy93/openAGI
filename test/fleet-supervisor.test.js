@@ -3080,6 +3080,31 @@ test("an automation thread's card is asked without reading its git or PR; the su
   assert.equal(cardQuestions(supervisor).length, 0);
 });
 
+test("a card past a capped Codex scan closes once that card scan no longer finds it", async (t) => {
+  // maxThreads 1: one in-scope thread fills the cap, so Codex reads capped.
+  const busy = makeThread({ key: "codex:busy", id: "busy", agentStatus: "running", lastActivityAt: ago(MIN) });
+  const auto = carding({ key: "codex:auto", kind: "codex", id: "auto", cwd: "/work/auto", excluded: "automation", prRefs: [] });
+  let listed = [busy, auto];
+  let scanned = ["codex:busy", "codex:auto"];
+  const listCodexThreads = async (config, options) => {
+    for (const key of scanned) options.cardScanned?.add(key);
+    return listed;
+  };
+  const { supervisor } = fixture(t, { threads: [], limits: { maxThreads: 1 }, deps: { listCodexThreads } });
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.threadKey), ["codex:auto"]);
+  // Answered: the source no longer keeps the thread, and the card scan did
+  // not read it this time. Capped, so its absence proves nothing yet.
+  listed = [busy];
+  scanned = ["codex:busy"];
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 1);
+  // The complete card scan read it and found no card open: the question closes.
+  scanned = ["codex:busy", "codex:auto"];
+  await supervisor.tick();
+  assert.equal(cardQuestions(supervisor).length, 0);
+});
+
 test("the review never sees or closes a card question", async (t) => {
   const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "looks done" })));
   const { supervisor } = fixture(t, { threads: [carding()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });

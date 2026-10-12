@@ -1269,9 +1269,11 @@ export class FleetSupervisor {
     let peers = new Map();
     try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
 
+    // The Codex keys whose open card this tick's scan settled (see act).
+    const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
     const [codexThreads, claudeThreads, conductorThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
-      guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run }), []),
+      guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
       guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
       guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
       guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
@@ -1390,7 +1392,7 @@ export class FleetSupervisor {
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away", storageUnknown });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1534,7 +1536,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1697,9 +1699,11 @@ export class FleetSupervisor {
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
-      // source that hit its cap only proves absence for excluded threads.
+      // source that hit its cap only proves absence for excluded threads,
+      // and for a card its complete card scan settled (no card open now).
       const known = question.threadKey ? byKey.get(question.threadKey) : null;
-      const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
+      const cardSettled = question.kind === "agent-card" && cardScanned.has(question.threadKey);
+      const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]) && !cardSettled;
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       // A group member a capped scan left out may still be failing.
       if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;
