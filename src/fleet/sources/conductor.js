@@ -84,7 +84,7 @@ function eventText(event) {
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    pendingAsks: new Map(), fullText: "", fullAt: null
+    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
@@ -93,7 +93,8 @@ function summarizeTail(rowsNewestFirst) {
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
-      if (text && !text.startsWith(SUPERVISOR_PREFIX)) {
+      if (text.startsWith(SUPERVISOR_PREFIX)) summary.lastSupervisorAt = at;
+      else if (text) {
         summary.lastUserText = text;
         summary.lastUserAt = at;
       }
@@ -385,6 +386,7 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
       turnStartedAt: summary.turnStartedAt ?? summary.lastUserAt,
       abortReason,
       abortedAt,
+      lastSupervisorAt: summary.lastSupervisorAt,
       blockedOnOwner,
       pendingQuestion: pendingAsk
         ? { text: clampText(redactSecrets(pendingAsk.text), limits.bodyMax), options: pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pendingAsk.at }

@@ -202,6 +202,8 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.equal(idle.lastAgentAt, iso(20 * MIN));
   assert.equal(idle.lastUserText, "get it green");
   assert.equal(idle.lastUserAt, iso(30 * MIN));
+  // The supervisor's message is not the owner's; it is stamped on its own.
+  assert.equal(idle.meta.lastSupervisorAt, iso(16 * MIN));
   assert.equal(idle.meta.turnStartedAt, iso(29 * MIN));
   assert.deepEqual(idle.openTasks, []);
 
@@ -213,6 +215,7 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   const aborted = threads["s-abort"];
   assert.equal(aborted.agentStatus, "aborted");
   assert.equal(aborted.meta.abortReason, "aborted by user");
+  assert.equal(aborted.meta.lastSupervisorAt, null);
   assert.equal(aborted.error, null);
 
   assert.equal(threads["s-self"].excluded, "self");

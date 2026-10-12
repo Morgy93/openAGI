@@ -401,7 +401,8 @@ function exclusionReason(thread, { pr, localGit, config }) {
 // abort, or the turn was one the supervisor started (ownerStoppedNudge).
 export function deliberateStop(thread) {
   if (thread.agentStatus !== "aborted") return false;
-  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return ownerStoppedNudge(thread);
+  if (ownerStoppedNudge(thread)) return true;
+  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
   const userAt = Date.parse(thread.lastUserAt ?? "");
   // Later metadata writes bump lastActivityAt; the source's abort time does not move.
   const abortAt = Date.parse(thread.meta?.abortedAt ?? thread.lastActivityAt ?? "");
@@ -415,11 +416,17 @@ export function deliberateStop(thread) {
 const OWNER_ABORT = /^(aborted by user|interrupted)$/i;
 
 // The owner stopped a turn the supervisor started, at any point in it: a no
-// to that nudge. Nothing goes to the thread until a new turn starts.
+// to that nudge. Nothing goes to the thread until a new turn starts. Readers
+// keep supervisor messages out of lastUserText and stamp meta.lastSupervisorAt
+// instead, so the stopped turn is the supervisor's when that is the newest
+// message; an older reader may still pass the message itself through.
 export function ownerStoppedNudge(thread) {
   if (thread.agentStatus !== "aborted") return false;
-  if (!String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
-  return OWNER_ABORT.test(String(thread.meta?.abortReason ?? "").trim());
+  if (!OWNER_ABORT.test(String(thread.meta?.abortReason ?? "").trim())) return false;
+  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return true;
+  const supervisorAt = Date.parse(thread.meta?.lastSupervisorAt ?? "");
+  if (!Number.isFinite(supervisorAt)) return false;
+  return !(Date.parse(thread.lastUserAt ?? "") > supervisorAt);
 }
 
 function isRunning(thread, now, limits) {
