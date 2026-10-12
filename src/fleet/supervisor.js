@@ -1287,14 +1287,17 @@ export class FleetSupervisor {
     // Conductor-hosted Codex threads learn which Conductor session shows them.
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [] }));
     const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
-    const inScope = threads
+    const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
+    const ranked = threads
       .filter((thread) => !thread.excluded)
-      .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))
-      .slice(0, config.limits.maxThreads);
+      .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
+    // An older thread past the cap still has its open card asked: the Codex
+    // source kept it for that card alone.
+    const inScope = [...ranked.slice(0, config.limits.maxThreads), ...ranked.slice(config.limits.maxThreads).filter(hasCard)];
     // An automation or no-repo thread's open question card still needs the
     // owner. It is decided (asked) with the rest, but never read for git or
     // PRs, and classify gives it nothing to nudge.
-    const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && thread.meta?.pendingCard?.items?.length > 0);
+    const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && hasCard(thread));
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);

@@ -584,6 +584,17 @@ test("a markdown Blocked-on list naming the owner's decision asks the owner, rea
   assert.deepEqual(section.items.map((item) => item.tag), ["owner", "passive", "other", "other"]);
 });
 
+test("the same generic blocker over other choices is a new ask key", () => {
+  const report = (p1s) => ["Not ready.", "", "**Open: 2.** Both need your call.", ...p1s.map((p1) => `- ${p1}`), "", "**Blocked on:**", "- **Your decision** on the two P1s above."].join("\n");
+  const keyOf = (text) => classify(makeThread({ lastAgentText: text })).ask.key;
+  const first = keyOf(report(["P1: migration drops the audit table", "P1: token logged in plaintext"]));
+  assert.equal(keyOf(report(["P1: migration drops the audit table", "P1: token logged in plaintext"])), first);
+  assert.notEqual(keyOf(report(["P1: cache key collides across forks", "P1: retry loop never backs off"])), first);
+  // Other sub-bullet choices under the same owner item are a new ask too.
+  const own = (choices) => `**Blocked on:**\n- Your call on the release:\n${choices.map((choice) => `  - ${choice}`).join("\n")}`;
+  assert.notEqual(keyOf(own(["Merge now", "Keep it open"])), keyOf(own(["Revert it", "Hold until Monday"])));
+});
+
 test("the short Blocked-on form asks; nothing, CI, or a third party's approval does not", () => {
   const ask = classify(makeThread({ lastAgentText: "**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head are running" }));
   assert.equal(ask.state, "needs-human");

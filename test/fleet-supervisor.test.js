@@ -3105,6 +3105,18 @@ test("a card past a capped Codex scan closes once that card scan no longer finds
   assert.equal(cardQuestions(supervisor).length, 0);
 });
 
+test("an in-scope thread past the supervisor's cap still has its card asked", async (t) => {
+  // maxThreads 1: a newer thread fills the cap; the older one is kept only for its card.
+  const busy = makeThread({ key: "codex:busy", id: "busy", agentStatus: "running", lastActivityAt: ago(MIN) });
+  const older = carding({ key: "codex:older", kind: "codex", id: "older", cwd: "/work/older", lastActivityAt: ago(60 * MIN) });
+  const quiet = makeThread({ key: "codex:quiet", id: "quiet", cwd: "/work/quiet", agentStatus: "idle", lastActivityAt: ago(90 * MIN) });
+  const { supervisor } = fixture(t, { threads: [busy, older, quiet], limits: { maxThreads: 1 } });
+  await supervisor.tick();
+  assert.deepEqual(cardQuestions(supervisor).map((q) => q.threadKey), ["codex:older"]);
+  // A thread past the cap with no card is still left out.
+  assert.equal(supervisor.getState().snapshot.counts.inScope, 2);
+});
+
 test("the review never sees or closes a card question", async (t) => {
   const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "looks done" })));
   const { supervisor } = fixture(t, { threads: [carding()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });

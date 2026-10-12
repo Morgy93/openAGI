@@ -707,7 +707,11 @@ function blockedAsk(blocked, full = "") {
   const labels = (own.length ? own : alternatives(pointed?.bullets ?? [])).map((option) => clampText(option, 40));
   const text = owner.map((item) => item.text.replace(/[.;,\s]+$/, "")).join(" / ");
   const context = pointed ? pointed.bullets.slice(0, 3).map((bullet) => clampText(bullet, 90)).join(" | ") : "";
-  return { topic: "decision", blocked: true, text, context, options: [...labels, "open thread"], key: shortHash(text) };
+  // The choices are part of the ask: the same generic blocker over other
+  // P1s or other sub-bullets is a new decision, not the one answered.
+  const choices = [...owner.flatMap((item) => item.options ?? []), ...(pointed?.bullets ?? [])].map((choice) => String(choice).replace(/\s+/g, " ").trim()).filter(Boolean);
+  const key = shortHash(choices.length ? [text, ...choices].join("\n") : text);
+  return { topic: "decision", blocked: true, text, context, options: [...labels, "open thread"], key };
 }
 
 function isRoutineStep(text) {
