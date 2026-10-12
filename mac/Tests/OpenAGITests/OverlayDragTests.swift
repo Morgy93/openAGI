@@ -35,6 +35,7 @@ final class OverlayDragTests: XCTestCase {
     defaults.set(Double(o.x), forKey: OverlayController.pillOriginXKey)
     defaults.set(Double(o.y), forKey: OverlayController.pillOriginYKey)
     let c = OverlayController(defaults: defaults)
+    c.animatesResizes = false
     controllers.append(c)
     c.show()
     let panel = try XCTUnwrap(c.panel)
@@ -176,39 +177,119 @@ final class OverlayDragTests: XCTestCase {
     XCTAssertEqual(OverlayController.clampedFrame(inside, in: visible), inside)
   }
 
-  func testPillFrameKeepsTopAndNearEdge() {
-    let vf = NSRect(x: 0, y: 0, width: 1000, height: 800)
-    // Left half: keeps the left edge.
-    XCTAssertEqual(OverlayController.pillFrame(for: NSRect(x: 100, y: 300, width: 320, height: 400), visibleFrame: vf),
-                   NSRect(x: 100, y: 656, width: 44, height: 44))
-    // Right half: keeps the right edge, as sizeToContent does when collapsing.
-    XCTAssertEqual(OverlayController.pillFrame(for: NSRect(x: 600, y: 300, width: 320, height: 400), visibleFrame: vf),
-                   NSRect(x: 876, y: 656, width: 44, height: 44))
+  /// Spots where the old frame-derived collapse moved the dot: the bottom
+  /// edge (expanded panel clamped upward), just either side of the screen's
+  /// center (expanded panel's midX lands on the other half), and corners.
+  private var parkingSpots: [NSPoint] {
+    let m = OverlayController.screenMargin
+    let s: CGFloat = 44
+    return [
+      NSPoint(x: visible.maxX - m - s, y: visible.minY + m),          // bottom-right
+      NSPoint(x: visible.minX + m, y: visible.minY + m),              // bottom-left
+      NSPoint(x: visible.midX - 100 - s / 2, y: visible.midY),        // left of center
+      NSPoint(x: visible.midX - 50 - s / 2, y: visible.midY),
+      NSPoint(x: visible.midX + 50 - s / 2, y: visible.midY),         // right of center
+      NSPoint(x: visible.midX + 100 - s / 2, y: visible.midY),
+      NSPoint(x: visible.maxX - m - s, y: visible.maxY - m - s),      // top-right
+      NSPoint(x: visible.minX + m, y: visible.maxY - m - s),          // top-left
+    ]
   }
 
-  /// A position saved while expanded must bring the pill back exactly where
-  /// collapsing would have put it, on both halves of the screen.
-  func testSavedWhileExpandedRestoresWithoutJump() throws {
-    for x in [visible.minX + 100, visible.maxX - 500] {
+  func testOpenCloseReturnsDotToWhereItWasParked() throws {
+    for spot in parkingSpots {
       OverlayState.shared.expanded = false
-      let (first, panel) = try showPill(at: NSPoint(x: x, y: visible.minY + 300))
+      let (c, panel) = try showPill(at: spot)
+      let parked = panel.frame
+      for round in 1...2 {
+        c.toggle() // expand
+        settle()
+        let open = panel.frame
+        XCTAssertEqual(open.width, 320, "\(spot) round \(round)")
+        XCTAssertTrue(visible.contains(open), "\(spot) round \(round): \(open) off-screen")
+        // Grows away from the nearer half: right of center keeps the right edge.
+        if parked.midX > visible.midX, open.minX > visible.minX + OverlayController.screenMargin {
+          XCTAssertEqual(open.maxX, parked.maxX, "\(spot)")
+        } else if parked.midX <= visible.midX, open.maxX < visible.maxX - OverlayController.screenMargin {
+          XCTAssertEqual(open.minX, parked.minX, "\(spot)")
+        }
+        c.collapse()
+        settle()
+        XCTAssertEqual(panel.frame, parked, "\(spot) round \(round): dot moved after open/close")
+      }
+      XCTAssertEqual(savedPillOrigin(), spot, "open/close must not change the saved spot")
+      panel.close()
+    }
+  }
+
+  func testDotDroppedNearCenterStaysPutAfterClickAndEsc() throws {
+    for dx: CGFloat in [-50, 50] {
+      OverlayState.shared.expanded = false
+      let (c, panel) = try showPill(at: NSPoint(x: visible.minX + 300, y: visible.midY))
+      let grab = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+      let drop = NSPoint(x: visible.midX + dx, y: grab.y)
+      try send(.leftMouseDown, to: panel, screen: grab)
+      try send(.leftMouseDragged, to: panel, screen: drop)
+      try send(.leftMouseUp, to: panel, screen: drop)
+      let dropped = panel.frame
+      XCTAssertEqual(dropped.midX, drop.x)
+      XCTAssertEqual(savedPillOrigin(), dropped.origin)
+
+      // Click opens, Esc closes.
+      try send(.leftMouseDown, to: panel, screen: drop)
+      try send(.leftMouseUp, to: panel, screen: drop)
+      settle()
+      XCTAssertTrue(OverlayState.shared.expanded)
+      XCTAssertEqual(panel.frame.width, 320)
+      panel.cancelOperation(nil)
+      settle()
+      XCTAssertFalse(OverlayState.shared.expanded)
+      XCTAssertEqual(panel.frame, dropped, "dx=\(dx)")
+      XCTAssertEqual(savedPillOrigin(), dropped.origin)
+      panel.close()
+    }
+  }
+
+  /// A spot saved while expanded (quit with the panel open) restores the dot
+  /// exactly where it was parked, not a spot derived from the expanded frame.
+  func testSavedWhileExpandedRestoresWithoutJump() throws {
+    for spot in parkingSpots {
+      OverlayState.shared.expanded = false
+      let (first, panel) = try showPill(at: spot)
+      let parked = panel.frame
       first.toggle() // expand
       settle()
-      let expanded = panel.frame
-      XCTAssertEqual(expanded.width, 320)
+      XCTAssertEqual(panel.frame.width, 320)
       first.persistPosition()
-      first.collapse()
-      settle()
-      let collapsed = panel.frame
       panel.close()
 
+      OverlayState.shared.expanded = false
       let second = OverlayController(defaults: defaults)
       controllers.append(second)
       second.show()
-      let restored = try XCTUnwrap(second.panel).frame
-      XCTAssertEqual(restored, collapsed, "x=\(x)")
-      XCTAssertEqual(restored.maxY, expanded.maxY)
+      XCTAssertEqual(try XCTUnwrap(second.panel).frame, parked, "\(spot)")
     }
+  }
+
+  /// Dragging the open panel by its header carries the dot along by the same
+  /// amount, even when the open panel had been pushed up off a bottom dot.
+  func testHeaderDragMovesDotByTheSameAmount() throws {
+    let m = OverlayController.screenMargin
+    let spot = NSPoint(x: visible.maxX - m - 44, y: visible.minY + m)
+    let (c, panel) = try showPill(at: spot)
+    c.toggle()
+    settle()
+    let open = panel.frame
+    XCTAssertGreaterThan(open.maxY, spot.y + 44, "expanded panel should be clamped upward")
+    c.beginDrag()
+    panel.setFrameOrigin(open.origin.offset(-40, 30))
+    c.endDrag(cursor: NSPoint(x: panel.frame.midX, y: panel.frame.maxY - 10))
+    XCTAssertEqual(panel.frame.origin, open.origin.offset(-40, 30))
+    let home = spot.offset(-40, 30)
+    XCTAssertEqual(c.pillHome?.origin, home)
+    XCTAssertEqual(savedPillOrigin(), home)
+    c.collapse()
+    settle()
+    XCTAssertEqual(panel.frame, NSRect(origin: home, size: NSSize(width: 44, height: 44)))
   }
 
   func testSavedSpotOffEveryScreenFallsBackToDefault() throws {
@@ -268,8 +349,8 @@ final class OverlayDragTests: XCTestCase {
     try send(.leftMouseUp, to: panel, screen: start.offset(-40, 20))
     XCTAssertEqual(panel.frame.origin, origin.offset(-40, 20))
     XCTAssertTrue(OverlayState.shared.expanded, "dragging the header must not collapse")
-    let saved = OverlayController.pillFrame(for: panel.frame, visibleFrame: visible)
-    XCTAssertEqual(savedPillOrigin(), saved.origin)
+    // The dot moved with the panel.
+    XCTAssertEqual(savedPillOrigin(), NSPoint(x: visible.minX + 300, y: visible.minY + 300).offset(-40, 20))
   }
 
   /// Same header layout with the Supervisor picker (FleetConsumer.available
@@ -311,8 +392,11 @@ final class OverlayDragTests: XCTestCase {
   }
 
   /// Let the animated resize (0.22s) and queued content-change resizes finish.
+  /// RunLoop.run(until:) can return early when nothing is scheduled, so spin
+  /// in short steps until the full second has passed.
   private func settle() {
-    RunLoop.main.run(until: Date().addingTimeInterval(1.0))
+    let end = Date().addingTimeInterval(1.0)
+    while Date() < end { RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02)) }
   }
 
   private func send(_ type: NSEvent.EventType, to panel: NSPanel, screen: NSPoint) throws {

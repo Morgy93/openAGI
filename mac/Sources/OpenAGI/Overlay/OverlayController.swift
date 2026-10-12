@@ -10,6 +10,23 @@ final class OverlayController {
   /// True while an OverlayDragView is moving the panel. Content-driven
   /// resizes wait for the drop so they never fight the drag.
   private(set) var isDragging = false
+  /// Where the collapsed dot lives. Collapsing always returns here, expanding
+  /// grows from here, and this is what gets saved. Deriving the dot from the
+  /// expanded frame instead moved it whenever the expanded panel had been
+  /// clamped (dot near the bottom) or had grown past the screen's center.
+  private(set) var pillHome: NSRect?
+  /// Which edge the expanded panel keeps lined up with the dot. Chosen once,
+  /// from the dot, when expanding; reused until the next collapse.
+  private var expandAnchorRight: Bool?
+  /// Whether the last layout sizeToContent applied was the expanded panel.
+  private var laidOutExpanded = false
+  /// The frame the last layout asked for. Mid-animation, panel.frame is an
+  /// in-between frame; later resizes build on where the panel is going.
+  private var layoutFrame: NSRect?
+  /// Tests turn this off so frames land without waiting on window animations.
+  var animatesResizes = true
+  private var dragStartFrame: NSRect?
+  private var dragStartHome: NSRect?
 
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
@@ -129,19 +146,33 @@ final class OverlayController {
       ctx.duration = 0
       p.animator().setFrame(p.frame, display: false)
     }
+    dragStartFrame = p.frame
+    dragStartHome = pillHome
   }
 
   /// Drop: fit the panel onto the display under the cursor (shrinking it for
-  /// a shorter display), re-measure content that changed mid-drag, and save.
+  /// a shorter display), move the dot's home by the same amount the panel
+  /// moved, re-measure content that changed mid-drag, and save.
   func endDrag(cursor: NSPoint) {
     guard isDragging else { return }
     isDragging = false
     guard let p = panel else { return }
     let screen = NSScreen.screens.first { $0.frame.contains(cursor) } ?? p.screen ?? NSScreen.main
+    var fitted = p.frame
     if let vf = screen?.visibleFrame {
-      let fitted = Self.clampedFrame(p.frame, in: vf)
+      fitted = Self.clampedFrame(p.frame, in: vf)
       if fitted != p.frame { p.setFrame(fitted, display: true) }
     }
+    let start = dragStartFrame ?? fitted
+    let startHome = dragStartHome ?? Self.pillFrame(for: start, anchorRight: expandAnchorRight ?? false)
+    dragStartFrame = nil
+    dragStartHome = nil
+    // The dot rides along with the panel: same x shift, same top-edge shift
+    // (the clamp keeps the top when it shrinks the panel).
+    var home = startHome.offsetBy(dx: fitted.minX - start.minX, dy: fitted.maxY - start.maxY)
+    if let vf = screen?.visibleFrame { home = Self.clampedFrame(home, in: vf) }
+    pillHome = home
+    layoutFrame = fitted
     sizeToContent(animate: false)
     persistPosition()
   }
@@ -160,44 +191,77 @@ final class OverlayController {
       width: w, height: h)
   }
 
-  /// The frame the collapsed pill takes for a panel at `frame`, using the same
-  /// anchoring as sizeToContent: top edge fixed, nearer horizontal edge kept.
-  static func pillFrame(for frame: NSRect, visibleFrame vf: NSRect?) -> NSRect {
-    let anchorRight = vf.map { frame.midX > $0.midX } ?? false
+  /// The pill-sized box at the top corner of `frame` on the anchored side.
+  /// Only a fallback for when no home has been recorded yet.
+  static func pillFrame(for frame: NSRect, anchorRight: Bool) -> NSRect {
     let x = anchorRight ? frame.maxX - pillSize : frame.minX
     return NSRect(x: x, y: frame.maxY - pillSize, width: pillSize, height: pillSize)
   }
 
+  /// The expanded panel's frame grown from the dot at `home`: top edges
+  /// aligned, the anchored side's edges aligned, then clamped on-screen.
+  static func expandedFrame(from home: NSRect, size: NSSize, anchorRight: Bool, in vf: NSRect) -> NSRect {
+    let x = anchorRight ? home.maxX - size.width : home.minX
+    return clampedFrame(NSRect(x: x, y: home.maxY - size.height, width: size.width, height: size.height), in: vf)
+  }
+
+  /// The visible frame of the display showing `rect`, or the main display's.
+  private static func visibleFrame(containing rect: NSRect) -> NSRect? {
+    func overlap(_ s: NSScreen) -> CGFloat {
+      let r = s.visibleFrame.intersection(rect)
+      return r.isNull ? 0 : r.width * r.height
+    }
+    let screen = NSScreen.screens.max { overlap($0) < overlap($1) }
+    if let screen, overlap(screen) > 0 { return screen.visibleFrame }
+    return NSScreen.main?.visibleFrame
+  }
+
   /// Resize the panel to fit its SwiftUI content, animated, WITHOUT ever
-  /// leaving the screen: the top edge stays put while height grows downward,
-  /// the horizontal anchor is whichever edge is nearer a screen edge (so a
-  /// pill parked on the right expands leftward instead of off-screen), and
-  /// the final frame is clamped inside the screen's visible frame.
+  /// leaving the screen. Collapsed, the panel is exactly the dot's home.
+  /// Expanding grows from the home: top edges aligned, height growing
+  /// downward, and the side chosen once from the dot (a dot on the right half
+  /// grows leftward instead of off-screen). Later content changes keep the
+  /// expanded panel's top edge and that side. Every frame is clamped inside
+  /// the screen's visible frame.
   private func sizeToContent(animate: Bool = true) {
     // endDrag runs this once at the drop.
     guard !isDragging else { return }
     guard let p = panel, let host = p.contentView else { return }
-    let screen = p.screen ?? NSScreen.main
-    guard let vf = screen?.visibleFrame else { return }
-    let m = Self.screenMargin
+    let old = p.frame
+    let base = layoutFrame ?? old
     let expanded = OverlayState.shared.expanded
 
-    let fitting = host.fittingSize
-    let newW = expanded ? Self.expandedWidth : Self.pillSize
-    let maxH = vf.height - m * 2
-    let newH = min(max(Self.pillSize, fitting.height), maxH)
+    // The home must stay on a connected display.
+    let rawHome = pillHome ?? Self.pillFrame(for: old, anchorRight: expandAnchorRight ?? false)
+    guard let homeVF = Self.visibleFrame(containing: rawHome) else { return }
+    let home = Self.clampedFrame(rawHome, in: homeVF)
+    pillHome = home
 
-    let old = p.frame
-    let anchorRight = old.midX > vf.midX
-    var newX = anchorRight ? old.maxX - newW : old.minX
-    var newY = old.maxY - newH // keep the top edge fixed; grow downward
-
-    newX = min(max(vf.minX + m, newX), vf.maxX - m - newW)
-    newY = min(max(vf.minY + m, newY), vf.maxY - m - newH)
-    let target = NSRect(x: newX, y: newY, width: newW, height: newH)
+    let target: NSRect
+    if !expanded {
+      expandAnchorRight = nil
+      laidOutExpanded = false
+      target = home
+    } else {
+      let fromHome = !laidOutExpanded
+      let vf = fromHome ? homeVF : ((p.screen ?? NSScreen.main)?.visibleFrame ?? homeVF)
+      let maxH = vf.height - Self.screenMargin * 2
+      let size = NSSize(width: Self.expandedWidth, height: min(max(Self.pillSize, host.fittingSize.height), maxH))
+      let anchorRight = expandAnchorRight ?? (home.midX > homeVF.midX)
+      expandAnchorRight = anchorRight
+      laidOutExpanded = true
+      if fromHome {
+        target = Self.expandedFrame(from: home, size: size, anchorRight: anchorRight, in: vf)
+      } else {
+        // Already open: keep the top edge and the anchored side where they are.
+        let x = anchorRight ? base.maxX - size.width : base.minX
+        target = Self.clampedFrame(NSRect(x: x, y: base.maxY - size.height, width: size.width, height: size.height), in: vf)
+      }
+    }
+    layoutFrame = target
     guard target != old else { return }
 
-    if animate {
+    if animate && animatesResizes {
       NSAnimationContext.runAnimationGroup { ctx in
         ctx.duration = 0.22
         ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
@@ -211,19 +275,22 @@ final class OverlayController {
 
   private func positionPanel() {
     guard let p = panel, let screen = NSScreen.main else { return }
+    let home: NSRect
     if let saved = savedPillFrame(),
-       let home = NSScreen.screens.first(where: { $0.visibleFrame.insetBy(dx: -8, dy: -8).intersects(saved) }) {
+       let display = NSScreen.screens.first(where: { $0.visibleFrame.insetBy(dx: -8, dy: -8).intersects(saved) }) {
       // A saved spot is only trustworthy while a display still shows it;
       // after unplugging a monitor it can be entirely off-screen.
-      p.setFrame(Self.clampedFrame(saved, in: home.visibleFrame), display: false)
+      home = Self.clampedFrame(saved, in: display.visibleFrame)
     } else {
       let vf = screen.visibleFrame
       // Default: upper-right, where downward growth has the most room.
-      p.setFrameOrigin(NSPoint(
-        x: vf.maxX - Self.expandedWidth - 40,
-        y: vf.maxY - 200
-      ))
+      home = NSRect(x: vf.maxX - 40 - Self.pillSize, y: vf.maxY - 184,
+                    width: Self.pillSize, height: Self.pillSize)
     }
+    pillHome = home
+    laidOutExpanded = false
+    expandAnchorRight = nil
+    p.setFrame(home, display: false)
     sizeToContent(animate: false)
   }
 
@@ -244,7 +311,7 @@ final class OverlayController {
 
   func persistPosition() {
     guard let p = panel else { return }
-    let pill = Self.pillFrame(for: p.frame, visibleFrame: (p.screen ?? NSScreen.main)?.visibleFrame)
+    let pill = pillHome ?? Self.pillFrame(for: p.frame, anchorRight: expandAnchorRight ?? false)
     defaults.set(Double(pill.minX), forKey: Self.pillOriginXKey)
     defaults.set(Double(pill.minY), forKey: Self.pillOriginYKey)
   }
