@@ -26,6 +26,13 @@ object OpenAGIType {
     // Body: 17 regular. Task titles.
     val body = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 17.sp, lineHeight = 22.sp)
 
+    // Chat body: 16 regular. Message text in a conversation, where fitting
+    // more of a long reply on screen matters more than row-scale legibility.
+    val chatBody = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 22.sp)
+
+    // Chat title: 18 semibold. The one-row chat top bar's title.
+    val chatTitle = TextStyle(fontFamily = sans, fontWeight = FontWeight.SemiBold, fontSize = 18.sp, lineHeight = 24.sp)
+
     // Secondary: 15 regular, muted.
     val secondary = TextStyle(fontFamily = sans, fontWeight = FontWeight.Normal, fontSize = 15.sp, lineHeight = 20.sp)
 

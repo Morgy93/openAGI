@@ -165,10 +165,18 @@ aligned, which reads as a log file. **Alignment carries the speaker** — that i
 what makes a chat feel like a chat on both platforms, and it means no speaker
 labels at all.
 
-- **You:** right aligned, max 78% width, `live` at 12% opacity as the bubble
-  fill, `ink` text, radius 18 with the bottom-trailing corner at 4.
-- **OpenAGI:** left aligned, max 85% width, `surface` fill, `ink` text, radius
-  18 with the bottom-leading corner at 4.
+- **You:** right aligned, a compact bubble only as wide as its text (max 85%),
+  `live` at 12% opacity as the fill, `ink` text, radius 18 with the
+  bottom-trailing corner at 4.
+- **OpenAGI:** full width, no bubble, `ink` text — a reply reads like a page,
+  so a long answer fits as much per line as the screen allows.
+- Message text is 16 regular (chat body), not the 17 row body.
+- **Top bar:** one row, about 52 tall: a back arrow where the chat was opened
+  from another screen, the title at 18 semibold, and the connection dot. The
+  host and status sit behind a tap on the title, in a small dialog — on a
+  chat the full connection line costs too much height.
+- **Wide windows** (an unfolded foldable, a tablet): messages and composer
+  stop at a 720 readable column, centred; the whole width still scrolls.
 - Consecutive messages from the same speaker tighten to 2pt apart; a change of
   speaker opens to 12. No timestamp unless more than 15 minutes passed, and then
   it is a centred `caption` in `muted` between the two groups.
@@ -182,15 +190,18 @@ labels at all.
   frames arrive, append into that same bubble so it grows. The list stays pinned
   to the bottom while the user has not scrolled away; if they have scrolled up,
   do not yank them back — show a "jump to latest" affordance instead.
-- The composer sits above the keyboard, never behind it, and keeps the safe area
-  on a home-indicator device. It grows to 5 lines then scrolls. Send is disabled
-  and `muted` until there is non-whitespace text.
+- The composer is a rounded pill (`surface`, `edge` hairline) with the field
+  and a round send arrow inside it. It sits above the keyboard, never behind
+  it, and keeps the safe area on a home-indicator device. One line at rest; it
+  grows to 6 lines then scrolls. Send is disabled and `muted` until there is
+  non-whitespace text.
+- Touching the conversation — to scroll or to tap — puts the keyboard away.
 - A failed send stays in place in `alert` with a "Try again" directly under it.
   It is never silently dropped and never a modal.
 - Long-press any message to copy it.
 
-The connection line on this screen reads `live` while the event stream is
-attached and `reconnecting` when it is not — the one screen where that
+The connection status on this screen (the dot, and the line in its dialog)
+reads `live` while the event stream is attached and `reconnecting` when it is not — the one screen where that
 distinction is worth the words.
 
 ## Screens must not be mostly empty

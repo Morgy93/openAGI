@@ -270,21 +270,16 @@ fun SupervisorScreen(
 
     if (chatOpen) {
         BackHandler { chatOpen = false }
-        Column(modifier = Modifier.fillMaxSize()) {
-            TextButton(onClick = { chatOpen = false }, modifier = Modifier.padding(start = 8.dp, top = 4.dp)) {
-                Text("Back", style = OpenAGIType.body, color = LocalOpenAGIColors.current.live)
-            }
-            Box(modifier = Modifier.weight(1f)) {
-                ChatScreen(
-                    context = context,
-                    credentials = credentials,
-                    streamAttached = streamAttached,
-                    title = "Supervisor",
-                    starters = SupervisorFormat.STARTERS,
-                    conversationState = chatConversationState,
-                )
-            }
-        }
+        // The chat's own one-row top bar carries the back arrow.
+        ChatScreen(
+            context = context,
+            credentials = credentials,
+            streamAttached = streamAttached,
+            title = "Supervisor",
+            starters = SupervisorFormat.STARTERS,
+            conversationState = chatConversationState,
+            onBack = { chatOpen = false },
+        )
         return
     }
 

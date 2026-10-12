@@ -7,15 +7,20 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -27,9 +32,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.Surface
@@ -46,6 +49,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -55,6 +66,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.ZoneId
@@ -82,7 +94,8 @@ import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
 import sh.openagi.mobile.ui.components.ConnectionState
-import sh.openagi.mobile.ui.components.ScreenHeader
+import sh.openagi.mobile.ui.components.ChatTopBar
+import sh.openagi.mobile.ui.components.SendArrowGlyph
 import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
@@ -363,11 +376,14 @@ fun ChatScreen(
     from: String? = null,
     starters: List<String> = emptyList(),
     conversationState: ChatConversationState,
+    onBack: (() -> Unit)? = null,
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
 
     var messages by conversationState.messages
     var inputText by conversationState.inputText
@@ -506,15 +522,32 @@ fun ChatScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        ScreenHeader(
+        ChatTopBar(
             title = title,
             connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
+            onBack = onBack,
         )
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            // On a wide window (an unfolded Fold, a tablet) the messages keep
+            // a readable column, centred, while the whole width still scrolls.
+            val gutter = chatGutter(maxWidth)
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+                contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = 12.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    // Touching the conversation, to scroll or to tap, puts the
+                    // keyboard away so there is room to read. Observed on the
+                    // initial pass and never consumed, so scrolling, links,
+                    // long-press copy and "Try again" all still work.
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            focusManager.clearFocus()
+                            keyboard?.hide()
+                        }
+                    },
             ) {
                 if (showLoadOlder) {
                     item(key = "load-older") {
@@ -558,7 +591,7 @@ fun ChatScreen(
                 StarterChips(
                     starters = starters,
                     onPick = { start(it) },
-                    modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = 20.dp, vertical = 12.dp),
+                    modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
                 )
             }
 
@@ -597,6 +630,10 @@ private fun chatErrorCopy(error: DaemonException, host: String): ErrorCopy.Messa
 private fun formatDividerTime(instant: Instant): String =
     DateTimeFormatter.ofPattern("h:mm a").withZone(ZoneId.systemDefault()).format(instant)
 
+// Replies read like a page: full width, no bubble, so a long answer fits as
+// much text per line as the screen allows. The owner's own messages stay as
+// compact bubbles on the trailing side, which is what still carries the
+// speaker without labels.
 @Composable
 private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform.ClipboardManager, onRetry: (ChatEntry.Assistant) -> Unit) {
     val colors = LocalOpenAGIColors.current
@@ -608,52 +645,47 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
                     style = OpenAGIType.caption,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.End,
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 2.dp),
                 )
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                Surface(
-                    color = colors.live.copy(alpha = 0.12f),
-                    shape = bubbleShape(isUser = true),
-                    modifier = Modifier.fillMaxWidth(0.78f),
-                ) {
-                    Text(
-                        entry.text,
-                        style = OpenAGIType.body,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier
-                            .combinedClickable(onClick = {}, onLongClick = { clipboard.setText(AnnotatedString(entry.text)) })
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                    )
+                // At most 85% of the width, and only as wide as the text.
+                Box(modifier = Modifier.fillMaxWidth(0.85f), contentAlignment = Alignment.CenterEnd) {
+                    Surface(
+                        color = colors.live.copy(alpha = 0.12f),
+                        shape = bubbleShape(isUser = true),
+                    ) {
+                        Text(
+                            entry.text,
+                            style = OpenAGIType.chatBody,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            modifier = Modifier
+                                .combinedClickable(onClick = {}, onLongClick = { clipboard.setText(AnnotatedString(entry.text)) })
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                        )
+                    }
                 }
             }
         }
         is ChatEntry.Assistant -> {
             Column(modifier = Modifier.fillMaxWidth()) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                    Surface(
-                        color = MaterialTheme.colorScheme.surface,
-                        shape = bubbleShape(isUser = false),
-                        modifier = Modifier.fillMaxWidth(0.85f),
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .combinedClickable(
-                                    onClick = {},
-                                    onLongClick = { if (entry.text.isNotBlank()) clipboard.setText(AnnotatedString(entry.text)) },
-                                )
-                                .padding(horizontal = 14.dp, vertical = 10.dp),
-                        ) {
-                            if (entry.streaming && entry.text.isBlank()) {
-                                Column {
-                                    TypingDots()
-                                    entry.activity?.let { Text("$it…", style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp)) }
-                                }
-                            } else {
-                                val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
-                                MarkdownView(entry.text, textColor = textColor)
-                            }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            onClick = {},
+                            onLongClick = { if (entry.text.isNotBlank()) clipboard.setText(AnnotatedString(entry.text)) },
+                        )
+                        .padding(vertical = 2.dp),
+                ) {
+                    if (entry.streaming && entry.text.isBlank()) {
+                        Column(modifier = Modifier.padding(vertical = 6.dp)) {
+                            TypingDots()
+                            entry.activity?.let { Text("$it…", style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp)) }
                         }
+                    } else {
+                        val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
+                        MarkdownView(entry.text, textColor = textColor, style = OpenAGIType.chatBody)
                     }
                 }
                 if (entry.failed) {
@@ -734,44 +766,77 @@ private fun JumpToLatestPill(onClick: () -> Unit, modifier: Modifier = Modifier)
     }
 }
 
+// The readable column on a wide window: messages and composer stop growing
+// at this width and centre, instead of running a line across a whole
+// unfolded Fold or tablet.
+internal val CHAT_MAX_WIDTH = 720.dp
+private val CHAT_MIN_GUTTER = 16.dp
+
+internal fun chatGutter(available: Dp): Dp = maxOf(CHAT_MIN_GUTTER, (available - CHAT_MAX_WIDTH) / 2)
+
+// A rounded pill with the field and the send button inside it: one line at
+// rest, growing to six lines and then scrolling. It sits above the keyboard,
+// never behind it, and keeps the gesture-bar inset.
 @Composable
 private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit) {
     val colors = LocalOpenAGIColors.current
-    Column(modifier = Modifier.fillMaxWidth().imePadding().navigationBarsPadding()) {
-        HorizontalDivider(color = colors.edge, thickness = 1.dp)
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+    val ink = MaterialTheme.colorScheme.onBackground
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .navigationBarsPadding()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            shape = RoundedCornerShape(24.dp),
+            border = BorderStroke(1.dp, colors.edge),
+            modifier = Modifier.widthIn(max = CHAT_MAX_WIDTH).fillMaxWidth(),
         ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                placeholder = { Text("Message OpenAGI") },
-                maxLines = 5,
-                modifier = Modifier.weight(1f),
-            )
-            SendButton(enabled = enabled, onClick = onSend)
+            Row(
+                modifier = Modifier.heightIn(min = 48.dp).padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.Bottom,
+            ) {
+                BasicTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    textStyle = OpenAGIType.chatBody.copy(color = ink),
+                    cursorBrush = SolidColor(colors.live),
+                    minLines = 1,
+                    maxLines = 6,
+                    modifier = Modifier.weight(1f).padding(vertical = 7.dp),
+                    decorationBox = { inner ->
+                        Box {
+                            if (value.isEmpty()) Text("Message OpenAGI", style = OpenAGIType.chatBody, color = muted)
+                            inner()
+                        }
+                    },
+                )
+                SendButton(enabled = enabled, onClick = onSend)
+            }
         }
     }
 }
 
 // DESIGN.md: "Send is disabled and `muted` until there is non-whitespace
-// text." A small dedicated control rather than the shared full-width
-// PrimaryButton, whose disabled state is a faded `live`, not `muted`.
+// text." A round arrow inside the pill: filled `live` when it can send.
 @Composable
 private fun SendButton(enabled: Boolean, onClick: () -> Unit) {
     val colors = LocalOpenAGIColors.current
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Box(
         modifier = Modifier
-            .height(44.dp)
-            .widthIn(min = 64.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .background(if (enabled) colors.live else Color.Transparent)
-            .clickable(enabled = enabled, onClick = onClick),
+            .padding(start = 8.dp)
+            .size(36.dp)
+            .clip(CircleShape)
+            .background(if (enabled) colors.live else muted.copy(alpha = 0.16f))
+            .clickable(enabled = enabled, onClickLabel = "Send", role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = "Send" },
         contentAlignment = Alignment.Center,
     ) {
-        Text("Send", style = OpenAGIType.body, color = if (enabled) Color.White else muted)
+        SendArrowGlyph(tint = if (enabled) Color.White else muted)
     }
 }
