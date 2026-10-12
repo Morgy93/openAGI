@@ -40,6 +40,8 @@ const IDLE_KICK_MIN_MS = 30_000;
 // Until one has run, an idle-watcher scan is taken to reach its sends this fast.
 const IDLE_LEAD_MS = 45_000;
 const MUTE_MS = 24 * 60 * MIN;
+// Watch groups whose start the scan can read (an ask, a wait, a turn).
+const TIMED_WATCH = new Set(["you", "waiting", "working"]);
 const SENDING = new Set(["nudge", "escalate-manager"]);
 const OPEN_ACTION = new Set(["planned", "proposed"]);
 const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"]);
@@ -2087,12 +2089,15 @@ export class FleetSupervisor {
 
   // The group's start holds while the thread stays in it: the earliest of
   // what this scan can tell and what earlier scans saw. A new group starts
-  // from this scan's guess, or now.
+  // from this scan's guess, or now. Push, blocked and quiet have no clock of
+  // their own (the guess is the thread's last activity): a move into one
+  // that this process saw happen starts at the move.
   trackWatch(key, watch, now) {
     if (!watch) { this.watchSince.delete(key); return null; }
     const prev = this.watchSince.get(key);
     const guess = Date.parse(watch.since ?? "");
     let since = Number.isFinite(guess) && guess <= now ? guess : now;
+    if (prev && prev.group !== watch.group && !TIMED_WATCH.has(watch.group)) since = now;
     if (prev?.group === watch.group) since = Math.min(prev.since, since);
     this.watchSince.set(key, { group: watch.group, since });
     return { ...watch, since: new Date(since).toISOString() };
@@ -2103,9 +2108,12 @@ export class FleetSupervisor {
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
     const askedAt = new Map();
-    for (const question of this.store.openQuestions()) {
+    // Only questions the owner can see (getState hides ones held for review),
+    // dated by when they were put to the owner: lastAskedAt is refreshed
+    // every scan, so it would restart the clock after each daemon restart.
+    for (const question of this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id))) {
       for (const key of [question.threadKey, ...(question.threadKeys ?? [])].filter(Boolean)) {
-        const at = question.lastAskedAt ?? question.createdAt ?? null;
+        const at = question.reopenedAt ?? question.createdAt ?? null;
         if (at && !(askedAt.get(key) <= at)) askedAt.set(key, at);
       }
     }
@@ -2113,7 +2121,8 @@ export class FleetSupervisor {
     const rows = items.map(({ thread, classified, pr }) => {
       byState[classified.state] = (byState[classified.state] ?? 0) + 1;
       const decision = decisionFor.get(thread.key) ?? null;
-      const watch = this.trackWatch(thread.key, watchOf(thread, classified, { now: finished, askedAt: askedAt.get(thread.key) ?? null }), finished);
+      // The wait age was measured when the scan classified, at its start.
+      const watch = this.trackWatch(thread.key, watchOf(thread, classified, { now: started, askedAt: askedAt.get(thread.key) ?? null }), finished);
       if (watch) { byWatch[watch.group] = (byWatch[watch.group] ?? 0) + 1; seen.add(thread.key); }
       return {
         key: thread.key,

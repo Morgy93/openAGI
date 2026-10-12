@@ -3685,5 +3685,30 @@ test("the snapshot says what each thread is watched for, and keeps when it start
   await supervisor.tick({ reason: "test" });
   row = supervisor.getState().snapshot.threads[0];
   assert.equal(row.watch.group, "you");
+  const askedAt = new Date(clock).toISOString();
+  assert.equal(row.watch.since, askedAt);
+  // A daemon restart forgets the tracked starts, and each scan re-stamps the
+  // question's lastAskedAt: the wait still dates from when it was asked.
+  clock += 4 * MIN;
+  supervisor.watchSince.clear();
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "you");
+  assert.equal(row.watch.since, askedAt);
+});
+
+test("a thread moved into a group with no clock of its own starts there at the move", async (t) => {
+  let clock = NOW;
+  const thread = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(5 * MIN) } });
+  const { supervisor } = fixture(t, { threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.getState().snapshot.threads[0].watch.group, "working");
+  // The turn ends with the PR not ready: needs a push, from now, not from
+  // the thread's last activity before this scan.
+  Object.assign(thread, { agentStatus: "idle", lastActivityAt: ago(1 * MIN) });
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.notEqual(row.watch.group, "working");
   assert.equal(row.watch.since, new Date(clock).toISOString());
 });
