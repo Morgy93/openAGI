@@ -108,7 +108,8 @@ final class OverlayDragView: NSView {
   /// pill is held). Finish the drag so the controller never stays in drag mode.
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
-    guard window == nil, startCursor != nil else { return }
+    if window != nil { installHoverArea(); return }
+    guard startCursor != nil else { return }
     startCursor = nil
     if isDragging {
       isDragging = false
@@ -125,13 +126,19 @@ final class OverlayDragView: NSView {
 
   // MARK: Hover
 
-  override func updateTrackingAreas() {
-    super.updateTrackingAreas()
-    trackingAreas.forEach(removeTrackingArea)
-    guard onHover != nil else { return }
-    addTrackingArea(NSTrackingArea(
+  // One area for the view's whole life: .inVisibleRect follows the bounds, so
+  // it never needs rebuilding. It is added when the view joins a window, not
+  // in updateTrackingAreas, which AppKit does not call for this view inside
+  // an NSHostingView. Only this area is ours; the tooltip's area is left alone.
+  private(set) var hoverArea: NSTrackingArea?
+
+  private func installHoverArea() {
+    guard hoverArea == nil else { return }
+    let area = NSTrackingArea(
       rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-      owner: self, userInfo: nil))
+      owner: self, userInfo: nil)
+    addTrackingArea(area)
+    hoverArea = area
   }
 
   override func mouseEntered(with event: NSEvent) { onHover?(true) }

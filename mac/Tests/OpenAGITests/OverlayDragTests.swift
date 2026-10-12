@@ -68,8 +68,15 @@ final class OverlayDragTests: XCTestCase {
     // and carries the tooltip.
     let view = try XCTUnwrap(hit(panel, NSPoint(x: 22, y: 22)) as? OverlayDragView)
     XCTAssertNotNil(view.onHover)
-    XCTAssertFalse(view.trackingAreas.isEmpty)
+    let area = try XCTUnwrap(view.hoverArea)
+    XCTAssertTrue(view.trackingAreas.contains { $0 === area })
+    XCTAssertTrue(area.options.contains(.mouseEnteredAndExited))
     XCTAssertEqual(view.toolTip?.hasPrefix("Quick Ask (⌥Space)"), true)
+    // Re-laying out or re-setting the tooltip keeps the one hover area.
+    view.toolTip = view.toolTip
+    view.updateTrackingAreas()
+    XCTAssertTrue(view.trackingAreas.contains { $0 === area })
+    XCTAssertEqual(view.trackingAreas.filter { $0.owner === view && $0.options.contains(.mouseEnteredAndExited) }.count, 1)
   }
 
   func testPillDragMovesPersistsAndDoesNotExpandOrTakeFocus() throws {
