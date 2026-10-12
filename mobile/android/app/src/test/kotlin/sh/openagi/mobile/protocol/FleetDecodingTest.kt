@@ -81,6 +81,41 @@ class FleetDecodingTest {
 
     // A daemon that has not scanned yet, or predates half these fields.
     @Test
+    fun decodesWatchAndLastAgentAt() {
+        val state = decode(
+            """
+            {"snapshot": {"counts": {"byWatch": {"you": 1, "waiting": 1, "quiet": 0}}, "threads": [
+              {"key": "a", "state": "waiting-ci", "lastAgentAt": "2026-10-12T21:50:00.000Z",
+               "watch": {"group": "waiting", "since": "2026-10-12T21:37:00.000Z", "waitingOn": "BuildBot3 full run",
+                         "waitSince": "2026-10-12T21:37:00.000Z", "runningSince": null, "later": 1}},
+              {"key": "b", "state": "excluded", "watch": null},
+              {"key": "c", "state": "running", "watch": {"group": "working", "since": "not a time"}}
+            ]}}
+            """.trimIndent(),
+        )
+        val snapshot = state.snapshot!!
+        assertEquals(mapOf("you" to 1, "waiting" to 1, "quiet" to 0), snapshot.counts.byWatch)
+        val watch = snapshot.threads[0].watch!!
+        assertEquals("waiting", watch.group)
+        assertEquals(Instant.parse("2026-10-12T21:37:00Z"), watch.since)
+        assertEquals("BuildBot3 full run", watch.waitingOn)
+        assertEquals(Instant.parse("2026-10-12T21:37:00Z"), watch.waitSince)
+        assertNull(watch.runningSince)
+        assertEquals(Instant.parse("2026-10-12T21:50:00Z"), snapshot.threads[0].lastAgentAt)
+        assertNull(snapshot.threads[1].watch)
+        assertEquals("working", snapshot.threads[2].watch!!.group)
+        assertNull(snapshot.threads[2].watch!!.since)
+    }
+
+    @Test
+    fun anOlderDaemonHasNoWatch() {
+        val thread = decode(fullState).snapshot!!.threads.first()
+        assertNull(thread.watch)
+        assertNull(thread.lastAgentAt)
+        assertTrue(decode(fullState).snapshot!!.counts.byWatch.isEmpty())
+    }
+
+    @Test
     fun anEmptyObjectDecodesToAnEmptyState() {
         val state = decode("{}")
         assertNull(state.mode)

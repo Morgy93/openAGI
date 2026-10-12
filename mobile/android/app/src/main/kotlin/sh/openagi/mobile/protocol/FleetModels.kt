@@ -48,6 +48,8 @@ data class FleetCounts(
     val threads: Int = 0,
     val inScope: Int = 0,
     val byState: Map<String, Int> = emptyMap(),
+    // Threads per watch group (FleetWatch.group); absent on an older daemon.
+    val byWatch: Map<String, Int> = emptyMap(),
     val needsYou: Int = 0,
     val actions: Int = 0,
 )
@@ -74,6 +76,25 @@ data class FleetThread(
     val live: Boolean = false,
     val route: String? = null,
     val decision: FleetDecision? = null,
+    // When the agent last said something, as opposed to any activity.
+    @Serializable(with = OptionalInstantSerializer::class) val lastAgentAt: Instant? = null,
+    // What the supervisor is watching this thread for, and since when. Null
+    // for an out-of-scope thread, and on every thread from an older daemon.
+    val watch: FleetWatch? = null,
+)
+
+// src/fleet/classify.js watchOf, kept across scans by the supervisor:
+// group is one of FleetWatchGroup; since is when the thread entered it;
+// waitingOn names what a "waiting" thread waits on ("BuildBot3 full run");
+// waitSince is how long its wait has been going; runningSince is when the
+// agent's current turn started.
+@Serializable
+data class FleetWatch(
+    val group: String? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val since: Instant? = null,
+    val waitingOn: String? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val waitSince: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val runningSince: Instant? = null,
 )
 
 // A thread whose PR the supervisor could not read still carries its ref, with
