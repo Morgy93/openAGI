@@ -162,9 +162,13 @@ function foldClaudeInto(target, claude) {
   if (!target.lastAgentText) {
     target.lastAgentText = claude.lastAgentText ?? "";
     target.lastAgentTail = claude.lastAgentTail ?? "";
-    target.lastAgentFull = claude.lastAgentFull ?? "";
-    target.lastAgentFullAt = claude.lastAgentFullAt ?? null;
     target.lastAgentAt = claude.lastAgentAt ?? target.lastAgentAt ?? null;
+  }
+  // A Conductor tail that kept only a synthetic limit notice has an excerpt
+  // but no real report; the transcript still holds the earlier reply.
+  if (!target.lastAgentFull && claude.lastAgentFull) {
+    target.lastAgentFull = claude.lastAgentFull;
+    target.lastAgentFullAt = claude.lastAgentFullAt ?? null;
   }
   target.cwd = target.cwd || claude.cwd || null;
   target.branch = target.branch || claude.branch || null;

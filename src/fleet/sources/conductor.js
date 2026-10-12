@@ -42,9 +42,7 @@ export const ASK_CLOSED_SQL = `
   WHERE turn_id = ? AND +session_id = ? AND role = 'assistant' AND (sent_at > ? OR (sent_at = ? AND rowid > ?))
     AND (content LIKE ? OR content LIKE '%"subtype":"init"%' OR content LIKE '%"type":"result"%' OR content LIKE '%"type":"error"%')
   ORDER BY sent_at, rowid LIMIT 50`;
-// An errored session shows no card, whatever its last rows say. Idle is not
-// enough: older Conductor reports an AskUserQuestion wait as idle, so the
-// unanswered call (no result, error, init or tool_result after it) decides.
+// An errored session shows no card, whatever its last rows say.
 const CARD_DEAD_STATUSES = new Set(["error"]);
 const TASKS_SQL = `
   SELECT content, created_at FROM session_messages
@@ -293,13 +291,22 @@ function workspaceTabs(rows) {
   return out;
 }
 
+// A call can only still block on the owner while the process that made it
+// lives: no live peer, or one started after the call, means it died with it.
+function askOutlivedBy(ask, peer) {
+  if (!peer) return false;
+  const since = Date.parse(peer.startedAt ?? "");
+  return !(Number.isFinite(since) && Date.parse(ask.at ?? "") < since);
+}
+
 function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id" }) {
   const { limits } = config;
   const rows = readRecentMessages(db, row.id, turnColumn);
   const summary = summarizeTail(rows);
-  // An errored session lost its card, so it reads as stopped instead. An
-  // idle one keeps a call still unanswered in its rows. Only a turn whose
-  // start and end are both outside the tail can hide one.
+  const claudeSessionId = row.claude_session_id || null;
+  const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
+  // An errored session lost its card, so it reads as stopped instead. Only a
+  // turn whose start and end are both outside the tail can hide one.
   const live = !CARD_DEAD_STATUSES.has(row.status);
   let asks = live ? [...summary.pendingAsks.values()] : [];
   if (live && !summary.turnStartedAt && !summary.lastEnd) {
@@ -307,11 +314,13 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
     const inTail = new Set(asks.map((ask) => ask.id));
     asks = [...readOlderAsks(db, row.id, rows).filter((ask) => !inTail.has(ask.id)), ...asks];
   }
+  // Idle is ambiguous. Older Conductor reports an AskUserQuestion wait as
+  // idle, but a process that died mid-call leaves the same rows (600a2afc).
+  // Only a live process that was already running at the call still holds it.
+  if (row.status === "idle") asks = asks.filter((ask) => askOutlivedBy(ask, peer));
   const card = cardOf(asks, limits);
   // The agent's own call first, as before cards (executor and older readers).
   const pendingAsk = asks.find((ask) => !ask.subagent) ?? asks[0] ?? null;
-  const claudeSessionId = row.claude_session_id || null;
-  const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
   const blockedOnOwner = peerBlockedOnOwner(peer);
   const { agentStatus: reported, error, abortReason, abortedAt = null } = blockedOnOwner

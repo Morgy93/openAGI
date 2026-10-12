@@ -68,6 +68,26 @@ test("mergeThreads keeps the Conductor error and status when it has its own", ()
   assert.equal(m.error.kind, "overloaded");
 });
 
+test("mergeThreads folds the Claude report when the Conductor tail kept only a synthetic notice", () => {
+  // The Conductor tail's last text is a limit notice: an excerpt, no real report.
+  const conductor = makeThread({ claudeSessionId: "c1", lastAgentText: "You've hit your session limit", lastAgentFull: "", lastAgentFullAt: null, lastAgentAt: ago(2 * MIN) });
+  const report = "Pushed abc1234.\n\nBlocked on:\n- your call on the schema change";
+  const claude = makeThread({
+    key: "claude:c1", kind: "claude", id: "c1", claudeSessionId: "c1", lastAgentText: report, lastAgentFull: report,
+    lastAgentFullAt: ago(10 * MIN), lastAgentAt: ago(10 * MIN)
+  });
+  const [m] = mergeThreads({ claude: [claude], conductor: [conductor] });
+  assert.equal(m.lastAgentText, "You've hit your session limit");
+  assert.equal(m.lastAgentAt, ago(2 * MIN));
+  assert.equal(m.lastAgentFull, report);
+  assert.equal(m.lastAgentFullAt, ago(10 * MIN));
+  // A real Conductor report is kept.
+  const own = makeThread({ claudeSessionId: "c1", lastAgentText: "Done.", lastAgentFull: "Done.", lastAgentFullAt: ago(MIN) });
+  const [kept] = mergeThreads({ claude: [claude], conductor: [own] });
+  assert.equal(kept.lastAgentFull, "Done.");
+  assert.equal(kept.lastAgentFullAt, ago(MIN));
+});
+
 test("prReadiness reports exact blocker strings", () => {
   const blockersOf = (prOver, git = cleanGit) => prReadiness(makePr(prOver), git).blockers;
   assert.deepEqual(blockersOf({}), []);

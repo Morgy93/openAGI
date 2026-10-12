@@ -1212,3 +1212,30 @@ test("an in-scope thread with an open card survives the cap", async (t) => {
   assert.equal(map["t-plain"], undefined, "an in-scope thread with no card is still capped");
   assert.equal(map["t-1"], undefined);
 });
+
+test("the card scan past the in-scope stop reports which threads it settled", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+  for (let i = 0; i < 10; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: (10 + i) * MIN, lines: [ev.complete("x", (10 + i) * MIN, "done")] });
+  const lines = [turnStart("turn-a", 100 * MIN), ev.assistant("Waiting on you.", 90 * MIN)];
+  // t-open still asks; t-answered's card was answered in the app; the
+  // history index never projected t-unindexed, so its card is unknown.
+  for (const id of ["t-open", "t-answered", "t-unindexed"]) {
+    const rollout = addThread(ctx, { id, mtimeAgo: 90 * MIN, lines, threadSource: "automation" });
+    if (id === "t-unindexed") continue;
+    h.turn(id, "turn-a");
+    h.ask(id, "turn-a", `call_${id}`, [{ title: "May I delete the posts?", options: ["Confirm", "Leave"] }], 90 * MIN);
+    if (id === "t-answered") h.user(id, "turn-a", cardReply([[`call_${id}`, 0, "Leave"]]), 80 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const cardScanned = new Set();
+  const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, cardScanned }));
+  assert.equal(map["t-open"]?.meta.pendingCard?.items[0].itemId, "call_t-open:0");
+  assert.equal(map["t-answered"], undefined);
+  assert.ok(cardScanned.has("codex:t-open"));
+  assert.ok(cardScanned.has("codex:t-answered"), "no card open: a card question on it may close");
+  assert.ok(!cardScanned.has("codex:t-unindexed"), "a card the index cannot read stays unknown");
+  assert.ok(cardScanned.has("codex:t-00"), "rows read before the stop are settled too");
+});
