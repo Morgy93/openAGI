@@ -49,6 +49,9 @@ export const DEFAULTS = Object.freeze({
   maxSendsPerTick: 4,
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
+  // No playbook nudge this long after the owner's own message in a thread:
+  // they are driving it, often on something other than its PR.
+  ownerDrivenMs: 3 * 60 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
   // A run holding a verification slot is slow only past this: normal runs
   // finish well inside it, and the verifier kills one at 90 min. The 30-min
