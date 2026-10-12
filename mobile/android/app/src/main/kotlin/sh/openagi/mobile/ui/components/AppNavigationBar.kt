@@ -58,3 +58,13 @@ fun AppNavigationBar(selected: AppTab, inboxBadgeCount: Int, onSelect: (AppTab) 
         }
     }
 }
+
+// Whether the tab bar shows. An open conversation (the Supervisor chat, reached
+// with a back arrow) gets the whole height, as in ChatGPT; back returns to the
+// tab with the bar. The bar never rides above the keyboard either: while the
+// keyboard is up, the screen being typed into gets that space. The Chat tab is
+// a tab in its own right (no back arrow), so it keeps the bar.
+fun tabBarVisible(selected: AppTab, supervisorChatOpen: Boolean, keyboardOpen: Boolean): Boolean {
+    if (keyboardOpen) return false
+    return !(selected == AppTab.SUPERVISOR && supervisorChatOpen)
+}

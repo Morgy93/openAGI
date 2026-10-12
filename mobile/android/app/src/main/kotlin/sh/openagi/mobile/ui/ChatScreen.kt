@@ -25,8 +25,9 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -39,7 +40,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,8 +50,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
@@ -79,6 +85,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -95,6 +102,7 @@ import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
 import sh.openagi.mobile.ui.components.ConnectionState
 import sh.openagi.mobile.ui.components.ChatTopBar
+import sh.openagi.mobile.ui.components.DownArrowGlyph
 import sh.openagi.mobile.ui.components.SendArrowGlyph
 import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
@@ -184,9 +192,12 @@ class ChatConversationState(
     internal val thread: String? = null,
     private val legacySessionKey: String? = null,
     internal val threadSupport: SharedThreadSupport = SharedThreadSupport(),
+    // The composer draft. The Activity passes a saveable one, so the draft
+    // also survives Android recreating the Activity.
+    draft: MutableState<String> = mutableStateOf(""),
 ) {
     internal val messages = mutableStateOf<List<ChatEntry>>(emptyList())
-    internal val inputText = mutableStateOf("")
+    internal val inputText = draft
     internal val isStreaming = mutableStateOf(false)
     internal val nextId = mutableStateOf(0L)
     // False until the daemon says there is nothing older than what is shown.
@@ -380,7 +391,10 @@ fun ChatScreen(
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
-    val listState = rememberLazyListState()
+    // Starts at the newest line (an index past the end is clamped to the
+    // last item), so a reopened chat never flashes its oldest messages
+    // before the scroll to the end below.
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = conversationState.messages.value.size)
     val clipboard = LocalClipboardManager.current
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -391,9 +405,26 @@ fun ChatScreen(
     var nextId by conversationState.nextId
 
     // DESIGN.md: "the list stays pinned to the bottom while the user has not
-    // scrolled away; if they have scrolled up, do not yank them back." Once
-    // there is nothing left to scroll forward to, the user is at the bottom.
-    val stickToBottom by remember { derivedStateOf { !listState.canScrollForward } }
+    // scrolled away; if they have scrolled up, do not yank them back." Only
+    // the person's own drags and flings decide that (see ChatScroll); the
+    // list merely having more below it, as it does on first open or while a
+    // reply grows, never counts as scrolling away.
+    var userScrolledAway by remember { mutableStateOf(false) }
+    val userScroll = remember {
+        object : NestedScrollConnection {
+            // Programmatic scrolls (following, Jump to latest) bypass nested
+            // scroll, so everything seen here is a drag or its fling.
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                userScrolledAway = ChatScroll.scrolledAwayAfterUserScroll(userScrolledAway, consumed.y, listState.canScrollForward)
+                return Offset.Zero
+            }
+        }
+    }
+    // Each scroll runs in its own coroutine: a newer scroll, or the person's
+    // touch, cancels the running one, and must not cancel the loop below.
+    fun followToEnd() {
+        scope.launch { listState.scrollToEnd() }
+    }
 
     fun newId(): Long { val id = nextId; nextId += 1; return id }
 
@@ -473,6 +504,8 @@ fun ChatScreen(
 
     fun start(text: String) {
         if (text.isEmpty() || isStreaming) return
+        // Sending is a request to see the answer.
+        userScrolledAway = false
         val userId = newId()
         val assistantId = newId()
         val now = Instant.now()
@@ -513,102 +546,149 @@ fun ChatScreen(
     val olderExhausted by conversationState.olderExhausted
     val loadingOlder by conversationState.loadingOlder
     val showLoadOlder = conversationState.sharedThread != null && !olderExhausted && messages.any { it.serverId != null }
-    val headerCount = if (showLoadOlder) 1 else 0
 
-    LaunchedEffect(messages) {
-        if (messages.isNotEmpty() && stickToBottom) {
-            listState.scrollToItem(messages.lastIndex + headerCount)
-        }
+    // Opening a chat, or coming back to one, shows the newest message: once
+    // the list has laid out anything, go to the very end. After that, keep
+    // the end in view whenever there is more below it (a reply streaming in,
+    // a refresh, the keyboard taking height) while the person has not
+    // scrolled away and is not touching the list.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it > 0 }
+        followToEnd()
+        snapshotFlow { listState.canScrollForward && !listState.isScrollInProgress && !userScrolledAway }
+            .collect { behind -> if (behind) followToEnd() }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        ChatTopBar(
-            title = title,
-            connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
-            onBack = onBack,
-        )
+    val showJump = userScrolledAway && listState.canScrollForward && messages.isNotEmpty()
 
-        BoxWithConstraints(modifier = Modifier.weight(1f).fillMaxWidth()) {
-            // On a wide window (an unfolded Fold, a tablet) the messages keep
-            // a readable column, centred, while the whole width still scrolls.
-            val gutter = chatGutter(maxWidth)
-            LazyColumn(
-                state = listState,
-                contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = 12.dp),
-                modifier = Modifier
-                    .fillMaxSize()
-                    // Touching the conversation, to scroll or to tap, puts the
-                    // keyboard away so there is room to read. Observed on the
-                    // initial pass and never consumed, so scrolling, links,
-                    // long-press copy and "Try again" all still work.
-                    .pointerInput(Unit) {
-                        awaitEachGesture {
-                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                            focusManager.clearFocus()
-                            keyboard?.hide()
-                        }
-                    },
-            ) {
-                if (showLoadOlder) {
-                    item(key = "load-older") {
-                        Text(
-                            if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
-                            style = OpenAGIType.caption,
-                            color = MaterialTheme.colorScheme.primary,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable(enabled = !loadingOlder) { conversationState.loadOlder(client) }
-                                .padding(vertical = 12.dp),
-                        )
-                    }
-                }
-                itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
-                    val previous = messages.getOrNull(index - 1)
-                    val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
-                    val topSpacing = MessageGrouping.spacingBeforeDp(
-                        previousIsUser = previous?.let { it is ChatEntry.User },
-                        previousEpochSeconds = previous?.timestamp?.epochSecond,
-                        currentIsUser = entry is ChatEntry.User,
-                        currentEpochSeconds = entry.timestamp.epochSecond,
-                    )
-                    Column(modifier = Modifier.fillMaxWidth().padding(top = topSpacing.dp)) {
-                        if (showDivider) {
+    // On a wide window (an unfolded Fold, a tablet) the messages and the
+    // composer keep one readable column, centred, while the whole width
+    // still scrolls.
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val gutter = chatGutter(maxWidth)
+        Column(modifier = Modifier.fillMaxSize()) {
+            ChatTopBar(
+                title = title,
+                connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
+                onBack = onBack,
+            )
+
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(
+                    state = listState,
+                    // Room under the last line for the jump button while it shows,
+                    // so it never sits on the end of a reply.
+                    contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = if (showJump) 12.dp + JUMP_BUTTON_SPACE else 12.dp),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .nestedScroll(userScroll)
+                        // Touching the conversation, to scroll or to tap, puts the
+                        // keyboard away so there is room to read. Observed on the
+                        // initial pass and never consumed, so scrolling, links,
+                        // long-press copy and "Try again" all still work.
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                focusManager.clearFocus()
+                                keyboard?.hide()
+                            }
+                        },
+                ) {
+                    if (showLoadOlder) {
+                        item(key = "load-older") {
                             Text(
-                                formatDividerTime(entry.timestamp),
+                                if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
                                 style = OpenAGIType.caption,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = MaterialTheme.colorScheme.primary,
                                 textAlign = TextAlign.Center,
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = !loadingOlder) {
+                                        // Reading back: stay with the older lines.
+                                        userScrolledAway = true
+                                        conversationState.loadOlder(client)
+                                    }
+                                    .padding(vertical = 12.dp),
                             )
                         }
-                        ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
                     }
+                    itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
+                        val previous = messages.getOrNull(index - 1)
+                        val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
+                        val topSpacing = MessageGrouping.spacingBeforeDp(
+                            previousIsUser = previous?.let { it is ChatEntry.User },
+                            previousEpochSeconds = previous?.timestamp?.epochSecond,
+                            currentIsUser = entry is ChatEntry.User,
+                            currentEpochSeconds = entry.timestamp.epochSecond,
+                        )
+                        Column(modifier = Modifier.fillMaxWidth().padding(top = topSpacing.dp)) {
+                            if (showDivider) {
+                                Text(
+                                    formatDividerTime(entry.timestamp),
+                                    style = OpenAGIType.caption,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                )
+                            }
+                            ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
+                        }
+                    }
+                }
+
+                if (messages.isEmpty() && starters.isNotEmpty()) {
+                    StarterChips(
+                        starters = starters,
+                        onPick = { start(it) },
+                        modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
+                    )
+                }
+
+                if (showJump) {
+                    JumpToLatestButton(
+                        onClick = {
+                            userScrolledAway = false
+                            followToEnd()
+                        },
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(end = gutter, bottom = 12.dp),
+                    )
                 }
             }
 
-            if (messages.isEmpty() && starters.isNotEmpty()) {
-                StarterChips(
-                    starters = starters,
-                    onPick = { start(it) },
-                    modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
-                )
-            }
-
-            if (!stickToBottom && messages.isNotEmpty()) {
-                JumpToLatestPill(
-                    onClick = { scope.launch { listState.scrollToItem(messages.lastIndex + headerCount) } },
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
-                )
-            }
+            Composer(
+                value = inputText,
+                onValueChange = { inputText = it },
+                enabled = inputText.isNotBlank() && !isStreaming,
+                onSend = { send() },
+                gutter = gutter,
+            )
         }
+    }
+}
 
-        Composer(
-            value = inputText,
-            onValueChange = { inputText = it },
-            enabled = inputText.isNotBlank() && !isStreaming,
-            onSend = { send() },
-        )
+// Where a chat list scrolls to: the very end of its last item, not that
+// item's top edge, so a reply taller than the screen shows its newest lines.
+// The list clamps the oversized scroll at its true end.
+internal suspend fun LazyListState.scrollToEnd() {
+    val last = layoutInfo.totalItemsCount - 1
+    if (last < 0) return
+    scrollToItem(last)
+    scrollBy(ChatScroll.PAST_THE_END_PX)
+}
+
+// The rule for "has the person scrolled away from the latest", fed only by
+// their own drags and flings. Pure, so it is unit-tested.
+internal object ChatScroll {
+    // Far larger than any reply; the list stops at its real end.
+    const val PAST_THE_END_PX = 1_000_000f
+
+    // deltaY is what the list just moved under the finger: positive toward
+    // older messages. Reaching the end again resumes following; moving back
+    // from it means reading, and stays that way until the end is reached.
+    fun scrolledAwayAfterUserScroll(wasAway: Boolean, deltaY: Float, canScrollForward: Boolean): Boolean = when {
+        !canScrollForward -> false
+        deltaY > 0f -> true
+        else -> wasAway
     }
 }
 
@@ -685,7 +765,7 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
                         }
                     } else {
                         val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
-                        MarkdownView(entry.text, textColor = textColor, style = OpenAGIType.chatBody)
+                        MarkdownView(entry.text, textColor = textColor, style = OpenAGIType.chatBody, onCanvas = true)
                     }
                 }
                 if (entry.failed) {
@@ -749,52 +829,68 @@ private fun StarterChips(starters: List<String>, onPick: (String) -> Unit, modif
     }
 }
 
+// A small round down arrow at the trailing edge, above the composer: a
+// centred pill covered the full-width reply text it floated over.
+private val JUMP_BUTTON_SIZE = 40.dp
+private val JUMP_BUTTON_SPACE = JUMP_BUTTON_SIZE + 8.dp
+
 @Composable
-private fun JumpToLatestPill(onClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun JumpToLatestButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
     val colors = LocalOpenAGIColors.current
     Surface(
-        color = colors.live,
-        shape = RoundedCornerShape(50),
-        modifier = modifier.clip(RoundedCornerShape(50)).clickable(onClick = onClick),
+        color = MaterialTheme.colorScheme.surface,
+        shape = CircleShape,
+        border = BorderStroke(1.dp, colors.edge),
+        shadowElevation = 2.dp,
+        modifier = modifier
+            .size(JUMP_BUTTON_SIZE)
+            .clip(CircleShape)
+            .clickable(onClickLabel = "Jump to latest", role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = "Jump to latest" },
     ) {
-        Text(
-            "Jump to latest",
-            style = OpenAGIType.secondary,
-            color = Color.White,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-        )
+        Box(contentAlignment = Alignment.Center) {
+            DownArrowGlyph(tint = MaterialTheme.colorScheme.onBackground)
+        }
     }
 }
 
 // The readable column on a wide window: messages and composer stop growing
 // at this width and centre, instead of running a line across a whole
-// unfolded Fold or tablet.
-internal val CHAT_MAX_WIDTH = 720.dp
+// unfolded Fold or tablet. 600 keeps a line of chat text under about 70
+// characters (DESIGN.md), at roughly 8.2dp per character as measured on a
+// device; the unfolded Fold's inner screen (750 to 830 wide) gets it too.
+internal val CHAT_MAX_WIDTH = 600.dp
 private val CHAT_MIN_GUTTER = 16.dp
 
 internal fun chatGutter(available: Dp): Dp = maxOf(CHAT_MIN_GUTTER, (available - CHAT_MAX_WIDTH) / 2)
 
+// The composer pill sits 4 outside the text column on each side, so the
+// text inside it lines up with the messages: 12 from the edge on a phone.
+internal fun composerInset(gutter: Dp): Dp = maxOf(0.dp, gutter - 4.dp)
+
 // A rounded pill with the field and the send button inside it: one line at
 // rest, growing to six lines and then scrolling. It sits above the keyboard,
-// never behind it, and keeps the gesture-bar inset.
+// never behind it, and keeps the gesture-bar inset. Its hairline turns
+// `live` while the field has focus.
 @Composable
-private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit) {
+private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit, gutter: Dp) {
     val colors = LocalOpenAGIColors.current
     val ink = MaterialTheme.colorScheme.onBackground
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    var focused by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .imePadding()
             .navigationBarsPadding()
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = composerInset(gutter), vertical = 8.dp),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
             color = MaterialTheme.colorScheme.surface,
             shape = RoundedCornerShape(24.dp),
-            border = BorderStroke(1.dp, colors.edge),
-            modifier = Modifier.widthIn(max = CHAT_MAX_WIDTH).fillMaxWidth(),
+            border = BorderStroke(1.dp, if (focused) colors.live else colors.edge),
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Row(
                 modifier = Modifier.heightIn(min = 48.dp).padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
@@ -807,7 +903,7 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Bo
                     cursorBrush = SolidColor(colors.live),
                     minLines = 1,
                     maxLines = 6,
-                    modifier = Modifier.weight(1f).padding(vertical = 7.dp),
+                    modifier = Modifier.weight(1f).padding(vertical = 7.dp).onFocusChanged { focused = it.isFocused },
                     decorationBox = { inner ->
                         Box {
                             if (value.isEmpty()) Text("Message OpenAGI", style = OpenAGIType.chatBody, color = muted)
@@ -822,7 +918,8 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Bo
 }
 
 // DESIGN.md: "Send is disabled and `muted` until there is non-whitespace
-// text." A round arrow inside the pill: filled `live` when it can send.
+// text." A round arrow inside the pill: filled `live` when it can send, the
+// arrow in `onLive` so it reads in both modes.
 @Composable
 private fun SendButton(enabled: Boolean, onClick: () -> Unit) {
     val colors = LocalOpenAGIColors.current
@@ -837,6 +934,6 @@ private fun SendButton(enabled: Boolean, onClick: () -> Unit) {
             .semantics { contentDescription = "Send" },
         contentAlignment = Alignment.Center,
     ) {
-        SendArrowGlyph(tint = if (enabled) Color.White else muted)
+        SendArrowGlyph(tint = if (enabled) colors.onLive else muted)
     }
 }

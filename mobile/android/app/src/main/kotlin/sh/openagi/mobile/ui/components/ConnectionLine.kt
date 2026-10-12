@@ -52,6 +52,15 @@ internal fun connectionDotStyle(state: ConnectionState): Pair<androidx.compose.u
     }
 }
 
+// The daemon's address, whatever the state.
+internal fun connectionHost(state: ConnectionState): String = when (state) {
+    is ConnectionState.Synced -> state.host
+    is ConnectionState.Failed -> state.host
+    is ConnectionState.NeverSynced -> state.host
+    is ConnectionState.Live -> state.host
+    is ConnectionState.Reconnecting -> state.host
+}
+
 // The status word the connection line shows after the host.
 internal fun connectionCaption(state: ConnectionState): String = when (state) {
     is ConnectionState.Synced -> RelativeTime.short(state.ageMinutes)
@@ -66,13 +75,8 @@ fun ConnectionLine(state: ConnectionState, modifier: Modifier = Modifier) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
 
     val (dotColor, dotFilled) = connectionDotStyle(state)
-    val (host, caption) = when (state) {
-        is ConnectionState.Synced -> state.host to RelativeTime.short(state.ageMinutes)
-        is ConnectionState.Failed -> state.host to "can't reach"
-        is ConnectionState.NeverSynced -> state.host to "not synced yet"
-        is ConnectionState.Live -> state.host to "live"
-        is ConnectionState.Reconnecting -> state.host to "reconnecting"
-    }
+    val host = connectionHost(state)
+    val caption = connectionCaption(state)
 
     Row(modifier = modifier) {
         val dotModifier = Modifier

@@ -1,13 +1,14 @@
 package sh.openagi.mobile.ui
 
-// DESIGN.md's Chat section: "Consecutive messages from the same speaker
-// tighten to 2pt apart; a change of speaker opens to 12. No timestamp
+// DESIGN.md's Chat section: "The owner's back-to-back bubbles tighten to 4
+// apart; a change of speaker opens to 12, and so does a second reply right
+// after a reply, so two full-width replies never read as one. No timestamp
 // unless more than 15 minutes passed, and then it is a centred caption in
 // muted between the two groups." Pure (no Compose types) so the rule is
 // trivially unit-testable; ChatScreen supplies the previous/current message's
 // speaker and epoch-second timestamp per list item.
 object MessageGrouping {
-    const val TIGHT_SPACING_DP = 2
+    const val TIGHT_SPACING_DP = 4
     const val GROUP_SPACING_DP = 12
     private const val TIMESTAMP_GAP_SECONDS = 15 * 60
 
@@ -26,6 +27,8 @@ object MessageGrouping {
     fun spacingBeforeDp(previousIsUser: Boolean?, previousEpochSeconds: Long?, currentIsUser: Boolean, currentEpochSeconds: Long): Int {
         if (previousIsUser == null) return 0
         if (needsTimestampDivider(previousEpochSeconds, currentEpochSeconds)) return GROUP_SPACING_DP
-        return if (previousIsUser == currentIsUser) TIGHT_SPACING_DP else GROUP_SPACING_DP
+        // Replies have no bubble edge to separate them, so only the owner's
+        // bubbles tighten.
+        return if (previousIsUser && currentIsUser) TIGHT_SPACING_DP else GROUP_SPACING_DP
     }
 }

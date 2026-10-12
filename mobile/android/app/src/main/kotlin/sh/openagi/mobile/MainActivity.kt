@@ -9,7 +9,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
@@ -52,6 +54,7 @@ import sh.openagi.mobile.sync.forgetPairing
 import sh.openagi.mobile.ui.components.SwitchDaemonDialog
 import sh.openagi.mobile.ui.components.AppNavigationBar
 import sh.openagi.mobile.ui.components.AppTab
+import sh.openagi.mobile.ui.components.tabBarVisible
 import sh.openagi.mobile.ui.theme.OpenAGITheme
 
 // Events on GET /events that mean "a surface other than Chat might now be
@@ -77,6 +80,7 @@ internal fun updatedConversationThread(event: String?, data: String): String? {
     return runCatching { ProtocolJson.json.decodeFromString(ConversationUpdated.serializer(), data).thread }.getOrNull()
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 class MainActivity : ComponentActivity() {
     // Plain mutableStateOf held on the Activity, not inside setContent's
     // composition: a deep-link tap while the app is already open arrives via
@@ -149,13 +153,21 @@ class MainActivity : ComponentActivity() {
                     // Both are the daemon's shared threads, the same ones every
                     // paired phone and G2 talks in; the files are offline caches.
                     val threadSupport = remember(credentials) { SharedThreadSupport() }
+                    // Composer drafts are saveable, so a half-typed message
+                    // survives Android recreating the Activity; the
+                    // conversation states below are rebuilt then.
+                    val chatDraft = rememberSaveable(credentials.nodeId) { mutableStateOf("") }
+                    val supervisorDraft = rememberSaveable(credentials.nodeId) { mutableStateOf("") }
                     val chatConversation = remember(credentials) {
-                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent", threadSupport = threadSupport)
+                        ChatConversationState(
+                            conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent", threadSupport = threadSupport,
+                            draft = chatDraft,
+                        )
                     }
                     val supervisorConversation = remember(credentials) {
                         ChatConversationState(
                             conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD,
-                            legacySessionKey = SupervisorFormat.LEGACY_SESSION_ID, threadSupport = threadSupport,
+                            legacySessionKey = SupervisorFormat.LEGACY_SESSION_ID, threadSupport = threadSupport, draft = supervisorDraft,
                         )
                     }
                     // One background SSE connection for the life of this
@@ -206,9 +218,12 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    val showTabBar = tabBarVisible(selectedTab, supervisorChatOpen.value, keyboardOpen = WindowInsets.isImeVisible)
                     Scaffold(
                         bottomBar = {
-                            AppNavigationBar(selected = selectedTab, inboxBadgeCount = inboxBadge, onSelect = { selectedTab = it })
+                            if (showTabBar) {
+                                AppNavigationBar(selected = selectedTab, inboxBadgeCount = inboxBadge, onSelect = { selectedTab = it })
+                            }
                         },
                         // Scaffold's default contentWindowInsets is safeDrawing,
                         // which bundles the IME inset in with status/navigation
@@ -223,7 +238,7 @@ class MainActivity : ComponentActivity() {
                         // for the navigation bar, and now each screen owns IME.
                         contentWindowInsets = WindowInsets.statusBars,
                     ) { padding ->
-                        // consumeWindowInsets: the bottom bar already sits under
+                        // consumeWindowInsets: the bottom bar, when shown, sits under
                         // the keyboard's lower edge, so Chat's imePadding() must
                         // add only the part of the keyboard above it. Without
                         // this it added the bar's height again, and the pan

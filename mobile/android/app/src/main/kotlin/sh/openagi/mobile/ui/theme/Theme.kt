@@ -27,10 +27,14 @@ data class OpenAGIExtraColors(
     val alert: androidx.compose.ui.graphics.Color,
     val edge: androidx.compose.ui.graphics.Color,
     val caution: androidx.compose.ui.graphics.Color,
+    // A glyph or label on a `live` fill: white on the deep light-mode green,
+    // the dark canvas on the bright dark-mode green (about 9:1), where white
+    // would sit near 2:1.
+    val onLive: androidx.compose.ui.graphics.Color,
 )
 
 val LocalOpenAGIColors = staticCompositionLocalOf {
-    OpenAGIExtraColors(OpenAGIColors.liveLight, OpenAGIColors.alertLight, OpenAGIColors.edgeLight, OpenAGIColors.cautionLight)
+    OpenAGIExtraColors(OpenAGIColors.liveLight, OpenAGIColors.alertLight, OpenAGIColors.edgeLight, OpenAGIColors.cautionLight, OpenAGIColors.white)
 }
 
 private fun lightScheme(dynamic: androidx.compose.material3.ColorScheme?) = lightColorScheme(
@@ -113,9 +117,9 @@ fun OpenAGITheme(
     }
     val colorScheme = if (darkTheme) darkScheme(dynamic) else lightScheme(dynamic)
     val extra = if (darkTheme) {
-        OpenAGIExtraColors(OpenAGIColors.liveDark, OpenAGIColors.alertDark, OpenAGIColors.edgeDark, OpenAGIColors.cautionDark)
+        OpenAGIExtraColors(OpenAGIColors.liveDark, OpenAGIColors.alertDark, OpenAGIColors.edgeDark, OpenAGIColors.cautionDark, OpenAGIColors.canvasDark)
     } else {
-        OpenAGIExtraColors(OpenAGIColors.liveLight, OpenAGIColors.alertLight, OpenAGIColors.edgeLight, OpenAGIColors.cautionLight)
+        OpenAGIExtraColors(OpenAGIColors.liveLight, OpenAGIColors.alertLight, OpenAGIColors.edgeLight, OpenAGIColors.cautionLight, OpenAGIColors.white)
     }
 
     // Status/navigation bar icons default to whatever the (dark) native

@@ -170,31 +170,50 @@ labels at all.
   bottom-trailing corner at 4.
 - **OpenAGI:** full width, no bubble, `ink` text — a reply reads like a page,
   so a long answer fits as much per line as the screen allows.
-- Message text is 16 regular (chat body), not the 17 row body.
-- **Top bar:** one row, about 52 tall: a back arrow where the chat was opened
-  from another screen, the title at 18 semibold, and the connection dot. The
-  host and status sit behind a tap on the title, in a small dialog — on a
-  chat the full connection line costs too much height.
+- Message text is 15 regular on a 22 line (chat body), not the 17 row body.
+  Markdown keeps its own block spacing.
+- **Top bar:** one row, at least 52 tall (taller at large font scales, never
+  clipping the title): a back arrow where the chat was opened from another
+  screen, the title at 18 semibold, and the connection dot. The host and status
+  sit behind a tap on the title, in a small dialog: the full host on its own
+  wrapping mono line, the status on the line under it. On a chat the full
+  connection line costs too much height.
+- **An open conversation gets the full height.** While a conversation reached
+  with a back arrow is open (the Supervisor chat), the app's tab bar is hidden;
+  back returns to the tab with the bar. The tab bar is never drawn above the
+  keyboard: while the keyboard is up, it hides.
 - **Wide windows** (an unfolded foldable, a tablet): messages and composer
-  stop at a 720 readable column, centred; the whole width still scrolls.
-- Consecutive messages from the same speaker tighten to 2pt apart; a change of
-  speaker opens to 12. No timestamp unless more than 15 minutes passed, and then
-  it is a centred `caption` in `muted` between the two groups.
+  stop at a 600 readable column, centred, whenever the window is wider than
+  that plus the 16 gutters (the unfolded Fold's inner screen included). 600
+  keeps a chat line under about 70 characters. The whole width still scrolls.
+- The owner's back-to-back bubbles tighten to 4 apart; a change of speaker
+  opens to 12, and so does a reply right after a reply, so two full-width
+  replies never read as one. No timestamp unless more than 15 minutes passed,
+  and then it is a centred `caption` in `muted` between the two groups.
 - **Assistant replies render Markdown** — bold, inline code, fenced code blocks,
   bullet and numbered lists, links. A reply full of raw `**asterisks**` is the
   clearest possible sign the app does not understand its own content. Fenced
   code uses the mono face on a subtly darker fill, scrolls horizontally rather
-  than wrapping, and is long-press copyable.
+  than wrapping, and is long-press copyable. In a chat reply in light mode,
+  code blocks and tables are `surface` with an `edge` hairline instead, since
+  the reply sits straight on `canvas`.
 - **Streaming is the point.** Before the first token, show a three-dot resting
   indicator inside an assistant bubble — not a full-screen spinner. As `delta`
-  frames arrive, append into that same bubble so it grows. The list stays pinned
-  to the bottom while the user has not scrolled away; if they have scrolled up,
-  do not yank them back — show a "jump to latest" affordance instead.
-- The composer is a rounded pill (`surface`, `edge` hairline) with the field
-  and a round send arrow inside it. It sits above the keyboard, never behind
-  it, and keeps the safe area on a home-indicator device. One line at rest; it
-  grows to 6 lines then scrolls. Send is disabled and `muted` until there is
-  non-whitespace text.
+  frames arrive, append into that same bubble so it grows. Opening a chat, or
+  coming back to one, starts at the newest line. The list stays pinned to the
+  very end of the newest message (not its top edge, so a long reply keeps
+  following as it streams) while the user has not scrolled away; only their
+  own drags and flings count as scrolling away. If they have scrolled up, do
+  not yank them back — show a small round down-arrow button at the
+  bottom-trailing corner above the composer ("Jump to latest"), with room left
+  under the last line while it shows so it never covers the reply.
+- The composer is a rounded pill (`surface`, `edge` hairline, `live` while
+  the field has focus) with the field and a round send arrow inside it. It
+  sits above the keyboard, never behind it, and keeps the safe area on a
+  home-indicator device. One line at rest; it grows to 6 lines then scrolls.
+  Send is disabled and `muted` until there is non-whitespace text; enabled it
+  is a `live` fill with the arrow white in light mode and `canvas` in dark
+  mode (about 9:1). A half-typed draft survives the app being recreated.
 - Touching the conversation — to scroll or to tap — puts the keyboard away.
 - A failed send stays in place in `alert` with a "Try again" directly under it.
   It is never silently dropped and never a modal.
