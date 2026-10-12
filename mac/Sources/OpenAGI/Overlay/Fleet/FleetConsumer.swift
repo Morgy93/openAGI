@@ -13,6 +13,10 @@ final class FleetConsumer: ObservableObject {
   static let shared = FleetConsumer()
 
   @Published private(set) var questions: [FleetQuestion] = []
+  /// The last scan's threads, for the Watching list under the questions.
+  @Published private(set) var threads: [FleetThread] = []
+  /// Watching groups the owner opened that start collapsed (Quiet).
+  @Published private(set) var openWatchGroups: Set<String> = []
   @Published private(set) var status: FleetStatus? = nil
   /// False hides the Supervisor tab.
   @Published private(set) var available = false
@@ -168,6 +172,11 @@ final class FleetConsumer: ObservableObject {
     }
   }
 
+  /// Opens or closes a Watching group that starts collapsed.
+  func toggleWatchGroup(_ group: String) {
+    if openWatchGroups.contains(group) { openWatchGroups.remove(group) } else { openWatchGroups.insert(group) }
+  }
+
   func clearNote(_ id: String) {
     notes[id] = nil
   }
@@ -231,6 +240,7 @@ final class FleetConsumer: ObservableObject {
     stillSending.formIntersection(open)
     notes = notes.filter { open.contains($0.key) }
     questions = state.questions
+    threads = state.threads
     status = state.status
     hasSupervisor = state.enabled || !state.questions.isEmpty
     // Answering the last question with auto-scan off must not pull the
@@ -245,6 +255,7 @@ final class FleetConsumer: ObservableObject {
   private func clearState() {
     generation &+= 1
     questions = []
+    threads = []
     status = nil
     notes = [:]
     stillSending = []

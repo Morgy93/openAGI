@@ -26,7 +26,7 @@ struct OverlayView: View {
   // a single chain of sixteen generic .onChange overloads. Opaque helper
   // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))))
+    watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody))))))))
   }
 
   private var panelBody: some View {
@@ -160,6 +160,14 @@ struct OverlayView: View {
     // that timed out here but may still be sending.
     .onChange(of: fleet.notes) { _, _ in onContentChange() }
     .onChange(of: fleet.stillSending) { _, _ in onContentChange() }
+  }
+
+  // The Supervisor tab's Watching list: the scan's threads add, remove and
+  // regroup rows, and opening Quiet adds its rows.
+  private func watchingWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: fleet.threads) { _, _ in onContentChange() }
+    .onChange(of: fleet.openWatchGroups) { _, _ in onContentChange() }
   }
 
   /// Outreach rows for "Needs you". Supervisor questions also arrive as

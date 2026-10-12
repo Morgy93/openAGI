@@ -108,8 +108,11 @@ struct FleetState: Decodable, Equatable {
   let lastTickAt: String?
   let lastError: String?
   let questions: [FleetQuestion]
+  /// snapshot.threads: the Watching list. Empty before the first scan.
+  let threads: [FleetThread]
 
-  enum CodingKeys: String, CodingKey { case mode, enabled, running, lastTickAt, lastError, questions }
+  enum CodingKeys: String, CodingKey { case mode, enabled, running, lastTickAt, lastError, questions, snapshot }
+  private enum SnapshotKeys: String, CodingKey { case threads }
 
   var status: FleetStatus {
     FleetStatus(mode: mode, enabled: enabled, running: running, lastTickAt: lastTickAt, lastError: lastError)
@@ -126,6 +129,10 @@ extension FleetState {
     lastError = try? c.decodeIfPresent(String.self, forKey: .lastError)
     let raw = (try? c.decodeIfPresent([Lossy<FleetQuestion>].self, forKey: .questions)) ?? []
     questions = raw.compactMap { $0.value }
+    // One unreadable row costs that row; a bad snapshot costs the list.
+    let snapshot = try? c.nestedContainer(keyedBy: SnapshotKeys.self, forKey: .snapshot)
+    let rawThreads = (try? snapshot?.decodeIfPresent([Lossy<FleetThread>].self, forKey: .threads)) ?? nil
+    threads = (rawThreads ?? []).compactMap { $0.value }
   }
 }
 
