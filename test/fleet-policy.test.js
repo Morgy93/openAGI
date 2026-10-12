@@ -1385,6 +1385,39 @@ test("d1dbe71a, 2026-10-12: the owner took the thread over for other work, so it
   assert.notEqual(run(carryOn, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN) }).decision.reason, "owner is driving this thread");
 });
 
+test("CI done still reaches a thread the owner took over: the agent is waiting on that run", () => {
+  // The owner wrote in the thread after a nudge ("run the full verify and
+  // merge when green"), then the agent started BuildBot3 and waited.
+  const thread = makeThread({
+    lastUserText: "run the full verify and merge when green", lastUserAt: ago(40 * MIN),
+    lastAgentText: "Full BuildBot3 run started on aaaaaaaaaa. I'll report the verdict when it lands.", lastAgentAt: ago(35 * MIN)
+  });
+  const red = run(thread, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }) }).decision;
+  assert.equal(red.playbook, "ci-finished");
+  const ledger = sentLedger({ ...red, playbook: "merge-ready" }, 5 * 60 * MIN);
+  const decision = run(thread, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }), ledger }).decision;
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.playbook, "ci-finished");
+  assert.notEqual(decision.reason, "owner is driving this thread");
+  // The owner spoke after the wait began ("stop that PR; switch tasks"): their word holds.
+  const switched = makeThread({ ...thread, lastUserText: "stop that PR; switch tasks", lastUserAt: ago(20 * MIN) });
+  const held = run(switched, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }), ledger }).decision;
+  assert.equal(held.action, "wait");
+  assert.equal(held.reason, "owner is driving this thread");
+  // A BuildBot3 task started before the owner's "switch tasks"; the agent only
+  // acknowledged it since. The wait began with the task: the owner's word holds.
+  const fullRun = { id: "t9", description: "bb-verify --full --pr 1", kind: "local_bash", startedAt: ago(50 * MIN) };
+  const gateDone = makePr({ gates: [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: "SUCCESS" }], ci: { state: "SUCCESS", failing: [], pending: [] } });
+  const waiting = (extra) => makeThread({ ...switched, agentStatus: "waiting", openTasks: [fullRun], lastAgentText: "Full run going.", lastAgentAt: ago(48 * MIN), ...extra });
+  // Control: the run started after the owner's word; its CI-done ping goes through.
+  const ownRun = run(waiting({ lastUserText: "run the full verify", lastUserAt: ago(55 * MIN) }), { pr: gateDone, ledger }).decision;
+  assert.equal(ownRun.playbook, "ci-finished");
+  assert.equal(ownRun.action, "nudge");
+  const acked = run(waiting({ lastAgentText: "Switching tasks.", lastAgentAt: ago(15 * MIN) }), { pr: gateDone, ledger }).decision;
+  assert.equal(acked.action, "wait");
+  assert.equal(acked.reason, "owner is driving this thread");
+});
+
 test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no, not a crash to resume", () => {
   // As the readers report it: the supervisor's message is kept out of
   // lastUserText (still the owner's 16:22 message) and stamped as

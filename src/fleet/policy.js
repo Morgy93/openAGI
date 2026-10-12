@@ -803,6 +803,9 @@ function baseDecision(ctx) {
 // task the owner starts (no nudge before it) is still followed through. A
 // turn that died mid-work still gets its resume after the short owner-active
 // window, and the laptop-verify guard is the owner's own rule, so both go.
+// So does "CI done" for a run the agent started after the owner's last word:
+// that run is the thread's current work, and the ping is what wakes the
+// agent. If the owner spoke after the wait began, their word holds.
 const CARRY_ON = /^(continue|keep going|go( on| ahead)?|yes|yep|ok(ay)?|proceed|do it|finish( it| up)?|merge( it)?|ship it|get (it|this) (merged|done|across the finish line))\b[\s.!]*$/i;
 function ownerDrivenUntil(ctx, intent) {
   const { thread, limits, now, classified, ledger } = ctx;
@@ -811,6 +814,11 @@ function ownerDrivenUntil(ctx, intent) {
   if (text.startsWith(SUPERVISOR_PREFIX) || CARRY_ON.test(text)) return null;
   const at = Date.parse(thread.lastUserAt ?? "");
   if (!Number.isFinite(at)) return null;
+  // The wait began when its oldest open task started (classify's wait age),
+  // not at the agent's last words: it may have acknowledged the owner since.
+  const waitAge = classified.wait?.ageMs;
+  const waitStart = Number.isFinite(waitAge) ? now - waitAge : Date.parse(thread.lastAgentAt ?? "");
+  if (intent.playbook === "ci-finished" && waitStart > at) return null;
   if (!(lastNudgeStart(ledger) < at)) return null;
   const until = at + limits.ownerDrivenMs;
   return until > now ? new Date(until).toISOString() : null;
