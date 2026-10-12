@@ -8,7 +8,7 @@ import {
   CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, liveCardItems, msSince, parsePrRef, redactSecrets, shortHash,
   uiTargetFor
 } from "./contracts.js";
-import { blockedOnSection, deliberateStop } from "./classify.js";
+import { blockedOnSection, deliberateStop, ownerStoppedNudge } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
 import { requiredChecksFor } from "./sources/github.js";
 
@@ -160,6 +160,9 @@ function isManager(ctx) {
 export function decideThread(classified, thread, options = {}) {
   const ctx = makeContext(classified, thread, options);
   if (ctx.mutedKeys.has(thread?.key)) return { ...baseDecision(ctx), reason: "muted by owner" };
+  // No nudge, resume or stuck question about a thread whose owner just
+  // stopped the supervisor's own turn there.
+  if (ownerStoppedNudge(thread)) return { ...baseDecision(ctx), reason: "owner stopped the supervisor's turn" };
   const decision = resolveIntent(ctx, intentFor(ctx));
   // A Codex card beside the thread's own decision (a resume, a nudge, a
   // question): its question is asked too.
@@ -543,6 +546,8 @@ function resolveNudge(ctx, intent, base) {
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   if (deliberateStop(thread)) return { ...decision, reason: "owner stopped this turn" };
+  const drivenUntil = ownerDrivenUntil(ctx, intent);
+  if (drivenUntil) return { ...decision, action: "wait", reason: "owner is driving this thread", notBefore: drivenUntil };
   const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.nudgeCooldownMs;
   const attempts = attemptsWithoutProgress(ledger, ctx.progressMark);
   const maxAttempts = playbook.maxAttempts ?? limits.maxNudgesWithoutProgress;
@@ -781,6 +786,25 @@ function baseDecision(ctx) {
     reason: classified.reason, blockers: classified.blockers ?? [], question: null, route: null, notBefore: null,
     targetKey: thread.key, progressMark: ctx.progressMark
   };
+}
+
+// The owner wrote in a thread after the supervisor had nudged it, and not
+// just "continue": they took it over, often for something other than its PR.
+// Their conversation outranks the supervisor's agenda for a while. A fresh
+// task the owner starts (no nudge before it) is still followed through. A
+// turn that died mid-work still gets its resume after the short owner-active
+// window, and the laptop-verify guard is the owner's own rule, so both go.
+const CARRY_ON = /^(continue|keep going|go( on| ahead)?|yes|yep|ok(ay)?|proceed|do it|finish( it| up)?|merge( it)?|ship it|get (it|this) (merged|done|across the finish line))\b[\s.!]*$/i;
+function ownerDrivenUntil(ctx, intent) {
+  const { thread, limits, now, classified, ledger } = ctx;
+  if (classified.state === "stopped" || intent.playbook === "no-local-verify") return null;
+  const text = String(thread.lastUserText ?? "").trim();
+  if (text.startsWith(SUPERVISOR_PREFIX) || CARRY_ON.test(text)) return null;
+  const at = Date.parse(thread.lastUserAt ?? "");
+  if (!Number.isFinite(at)) return null;
+  if (!(Date.parse(ledger?.lastNudgeAt ?? "") < at)) return null;
+  const until = at + limits.ownerDrivenMs;
+  return until > now ? new Date(until).toISOString() : null;
 }
 
 function ownerActiveUntil(thread, limits, now) {

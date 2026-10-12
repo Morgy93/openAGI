@@ -398,16 +398,28 @@ function exclusionReason(thread, { pr, localGit, config }) {
 }
 
 // The owner pressed stop: their message came within a minute before the
-// abort. A supervisor message is never the owner's.
+// abort, or the turn was one the supervisor started (ownerStoppedNudge).
 export function deliberateStop(thread) {
   if (thread.agentStatus !== "aborted") return false;
-  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
+  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return ownerStoppedNudge(thread);
   const userAt = Date.parse(thread.lastUserAt ?? "");
   // Later metadata writes bump lastActivityAt; the source's abort time does not move.
   const abortAt = Date.parse(thread.meta?.abortedAt ?? thread.lastActivityAt ?? "");
   if (!Number.isFinite(userAt) || !Number.isFinite(abortAt)) return false;
   const gap = abortAt - userAt;
   return gap >= 0 && gap <= DELIBERATE_STOP_MS;
+}
+
+// Only the owner aborts a turn: Conductor writes "aborted by user", Claude and
+// Codex "interrupted". An app restart writes no abort; that turn is stalled.
+const OWNER_ABORT = /^(aborted by user|interrupted)$/i;
+
+// The owner stopped a turn the supervisor started, at any point in it: a no
+// to that nudge. Nothing goes to the thread until a new turn starts.
+export function ownerStoppedNudge(thread) {
+  if (thread.agentStatus !== "aborted") return false;
+  if (!String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
+  return OWNER_ABORT.test(String(thread.meta?.abortReason ?? "").trim());
 }
 
 function isRunning(thread, now, limits) {

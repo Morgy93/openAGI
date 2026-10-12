@@ -1359,6 +1359,46 @@ test("the d1dbe71a report asks the owner about their decision, not another merge
   assert.match(decision.question.body, /Your decision on the two P1s/);
 });
 
+test("d1dbe71a, 2026-10-12: the owner took the thread over for other work, so its PR is not nudged for 3 h", () => {
+  // Nudged about PR #1 the day before; then the owner used the chat to fix ChatGPT.
+  const thread = makeThread({
+    lastUserText: "lets figure out how to get chatgpt", lastUserAt: ago(48 * MIN),
+    lastAgentText: "ChatGPT is open again.", lastAgentFull: "ChatGPT is open again.", lastAgentAt: ago(25 * MIN), lastAgentFullAt: ago(25 * MIN), lastActivityAt: ago(25 * MIN)
+  });
+  const pr = redPr();
+  const fresh = run(thread, { pr }).decision;
+  assert.equal(fresh.action, "nudge", "no nudge before the owner's message: a task they started is followed through");
+  const decision = run(thread, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN) }).decision;
+  assert.equal(decision.action, "wait");
+  assert.equal(decision.reason, "owner is driving this thread");
+  assert.equal(decision.notBefore, new Date(NOW - 48 * MIN + DEFAULTS.ownerDrivenMs).toISOString());
+  // Three hours after the owner's message the PR is fair game again.
+  const later = run(thread, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN), now: NOW + DEFAULTS.ownerDrivenMs }).decision;
+  assert.notEqual(later.reason, "owner is driving this thread");
+  // "continue" after a nudge carries the supervisor's agenda on; no hold.
+  const carryOn = makeThread({ ...thread, lastUserText: "continue" });
+  assert.notEqual(run(carryOn, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN) }).decision.reason, "owner is driving this thread");
+});
+
+test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no, not a crash to resume", () => {
+  const nudgeText = "[OpenAGI supervisor] Ready to merge? If not, get it ready.";
+  const stopped = (meta) => makeThread({
+    agentStatus: "aborted", lastUserText: nudgeText, lastUserAt: ago(22 * MIN),
+    lastActivityAt: ago(22 * MIN - 2_000), meta: { abortReason: "aborted by user", abortedAt: ago(22 * MIN - 2_000), ...meta }
+  });
+  const { classified, decision } = run(stopped(), { pr: redPr() });
+  assert.notEqual(classified.state, "stopped");
+  assert.equal(decision.action, "none");
+  assert.equal(decision.playbook, null);
+  assert.equal(decision.reason, "owner stopped the supervisor's turn");
+  // Claude and Codex record the owner's stop as "interrupted".
+  assert.equal(run(stopped({ abortReason: "interrupted" }), { pr: redPr() }).decision.action, "none");
+  // An abort that is not the owner's still resumes.
+  const other = run(stopped({ abortReason: "replaced" }), { pr: redPr() });
+  assert.equal(other.classified.state, "stopped");
+  assert.equal(other.decision.playbook, "resume");
+});
+
 test("the supervisor's own read limits are no reason to nudge: 100+ threads, a certificate the pending full run publishes", () => {
   const pr = makePr({ threadsTruncated: true });
   const { classified, decision } = run(makeThread(), { pr });
