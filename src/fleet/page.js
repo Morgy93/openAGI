@@ -408,7 +408,8 @@ details.thread>summary{padding:0}
       var row = el('div', 'item', null, wrap);
       var head = el('div', 'head', null, row);
       el('span', 't', targetName(a, byKey), head);
-      el('span', 'chip ' + (ACTION_TONE[a.status] || 'dim'), ACTION_LABEL[a.status] || a.status || 'Unknown', head);
+      var label = a.kind === 'judge' ? 'Judge: ' + (a.verdict || a.status) : (ACTION_LABEL[a.status] || a.status || 'Unknown');
+      el('span', 'chip ' + (ACTION_TONE[a.status] || 'dim'), label, head);
       var sub = el('div', 'sub', null, row);
       if (a.playbook) el('span', null, a.playbook, sub);
       if (a.route) el('span', null, ROUTE_LABEL[a.route] || a.route, sub);

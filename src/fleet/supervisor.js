@@ -8,12 +8,13 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
+import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
+import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
@@ -62,6 +63,20 @@ const REVIEW_RETRY_MS = 15 * MIN;
 // An unchanged question kept again and again is re-checked at 1x, 2x, then
 // at most 4x the review interval.
 const REVIEW_BACKOFF_MAX = 2;
+// The nudge judge (judge.js): at most this many model calls per tick, this
+// many at once. A verdict holds while the chat, playbook and facts are the
+// same. A tick whose every call failed pauses the judge a while.
+const JUDGE_MAX_PER_TICK = 6;
+const JUDGE_CONCURRENCY = 3;
+const JUDGE_CACHE_MS = 2 * 60 * MIN;
+const JUDGE_DOWN_MS = 5 * MIN;
+const JUDGE_CALL_MS = 45_000;
+// All judge calls in one scan end by then (a call reads in ~10-20 s): each
+// call gets only the time left, none starts with less than JUDGE_MIN_CALL_MS
+// left, and the rest wait for the next scan, so owner answers and sends are
+// not held.
+const JUDGE_TICK_MS = 60_000;
+const JUDGE_MIN_CALL_MS = 10_000;
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -126,6 +141,65 @@ function pausedDeliveryDecision(delivery, blockedSince, now) {
     }
   };
 }
+// An automatic nudge the judge reads first. A resume after a limit reset or
+// an error retry stays mechanical.
+function judgeable(decision, thread) {
+  if (decision?.action !== "nudge" || !decision.message || !decision.route || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
+  if (decision.playbook !== "resume") return true;
+  return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
+}
+
+// Elapsed times ("waiting 34m", "full verify 12m") change every scan by
+// themselves; masked, so only a change in the facts reads the chat again
+// (the cache still expires after JUDGE_CACHE_MS).
+function withoutElapsed(text) {
+  return String(text ?? "").replace(/\b\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "#");
+}
+
+// Every fact the judge's prompt shows besides the chat (judge.js prLines and
+// buildJudgePrompt): the PR, the supervisor's state, reason and blockers,
+// and the planned nudge's reason and words.
+function judgeFacts(pr, classified, decision = null) {
+  const gates = (pr?.gates ?? []).map((gate) => [gate.label || gate.name, gate.state ?? null]);
+  const blockers = (classified?.blockers?.length ? classified.blockers : classified?.readiness?.blockers) ?? [];
+  return JSON.stringify([
+    pr?.ref ?? null, pr?.headOid ?? null, pr?.state ?? null, Boolean(pr?.isDraft), pr?.ci?.state ?? null, pr?.ci?.failing ?? [], pr?.ci?.pending ?? [],
+    gates, pr?.unresolvedThreads ?? null, pr?.reviewDecision ?? null, classified?.state ?? null, withoutElapsed(classified?.reason),
+    blockers.map(withoutElapsed), withoutElapsed(decision?.reason), withoutElapsed(decision?.message)
+  ]);
+}
+
+// Same chat (the agent's last real message and when), same playbook, same
+// facts, same earlier nudges: same verdict. Every judged playbook keys on the
+// PR facts too, so a CI run that went red is read again. nudges: the earlier
+// nudges the prompt shows (nudgeHistory), so a nudge sent since is read again.
+export function judgeCacheKey(thread, decision, pr = null, classified = null, nudges = []) {
+  const shown = (nudges ?? []).map((nudge) => [nudge.at ?? null, nudge.playbook ?? null, nudge.message ?? null]);
+  return [thread.key, replyMark(thread), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision)), shortHash(JSON.stringify(shown))].join("|");
+}
+
+// Which agent message a verdict was read from.
+function replyMark(thread) {
+  const reply = agentReply(thread);
+  return shortHash(`${reply.at ?? ""}\n${reply.text}`);
+}
+
+// The judge's question: its title and choices, for the agent message it
+// was read from. Not the free-text body, which a re-read words differently:
+// the same ask for the same reply stays one question (and an answer to it
+// keeps it quiet), while a new reply may ask anew.
+export function judgeAskKey(thread, question) {
+  const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  const options = (question.options ?? []).map(norm).sort();
+  return `judge:${thread.key}:${shortHash([norm(question.title), options.join("|"), replyMark(thread)].join("\n"))}`;
+}
+
+// pending: the judge has not read the chat (a failure, the per-scan cap), so
+// its open question for this thread stays.
+function judgeWait(decision, reason, pending = true) {
+  return { ...decision, action: "wait", message: null, route: null, notBefore: null, reason, judgePending: pending };
+}
+
 // A resume of a stopped or capped turn goes before merge-ready chatter.
 const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 
@@ -308,6 +382,15 @@ export class FleetSupervisor {
     // New questions waiting on the review: hidden from the state the main
     // mirrors until the review has seen them.
     this.awaitingReview = new Set();
+    // cache key -> { verdict, at }; see judgeNudges.
+    this.judgeCache = new Map();
+    this.judgeDownUntil = 0;
+    this.judgeError = null;
+    // threadKey -> when the judge last read it (a verdict or a failure), so
+    // the per-scan cap rotates past threads that keep failing.
+    this.judgeTriedAt = new Map();
+    // threadKey -> when the owner last answered one of its questions.
+    this.ownerAnsweredAt = new Map();
   }
 
   now() {
@@ -438,6 +521,13 @@ export class FleetSupervisor {
       if (delivery.ready === false) return `computer use not ready: ${delivery.detail ?? "check Open Computer Use"}`;
     }
     return "no live route: open the thread to answer";
+  }
+
+  // The nudge judge; tests inject a fake one (deps.judge) or its run.
+  get nudgeJudge() {
+    if (this.deps.judge !== undefined) return this.deps.judge;
+    this._nudgeJudge ??= createNudgeJudge({ config: this.config, run: this.deps.judgeRun ?? this.deps.run ?? runCommand });
+    return this._nudgeJudge;
   }
 
   // runModel for the review; tests inject a fake one.
@@ -745,7 +835,10 @@ export class FleetSupervisor {
       // fixed a blocker is sent even though the blocker is no longer asked,
       // unless the agent has spoken since (it recovered, or asks something new).
       const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
-      const stale = question.kind === "agent-ask" || question.kind === "agent-card" ? !asked.has(question.dedupeKey) : agentSince;
+      // The judge does not read a thread whose answer waits (judgeNudges),
+      // so its ask is not asked again: it stands until the agent speaks.
+      const judgeAsk = String(question.dedupeKey ?? "").startsWith("judge:");
+      const stale = (question.kind === "agent-ask" || question.kind === "agent-card") && !judgeAsk ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
@@ -1078,6 +1171,7 @@ export class FleetSupervisor {
     // nothing; anything else is refused.
     if (question.kind === "agent-card" && answer !== "open thread") return null;
     this.answering.add(id);
+    if (question.threadKey) this.ownerAnsweredAt.set(question.threadKey, this.now());
     try {
       let delivery = null;
       const settling = [];
@@ -1186,6 +1280,9 @@ export class FleetSupervisor {
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
+    // The owner is speaking to this thread: a judged or planned nudge in
+    // flight for it is dropped, as for an owner answer.
+    this.ownerAnsweredAt.set(thread.key, this.now());
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
@@ -1362,6 +1459,8 @@ export class FleetSupervisor {
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
+    // Automatic nudges are read by the judge before they go out (Auto only).
+    await this.judgeNudges(items, { started });
 
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
@@ -1404,6 +1503,149 @@ export class FleetSupervisor {
     this.lastTickAt = snapshot.at;
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
     return snapshot;
+  }
+
+  // The judge reads the chat before an automatic nudge goes out: send its
+  // message, wait, or ask the owner. Only in Auto, only for the playbooks
+  // in JUDGED_PLAYBOOKS, and never for a limit or error resume (those stay
+  // mechanical). A failure waits, never a blind send. Item decisions are
+  // replaced in place.
+  async judgeNudges(items, { started }) {
+    const judge = this.nudgeJudge;
+    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode !== "auto") return;
+    for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
+    for (const [key, at] of this.judgeTriedAt) if (started - at >= JUDGE_CACHE_MS) this.judgeTriedAt.delete(key);
+    // Only answers given since this scan began count (ownerAnswerThreads).
+    for (const [key, at] of this.ownerAnsweredAt) if (at < started) this.ownerAnsweredAt.delete(key);
+    // A thread the owner answered, or whose answer waits to be typed or is
+    // being sent, gets no automatic nudge: the answer goes first
+    // (deliverQueuedAnswers), never a playbook nudge beside or over it.
+    const answering = this.ownerAnswerThreads(started);
+    const history = this.nudgeHistory(new Set(items.filter((item) => judgeable(item.decision, item.thread)).map((item) => item.thread.key)));
+    const due = [];
+    for (const item of items) {
+      const { decision, thread } = item;
+      if (!judgeable(decision, thread)) continue;
+      if (answering.has(thread.key)) { item.decision = judgeWait(decision, "owner answer goes first; no nudge"); continue; }
+      if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
+      const key = judgeCacheKey(thread, decision, item.pr, item.classified, history.get(thread.key) ?? []);
+      const cached = this.judgeCache.get(key);
+      if (cached) item.decision = this.applyJudgeVerdict(item, cached.verdict);
+      else due.push({ item, key });
+    }
+    if (!due.length) return;
+    if (this.judgeDownUntil > this.now()) {
+      for (const { item } of due) item.decision = judgeWait(item.decision, `judge unavailable: ${this.judgeError ?? "paused"}`);
+      return;
+    }
+    // Resumes first, then the thread nudged or judged longest ago (the send
+    // order), so threads the judge keeps failing on cannot hold the cap.
+    const lastTried = ({ item }) => Math.max(Date.parse(item.ledger?.nudges?.at(-1)?.at ?? "") || 0, this.judgeTriedAt.get(item.thread.key) ?? 0);
+    due.sort((a, b) => (a.item.decision.playbook === "resume" ? 0 : 1) - (b.item.decision.playbook === "resume" ? 0 : 1) || lastTried(a) - lastTried(b));
+    const now = due.slice(0, JUDGE_MAX_PER_TICK);
+    for (const { item } of due.slice(JUDGE_MAX_PER_TICK)) item.decision = judgeWait(item.decision, "judge: read next scan (per-scan cap)");
+    const judgeStart = this.now();
+    // A call the judge's own timeout would end is a failure; one the scan's
+    // time left ends sooner is only read next scan.
+    const fullMs = Math.min(JUDGE_CALL_MS, this.config.judge?.timeoutMs ?? JUDGE_CALL_MS);
+    const results = await mapLimit(now, JUDGE_CONCURRENCY, async ({ item }) => {
+      const left = JUDGE_TICK_MS - (this.now() - judgeStart);
+      if (left < JUDGE_MIN_CALL_MS) return { later: true };
+      const capMs = Math.min(JUDGE_CALL_MS, left);
+      try {
+        const verdict = await withTimeout(Promise.resolve(judge.judge({
+          thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started, timeoutMs: capMs
+        })), capMs, "judge");
+        return { verdict };
+      } catch (error) {
+        const message = error?.message ?? String(error);
+        if (capMs < fullMs && /timed out/i.test(message)) return { later: true };
+        return { error: clampText(redactSecrets(message), 120) || "failed" };
+      }
+    });
+    // The owner may have answered while the calls ran: that answer wins over
+    // a verdict read from the chat before it.
+    const answeredMeanwhile = this.ownerAnswerThreads(started);
+    let failed = 0;
+    let ran = 0;
+    now.forEach(({ item, key }, index) => {
+      const result = results[index] ?? { error: "failed" };
+      const { decision, thread } = item;
+      if (result.later) { item.decision = judgeWait(decision, "judge: read next scan (time cap)"); return; }
+      ran += 1;
+      this.judgeTriedAt.set(thread.key, started);
+      if (result.error) {
+        failed += 1;
+        this.judgeError = result.error;
+        this.store.recordAction({ kind: "judge", threadKey: thread.key, playbook: decision.playbook, verdict: "failed", status: "failed", reason: `judge unavailable: ${result.error}` });
+        item.decision = judgeWait(decision, `judge unavailable: ${result.error}`);
+        return;
+      }
+      if (answeredMeanwhile.has(thread.key)) { item.decision = judgeWait(decision, "owner answered meanwhile; no nudge"); return; }
+      const { verdict } = result;
+      this.judgeCache.set(key, { verdict, at: started });
+      const said = verdict.action === "send" ? { message: verdict.message } : verdict.action === "ask-owner" ? { message: verdict.question.title } : {};
+      this.store.recordAction({ kind: "judge", threadKey: thread.key, playbook: decision.playbook, verdict: verdict.action, status: "done", reason: verdict.reason, ...said });
+      item.decision = this.applyJudgeVerdict(item, verdict);
+    });
+    // Only calls that ran count: one the time cap cut off is no failure.
+    // The pause runs from when the failures finished, not the scan's start.
+    if (ran && failed === ran) this.judgeDownUntil = this.now() + JUDGE_DOWN_MS;
+    else if (ran) this.judgeError = null;
+  }
+
+  // Threads with an owner answer that waits to be typed, is being sent, or
+  // came in since `since` (or is being answered right now).
+  ownerAnswerThreads(since) {
+    const keys = new Set(this.store.queuedAnswers().map((question) => question.threadKey));
+    for (const id of this.answering) {
+      const threadKey = this.store.question(id)?.threadKey;
+      if (threadKey) keys.add(threadKey);
+    }
+    for (const [key, at] of this.ownerAnsweredAt) if (at >= since) keys.add(key);
+    return keys;
+  }
+
+  // A verdict turned into the thread's decision.
+  applyJudgeVerdict(item, verdict) {
+    const { decision, thread } = item;
+    if (verdict.action === "wait") return judgeWait(decision, `judge: ${verdict.reason}`, false);
+    if (verdict.action === "send") {
+      const messageHash = shortHash(verdict.message);
+      // The same words as the last send, with no reply since, is noise.
+      const repeat = repeatsLastSend(thread, item.ledger, messageHash);
+      if (repeat) return judgeWait(decision, `judge: same message sent at ${repeat.clock}; no reply since`, false);
+      // judged: read in this scan, so act() may send it in Auto.
+      return { ...decision, message: verdict.message, messageHash, judged: true, reason: `${decision.reason}; judge: ${verdict.reason}` };
+    }
+    const reply = agentReply(thread);
+    const pr = Number(/#(\d+)$/.exec(thread.prRefs?.[0] ?? "")?.[1]);
+    const label = ownerLabel(thread, pr > 0 ? pr : null, parsePrRef(thread.prRefs?.[0] ?? "")?.repo);
+    const limits = this.config.limits ?? DEFAULTS;
+    return {
+      ...decision, action: "ask-user", message: null, route: null, reason: `judge: ${verdict.reason}`,
+      question: {
+        title: clampText(`${label}: ${verdict.question.title}`, limits.titleMax),
+        body: verdict.question.body || clampText(verdict.reason, limits.bodyMax),
+        options: verdict.question.options,
+        dedupeKey: judgeAskKey(thread, verdict.question),
+        kind: "agent-ask",
+        askContext: clampTail(redactSecrets(reply.text), limits.excerptMax),
+        agentAskedAt: reply.at ?? null
+      }
+    };
+  }
+
+  // threadKey -> the last few nudges sent to it, newest last.
+  nudgeHistory(keys) {
+    const out = new Map();
+    for (const action of this.store.actions(this.config.limits.maxActionsKept)) {
+      if (action.kind !== "nudge" || action.status !== "sent" || !keys.has(action.threadKey)) continue;
+      const list = out.get(action.threadKey) ?? [];
+      if (list.length < 3) list.unshift({ playbook: action.playbook, at: action.at, message: action.message });
+      out.set(action.threadKey, list);
+    }
+    return out;
   }
 
   // Remembered outage threads, minus any that moved on by themselves after
@@ -1637,6 +1879,7 @@ export class FleetSupervisor {
     // A computer-use send that timed out or lost Open Computer Use leaves
     // the app agent busy or restarting: the rest of the tick's typing waits.
     let uiStalled = answeredNow.uiStalled === true;
+    const judgeOn = Boolean(this.nudgeJudge?.enabled) && typeof this.nudgeJudge?.judge === "function";
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
@@ -1671,6 +1914,20 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; deferred: remote scan`;
         continue;
       }
+      // The judge reads every automatic nudge first: one this scan did not
+      // judge (the owner switched to Auto after judgeNudges ran) waits for
+      // the next scan instead of going out unread.
+      if (judgeOn && !decision.judged && judgeable(decision, target)) {
+        decision.reason = `${decision.reason}; held: not judged this scan`;
+        continue;
+      }
+      // An owner answer that started after the judge read (during the
+      // review, the notifications, the kept answers or an earlier send)
+      // goes first: checked again right before each send.
+      if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
+        decision.reason = `${decision.reason}; held: owner answered`;
+        continue;
+      }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
       if (uiKey && typedInto.has(uiKey)) continue;
       if (uiKey) typedInto.add(uiKey);
@@ -1699,6 +1956,8 @@ export class FleetSupervisor {
       // A failed disk read is unknown: its questions wait for a good one.
       if (storageUnknown && String(question.dedupeKey ?? "").startsWith("infra:storage:")) continue;
       const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
+      // The judge has not read this chat again yet: its question stands.
+      if (decided?.judgePending && String(question.dedupeKey ?? "").startsWith("judge:")) continue;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A

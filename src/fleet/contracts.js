@@ -291,6 +291,13 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
       timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
     },
+    // The nudge judge (judge.js): a model reads the chat before an automatic
+    // nudge. Off unless OPENAGI_FLEET_JUDGE=1 and a model is named.
+    judge: {
+      enabled: Boolean(overrides.judge?.enabled ?? envFlag(env.OPENAGI_FLEET_JUDGE)) && Boolean(overrides.judge?.model ?? String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim()),
+      model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
+      timeoutMs: overrides.judge?.timeoutMs ?? 40_000
+    },
     // Disk space: safe cleanup, archive to the SD card, and asks. On with
     // the supervisor unless OPENAGI_FLEET_STORAGE=0.
     storage: {
