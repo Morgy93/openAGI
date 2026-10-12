@@ -1239,3 +1239,66 @@ test("the card scan past the in-scope stop reports which threads it settled", as
   assert.ok(!cardScanned.has("codex:t-unindexed"), "a card the index cannot read stays unknown");
   assert.ok(cardScanned.has("codex:t-00"), "rows read before the stop are settled too");
 });
+
+test("history cards: supervisor rows filling the newest user rows never hide an older open ask", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  const rollout = addThread(ctx, { id: "t-busy", lines: [turnStart("turn-a", 300 * MIN), ev.assistant("Working", MIN)] });
+  h.turn("t-busy", "turn-a");
+  h.user("t-busy", "turn-a", "ship it", 300 * MIN);
+  h.ask("t-busy", "turn-a", "call_done", [{ title: "Use staging?", options: ["Yes", "No"] }], 290 * MIN);
+  h.user("t-busy", "turn-a", cardReply([["call_done", 0, "Yes"]]), 285 * MIN);
+  h.ask("t-busy", "turn-a", "call_open", [{ title: "Which reviewer?", options: ["Adam", "Nikhil"] }], 280 * MIN);
+  // Sixty supervisor turns since: none closes the ask, none is the owner's.
+  for (let i = 0; i < 60; i += 1) {
+    h.turn("t-busy", `turn-s${i}`);
+    h.user("t-busy", `turn-s${i}`, "[OpenAGI supervisor] continue", (270 - i * 4) * MIN);
+  }
+  h.project("t-busy", rollout);
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  // The answered ask stays closed: its reply is read across the scan too.
+  assert.deepEqual(map["t-busy"].meta.pendingCard?.items.map((item) => item.itemId), ["call_open:0"]);
+});
+
+test("history cards: an ask left open across a supervisor turn stays on the card beside a newer turn's", async (t) => {
+  const ctx = makeHome(t);
+  const h = makeHistory(ctx);
+  for (const id of ["t-both", "t-later-answered"]) {
+    const rollout = addThread(ctx, { id, lines: [turnStart("turn-s", 20 * MIN), ev.assistant("Working", MIN)] });
+    h.turn(id, "turn-a");
+    h.user(id, "turn-a", "QA it", 40 * MIN);
+    h.ask(id, "turn-a", "call_a", [{ title: "Keep the cache warm?", options: ["Keep it", "Drop it"] }], 35 * MIN);
+    h.turn(id, "turn-s");
+    h.user(id, "turn-s", "[OpenAGI supervisor] continue", 20 * MIN);
+    h.ask(id, "turn-s", "call_b", [{ title: "Which region?", options: ["us-east-1", "eu-west-1"] }], 15 * MIN);
+    if (id === "t-later-answered") h.user(id, "turn-s", cardReply([["call_b", 0, "us-east-1"]]), 10 * MIN);
+    h.project(id, rollout);
+  }
+  h.db.close();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks }));
+  const both = map["t-both"].meta.pendingCard;
+  assert.equal(both.cardId, "turn-s");
+  assert.deepEqual(both.items.map((item) => item.itemId), ["call_a:0", "call_b:0"]);
+  // Answering the newer turn's card leaves the older turn's ask open.
+  assert.deepEqual(map["t-later-answered"].meta.pendingCard?.items.map((item) => item.itemId), ["call_a:0"]);
+});
+
+test("cards past the in-scope stop are read from the rollout tail when the history index cannot say", async (t) => {
+  for (const withHistory of [false, true]) {
+    const ctx = makeHome(t);
+    // With an index that never projected t-auto, or with none at all.
+    if (withHistory) makeHistory(ctx).db.close();
+    const config = { ...ctx.config, limits: { ...ctx.config.limits, maxThreads: 2 } };
+    for (let i = 0; i < 12; i += 1) addThread(ctx, { id: `t-${String(i).padStart(2, "0")}`, mtimeAgo: 10 * MIN, lines: [ev.complete("x", 10 * MIN, "done")] });
+    addThread(ctx, { id: "t-auto", threadSource: "automation", mtimeAgo: 90 * MIN, lines: [turnStart("turn-a", 100 * MIN),
+      tailCall("call_auto", "May I delete the posts?", ["Confirm", "Leave"], 90 * MIN), tailCardItem("call_auto", "May I delete the posts?", ["Confirm", "Leave"], 90 * MIN)] });
+    addThread(ctx, { id: "t-quiet", threadSource: "automation", mtimeAgo: 90 * MIN, lines: [turnStart("turn-a", 100 * MIN), ev.assistant("Done.", 90 * MIN)] });
+    const cardScanned = new Set();
+    const map = byId(await listCodexThreads(config, { now: NOW, run: noLocks, cardScanned }));
+    assert.equal(map["t-auto"]?.meta.pendingCard?.items[0].itemId, "call_auto:0", `history: ${withHistory}`);
+    assert.equal(map["t-quiet"], undefined);
+    // A tail read never settles a card the index could not.
+    assert.ok(!cardScanned.has("codex:t-auto"));
+  }
+});

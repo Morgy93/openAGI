@@ -318,6 +318,12 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   // idle, but a process that died mid-call leaves the same rows (600a2afc).
   // Only a live process that was already running at the call still holds it.
   if (row.status === "idle") asks = asks.filter((ask) => askOutlivedBy(ask, peer));
+  // A process that died mid-card leaves its row "working". A peer started
+  // after the call, or none once the turn went silent, means the card died
+  // with it; no peer while rows still arrive is unknown, so the card stays.
+  else if (row.status === "working" && (peer || now - Date.parse(summary.lastAt ?? "") >= limits.silentTurnMs)) {
+    asks = asks.filter((ask) => askOutlivedBy(ask, peer));
+  }
   const card = cardOf(asks, limits);
   // The agent's own call first, as before cards (executor and older readers).
   const pendingAsk = asks.find((ask) => !ask.subagent) ?? asks[0] ?? null;

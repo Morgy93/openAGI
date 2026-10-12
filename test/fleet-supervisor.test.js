@@ -414,6 +414,8 @@ test("a background nudge that never reached the agent leaves no sent hash behind
   assert.equal(nudges.find((nudge) => nudge.messageHash === "abc").status, "failed");
   assert.equal(nudges.at(-1).status, "owner-answer");
   assert.equal(supervisor.store.ledgerFor("codex:t1").attemptsWithoutProgress, 0);
+  // It also lifts the policy's hold on an answered nudge.
+  assert.ok(Number.isFinite(Date.parse(supervisor.store.ledgerFor("codex:t1").keepGoingAt)));
 });
 
 test("a recent infra escalation holds back a thread-level one to the same manager", async (t) => {

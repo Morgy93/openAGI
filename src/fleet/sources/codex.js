@@ -326,26 +326,26 @@ function askItems(ask) {
   });
 }
 
-// The open card: the newest ask turn's items no reply closed. Its id is
-// that turn, so one card keeps one id while the agent adds to it. The app
+// The open card: every still-open ask turn's items no reply closed (a
+// supervisor turn between two asks closes neither). Its id is the newest
+// ask turn, so one card keeps one id while the agent adds to it. The app
 // sends one reply per Send: an item it skips (Skip is local only) was asked
-// before that reply, so a reply naming any item of the card closes every
-// item asked before it. order: the row's place (rollout ordinal or tail row).
+// before that reply, so a reply naming any item of a turn closes every item
+// of that turn asked before it. order: the row's place (rollout ordinal or tail row).
 function buildCard(asks, replies, limits) {
   if (!asks.length) return null;
   const turnId = asks.at(-1).turnId;
-  const turnAsks = asks.filter((ask) => ask.turnId === turnId);
-  const all = turnAsks.flatMap((ask) => askItems(ask).map((item) => ({ ...item, order: ask.order }))).map((item, index) => ({ ...item, index }));
-  const ids = new Set(all.map((item) => item.itemId));
+  const all = asks.flatMap((ask) => askItems(ask).map((item) => ({ ...item, order: ask.order, turnId: ask.turnId }))).map((item, index) => ({ ...item, index }));
   const closed = new Set();
   for (const reply of replies) {
-    if (![...reply.ids].some((id) => ids.has(id))) continue;
-    for (const item of all) if (reply.ids.has(item.itemId) || item.order < reply.order) closed.add(item.itemId);
+    const turns = new Set(all.filter((item) => reply.ids.has(item.itemId)).map((item) => item.turnId));
+    if (!turns.size) continue;
+    for (const item of all) if (reply.ids.has(item.itemId) || (turns.has(item.turnId) && item.order < reply.order)) closed.add(item.itemId);
   }
   const items = all.filter((item) => !closed.has(item.itemId));
   if (!items.length) return null;
   return {
-    app: "codex", cardId: String(turnId ?? turnAsks[0].callId), at: items[0].at, count: all.length,
+    app: "codex", cardId: String(turnId ?? asks.find((ask) => ask.turnId === turnId).callId), at: items[0].at, count: all.length,
     items: items.map((item) => cleanCardItem(item, limits))
   };
 }
@@ -386,6 +386,9 @@ export async function openThreadHistory(codexHome) {
       projection: db.prepare("SELECT next_rollout_byte_offset AS offset, next_rollout_ordinal AS ordinal FROM thread_history_projection_state WHERE thread_id = ?"),
       users: db.prepare(`SELECT turn_id, rollout_ordinal, item_json FROM thread_items
         WHERE thread_id = ? AND item_type = 'userMessage' ORDER BY rollout_ordinal DESC LIMIT ${CARD_USER_ROWS}`),
+      // Every user row the ask scan covers, when the newest ones hold no owner turn.
+      usersFrom: db.prepare(`SELECT turn_id, rollout_ordinal, item_json FROM thread_items
+        WHERE thread_id = ? AND item_type = 'userMessage' AND rollout_ordinal >= ? AND created_at_ms >= ? ORDER BY rollout_ordinal DESC`),
       turnStart: db.prepare("SELECT rollout_ordinal FROM thread_turns WHERE thread_id = ? AND turn_id = ?"),
       // created_at_ms is checked first: it sits before the large item_json.
       asks: db.prepare(`SELECT turn_id, item_id, item_json, rollout_ordinal, created_at_ms FROM thread_items
@@ -416,22 +419,30 @@ export function readHistoryCard(history, id, { bytes = null, rolloutPath = null,
     // or start an owner turn leave the card to the tail.
     const lag = Number.isFinite(bytes) ? bytes - Number(state.offset) : 0;
     if (lag > 0 && UNINDEXED_CARD_ROWS.test(readTail(rolloutPath, lag + 1))) return undefined;
-    const replies = [];
+    const bound = (Number(state.ordinal) || 0) - CARD_SCAN_ROWS;
+    const cutoff = now - CARD_DROP_MS;
+    let replies = [];
     let owner = null;
+    const readUsers = (rows) => {
+      replies = [];
+      owner = null;
+      for (const row of rows) {
+        const text = itemText(row.item_json);
+        const kind = userInputKind(text);
+        if (kind === "reply") replies.push({ ids: new Set(parseCardReply(text)), order: Number(row.rollout_ordinal) });
+        else if (kind === "owner" && !owner) owner = row;
+      }
+    };
     const users = history.users.all(indexed);
-    for (const row of users) {
-      const text = itemText(row.item_json);
-      const kind = userInputKind(text);
-      if (kind === "reply") replies.push({ ids: new Set(parseCardReply(text)), order: Number(row.rollout_ordinal) });
-      else if (kind === "owner" && !owner) owner = row;
-    }
-    // No owner turn among the rows read: older asks are long settled.
-    const ownerFrom = owner
-      ? Number(history.turnStart.get(indexed, owner.turn_id)?.rollout_ordinal ?? owner.rollout_ordinal)
-      : users.length >= CARD_USER_ROWS ? Number(users.at(-1).rollout_ordinal) : 0;
-    const from = Math.max(ownerFrom, (Number(state.ordinal) || 0) - CARD_SCAN_ROWS);
+    readUsers(users);
+    // The newest rows are all supervisor, heartbeat, context or reply rows:
+    // none closes an ask, so the whole bounded scan is read for the owner's
+    // turn and the replies instead of treating the oldest of them as one.
+    if (!owner && users.length >= CARD_USER_ROWS) readUsers(history.usersFrom.all(indexed, Math.max(0, bound), cutoff));
+    const ownerFrom = owner ? Number(history.turnStart.get(indexed, owner.turn_id)?.rollout_ordinal ?? owner.rollout_ordinal) : 0;
+    const from = Math.max(ownerFrom, bound);
     const asks = [];
-    for (const row of history.asks.all(indexed, from, now - CARD_DROP_MS)) {
+    for (const row of history.asks.all(indexed, from, cutoff)) {
       const item = parseArgs(row.item_json);
       if (item?.delivery !== "async") continue;
       asks.unshift({ callId: String(row.item_id), turnId: row.turn_id, payload: item, at: toIso(Number(row.created_at_ms)), order: Number(row.rollout_ordinal) });
@@ -815,9 +826,11 @@ function capThreads(threads, max) {
   return threads.filter((thread) => keep.has(thread));
 }
 
-// Threads past the paging stop whose history index holds an open card,
-// paged to the lookback boundary (at most CARD_SCAN_PAGES pages). Every row
-// whose card was settled (read, or one that never asks) joins cardScanned.
+// Threads past the paging stop with an open card, paged to the lookback
+// boundary (at most CARD_SCAN_PAGES pages): from the history index, or the
+// bounded rollout tail when the index is missing or cannot say for a row.
+// Every row whose card the index settled (read, or one that never asks)
+// joins cardScanned.
 function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes, cardScanned }) {
   const carded = [];
   for (let page = 0; after && page < CARD_SCAN_PAGES; page += 1) {
@@ -830,9 +843,11 @@ function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tai
       }
       let bytes = null;
       try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
-      // A history index that does not cover the rollout (undefined) leaves the card unknown.
-      const card = readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now });
-      if (card !== undefined) cardScanned?.add(key);
+      // A history index that does not cover the rollout (undefined) leaves
+      // the card unknown: the tail may still show one.
+      const indexed = history ? readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now }) : undefined;
+      if (indexed !== undefined) cardScanned?.add(key);
+      const card = indexed !== undefined ? indexed : readCard(row, { config, now, history: null, tailBytes }, bytes);
       return card?.items?.length > 0;
     }));
     after = rows.length < pageSize ? null : rows.at(-1);
@@ -888,8 +903,8 @@ export async function listCodexThreads(config, options = {}) {
     }
     // capThreads keeps any thread with an open card, so the older rows the
     // loop stopped before are checked for one too, page by page to the
-    // lookback, in the history index only (no tail reads).
-    if (unread && history) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES, cardScanned }));
+    // lookback: in the history index, else in the bounded rollout tail.
+    if (unread) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES, cardScanned }));
     // A failed title scan marks nothing shared; identity checks still see
     // every thread the supervisor retained.
     let shared = { names: new Set(), labels: new Map() };

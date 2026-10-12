@@ -701,6 +701,8 @@ export class FleetStore {
     const ledger = this.state.ledger[key];
     if (!ledger) return null;
     ledger.attemptsWithoutProgress = 0;
+    // Lifts the policy's hold on an answered nudge (resolveNudge).
+    ledger.keepGoingAt = iso(this.now());
     this._save();
     return structuredClone(ledger);
   }

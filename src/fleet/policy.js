@@ -552,7 +552,9 @@ function resolveNudge(ctx, intent, base) {
   const holdMs = Math.max(cooldownMs * maxAttempts, REPLY_HOLD_MIN_MS);
   const heldOut = (entry) => now - Date.parse(sentAtOf(entry) ?? "") >= holdMs;
   const reply = replyCheck(ctx, intent.playbook);
-  if (reply.wait) {
+  // The owner's "keep going" after that nudge lifts the hold on its answer.
+  const lifted = Date.parse(ledger?.keepGoingAt ?? "") > Date.parse(sentAtOf(reply.last) ?? "");
+  if (reply.wait && !lifted) {
     if (attempts >= maxAttempts || heldOut(reply.last)) return stuckDecision(ctx, playbook, vars, attempts, decision, `answered the ${clock(sentAtOf(reply.last))} nudge; nothing new since`);
     return { ...decision, action: "wait", reason: reply.wait };
   }
