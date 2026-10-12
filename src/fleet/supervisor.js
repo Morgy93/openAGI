@@ -9,7 +9,7 @@
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
 import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
-import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
+import { WATCH_GROUPS, classifyThread, mergeThreads, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
@@ -362,6 +362,8 @@ export class FleetSupervisor {
     this.lastTickAt = null;
     this.lastError = null;
     this.lastThreads = new Map();
+    // key -> { group, since }: when each thread entered its watch group.
+    this.watchSince = new Map();
     this.branchLookups = new Map();
     // ref -> last MERGED or CLOSED read, for ticks GitHub cannot answer.
     this.settledPrs = new Map();
@@ -2083,12 +2085,36 @@ export class FleetSupervisor {
     });
   }
 
+  // The group's start holds while the thread stays in it: the earliest of
+  // what this scan can tell and what earlier scans saw. A new group starts
+  // from this scan's guess, or now.
+  trackWatch(key, watch, now) {
+    if (!watch) { this.watchSince.delete(key); return null; }
+    const prev = this.watchSince.get(key);
+    const guess = Date.parse(watch.since ?? "");
+    let since = Number.isFinite(guess) && guess <= now ? guess : now;
+    if (prev?.group === watch.group) since = Math.min(prev.since, since);
+    this.watchSince.set(key, { group: watch.group, since });
+    return { ...watch, since: new Date(since).toISOString() };
+  }
+
   buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null, storage = null }) {
     const byState = {};
+    const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
+    const askedAt = new Map();
+    for (const question of this.store.openQuestions()) {
+      for (const key of [question.threadKey, ...(question.threadKeys ?? [])].filter(Boolean)) {
+        const at = question.lastAskedAt ?? question.createdAt ?? null;
+        if (at && !(askedAt.get(key) <= at)) askedAt.set(key, at);
+      }
+    }
+    const seen = new Set();
     const rows = items.map(({ thread, classified, pr }) => {
       byState[classified.state] = (byState[classified.state] ?? 0) + 1;
       const decision = decisionFor.get(thread.key) ?? null;
+      const watch = this.trackWatch(thread.key, watchOf(thread, classified, { now: finished, askedAt: askedAt.get(thread.key) ?? null }), finished);
+      if (watch) { byWatch[watch.group] = (byWatch[watch.group] ?? 0) + 1; seen.add(thread.key); }
       return {
         key: thread.key,
         kind: thread.kind,
@@ -2113,9 +2139,12 @@ export class FleetSupervisor {
         app: uiTargetFor(thread)?.app ?? null,
         ...(thread.meta?.prompt ? { prompt: { text: clampText(thread.meta.prompt.text, 300), buttons: thread.meta.prompt.buttons, stateId: thread.meta.prompt.stateId } } : {}),
         route: chooseRoute(thread, mode, delivery),
-        decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null } : null
+        decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null } : null,
+        lastAgentAt: thread.lastAgentAt ?? null,
+        watch
       };
     });
+    for (const key of this.watchSince.keys()) if (!seen.has(key)) this.watchSince.delete(key);
     const infraDecisions = decisions.filter((decision) => decision.threadKey.startsWith("infra:"))
       .map((decision) => ({ key: decision.threadKey, action: decision.action, reason: clampText(decision.reason, 200), notBefore: decision.notBefore ?? null }));
     const sources = { codex: 0, claude: 0, conductor: 0 };
@@ -2130,6 +2159,7 @@ export class FleetSupervisor {
         inScope: inScope.length,
         sources,
         byState,
+        byWatch,
         needsYou: this.store.openQuestions().length,
         actions: decisions.filter((decision) => SENDING.has(decision.action)).length
       },

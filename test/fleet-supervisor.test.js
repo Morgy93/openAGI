@@ -3655,3 +3655,35 @@ test("a re-read of the same reply worded differently is the same judge question"
   assert.equal(supervisor.getState().questions.filter((q) => q.kind === "agent-ask" && q.status === "open").length, 0);
   assert.equal(notified.length, pings, "no new ping");
 });
+
+test("the snapshot says what each thread is watched for, and keeps when it started across scans", async (t) => {
+  let clock = NOW;
+  const full = { id: "t1", description: "bb-verify --full --pr 7", kind: "local_bash", startedAt: ago(20 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [full], meta: { turnStartedAt: ago(30 * MIN) } });
+  const { supervisor } = fixture(t, { threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  let row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "waiting");
+  assert.equal(row.watch.waitingOn, "BuildBot3 full run");
+  assert.equal(row.watch.since, ago(20 * MIN));
+  assert.equal(supervisor.getState().snapshot.counts.byWatch.waiting, 1);
+  // Still waiting five minutes later: the start holds.
+  clock += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.since, ago(20 * MIN));
+  // The run ends and the agent works again: a new group, a new start.
+  Object.assign(thread, { agentStatus: "running", openTasks: [], lastActivityAt: new Date(clock).toISOString(), meta: { turnStartedAt: new Date(clock - 2 * MIN).toISOString() } });
+  clock += 1 * MIN;
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "working");
+  assert.equal(row.watch.since, new Date(clock - 3 * MIN).toISOString());
+  // Past the full-run limit the owner is asked: waiting on you, since then.
+  Object.assign(thread, { agentStatus: "waiting", openTasks: [{ ...full, startedAt: new Date(clock - 40 * MIN).toISOString() }] });
+  clock += 1 * MIN;
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "you");
+  assert.equal(row.watch.since, new Date(clock).toISOString());
+});

@@ -403,3 +403,30 @@ test("Oldest run skips queued runs and uses policy's slow limits", async () => {
   assert.match(pill.text, /#5$/, "an older full run under its limit does not hide a slow quick run");
   assert.equal(pill.tone, "warn");
 });
+
+test("Watching groups threads by what the supervisor waits on, longest first, with how long", async () => {
+  const at = (min) => new Date(Date.now() - min * 60_000).toISOString();
+  const base = sampleState();
+  const row = (key, title, watch, extra = {}) => ({
+    key, kind: "conductor", title, workspace: null, repo: "o/r", branch: "b", agentStatus: "waiting", state: "waiting-ci", reason: "waiting",
+    blockers: [], pr: { ref: "o/r#1", url: "https://github.com/o/r/pull/1", state: "OPEN", ci: null }, lastActivityAt: at(1), lastAgentText: "",
+    live: false, route: null, decision: null, watch, ...extra
+  });
+  const threads = [
+    row("conductor:w1", "Short wait", { group: "waiting", since: at(5), waitingOn: "BuildBot3 full run", waitSince: at(5), runningSince: at(9) }),
+    row("conductor:w2", "Long wait", { group: "waiting", since: at(42), waitingOn: "BuildBot3 full run", waitSince: at(42), runningSince: at(50) }),
+    row("conductor:r1", "Busy", { group: "working", since: at(12), waitingOn: null, waitSince: null, runningSince: at(12) }, { agentStatus: "running", state: "running" }),
+    row("claude:x", "Out", null, { state: "excluded" })
+  ];
+  const page = boot({ state: { ...base, snapshot: { ...base.snapshot, threads } } });
+  await settle();
+  const fleet = page.el("fleetList");
+  const text = fleet.textContent;
+  assert.ok(text.includes("Waiting on CI or BuildBot3"));
+  assert.ok(text.includes("Working"));
+  assert.ok(text.includes("on BuildBot3 full run for 42m"));
+  assert.ok(text.includes("for 12m"));
+  assert.ok(text.indexOf("Working") < text.indexOf("Waiting on CI or BuildBot3"), "groups in watch order");
+  assert.ok(text.indexOf("Long wait") < text.indexOf("Short wait"), "longest wait first");
+  assert.ok(text.includes("Turn running"));
+});

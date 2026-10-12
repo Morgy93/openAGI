@@ -134,6 +134,43 @@ const HEALTH_BY_STATE = Object.freeze({
 
 // error is the row's error (any non-null value). A turn that ended on an
 // error is red whatever the PR says, unless the agent is running again.
+// What the supervisor is watching a thread for, as the owner reads it: one
+// group, what it waits on, and since when (this scan's best guess; the
+// supervisor keeps the earliest across scans while the group holds).
+const WATCH_BY_STATE = Object.freeze({
+  running: "working",
+  "waiting-ci": "waiting",
+  "needs-human": "you", "ready-needs-human": "you",
+  "asked-in-scope": "push", "pr-not-ready": "push", stopped: "push", "local-verify": "push",
+  "infra-blocked": "blocked",
+  "idle-no-pr": "quiet", done: "quiet"
+});
+export const WATCH_GROUPS = Object.freeze(["you", "working", "waiting", "push", "blocked", "quiet"]);
+
+function waitLabel(wait) {
+  if (wait?.taskKind === "full") return "BuildBot3 full run";
+  if (wait?.taskKind === "quick") return "bb-quick";
+  if (wait?.source === "task") return "a background task";
+  return "CI";
+}
+
+// askedAt: when an open question about this thread was put to the owner.
+export function watchOf(thread, classified, { now = Date.now(), askedAt = null } = {}) {
+  const state = classified?.state;
+  if (!state || state === "excluded") return null;
+  const group = askedAt ? "you" : (WATCH_BY_STATE[state] ?? "quiet");
+  const wait = classified.wait ?? null;
+  const waitSince = Number.isFinite(wait?.ageMs) ? new Date(now - wait.ageMs).toISOString() : null;
+  const busy = thread.agentStatus === "running" || thread.agentStatus === "waiting";
+  const runningSince = busy ? (thread.meta?.turnStartedAt ?? null) : null;
+  const waitingOn = group === "waiting" ? waitLabel(wait) : group === "you" ? "your answer" : null;
+  const since = group === "you" ? askedAt
+    : group === "waiting" ? waitSince
+      : group === "working" ? runningSince
+        : null;
+  return { group, since: since ?? thread.lastActivityAt ?? null, runningSince, waitSince, waitingOn };
+}
+
 export function threadHealth(state, error = null) {
   if (state === "excluded" || !Object.hasOwn(HEALTH_BY_STATE, state)) return "gray";
   if (state !== "running" && error != null) return "red";
