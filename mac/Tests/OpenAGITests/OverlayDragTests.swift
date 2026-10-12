@@ -309,6 +309,41 @@ final class OverlayDragTests: XCTestCase {
     XCTAssertTrue(visible.contains(frame), "\(frame) not inside \(visible)")
   }
 
+  /// An upgrade keeps the dot where 0.0.46 showed it: that build put the saved
+  /// origin on a 320x60 frame and shrank it to the pill on the nearer side.
+  func testLegacyOriginRestoresWhereTheOldBuildShowedTheDot() throws {
+    let vf = visible
+    let cases: [(NSPoint, NSPoint)] = [
+      // Left half: the pill keeps the left edge, 16pt up (60 - 44).
+      (NSPoint(x: vf.minX + 200, y: vf.minY + 300), NSPoint(x: vf.minX + 200, y: vf.minY + 316)),
+      // Right half: the pill sits at the right end of the old 320pt frame.
+      (NSPoint(x: vf.maxX - 500, y: vf.minY + 300), NSPoint(x: vf.maxX - 500 + 276, y: vf.minY + 316)),
+    ]
+    for (legacy, expected) in cases {
+      defaults.removeObject(forKey: OverlayController.pillOriginXKey)
+      defaults.removeObject(forKey: OverlayController.pillOriginYKey)
+      defaults.set(Double(legacy.x), forKey: "openagi.overlay.originX")
+      defaults.set(Double(legacy.y), forKey: "openagi.overlay.originY")
+      let c = OverlayController(defaults: defaults)
+      c.animatesResizes = false
+      controllers.append(c)
+      c.show()
+      XCTAssertEqual(try XCTUnwrap(c.panel).frame.origin, expected, "legacy \(legacy)")
+      c.panel?.close()
+    }
+  }
+
+  /// A dot parked in the menu-bar or Dock strip belongs to the display it is
+  /// on, not whichever display is main.
+  func testDotInMenuBarStripStaysOnItsDisplay() throws {
+    let screen = try XCTUnwrap(NSScreen.main)
+    let strip = NSRect(x: screen.frame.midX, y: screen.frame.maxY - 10, width: 44, height: 44)
+      .intersection(screen.frame)
+    XCTAssertFalse(screen.visibleFrame.contains(strip))
+    XCTAssertTrue(OverlayController.screen(containing: strip) === screen)
+    XCTAssertNil(OverlayController.screen(containing: NSRect(x: -50_000, y: -50_000, width: 44, height: 44)))
+  }
+
   func testContentResizeWaitsForDrop() throws {
     let (c, panel) = try showPill()
     c.beginDrag()

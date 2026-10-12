@@ -206,14 +206,29 @@ final class OverlayController {
   }
 
   /// The visible frame of the display showing `rect`, or the main display's.
+  /// The display is picked by its full frame, so a dot sitting in a menu-bar
+  /// or Dock strip stays on its own display instead of snapping to main.
   private static func visibleFrame(containing rect: NSRect) -> NSRect? {
+    (screen(containing: rect) ?? NSScreen.main)?.visibleFrame
+  }
+
+  /// The display whose full frame overlaps `rect` the most, if any does.
+  static func screen(containing rect: NSRect, in screens: [NSScreen] = NSScreen.screens) -> NSScreen? {
     func overlap(_ s: NSScreen) -> CGFloat {
-      let r = s.visibleFrame.intersection(rect)
+      let r = s.frame.intersection(rect)
       return r.isNull ? 0 : r.width * r.height
     }
-    let screen = NSScreen.screens.max { overlap($0) < overlap($1) }
-    if let screen, overlap(screen) > 0 { return screen.visibleFrame }
-    return NSScreen.main?.visibleFrame
+    guard let best = screens.max(by: { overlap($0) < overlap($1) }), overlap(best) > 0 else { return nil }
+    return best
+  }
+
+  /// Where 0.0.46 and earlier showed the dot for a saved legacy origin: that
+  /// build put the origin on a 320x60 frame and shrank it to the pill at the
+  /// top corner on the side nearer the screen edge. An origin saved while
+  /// Quick Ask was open comes back where that build would have shown it too.
+  static func legacyPillFrame(origin: NSPoint, in vf: NSRect) -> NSRect {
+    let old = NSRect(x: origin.x, y: origin.y, width: expandedWidth, height: 60)
+    return pillFrame(for: old, anchorRight: old.midX > vf.midX)
   }
 
   /// Resize the panel to fit its SwiftUI content, animated, WITHOUT ever
@@ -277,7 +292,7 @@ final class OverlayController {
     guard let p = panel, let screen = NSScreen.main else { return }
     let home: NSRect
     if let saved = savedPillFrame(),
-       let display = NSScreen.screens.first(where: { $0.visibleFrame.insetBy(dx: -8, dy: -8).intersects(saved) }) {
+       let display = Self.screen(containing: saved) {
       // A saved spot is only trustworthy while a display still shows it;
       // after unplugging a monitor it can be entirely off-screen.
       home = Self.clampedFrame(saved, in: display.visibleFrame)
@@ -300,11 +315,12 @@ final class OverlayController {
       let origin = NSPoint(x: defaults.double(forKey: Self.pillOriginXKey), y: defaults.double(forKey: Self.pillOriginYKey))
       return NSRect(origin: origin, size: size)
     }
-    // Older builds saved a frame origin without its size. Nothing could drag
-    // the pill then, so treat it as the pill's origin.
+    // Older builds saved a frame origin without its size, open or closed.
     if defaults.object(forKey: Self.legacyOriginXKey) != nil {
       let origin = NSPoint(x: defaults.double(forKey: Self.legacyOriginXKey), y: defaults.double(forKey: Self.legacyOriginYKey))
-      return NSRect(origin: origin, size: size)
+      let old = NSRect(x: origin.x, y: origin.y, width: Self.expandedWidth, height: 60)
+      guard let vf = (Self.screen(containing: old) ?? NSScreen.main)?.visibleFrame else { return nil }
+      return Self.legacyPillFrame(origin: origin, in: vf)
     }
     return nil
   }
