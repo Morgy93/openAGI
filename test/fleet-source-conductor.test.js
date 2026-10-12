@@ -700,3 +700,24 @@ test("the out-of-tail card reads use the turn_id index, never a walk of the sess
   }
   db.close();
 });
+
+test("a working session's card dies with its process: a peer started after the call, or none once the turn went silent", async (t) => {
+  const home = makeHome(t);
+  seedCard(home);
+  const config = makeConfig(home);
+  const later = NOW + DEFAULTS.silentTurnMs;
+  // Silent with no process: no card, and the stopped turn reads stalled.
+  let threads = byId(await listConductorThreads(config, { now: later, peers: new Map() }));
+  assert.equal(threads["s-run"].meta.pendingCard, null);
+  assert.equal(threads["s-run"].meta.pendingQuestion, null);
+  assert.equal(threads["s-run"].agentStatus, "stalled");
+  assert.notEqual(classifyThread(threads["s-run"], { now: later, config }).state, "needs-human");
+  // A process restarted after the call is not the one that asked.
+  const restarted = new Map([["s-run", { peerName: "madrid", pid: 902, status: "idle", waitingFor: null, startedAt: iso(MIN) }]]);
+  threads = byId(await listConductorThreads(config, { now: NOW, peers: restarted }));
+  assert.equal(threads["s-run"].meta.pendingCard, null);
+  // The process that asked still lives: the card stays however long it waits.
+  const asker = new Map([["s-run", { peerName: "madrid", pid: 902, status: "idle", waitingFor: null, startedAt: iso(10 * MIN) }]]);
+  threads = byId(await listConductorThreads(config, { now: later, peers: asker }));
+  assert.equal(threads["s-run"].meta.pendingCard?.cardId, "toolu_card");
+});

@@ -1565,3 +1565,17 @@ test("a long background wait on GitHub's own lag waits; a mid-turn reply is not 
   const decision = decideThread(classified, busy, { ledger, playbooks, config, now: NOW, pr: redPr(), mode: "auto", manager });
   assert.doesNotMatch(decision.reason, /answered/);
 });
+
+test("the owner's keep going lifts the hold on an answered nudge, so the next tick nudges again", () => {
+  const reply = "Supervisor warnings are stale.\n\nBlocked on: required reviewer approval from Adam/Nikhil.";
+  const longAgo = 3 * 24 * 60 * MIN;
+  const thread = makeThread({ lastAgentText: reply, lastAgentFull: reply, lastAgentAt: ago(longAgo - 10 * MIN), lastAgentFullAt: ago(longAgo - 10 * MIN), lastActivityAt: ago(longAgo - 10 * MIN) });
+  const pr = redPr();
+  const first = run(makeThread(), { pr }).decision;
+  const ledger = sentLedger(first, longAgo);
+  assert.equal(run(thread, { pr, ledger }).decision.question?.kind, "stuck");
+  // "keep going": attempts reset and the hold on that answer lifted.
+  const kept = run(thread, { pr, ledger: { ...ledger, attemptsWithoutProgress: 0, keepGoingAt: ago(MIN) } }).decision;
+  assert.equal(kept.action, "nudge");
+  assert.equal(kept.playbook, "merge-ready");
+});
