@@ -1,6 +1,6 @@
 {
   "name": "openagi",
-  "version": "0.0.48",
+  "version": "0.0.49",
   "private": true,
   "type": "module",
   "description": "Generic ABI runtime scaffold for directional adaptive scrutiny, tiered memory, and propagation.",
