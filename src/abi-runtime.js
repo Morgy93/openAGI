@@ -61,7 +61,7 @@ import { SkillRegistry } from "./skills.js";
 import { registerCoreTools, ToolRegistry } from "./tool-registry.js";
 import { registerDefaultWorkflows, WorkflowRegistry } from "./workflow-registry.js";
 import { applyPersona } from "./persona.js";
-import { createId, nowIso } from "./utils.js";
+import { createId, nowIso, summarizeText } from "./utils.js";
 
 const AUTOPILOT_DEFAULT_PROMPT = `Autopilot pulse. Look at what's recent — sessions, memory, scheduled jobs, MCP tools you have access to.
 Decide if anything needs action right now: a follow-up to send, a memory to record, a schedule to set, a check to run.
@@ -655,8 +655,9 @@ export class AbiRuntime {
           source: signal.source,
           // Put body evidence first so a long summary cannot consume its
           // compression budget. Normalization may use the summary as the
-          // body fallback; store that text only once.
-          content: [signal.content, signal.content === signal.summary ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
+          // body fallback; compare using the same normalization and length
+          // limit as integration summaries, while preserving the full body.
+          content: [signal.content, summarizeText(signal.content, 500) === summarizeText(signal.summary, 500) ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
             .filter((part) => part != null && part !== "")
             .join("\n"),
           tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],

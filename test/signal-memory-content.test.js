@@ -67,3 +67,22 @@ test('long compressed memory retains distinct bodies behind a maximum-length sum
   assert.ok(first.memory.content.length <= 362);
   assert.equal(runtime.memory.retrieve('Tuesday', { limit: 1 })[0].item.id, first.memory.id);
 });
+
+for (const [label, summary] of [
+  ['repeated whitespace', 'Synthetic   status\n\tdetail. '.repeat(16)],
+  ['truncated summary', 'Synthetic status detail. '.repeat(29) + 'Final evidence.'],
+]) {
+  test(`summary fallback with ${label} retains diagnostics without duplication`, () => {
+    const runtime = fixture();
+    const [output] = runtime.processIntegrationEvent('abi', {
+      ...signal(undefined), summary, risk: 0.1, novelty: 0.1, specificity: 0.45,
+    });
+    assert.equal(output.memory.tier, 'short');
+    const body = summary.replace(/\s+/g, ' ').trim();
+    assert.ok(output.memory.content.startsWith(body));
+    assert.equal(output.memory.content.split('Synthetic status detail.').length - 1,
+      body.split('Synthetic status detail.').length - 1);
+    assert.match(output.memory.content, /Decision: observe/);
+    assert.match(output.memory.content, /Reasons: retain useful evidence/);
+  });
+}
