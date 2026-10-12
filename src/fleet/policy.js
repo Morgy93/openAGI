@@ -814,7 +814,11 @@ function ownerDrivenUntil(ctx, intent) {
   if (text.startsWith(SUPERVISOR_PREFIX) || CARRY_ON.test(text)) return null;
   const at = Date.parse(thread.lastUserAt ?? "");
   if (!Number.isFinite(at)) return null;
-  if (intent.playbook === "ci-finished" && Date.parse(thread.lastAgentAt ?? "") > at) return null;
+  // The wait began when its oldest open task started (classify's wait age),
+  // not at the agent's last words: it may have acknowledged the owner since.
+  const waitAge = classified.wait?.ageMs;
+  const waitStart = Number.isFinite(waitAge) ? now - waitAge : Date.parse(thread.lastAgentAt ?? "");
+  if (intent.playbook === "ci-finished" && waitStart > at) return null;
   if (!(lastNudgeStart(ledger) < at)) return null;
   const until = at + limits.ownerDrivenMs;
   return until > now ? new Date(until).toISOString() : null;
