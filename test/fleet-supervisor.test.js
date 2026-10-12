@@ -3304,3 +3304,18 @@ test("a judge question stays open while the judge cannot read the chat, and clos
   await supervisor.tick({ reason: "test" });
   assert.equal(open().length, 0);
 });
+
+test("judge calls in one scan stop at a time cap; the rest wait for the next scan", async (t) => {
+  const threads = Array.from({ length: 6 }, (_, n) => makeThread({ key: `codex:c${n}`, id: `c${n}`, cwd: `/work/c${n}` }));
+  let clock = NOW;
+  const judge = {
+    enabled: true, calls: [],
+    // Each call takes 40 s of scan time.
+    judge: async (input) => { judge.calls.push(input); clock += 40_000; return { action: "wait", reason: "queued" }; }
+  };
+  const { supervisor } = fixture(t, { mode: "auto", threads, now: () => clock, limits: { maxThreads: 20 }, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.ok(judge.calls.length < 6, `stopped early, made ${judge.calls.length}`);
+  const rows = supervisor.getState().snapshot.threads;
+  assert.ok(rows.some((row) => /time cap/.test(row.decision?.reason ?? "")));
+});

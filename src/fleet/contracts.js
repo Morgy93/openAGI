@@ -293,7 +293,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     judge: {
       enabled: Boolean(overrides.judge?.enabled ?? envFlag(env.OPENAGI_FLEET_JUDGE)) && Boolean(overrides.judge?.model ?? String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim()),
       model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
-      timeoutMs: overrides.judge?.timeoutMs ?? 90_000
+      timeoutMs: overrides.judge?.timeoutMs ?? 40_000
     },
     // Disk space: safe cleanup, archive to the SD card, and asks. On with
     // the supervisor unless OPENAGI_FLEET_STORAGE=0.

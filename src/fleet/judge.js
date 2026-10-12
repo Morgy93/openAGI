@@ -15,7 +15,7 @@ export const JUDGE_ACTIONS = Object.freeze(["send", "wait", "ask-owner"]);
 // Automatic nudges the judge reads first. Owner answers, owner messages,
 // escalations, infra recovery and questions never come here.
 export const JUDGED_PLAYBOOKS = new Set(["merge-ready", "ci-finished", "status-check", "idle-report", "bb3-slow-agent", "resume"]);
-export const DEFAULT_JUDGE_TIMEOUT_MS = 90_000;
+export const DEFAULT_JUDGE_TIMEOUT_MS = 40_000;
 const MESSAGE_MAX = 600;
 const REASON_MAX = 200;
 const TITLE_MAX = 80;
@@ -201,6 +201,32 @@ export function validateVerdict(raw, limits = DEFAULTS) {
   return { action, reason, question: { title, body, options: options.length ? options : ["open thread"] } };
 }
 
+// A Codex home with only the owner's model provider (and its model catalog):
+// the judge runs no MCP servers, no notify hook and no plugins from the
+// owner's own config, and reads untrusted chat text with no tools at hand.
+// Built from <codexHome>/config.toml; null when it names no provider.
+export function judgeCodexConfig(text) {
+  const lines = String(text ?? "").split("\n");
+  const top = [];
+  let provider = null;
+  for (const raw of lines) {
+    if (/^\s*\[/.test(raw)) break;
+    if (/^\s*(?:model_provider|model_catalog_json)\s*=/.test(raw)) top.push(raw.trim());
+    const named = /^\s*model_provider\s*=\s*"([^"]+)"/.exec(raw);
+    if (named) provider = named[1];
+  }
+  if (!provider) return null;
+  const block = [];
+  let inside = false;
+  for (const raw of lines) {
+    const header = /^\s*\[([^\]]+)\]\s*$/.exec(raw);
+    if (header) { inside = header[1].trim() === `model_providers.${provider}`; if (inside) block.push(raw.trim()); continue; }
+    if (inside) block.push(raw);
+  }
+  if (!block.length) return null;
+  return `${top.join("\n")}\n\n${block.join("\n").trim()}\n`;
+}
+
 // config.judge: { enabled, model, timeoutMs }. run: runCommand-like.
 export function createNudgeJudge({ config, run = runCommand, env = process.env } = {}) {
   const settings = config?.judge ?? {};
@@ -219,6 +245,18 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env }
     return lbKey ? { ...base, CODEX_LB_API_KEY: lbKey } : base;
   };
 
+  // The minimal Codex home, written once per call into the call's temp dir.
+  const codexHome = (dir) => {
+    let text = "";
+    try { text = fs.readFileSync(path.join(config?.paths?.codexHome ?? path.join(os.homedir(), ".codex"), "config.toml"), "utf8"); } catch { /* checked below */ }
+    const minimal = judgeCodexConfig(text);
+    if (!minimal) throw new Error("no model provider in the Codex config");
+    const home = path.join(dir, "codex-home");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, "config.toml"), minimal);
+    return home;
+  };
+
   async function judge(input) {
     if (!enabled) throw new Error("judge off");
     const prompt = buildJudgePrompt(input);
@@ -231,7 +269,7 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env }
       let result;
       try {
         // No input: runCommand closes stdin, which codex exec needs.
-        result = await run(config?.bins?.codex ?? "codex", args, { cwd: dir, env: childEnv(), timeoutMs, maxBytes: OUTPUT_MAX_BYTES });
+        result = await run(config?.bins?.codex ?? "codex", args, { cwd: dir, env: { ...childEnv(), CODEX_HOME: codexHome(dir) }, timeoutMs, maxBytes: OUTPUT_MAX_BYTES });
       } catch (error) {
         result = { code: null, stdout: "", stderr: "", timedOut: false, error: error?.message ?? String(error) };
       }

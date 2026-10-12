@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
-import { JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFirstJson, validateVerdict } from "../src/fleet/judge.js";
+import { JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFirstJson, validateVerdict, judgeCodexConfig } from "../src/fleet/judge.js";
 
 const NOW = Date.parse("2026-10-11T12:00:00.000Z");
 
@@ -28,11 +28,31 @@ function fakeRun(out, result = { code: 0, stdout: "", stderr: "", timedOut: fals
   return { run, calls };
 }
 
+const OWNER_CODEX_CONFIG = [
+  'model = "gpt-6.1-sol"',
+  'model_catalog_json = "/h/.codex/model-catalog-lb.json"',
+  'model_provider = "codex-lb"',
+  'notify = ["/bin/notify-me"]',
+  "",
+  "[mcp_servers.superhuman]",
+  'url = "https://mcp.example"',
+  "",
+  "[model_providers.codex-lb]",
+  'name = "openai"',
+  'base_url = "http://lb.local:2455/backend-api/codex"',
+  'wire_api = "responses"',
+  'env_key = "CODEX_LB_API_KEY"',
+  "",
+  "[profiles.other]",
+  'model = "x"'
+].join("\n");
+
 function config(t, judge = { enabled: true, model: "gpt-6.1-sol" }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-judge-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
   fs.writeFileSync(path.join(home, ".codex", "codex-lb.env"), "CODEX_LB_API_KEY=lb-key-1\nOTHER_SECRET=nope\n");
+  fs.writeFileSync(path.join(home, ".codex", "config.toml"), OWNER_CODEX_CONFIG);
   return resolveFleetConfig({}, { home, judge, bins: { codex: "/bin/codex-test" } });
 }
 
@@ -52,7 +72,7 @@ test("config: judge is off unless switched on and a model is named", () => {
   const on = resolveFleetConfig({ OPENAGI_FLEET_JUDGE: "1", OPENAGI_FLEET_JUDGE_MODEL: "gpt-6.1-sol" }).judge;
   assert.equal(on.enabled, true);
   assert.equal(on.model, "gpt-6.1-sol");
-  assert.equal(on.timeoutMs, 90_000);
+  assert.equal(on.timeoutMs, 40_000);
 });
 
 test("parseFirstJson reads the first object of a doubled -o file", () => {
@@ -106,7 +126,10 @@ test("judge runs codex exec read-only with the LB key and parses the doubled fil
   assert.deepEqual(args.slice(0, 7), ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", "gpt-6.1-sol"]);
   assert.ok(args.includes("--output-schema"));
   assert.equal(options.input, undefined, "stdin closed, no input");
-  assert.equal(options.timeoutMs, 90_000);
+  assert.equal(options.timeoutMs, 40_000);
+  // Its own Codex home: the owner's provider and model catalog only, no MCP
+  // servers, no notify hook, no other tables.
+  assert.match(options.env.CODEX_HOME, /codex-home$/);
   assert.equal(options.env.CODEX_LB_API_KEY, "lb-key-1");
   assert.equal(options.env.OPENAI_API_KEY, undefined);
   assert.equal(options.env.OTHER_SECRET, undefined);
@@ -120,8 +143,18 @@ test("judge failures throw: junk, no file, exit code, timeout, off", async (t) =
   await assert.rejects(createNudgeJudge({ config: cfg, run: fakeRun("hello").run }).judge(INPUT), /not JSON/);
   await assert.rejects(createNudgeJudge({ config: cfg, run: fakeRun({ action: "maybe", reason: "x" }).run }).judge(INPUT), /bad action/);
   await assert.rejects(createNudgeJudge({ config: cfg, run: fakeRun(null, { code: 1, stdout: "", stderr: "noise\nERROR: model not found", timedOut: false, error: null }).run }).judge(INPUT), /model not found/);
-  await assert.rejects(createNudgeJudge({ config: cfg, run: fakeRun(null, { code: null, stdout: "", stderr: "", timedOut: true, error: null }).run }).judge(INPUT), /timed out after 90s/);
+  await assert.rejects(createNudgeJudge({ config: cfg, run: fakeRun(null, { code: null, stdout: "", stderr: "", timedOut: true, error: null }).run }).judge(INPUT), /timed out after 40s/);
   const off = createNudgeJudge({ config: config(t, { enabled: true, model: null }), run: fakeRun({}).run });
   assert.equal(off.enabled, false);
   await assert.rejects(off.judge(INPUT), /judge off/);
+});
+
+test("the judge's Codex config keeps only the provider and its model catalog", () => {
+  const minimal = judgeCodexConfig(OWNER_CODEX_CONFIG);
+  assert.match(minimal, /^model_catalog_json = /m);
+  assert.match(minimal, /^model_provider = "codex-lb"/m);
+  assert.match(minimal, /^\[model_providers\.codex-lb\]$/m);
+  assert.match(minimal, /base_url = "http:\/\/lb\.local:2455\/backend-api\/codex"/);
+  assert.doesNotMatch(minimal, /mcp_servers|notify|superhuman|profiles/);
+  assert.equal(judgeCodexConfig('model = "x"\n'), null, "no provider: no judge home");
 });

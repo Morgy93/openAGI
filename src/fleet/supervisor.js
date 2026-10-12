@@ -70,7 +70,10 @@ const JUDGE_MAX_PER_TICK = 6;
 const JUDGE_CONCURRENCY = 3;
 const JUDGE_CACHE_MS = 2 * 60 * MIN;
 const JUDGE_DOWN_MS = 5 * MIN;
-const JUDGE_CALL_MS = 95_000;
+const JUDGE_CALL_MS = 45_000;
+// All judge calls in one scan end by then (a call reads in ~10-20 s); the
+// rest wait for the next scan, so owner answers and sends are not held.
+const JUDGE_TICK_MS = 60_000;
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -1473,7 +1476,9 @@ export class FleetSupervisor {
     const now = due.slice(0, JUDGE_MAX_PER_TICK);
     for (const { item } of due.slice(JUDGE_MAX_PER_TICK)) item.decision = judgeWait(item.decision, "judge: read next scan (per-scan cap)");
     const history = this.nudgeHistory(new Set(now.map(({ item }) => item.thread.key)));
+    const judgeStart = this.now();
     const results = await mapLimit(now, JUDGE_CONCURRENCY, async ({ item }) => {
+      if (this.now() - judgeStart >= JUDGE_TICK_MS) return { later: true };
       try {
         const verdict = await withTimeout(Promise.resolve(judge.judge({
           thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started
@@ -1487,6 +1492,7 @@ export class FleetSupervisor {
     now.forEach(({ item, key }, index) => {
       const result = results[index] ?? { error: "failed" };
       const { decision, thread } = item;
+      if (result.later) { item.decision = judgeWait(decision, "judge: read next scan (time cap)"); return; }
       if (result.error) {
         failed += 1;
         this.judgeError = result.error;
