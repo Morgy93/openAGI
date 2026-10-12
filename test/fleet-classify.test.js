@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, blockedOnSection, classifyThread, mergeThreads, prReadiness, threadHealth
+  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, WATCH_GROUPS, blockedOnSection, classifyThread, mergeThreads, prReadiness, threadHealth, watchOf
 } from "../src/fleet/classify.js";
 import { DEFAULTS, STATES, clampTail, clampTailLines } from "../src/fleet/contracts.js";
 
@@ -646,4 +646,36 @@ test("an owner Blocked-on item beats a CI wait the agent wrote, and a merge afte
   const merged = makePr({ state: "MERGED", mergedAt: ago(5 * MIN), closedAt: ago(5 * MIN) });
   assert.notEqual(classify(makeThread({ lastAgentText: "Blocked on:\n- your merge decision" }), { pr: merged }).state, "needs-human");
   assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: merged }).state, "needs-human");
+});
+
+test("watchOf: the owner's view of what each thread is watched for, and since when", () => {
+  const classify = (thread, pr = makePr()) => classifyThread(thread, { pr, now: NOW, config });
+  // A full BuildBot3 run the agent waits on: waiting, on that run, since the task started.
+  const full = { id: "t1", description: "bb-verify --full --pr 6522", kind: "local_bash", startedAt: ago(25 * MIN) };
+  const waiting = makeThread({ agentStatus: "waiting", openTasks: [full], meta: { turnStartedAt: ago(40 * MIN) } });
+  const w = watchOf(waiting, classify(waiting, makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } })), { now: NOW });
+  assert.equal(w.group, "waiting");
+  assert.equal(w.waitingOn, "BuildBot3 full run");
+  assert.equal(w.since, ago(25 * MIN));
+  assert.equal(w.waitSince, ago(25 * MIN));
+  assert.equal(w.runningSince, ago(40 * MIN));
+  // Mid-turn: working since the turn began.
+  const running = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(12 * MIN) } });
+  const r = watchOf(running, classify(running), { now: NOW });
+  assert.equal(r.group, "working");
+  assert.equal(r.since, ago(12 * MIN));
+  // A question to the owner outranks the state: waiting on you, since it was asked.
+  const asked = watchOf(running, classify(running), { now: NOW, askedAt: ago(7 * MIN) });
+  assert.equal(asked.group, "you");
+  assert.equal(asked.waitingOn, "your answer");
+  assert.equal(asked.since, ago(7 * MIN));
+  // An owner ask still held for review (no visible question) is not blamed on the owner.
+  assert.equal(watchOf(makeThread(), { state: "needs-human" }, { now: NOW }).group, "push");
+  assert.equal(watchOf(makeThread(), { state: "needs-human" }, { now: NOW, askedAt: ago(3 * MIN) }).group, "you");
+  // Out of scope is not watched; every group is a known one.
+  assert.equal(watchOf(makeThread(), { state: "excluded" }, { now: NOW }), null);
+  for (const state of STATES) {
+    const watch = watchOf(makeThread(), { state }, { now: NOW });
+    if (watch) assert.ok(WATCH_GROUPS.includes(watch.group), state);
+  }
 });

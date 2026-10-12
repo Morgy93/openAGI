@@ -100,7 +100,7 @@ details.thread>summary{padding:0}
     <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
   <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
-  <section aria-labelledby="fleetH"><h2 id="fleetH">Fleet <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
+  <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
 </main>
 </div>
 <script>
@@ -129,7 +129,14 @@ details.thread>summary{padding:0}
     'infra-blocked': 'warn', 'local-verify': 'warn', 'waiting-ci': 'good', running: 'good', 'idle-no-pr': 'dim',
     done: 'dim', excluded: 'dim'
   };
-  var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true };
+  var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true, quiet: true };
+  // Watching: what the supervisor watches each thread for (snapshot watch.group).
+  var WATCH_ORDER = ['you', 'working', 'waiting', 'push', 'blocked', 'quiet'];
+  var WATCH_LABEL = {
+    you: 'Waiting on you', working: 'Working', waiting: 'Waiting on CI or BuildBot3', push: 'Needs a push',
+    blocked: 'Blocked by infra', quiet: 'Quiet'
+  };
+  var WATCH_TONE = { you: 'hot', working: 'good', waiting: 'good', push: 'warn', blocked: 'warn', quiet: 'dim' };
   var ACTION_LABEL = { planned: 'Planned', proposed: 'Proposed', sent: 'Sent', 'dry-run': 'Dry run', blocked: 'Blocked', failed: 'Failed', done: 'Done' };
   var ACTION_TONE = { planned: 'dim', proposed: 'warn', sent: 'good', 'dry-run': 'dim', blocked: 'hot', failed: 'hot', done: 'good' };
   var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app' };
@@ -191,6 +198,21 @@ details.thread>summary{padding:0}
     var t = Date.parse(iso || '');
     if (!isFinite(t)) return '';
     return secs(Math.max(0, (Date.now() - t) / 1000)) + ' ago';
+  }
+
+  // How long since iso, without "ago": "23m", "2h".
+  function dur(iso) {
+    var t = Date.parse(iso || '');
+    if (!isFinite(t)) return '';
+    return secs(Math.max(0, (Date.now() - t) / 1000));
+  }
+
+  // "on BuildBot3 full run for 23m", "for 1h": the row's watch line.
+  function watchText(w) {
+    if (!w) return '';
+    var d = dur(w.since);
+    var on = w.waitingOn && w.group === 'waiting' ? 'on ' + w.waitingOn + ' ' : '';
+    return d ? on + 'for ' + d : on.trim();
   }
 
   function when(iso) {
@@ -538,13 +560,19 @@ details.thread>summary{padding:0}
     if (t.workspace) el('span', null, t.workspace, sub);
     else if (t.repo) el('span', null, t.repo, sub);
     if (t.pr && t.pr.ref) link(shortRef(t.pr.ref), prHref(t.pr, t.pr.ref), sub);
-    if (t.lastActivityAt) el('span', null, ago(t.lastActivityAt), sub);
+    if (t.watch && t.watch.since) el('span', 'since', watchText(t.watch), sub);
+    else if (t.lastActivityAt) el('span', null, ago(t.lastActivityAt), sub);
     var blockers = Array.isArray(t.blockers) ? t.blockers : [];
     var top = blockers[0] || t.reason;
     if (top) el('div', 'blocker ' + (STATE_TONE[t.state] || 'dim'), clip(top, 160), s);
 
     var more = el('div', 'more', null, d);
     line(more, 'Agent', [t.kind, t.agentStatus].filter(Boolean).join(', '));
+    var w = t.watch || null;
+    if (w && w.runningSince) line(more, 'Turn running', 'for ' + dur(w.runningSince) + ' (since ' + when(w.runningSince) + ')');
+    if (w && w.waitSince && w.group !== 'waiting') line(more, 'Waiting', 'for ' + dur(w.waitSince));
+    if (t.lastAgentAt) line(more, 'Agent last spoke', ago(t.lastAgentAt));
+    if (t.lastActivityAt) line(more, 'Last activity', ago(t.lastActivityAt));
     line(more, 'Branch', t.branch);
     if (t.pr) {
       var prBits = [t.pr.state, ciText(t.pr.ci) ? 'CI ' + ciText(t.pr.ci) : '',
@@ -572,23 +600,32 @@ details.thread>summary{padding:0}
     $('fleetCount').textContent = threads.length ? String(inScope) : '';
     if (!snap) { el('p', 'empty', 'No scan yet. Tap Scan now.', box); return; }
     if (!threads.length) { el('p', 'empty', 'No recent coding threads.', box); return; }
+    // Grouped by what the supervisor watches each thread for; a snapshot from
+    // before watch existed groups by state as it used to. Out of scope last.
+    var byWatch = threads.some(function (t) { return t.watch; });
     var groups = new Map();
     threads.forEach(function (t) {
-      var st = t.state || 'unknown';
+      var st = byWatch ? (t.watch ? t.watch.group : 'excluded') : (t.state || 'unknown');
       if (!groups.has(st)) groups.set(st, []);
       groups.get(st).push(t);
     });
-    var order = STATE_ORDER.filter(function (st) { return groups.has(st); });
+    var order = (byWatch ? WATCH_ORDER.concat(['excluded']) : STATE_ORDER).filter(function (st) { return groups.has(st); });
     groups.forEach(function (_list, st) { if (order.indexOf(st) < 0) order.push(st); });
     order.forEach(function (st) {
+      // Longest-waiting first where time matters; newest activity first otherwise.
       var list = groups.get(st).slice().sort(function (a, b) {
+        if (byWatch && st !== 'quiet' && st !== 'excluded' && a.watch && b.watch) {
+          return String(a.watch.since || '').localeCompare(String(b.watch.since || ''));
+        }
         return String(b.lastActivityAt || '').localeCompare(String(a.lastActivityAt || ''));
       });
       var g = el('details', 'group', null, box);
       g.open = groupOpen.has(st) ? groupOpen.get(st) : !COLLAPSED[st];
       g.addEventListener('toggle', function () { groupOpen.set(st, g.open); });
       var sum = el('summary', null, null, g);
-      el('span', 'chip ' + (STATE_TONE[st] || 'dim'), STATE_LABEL[st] || st, sum);
+      var label = byWatch ? (WATCH_LABEL[st] || STATE_LABEL[st] || st) : (STATE_LABEL[st] || st);
+      var tone = byWatch ? (WATCH_TONE[st] || STATE_TONE[st] || 'dim') : (STATE_TONE[st] || 'dim');
+      el('span', 'chip ' + tone, label, sum);
       el('span', 'n', String(list.length), sum);
       var wrap = el('div', 'list', null, g);
       list.forEach(function (t) { renderThread(t, wrap); });

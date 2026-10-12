@@ -67,6 +67,8 @@ struct SupervisorSection: View {
         }
         .frame(maxHeight: 300)
       }
+
+      WatchingList()
     }
   }
 

@@ -40,6 +40,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -92,7 +93,8 @@ import sh.openagi.mobile.util.RelativeTime
 
 // FEATURES.md's "Supervisor": the fleet supervisor's view of every coding
 // thread, read from /fleet/api/state. What needs a person comes first (its
-// open questions), then every thread, worst health first. The mode, a manual
+// open questions), then Watching: every thread grouped by what the supervisor
+// watches it for, with how long it has been that way. The mode, a manual
 // scan and a supervisor chat sit in the header. Nothing here is optimistic:
 // a mode change, an answer or a sent nudge shows only once the daemon says so,
 // the same rule approvals follow.
@@ -130,6 +132,10 @@ fun SupervisorScreen(
     var actionNoteThread by remember { mutableStateOf<String?>(null) }
     var openThread by remember { mutableStateOf<FleetThread?>(null) }
     var chatOpen by chatOpenState
+    // The clock the Watching durations read; ticks while the list is visible.
+    var now by remember { mutableStateOf(Instant.now()) }
+    // Which Watching groups the owner opened or folded, kept across refreshes.
+    val groupOpen = remember { mutableStateMapOf<String, Boolean>() }
 
     // Responses can land out of order: a 30s poll sent while an answer was
     // relaying may return after it with the state from before. A poll is
@@ -141,6 +147,7 @@ fun SupervisorScreen(
         loadError = null
         lastLoadFailed = false
         lastSyncedAt = Instant.now()
+        now = Instant.now()
     }
 
     fun reject(seq: Int, error: DaemonException) {
@@ -268,6 +275,17 @@ fun SupervisorScreen(
         }
     }
 
+    // "for 23m" keeps counting between polls: every 30s while on screen.
+    LaunchedEffect(lifecycleOwner, chatOpen) {
+        if (chatOpen) return@LaunchedEffect
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                now = Instant.now()
+                delay(30_000L)
+            }
+        }
+    }
+
     if (chatOpen) {
         BackHandler { chatOpen = false }
         // The chat's own one-row top bar carries the back arrow.
@@ -346,6 +364,8 @@ fun SupervisorScreen(
                         item(key = "threads") {
                             ThreadsSection(
                                 state = current,
+                                now = now,
+                                groupOpen = groupOpen,
                                 onOpen = {
                                     openThread = it
                                     actionNote = null
@@ -389,6 +409,7 @@ fun SupervisorScreen(
         val thread = current?.snapshot?.threads?.firstOrNull { it.key == opened.key } ?: opened
         ThreadDetailSheet(
             thread = thread,
+            now = now,
             proposed = if (current?.mode == FleetMode.PROPOSE) SupervisorFormat.proposedFor(thread, current.actions) else emptyList(),
             busyActionId = busyActionId,
             actionNote = actionNote?.takeIf { actionNoteThread == thread.key },
@@ -679,26 +700,50 @@ private fun QuestionRow(
     }
 }
 
+// Watching: every thread grouped by what the supervisor watches it for
+// (waiting on you, working, waiting on CI or BuildBot3, ...), longest wait
+// first, each with how long it has been that way. A daemon from before watch
+// groups by state instead. Quiet and out-of-scope groups start folded.
 @Composable
-private fun ThreadsSection(state: FleetState, onOpen: (FleetThread) -> Unit) {
+private fun ThreadsSection(
+    state: FleetState,
+    now: Instant,
+    groupOpen: MutableMap<String, Boolean>,
+    onOpen: (FleetThread) -> Unit,
+) {
     val snapshot = state.snapshot
-    val threads = SupervisorFormat.sorted(snapshot?.threads.orEmpty())
+    val threads = snapshot?.threads.orEmpty()
+    val groups = WatchFormat.groups(threads)
     val proposing = state.mode == FleetMode.PROPOSE
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Threads", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+        Row(verticalAlignment = Alignment.Bottom) {
+            Text("Watching", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+            val inScope = snapshot?.counts?.inScope?.takeIf { it > 0 } ?: threads.size
+            if (threads.isNotEmpty()) {
+                Text("$inScope", style = OpenAGIType.secondary, color = muted, modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
+            }
+        }
         when {
             snapshot == null -> RowGroup { InlineMessage("No scan yet. Tap Scan now.") }
             threads.isEmpty() -> RowGroup { InlineMessage("No recent coding threads.") }
-            else -> {
-                Text(SupervisorFormat.summary(threads), style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                RowGroup {
-                    threads.forEachIndexed { index, thread ->
-                        ThreadRow(
-                            thread = thread,
-                            hasProposal = proposing && SupervisorFormat.proposedFor(thread, state.actions).isNotEmpty(),
-                            onClick = { onOpen(thread) },
-                        )
-                        if (index != threads.lastIndex) Hairline()
+            else -> groups.forEach { group ->
+                val open = groupOpen[group.key] ?: !group.collapsedByDefault
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    WatchGroupHeader(group = group, open = open, onToggle = { groupOpen[group.key] = !open })
+                    if (open) {
+                        RowGroup {
+                            group.threads.forEachIndexed { index, thread ->
+                                ThreadRow(
+                                    thread = thread,
+                                    group = group.key,
+                                    now = now,
+                                    hasProposal = proposing && SupervisorFormat.proposedFor(thread, state.actions).isNotEmpty(),
+                                    onClick = { onOpen(thread) },
+                                )
+                                if (index != group.threads.lastIndex) Hairline()
+                            }
+                        }
                     }
                 }
             }
@@ -706,16 +751,45 @@ private fun ThreadsSection(state: FleetState, onOpen: (FleetThread) -> Unit) {
     }
 }
 
+// The group's name in its tone, the count, and Show or Hide; the whole line
+// toggles the group.
 @Composable
-private fun ThreadRow(thread: FleetThread, hasProposal: Boolean, onClick: () -> Unit) {
+private fun WatchGroupHeader(group: WatchFormat.Group, open: Boolean, onToggle: () -> Unit) {
     val colors = LocalOpenAGIColors.current
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val tone = when (group.key) {
+        "you", "needs-human", "ready-needs-human" -> colors.alert
+        "push", "blocked", "stopped", "asked-in-scope", "pr-not-ready", "infra-blocked", "local-verify" -> colors.caution
+        "working", "waiting", "waiting-ci", "running" -> colors.live
+        else -> muted
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .clickable(onClickLabel = if (open) "Hide" else "Show", role = Role.Button, onClick = onToggle),
+    ) {
+        Text(group.label, style = OpenAGIType.secondary, color = tone, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+        Text("${group.threads.size}", style = OpenAGIType.secondary, color = muted, modifier = Modifier.padding(start = 8.dp))
+        Box(modifier = Modifier.weight(1f))
+        Text(if (open) "Hide" else "Show", style = OpenAGIType.caption, color = muted)
+    }
+}
+
+// One line of name and PR, one line of how long ("on BuildBot3 full run for
+// 23m"), and the reason where the thread needs something.
+@Composable
+private fun ThreadRow(thread: FleetThread, group: String, now: Instant, hasProposal: Boolean, onClick: () -> Unit) {
+    val colors = LocalOpenAGIColors.current
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val ciFailing = SupervisorFormat.ciFailing(thread.pr?.ci)
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 60.dp)
             .clickable(onClickLabel = "Open details", onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -724,29 +798,44 @@ private fun ThreadRow(thread: FleetThread, hasProposal: Boolean, onClick: () -> 
                 SupervisorFormat.name(thread),
                 style = OpenAGIType.body,
                 color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 2,
+                maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f).padding(start = 10.dp),
             )
-            thread.lastActivityAt?.let {
-                Text(RelativeTime.short(ageMinutes(it)), style = OpenAGIType.caption, color = muted, modifier = Modifier.padding(start = 8.dp))
+            WatchFormat.prShortRef(thread.pr?.ref)?.let {
+                Text(
+                    it,
+                    style = OpenAGIType.caption,
+                    color = if (ciFailing) colors.alert else muted,
+                    maxLines = 1,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
             }
         }
-        Column(modifier = Modifier.padding(start = 18.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            HealthAndState(thread, OpenAGIType.caption)
+        val time = thread.watch?.takeIf { it.since != null }?.let { WatchFormat.watchLine(it, now) }
+            ?: thread.lastActivityAt?.let { WatchFormat.ago(it, now) }
+        val line = listOfNotNull(
+            time,
+            if (ciFailing) "CI failing" else null,
+            if (hasProposal) "Nudge ready" else null,
+        ).joinToString(" · ")
+        if (line.isNotEmpty()) {
+            Text(line, style = OpenAGIType.caption, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(start = 18.dp))
+        }
+        if (group in REASON_GROUPS) {
             (thread.reason?.takeIf { it.isNotBlank() } ?: thread.blockers.firstOrNull())?.let {
-                Text(it, style = OpenAGIType.secondary, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-            val chip = SupervisorFormat.prChip(thread.pr)
-            if (chip != null || hasProposal) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
-                    chip?.let { Chip(it, color = if (SupervisorFormat.ciFailing(thread.pr?.ci)) colors.alert else MaterialTheme.colorScheme.onSurface) }
-                    if (hasProposal) Chip("Nudge ready to send", color = colors.live)
-                }
+                Text(it, style = OpenAGIType.caption, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(start = 18.dp))
             }
         }
     }
 }
+
+// Groups where the why matters on the row itself: something is stuck or
+// waiting on a person. Working, waiting on CI and quiet rows say enough.
+private val REASON_GROUPS = setOf(
+    "you", "push", "blocked",
+    "needs-human", "ready-needs-human", "stopped", "asked-in-scope", "pr-not-ready", "infra-blocked",
+)
 
 @Composable
 private fun Chip(text: String, color: Color) {
@@ -768,6 +857,7 @@ private fun DetailRow(label: String, value: String, valueColor: Color? = null, o
 @Composable
 private fun ThreadDetailSheet(
     thread: FleetThread,
+    now: Instant,
     proposed: List<FleetAction>,
     busyActionId: String?,
     actionNote: Pair<String, SupervisorFormat.Note>?,
@@ -780,6 +870,18 @@ private fun ThreadDetailSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     val rows = buildList<@Composable () -> Unit> {
+        // How long: what it is watched for, the turn, the wait, the agent.
+        thread.watch?.let { watch ->
+            val group = watch.group?.takeIf { it.isNotBlank() }?.let { WatchFormat.groupLabel(it, byWatch = true) }
+            val value = listOfNotNull(group, WatchFormat.watchLine(watch, now)).joinToString(", ")
+            if (value.isNotBlank()) add { DetailRow("Watching", value) }
+        }
+        thread.watch?.runningSince?.let { started ->
+            add { DetailRow("Turn running", WatchFormat.turnRunning(thread.watch, now) + " (since " + clockTime(started) + ")") }
+        }
+        WatchFormat.waiting(thread.watch, now)?.let { add { DetailRow("Waiting", it) } }
+        thread.lastAgentAt?.let { add { DetailRow("Agent last spoke", WatchFormat.ago(it, now)) } }
+        thread.lastActivityAt?.let { add { DetailRow("Last activity", WatchFormat.ago(it, now)) } }
         thread.reason?.takeIf { it.isNotBlank() }?.let { add { DetailRow("Reason", it) } }
         if (thread.blockers.isNotEmpty()) add { DetailRow("Blockers", thread.blockers.joinToString("\n") { "• $it" }) }
         thread.pr?.let { pr ->

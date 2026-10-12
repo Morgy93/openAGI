@@ -3655,3 +3655,75 @@ test("a re-read of the same reply worded differently is the same judge question"
   assert.equal(supervisor.getState().questions.filter((q) => q.kind === "agent-ask" && q.status === "open").length, 0);
   assert.equal(notified.length, pings, "no new ping");
 });
+
+test("the snapshot says what each thread is watched for, and keeps when it started across scans", async (t) => {
+  let clock = NOW;
+  const full = { id: "t1", description: "bb-verify --full --pr 7", kind: "local_bash", startedAt: ago(20 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [full], meta: { turnStartedAt: ago(30 * MIN) } });
+  const { supervisor } = fixture(t, { threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  let row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "waiting");
+  assert.equal(row.watch.waitingOn, "BuildBot3 full run");
+  assert.equal(row.watch.since, ago(20 * MIN));
+  assert.equal(supervisor.getState().snapshot.counts.byWatch.waiting, 1);
+  // Still waiting five minutes later: the start holds.
+  clock += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.since, ago(20 * MIN));
+  // The run ends and the agent works again: a new group, a new start.
+  Object.assign(thread, { agentStatus: "running", openTasks: [], lastActivityAt: new Date(clock).toISOString(), meta: { turnStartedAt: new Date(clock - 2 * MIN).toISOString() } });
+  clock += 1 * MIN;
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "working");
+  assert.equal(row.watch.since, new Date(clock - 3 * MIN).toISOString());
+  // Past the full-run limit the owner is asked: waiting on you, since then.
+  Object.assign(thread, { agentStatus: "waiting", openTasks: [{ ...full, startedAt: new Date(clock - 40 * MIN).toISOString() }] });
+  clock += 1 * MIN;
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "you");
+  const askedAt = new Date(clock).toISOString();
+  assert.equal(row.watch.since, askedAt);
+  // A daemon restart forgets the tracked starts, and each scan re-stamps the
+  // question's lastAskedAt: the wait still dates from when it was asked.
+  clock += 4 * MIN;
+  supervisor.watchSince.clear();
+  await supervisor.tick({ reason: "test" });
+  row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "you");
+  assert.equal(row.watch.since, askedAt);
+});
+
+test("a new turn in the same watch group restarts its clock", async (t) => {
+  let clock = NOW;
+  const thread = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(30 * MIN) } });
+  const { supervisor } = fixture(t, { threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.getState().snapshot.threads[0].watch.since, ago(30 * MIN));
+  // Turn A ended and turn B began between two scans: still "working", from B.
+  clock += 10 * MIN;
+  Object.assign(thread, { lastActivityAt: new Date(clock).toISOString(), meta: { turnStartedAt: new Date(clock - 2 * MIN).toISOString() } });
+  await supervisor.tick({ reason: "test" });
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "working");
+  assert.equal(row.watch.since, new Date(clock - 2 * MIN).toISOString());
+});
+
+test("a thread moved into a group with no clock of its own starts there at the move", async (t) => {
+  let clock = NOW;
+  const thread = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(5 * MIN) } });
+  const { supervisor } = fixture(t, { threads: [thread], now: () => clock });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.getState().snapshot.threads[0].watch.group, "working");
+  // The turn ends with the PR not ready: needs a push, from now, not from
+  // the thread's last activity before this scan.
+  Object.assign(thread, { agentStatus: "idle", lastActivityAt: ago(1 * MIN) });
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.notEqual(row.watch.group, "working");
+  assert.equal(row.watch.since, new Date(clock).toISOString());
+});
