@@ -7,24 +7,36 @@ import SwiftUI
 /// Like SupervisorSection, nothing that changes this view's height is
 /// private @State: the open groups live on FleetConsumer, and OverlayView
 /// watches them and `threads` so the panel resizes.
+///
+/// The sections scroll inside `maxListHeight`, like the questions and
+/// approvals above them: the panel is capped at the screen's height, so an
+/// uncapped list would be cut off on a laptop with everything else showing.
+/// "N more" stays outside the scroll area so it is always reachable.
 struct WatchingList: View {
   @ObservedObject var fleet = FleetConsumer.shared
-  @ObservedObject var app = AppState.shared
+  /// Tests render a fixed layout instead of the consumer's threads.
+  var layoutOverride: FleetWatching.Layout? = nil
+
+  static let maxListHeight: CGFloat = 220
 
   var body: some View {
-    let layout = FleetWatching.layout(fleet.threads, openGroups: fleet.openWatchGroups)
+    let layout = layoutOverride ?? FleetWatching.layout(fleet.threads, openGroups: fleet.openWatchGroups)
     if !layout.sections.isEmpty {
       VStack(alignment: .leading, spacing: 5) {
         Text("Watching").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-        // Durations tick with the clock; every row stays one line, so the
-        // panel's height never changes when they do.
-        TimelineView(.periodic(from: .now, by: 30)) { context in
-          VStack(alignment: .leading, spacing: 5) {
-            ForEach(layout.sections) { section in
-              sectionView(section, now: context.date)
+        ScrollView {
+          // Durations tick with the clock; every row stays one line, so the
+          // panel's height never changes when they do.
+          TimelineView(.periodic(from: .now, by: 30)) { context in
+            VStack(alignment: .leading, spacing: 5) {
+              ForEach(layout.sections) { section in
+                sectionView(section, now: context.date)
+              }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
           }
         }
+        .frame(maxHeight: Self.maxListHeight)
         if layout.hidden > 0 {
           Button("\(layout.hidden) more") { openFleetPage() }
             .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.blue)
@@ -101,5 +113,5 @@ struct WatchingList: View {
     }
   }
 
-  private func openFleetPage() { app.openDashboard(path: "/fleet") }
+  private func openFleetPage() { AppState.shared.openDashboard(path: "/fleet") }
 }
