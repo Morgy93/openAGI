@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { MESSAGE_PREFIX, RELAY_REPLY_NOTE, backgroundRouteFor, buildRelayPrompt, createExecutor, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { MESSAGE_PREFIX, RELAY_REPLY_NOTE, backgroundRouteFor, buildRelayPrompt, createExecutor, isCodexIdentityBlock, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
 import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
@@ -706,6 +706,43 @@ test("no background route unless allowed, safe and the block was only the owner'
   assert.equal((await stale.executor.deliver({ thread: thread(stale.cwd), message: "continue", route: "computer-use" })).route, "codex-exec");
   assert.deepEqual(stale.calls.map((call) => call.cmd), [stale.config.bins.lsof, "/abs/codex"]);
   await stale.executor.whenIdle();
+});
+
+// codex:019fe344 (#5557): the approved BuildBot3-failure ping was blocked
+// twice because Codex could not show the thread was open, and a twin title
+// blocked 151 sends. Codex shows no id on screen; codex exec reaches the
+// thread by its id instead.
+test("a Codex send the app cannot verify goes by codex exec, addressed by the thread id", async (t) => {
+  withoutLbKey(t);
+  const thread = (cwd, extra = {}) => codexThread(cwd, { id: "019fe344-eb70-7da2-9186-62c55dbd61d2", title: "On top of PR #5544, I want to build a mock chat", agentStatus: "idle", ...extra });
+  for (const detail of [
+    "could not verify thread: \"on top of pr #5544, i want to build a mo\" is not the open thread",
+    "ambiguous: two threads share this title",
+    "ambiguous: two threads share this title; a thread with that title is already open"
+  ]) {
+    const { cwd, calls, store, executor } = fallbackSetup(t, { results: [{ status: "blocked", detail }] });
+    const result = await executor.deliver({ thread: thread(cwd), message: "BuildBot3 full run failed on 452084dce8", route: "computer-use", playbook: "merge-ready" });
+    assert.equal(result.status, "sent", detail);
+    assert.equal(result.route, "codex-exec", detail);
+    assert.deepEqual(calls.at(-1).args.slice(0, 3), ["exec", "resume", "019fe344-eb70-7da2-9186-62c55dbd61d2"], detail);
+    await executor.whenIdle();
+    assert.equal(store.action(result.actionId).fallbackFrom, detail);
+  }
+  // A live turn's writer lock, a send left unconfirmed in the composer, or a
+  // Conductor chat (its page names the session by id) gets no exec.
+  const verify = () => [{ status: "blocked", detail: "could not verify thread: another thread is open" }];
+  for (const [label, extra, results] of [
+    ["writer-locked", { writerLocked: true }, verify()],
+    ["turn running", { agentStatus: "running" }, verify()],
+    ["unconfirmed", {}, [{ status: "blocked", detail: "could not verify thread: another thread is open", unconfirmed: true }]]
+  ]) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results });
+    const result = await executor.deliver({ thread: thread(cwd, extra), message: "continue", route: "computer-use" });
+    assert.equal(result.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+  assert.equal(isCodexIdentityBlock({ kind: "conductor" }, { status: "blocked", detail: "could not verify thread: another session is open" }), false);
+  assert.equal(isCodexIdentityBlock({ kind: "codex" }, { status: "blocked", detail: "composer not found" }), false);
 });
 
 test("a Conductor chat goes by peer relay to its live peer only when that peer is idle now", async (t) => {

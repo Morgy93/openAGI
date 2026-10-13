@@ -5,8 +5,8 @@
 import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
-  threadKey, toIso
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, isSupervisorOwnPrompt, openReadOnlyDb, prRefKey,
+  redactSecrets, repoFromRemote, threadKey, toIso
 } from "../contracts.js";
 import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
 
@@ -14,6 +14,11 @@ const STATUS_MAP = Object.freeze({ working: "running", waiting: "waiting", idle:
 const TAIL_ROWS = 400;
 const MAX_STALE_MANAGER_ROWS = 10;
 const MIN_REF_PREFIX = 8;
+// The PRs a session named, newest first, at most this many.
+const MAX_PR_MENTIONS = 12;
+const PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
+// "#7089" in the agent's own words; the repo comes from the workspace's git.
+const PR_NUMBER = /(?<![\w/#&;-])#(\d{3,7})\b/g;
 
 const SESSIONS_SQL = `
   SELECT s.id, s.status, s.claude_session_id, s.title, s.model, s.updated_at, s.unread_count,
@@ -94,8 +99,10 @@ function sentMessageText(event) {
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null
+    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null, firstUserText: null, prMentions: []
   };
+  // Per row, the PRs it names in reading order; rows oldest first.
+  const mentions = [];
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
     if (row.role === "user") {
@@ -103,15 +110,19 @@ function summarizeTail(rowsNewestFirst) {
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
+      summary.firstUserText ??= text || null;
       if (text.startsWith(SUPERVISOR_PREFIX)) summary.lastSupervisorAt = at;
       else if (text) {
         summary.lastUserText = text;
         summary.lastUserAt = at;
+        mentions.push(prMentions(text, false));
       }
       continue;
     }
     const event = parseEvent(row.content);
     if (!event) continue;
+    // A subagent's rows name the PRs it was sent to look at, not this chat's.
+    if (!event.parent_tool_use_id) mentions.push(eventPrMentions(event));
     // System rows (commands_changed and other state broadcasts) also land
     // on idle tabs; only turn rows are activity.
     if (event.type !== "system") summary.lastAt = latestIso(summary.lastAt, at);
@@ -161,7 +172,38 @@ function summarizeTail(rowsNewestFirst) {
       for (const id of summary.pendingAsks.keys()) if (answersTool(event, id)) summary.pendingAsks.delete(id);
     }
   }
+  summary.prMentions = [...new Set(mentions.reverse().flat())].slice(0, MAX_PR_MENTIONS);
   return summary;
+}
+
+// "owner/repo#n" for a PR link; "#n" for a bare number (bare: the agent's
+// own words only, where "#7089" means its PR).
+function prMentions(text, bare) {
+  const source = String(text ?? "");
+  const found = [];
+  for (const match of source.matchAll(PR_URL)) found.push({ index: match.index, ref: prRefKey(`${match[1]}/${match[2]}`, Number(match[3])) });
+  if (bare) for (const match of source.matchAll(PR_NUMBER)) found.push({ index: match.index, ref: `#${Number(match[1])}` });
+  return found.sort((a, b) => a.index - b.index).map((entry) => entry.ref);
+}
+
+// The PRs one stream event names: the agent's text and tool calls, and a
+// tool result that prints exactly one PR link (gh pr create). A result
+// listing several (gh pr list, a search) names none of them as this chat's.
+function eventPrMentions(event) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  if (event.type === "assistant") {
+    return content.flatMap((block) => {
+      if (block?.type === "text") return prMentions(block.text, true);
+      if (block?.type === "tool_use") return prMentions(JSON.stringify(block.input ?? {}), false);
+      return [];
+    });
+  }
+  if (event.type !== "user") return [];
+  return content.filter((block) => block?.type === "tool_result").flatMap((block) => {
+    const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
+    const refs = [...new Set(prMentions(text, false))];
+    return refs.length === 1 ? refs : [];
+  });
 }
 
 // Conductor's AskUserQuestion: the tool call blocks the turn on the owner's
@@ -356,7 +398,8 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const title = row.title && row.title !== "Untitled" ? row.title : row.pr_title || row.directory_name || row.id;
   const selfIds = config.selfSessionIds ?? [];
-  const excluded = selfIds.includes(row.id) || (claudeSessionId && selfIds.includes(claudeSessionId)) ? "self"
+  const ownPrompt = isSupervisorOwnPrompt(row.title) || isSupervisorOwnPrompt(summary.firstUserText);
+  const excluded = ownPrompt || selfIds.includes(row.id) || (claudeSessionId && selfIds.includes(claudeSessionId)) ? "self"
     : !row.workspace_path ? "no-repo"
     : stale ? "stale"
     : null;
@@ -402,6 +445,11 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
         ? { text: clampText(redactSecrets(pendingAsk.text), limits.bodyMax), options: pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pendingAsk.at }
         : null,
       pendingCard: card,
+      // The PRs the chat named, newest first: "owner/repo#n", or "#n" for the
+      // workspace's own repo (resolved once git names it). The workspace
+      // branch alone goes stale: cape-town sat on merged #6817 while it
+      // pushed #7063-#7066 and #7089 from other branches.
+      prMentions: summary.prMentions,
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,

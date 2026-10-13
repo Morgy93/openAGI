@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   CARD_DROP_MS, CARD_EXCLUSIONS, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
+  CONDUCTOR_CODEX_ORIGINATOR, isSupervisorOwnPrompt, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
 import { asksOwner } from "../classify.js";
 import { classifyCodexErrorCode } from "../errors.js";
@@ -472,6 +472,8 @@ function metadataExclusion(row, config) {
   const head = String(row.first_user_head ?? "");
   if (HEARTBEAT_PATTERN.test(head) || CHAT_CHECKER_PATTERN.test(head)) return "automation";
   if ((config.selfSessionIds ?? []).includes(String(row.id))) return "self";
+  // The supervisor's own display thread, named by its opening prompt.
+  if (isSupervisorOwnPrompt(head) || isSupervisorOwnPrompt(row.title)) return "self";
   return null;
 }
 

@@ -302,7 +302,7 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
     listCodexThreads: async () => [thread()], listClaudeThreads: async () => [], listConductorThreads: async () => [],
     readCodexLbErrors: async () => [], findLocalHeavyVerification: async () => [],
     readLocalGit: async () => ({ head: 'b'.repeat(40), branch: 'spencer/fix', upstream: 'origin/spencer/fix', ahead: 0, remote: 'acme/app' }),
-    findPrForBranch: async () => null, fetchPrStates: async () => new Map(),
+    findPrForBranch: async () => null, fetchPrStates: async () => new Map(), fetchPrStateLite: async () => new Map(),
     probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: 'ok', reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
     checkLb: async () => ({ healthy: true, detail: '200', watchLine: null }),
     findManagerSession: () => null
@@ -386,7 +386,7 @@ test('a question the review closes never reaches the main or the glasses, and re
     listCodexThreads: async () => [thread], listClaudeThreads: async () => [], listConductorThreads: async () => [],
     readCodexLbErrors: async () => [], findLocalHeavyVerification: async () => [],
     readLocalGit: async () => ({ head: 'b'.repeat(40), branch: 'spencer/fix', upstream: 'origin/spencer/fix', ahead: 0, remote: 'acme/app' }),
-    findPrForBranch: async () => null, fetchPrStates: async () => new Map(),
+    findPrForBranch: async () => null, fetchPrStates: async () => new Map(), fetchPrStateLite: async () => new Map(),
     probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: 'ok', reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
     checkLb: async () => ({ healthy: true, detail: '200', watchLine: null }),
     findManagerSession: () => null

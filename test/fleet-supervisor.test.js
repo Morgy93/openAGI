@@ -48,6 +48,13 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
   // Storage stays off unless a test asks: it would read the real disks.
   const config = resolveFleetConfig({ OPENAGI_FLEET_STORAGE: "0", ...env }, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none", ...(delivery ? { delivery } : {}), ...(review ? { review } : {}) });
   const prMap = prs ?? new Map([["acme/app#7", makePr()]]);
+  // The state-only read (candidates, the check before a send) answers what
+  // the full read does, so no test reaches the real gh.
+  const fullRead = deps.fetchPrStates ?? (async () => prMap);
+  const liteRead = async (refs, ...rest) => {
+    const full = await fullRead(refs, ...rest);
+    return new Map(refs.filter((ref) => full?.get?.(ref)).map((ref) => [ref, { state: full.get(ref).state }]));
+  };
   const supervisor = new FleetSupervisor({
     dataDir,
     config,
@@ -64,6 +71,7 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
       readLocalGit: async () => ({ head: HEAD, branch: "spencer/fix", upstream: "origin/spencer/fix", ahead: 0, remote: "acme/app" }),
       findPrForBranch: async () => null,
       fetchPrStates: async () => prMap,
+      fetchPrStateLite: liteRead,
       probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: "ok", reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
       checkLb: async () => ({ healthy: true, detail: "200", watchLine: null }),
       findManagerSession: () => manager,
@@ -3946,4 +3954,108 @@ test("needsYou and the Watching you group count only questions the owner can see
   const snapshot = supervisor.getState().snapshot;
   assert.equal(snapshot.counts.needsYou, 0);
   assert.equal(snapshot.counts.byWatch.you, 0);
+});
+
+// cape-town: the workspace sat on feature/bob-skills (#6817, merged Sep 27)
+// while its chat pushed #7063-#7066 and #7089 from other branches, so the
+// supervisor showed and nudged the merged #6817.
+test("a chat that names several PRs is mapped to its newest open one, not its branch's merged PR", async (t) => {
+  const BB = "buildbetter-app/buildbetter";
+  const cape = makeThread({
+    key: "conductor:342281f9", kind: "conductor", id: "342281f9", title: "BOB briefs stale data fix", workspace: "cape-town", repo: null,
+    cwd: "/work/cape-town", branch: "feature/bob-skills", prRefs: [],
+    // Newest first, as the Conductor source reads them; #9 is an issue.
+    meta: { prMentions: ["#9", "#7089", "#7063", `${BB}#7089`, "openai/codex#4242", "#6817"] }
+  });
+  const states = new Map([[`${BB}#7089`, "OPEN"], [`${BB}#7063`, "OPEN"], [`${BB}#6817`, "MERGED"]]);
+  const lite = [];
+  const fetched = [];
+  const { supervisor } = fixture(t, {
+    threads: [cape],
+    deps: {
+      readLocalGit: async () => ({ head: HEAD, branch: "feature/bob-skills", upstream: "origin/feature/bob-skills", ahead: 0, remote: BB }),
+      findPrForBranch: async () => `${BB}#6817`,
+      fetchPrStateLite: async (refs) => {
+        lite.push([...refs]);
+        return new Map(refs.map((ref) => [ref, states.has(ref) ? { state: states.get(ref) } : null]));
+      },
+      fetchPrStates: async (refs) => {
+        fetched.push(...refs);
+        return new Map(refs.map((ref) => [ref, makePr({ ref, repo: BB, number: Number(ref.split("#")[1]), state: states.get(ref) })]));
+      }
+    }
+  });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  const row = snapshot.threads.find((thread) => thread.key === "conductor:342281f9");
+  assert.equal(row.pr.ref, `${BB}#7089`);
+  assert.deepEqual(fetched, [`${BB}#7089`]);
+  // Another repo's PR is not this chat's; the branch PR is a candidate too.
+  assert.ok(!lite.flat().includes("openai/codex#4242"));
+  assert.ok(lite.flat().includes(`${BB}#6817`));
+  // Merged is final: the next scan does not read #6817 again.
+  lite.length = 0;
+  await supervisor.tick({ reason: "test" });
+  assert.ok(!lite.flat().includes(`${BB}#6817`));
+
+  // Every PR it named merged, its branch PR open: the branch PR.
+  states.set(`${BB}#7089`, "MERGED");
+  states.set(`${BB}#7063`, "MERGED");
+  states.set(`${BB}#6817`, "OPEN");
+  const again = fixture(t, { threads: [cape], deps: { ...supervisor.deps } });
+  const reread = await again.supervisor.tick({ reason: "test" });
+  assert.equal(reread.threads.find((thread) => thread.key === "conductor:342281f9").pr.ref, `${BB}#6817`);
+});
+
+// monrovia was told "Ready to merge? ... Left on #7589" 2 s after #7589
+// merged: the PR is read again right before the send.
+test("a nudge whose PR merged since the scan is not sent", async (t) => {
+  const BB = "buildbetter-app/buildbetter";
+  const ref = `${BB}#7589`;
+  const thread = makeThread({ key: "conductor:f207436c", kind: "conductor", id: "f207436c", workspace: "monrovia", prRefs: [ref],
+    live: { peerName: "monrovia-1", pid: 4242, status: "idle" } });
+  const scan = (stateAtSend) => fixture(t, {
+    mode: "auto", threads: [thread], prs: new Map([[ref, makePr({ ref, repo: BB, number: 7589 })]]),
+    deps: { fetchPrStateLite: async (refs) => new Map(refs.map((one) => [one, { state: stateAtSend }])) }
+  });
+  const open = scan("OPEN");
+  await open.supervisor.tick({ reason: "test" });
+  assert.equal(open.delivered.length, 1, "still open: sent");
+  const merged = scan("MERGED");
+  await merged.supervisor.tick({ reason: "test" });
+  assert.equal(merged.delivered.length, 0);
+  const action = merged.supervisor.getState().actions.find((a) => a.threadKey === "conductor:f207436c" && a.playbook === "merge-ready");
+  assert.equal(action.status, "stale");
+  assert.equal(action.detail, "not sent: #7589 merged since the scan");
+});
+
+// madrid got "#7586's required BuildBot3 full run is now failing" 76 min
+// after #7586 merged. A nudge naming a settled PR, or about the PR itself,
+// is moot; one about something else still goes, and so does any nudge when
+// GitHub cannot answer.
+test("the check before a send cancels a nudge about a settled PR only", async (t) => {
+  const BB = "buildbetter-app/buildbetter";
+  const ref = `${BB}#7586`;
+  let answer = async (refs) => new Map(refs.map((one) => [one, { state: "MERGED" }]));
+  const { supervisor } = fixture(t, { deps: { fetchPrStateLite: (...args) => answer(...args) } });
+  const thread = makeThread({ key: "conductor:cd2c0072", kind: "conductor", id: "cd2c0072", workspace: "madrid", prRefs: [ref] });
+  const pr = makePr({ ref, repo: BB, number: 7586, state: "MERGED" });
+  const statusCheck = { playbook: "status-check", message: "#7586’s required BuildBot3 full run is now failing. Inspect the failure." };
+  assert.equal(await supervisor.prSettledBeforeSend(thread, pr, statusCheck), "#7586 merged");
+  assert.equal(await supervisor.prSettledBeforeSend(thread, pr, { playbook: "ci-finished", message: "CI finished on 1dc7949c4c: fail." }), "#7586 merged");
+  assert.equal(await supervisor.prSettledBeforeSend(thread, pr, { playbook: "resume", message: "continue — pick up where you stopped." }), null);
+  answer = async () => { throw new Error("gh: timeout"); };
+  assert.equal(await supervisor.prSettledBeforeSend(thread, makePr({ ref, repo: BB, number: 7586 }), statusCheck), null);
+});
+
+test("a proposed nudge whose PR merged before the owner sent it is not sent", async (t) => {
+  let state = "OPEN";
+  const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { fetchPrStateLite: async (refs) => new Map(refs.map((ref) => [ref, { state }])) } });
+  await supervisor.tick({ reason: "test" });
+  const proposed = supervisor.getState().actions.find((a) => a.status === "proposed");
+  state = "MERGED";
+  const result = await supervisor.sendProposed(proposed.id);
+  assert.equal(delivered.length, 0);
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(result.action.status, "stale");
+  assert.equal(result.action.detail, "not sent: #7 merged since the scan");
 });

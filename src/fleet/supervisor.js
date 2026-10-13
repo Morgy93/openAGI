@@ -48,6 +48,14 @@ const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"])
 const INFRA_KINDS = ["bb3", "lb"];
 const BLOCKED_STATES = new Set(["infra-blocked", "waiting-ci"]);
 const SETTLED_PR_STATES = new Set(["MERGED", "CLOSED"]);
+// A thread naming several PRs is read for this many of its newest, and the
+// newest open one is its PR (a merged one never reopens, so it is kept).
+const MAX_PR_CANDIDATES = 4;
+const MAX_MERGED_KEPT = 2_000;
+// The PR state read right before a send, at most.
+const PRE_SEND_PR_MS = 10_000;
+// Nudges about the thread's PR itself: one whose PR merged or closed is moot.
+const PR_PLAYBOOKS = new Set(["merge-ready", "ci-finished"]);
 // How long a remembered outage thread hidden by a failed source waits for it.
 const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
@@ -100,6 +108,32 @@ async function mapLimit(items, limit, fn) {
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+// A Conductor chat's PR mentions (meta.prMentions, newest first) as refs,
+// once git named the workspace's repo: "#7089" is that repo's, and a link
+// to another repo's PR is not this chat's work. They lead the refs a
+// Claude transcript linked (pr-link rows), which carry no time.
+function resolvePrMentions(threads) {
+  for (const thread of threads) {
+    const mentions = thread.meta?.prMentions;
+    if (!Array.isArray(mentions) || !mentions.length) continue;
+    const repo = thread.repo ? String(thread.repo).toLowerCase() : null;
+    const refs = mentions.map((mention) => {
+      const text = String(mention ?? "");
+      if (text.startsWith("#")) return repo ? `${thread.repo}${text}` : null;
+      const parsed = parsePrRef(text);
+      return parsed && (!repo || parsed.repo.toLowerCase() === repo) ? text : null;
+    }).filter(Boolean);
+    thread.prRefs = [...new Set([...refs, ...(thread.prRefs ?? [])])];
+  }
+}
+
+// The workspace branch's PR joins a chat's mentioned PRs as a candidate.
+function withBranchRef(thread, ref) {
+  thread.branchPrRef = ref;
+  const refs = thread.prRefs ?? [];
+  thread.prRefs = refs.includes(ref) ? refs : [...refs, ref];
 }
 
 function emptyBb3() {
@@ -396,11 +430,14 @@ export class FleetSupervisor {
     this.lastTickAt = null;
     this.lastError = null;
     this.lastThreads = new Map();
+    this.lastPrs = new Map();
     // key -> { group, since }: when each thread entered its watch group.
     this.watchSince = new Map();
     this.branchLookups = new Map();
     // ref -> last MERGED or CLOSED read, for ticks GitHub cannot answer.
     this.settledPrs = new Map();
+    // Refs GitHub reported MERGED: final, so never read again as candidates.
+    this.mergedPrs = new Set();
     this.answering = new Set();
     this._uiDriver = undefined;
     this._uiBlockedSince = null;
@@ -1348,6 +1385,11 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
+    const settled = action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null;
+    if (settled) {
+      const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
+      return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
+    }
     const sentAt = new Date(this.now()).toISOString();
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
     if ((delivery.route ?? action.route) === "computer-use") this.noteUiResult(thread, delivery);
@@ -1433,7 +1475,9 @@ export class FleetSupervisor {
     const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && hasCard(thread));
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
+    resolvePrMentions(inScope);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
+    await this.preferOpenPrs(inScope, config, run);
     const unreadPrs = new Set();
     // An open question's PR is read too, even once its thread moved to
     // another PR or left the scan: its merge settles the question.
@@ -1537,6 +1581,8 @@ export class FleetSupervisor {
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
     this.lastThreads = byKey;
+    // Each thread's PR as this scan read it, for a proposal sent later.
+    this.lastPrs = new Map(items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr]));
 
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
@@ -1769,10 +1815,13 @@ export class FleetSupervisor {
     for (const thread of candidates) {
       // prLookedUp: this thread's PR is known to be none (nothing to look up,
       // or GitHub answered no PR). Policy judges no-PR threads only then.
-      if (thread.prRefs?.length) continue;
+      // A Conductor chat's mentions may all be other PRs ("on top of #5544"):
+      // its workspace branch's PR joins them as one more candidate.
+      const mentioned = Boolean(thread.prRefs?.length);
+      if (mentioned && thread.kind !== "conductor") continue;
       // No branch, or a trunk one: no PR to find. A missing repo (git could
       // not be read) leaves it unknown.
-      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { thread.prLookedUp = true; continue; }
+      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { if (!mentioned) thread.prLookedUp = true; continue; }
       if (!thread.repo) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
@@ -1784,11 +1833,11 @@ export class FleetSupervisor {
       // An unknown head (git failed) keeps the cached answer, and so does a
       // thread past this tick's lookup budget: the last answer beats none.
       if (fresh && (head === null || cached.head === head || lookups >= MAX_BRANCH_LOOKUPS)) {
-        if (cached.ref) thread.prRefs = [cached.ref];
+        if (cached.ref) withBranchRef(thread, cached.ref);
         // No PR for this same head only (both unknown counts as the same):
         // a git failure after a known head, or a spent budget with a newer
         // head, leaves the answer unknown.
-        else if (cached.head === head) thread.prLookedUp = true;
+        else if (cached.head === head && !mentioned) thread.prLookedUp = true;
         continue;
       }
       if (lookups >= MAX_BRANCH_LOOKUPS) continue;
@@ -1796,13 +1845,67 @@ export class FleetSupervisor {
       try {
         const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head, cwd: head ? thread.cwd : null })), 20_000, "pr lookup");
         this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now, head });
-        if (ref) thread.prRefs = [ref];
-        else thread.prLookedUp = true;
+        if (ref) withBranchRef(thread, ref);
+        else if (!mentioned) thread.prLookedUp = true;
       } catch (error) {
         sourceErrors.prLookup = clampText(error?.message, 200);
-        if (cached?.ref) thread.prRefs = [cached.ref];
+        if (cached?.ref) withBranchRef(thread, cached.ref);
       }
     }
+  }
+
+  // A thread naming several PRs is about the newest open one: a merged PR
+  // it named before is done (cape-town showed merged #6817 while #7089 was
+  // open). Each thread's newest MAX_PR_CANDIDATES are read for state only;
+  // a number GitHub says is no PR is dropped. With nothing open, or GitHub
+  // unreadable, the newest stays first.
+  async preferOpenPrs(inScope, config, run) {
+    if (this.skip.github) return;
+    const several = inScope.filter((thread) => (thread.prRefs?.length ?? 0) > 1);
+    const wanted = [...new Set(several.flatMap((thread) => [...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef]))]
+      .filter((ref) => parsePrRef(ref) && !this.mergedPrs.has(ref));
+    let states = new Map();
+    if (wanted.length) {
+      try {
+        const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
+        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+      } catch {
+        return;
+      }
+    }
+    for (const [ref, pr] of states) if (pr?.state === "MERGED") this.mergedPrs.add(ref);
+    if (this.mergedPrs.size > MAX_MERGED_KEPT) this.mergedPrs = new Set([...this.mergedPrs].slice(-MAX_MERGED_KEPT / 2));
+    for (const thread of several) {
+      const candidates = [...new Set([...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef].filter(Boolean))];
+      const state = (ref) => (this.mergedPrs.has(ref) ? "MERGED" : states.has(ref) ? (states.get(ref)?.state ?? null) : undefined);
+      const open = candidates.find((ref) => state(ref) === "OPEN");
+      // null: GitHub answered that the number is no PR.
+      const kept = thread.prRefs.filter((ref) => state(ref) !== null);
+      thread.prRefs = open ? [open, ...kept.filter((ref) => ref !== open)] : kept;
+    }
+  }
+
+  // The thread's PR read again right before a nudge: one merged or closed
+  // since the scan cancels it (monrovia was told #7589 was not ready 2 s
+  // after it merged), and so does a nudge about a PR already settled
+  // (madrid heard about #7586's BuildBot3 run 76 min after it merged).
+  // Null to send; an unreadable PR sends as the scan decided.
+  async prSettledBeforeSend(thread, pr, decision) {
+    const ref = pr?.ref ?? thread?.prRefs?.[0] ?? null;
+    const parsed = parsePrRef(ref);
+    if (!parsed || this.skip.github) return null;
+    let fresh;
+    try {
+      const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
+      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand })), PRE_SEND_PR_MS, "github"))?.get(ref);
+    } catch {
+      return null;
+    }
+    if (!SETTLED_PR_STATES.has(fresh?.state)) return null;
+    const since = !SETTLED_PR_STATES.has(pr?.state);
+    const about = PR_PLAYBOOKS.has(decision.playbook) || new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? ""));
+    if (!since && !about) return null;
+    return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
   }
 
   async fetchPrs(inScope, config, run, sourceErrors, unread = new Set(), extraRefs = []) {
@@ -1986,6 +2089,16 @@ export class FleetSupervisor {
       }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
       if (uiKey && typedInto.has(uiKey)) continue;
+      if (decision.action === "nudge") {
+        const item = items.find((entry) => entry.thread.key === decision.threadKey);
+        const settled = await this.prSettledBeforeSend(item?.thread ?? target, item?.pr ?? null, decision);
+        if (settled) {
+          const detail = `not sent: ${settled}`;
+          if (existing) store.updateAction(existing.id, { ...record, status: "stale", detail, at });
+          else store.recordAction({ ...record, status: "stale", detail, at });
+          continue;
+        }
+      }
       if (uiKey) typedInto.add(uiKey);
       tries += 1;
       attempted.add(decision.threadKey);

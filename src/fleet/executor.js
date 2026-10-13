@@ -217,6 +217,19 @@ export function isPresenceBlock(delivery) {
   return delivery?.status === "blocked" && PRESENCE_BLOCK.test(String(delivery.detail ?? ""));
 }
 
+// A Codex app send that could not prove which thread is open: a title two
+// threads share, or the app still on another thread after the id link.
+// Codex shows no thread id on screen, so only codex exec, addressed by the
+// thread's id, can reach it (#5557's approved ping was blocked twice so).
+// Nothing was typed: these blocks come before the composer.
+const CODEX_UNVERIFIED = /^(?:ambiguous: two threads share this title|could not verify thread: )/;
+
+export function isCodexIdentityBlock(thread, delivery) {
+  if (thread?.kind !== "codex" || delivery?.status !== "blocked" || delivery.unconfirmed) return false;
+  const detail = String(delivery.detail ?? "");
+  return CODEX_UNVERIFIED.test(detail) && !/left as a draft/.test(detail);
+}
+
 // The non-UI route a presence-blocked app send may take instead, if the owner
 // allowed it (config.backgroundRoutes) and it cannot fork or queue unseen:
 // codex-exec only for a Codex thread no app holds (no writer, so nothing
@@ -599,10 +612,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         active.delete(thread.key);
         active.delete(step.target.targetKey);
       }
-      // The owner is at the Mac: a route that does not take the screen, if
-      // the owner allowed one for this thread. Otherwise it waits for idle.
+      // The owner is at the Mac, or the Codex app cannot show which thread is
+      // open: a route that does not take the screen, if the owner allowed one
+      // for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
-      if (!isPresenceBlock(result) || (queue && step.target?.app === "conductor")) return result;
+      if (!(isPresenceBlock(result) || isCodexIdentityBlock(thread, result)) || (queue && step.target?.app === "conductor")) return result;
       const fallback = await fallbackRoute(thread, step.target, deadlineAt);
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };

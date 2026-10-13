@@ -742,3 +742,42 @@ test("a working session's card dies with its process: a peer started after the c
   threads = byId(await listConductorThreads(config, { now: later, peers: asker }));
   assert.equal(threads["s-run"].meta.pendingCard?.cardId, "toolu_card");
 });
+
+// cape-town sat on feature/bob-skills (#6817, merged Sep 27) while its chat
+// pushed #7063-#7066 and #7089 from other branches: the chat's own words name
+// its PRs, newest first.
+function seedCapeTown(home, title = "BOB briefs stale data fix") {
+  const file = path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db");
+  const db = createDb(file);
+  db.exec(`INSERT INTO repos (id, remote_url, name) VALUES ('r1', 'https://github.com/buildbetter-app/buildbetter.git', 'bbapp')`);
+  db.prepare(`INSERT INTO workspaces (local_id, repository_id, directory_name, active_session_id, branch, state, derived_status, workspace_path, pr_title)
+    VALUES ('w-cape', 'r1', 'cape-town', 's-cape', 'feature/bob-skills', 'ready', 'in-progress', '/Users/x/Dev/bbapp/.conductor/cape-town', 'Back every BOB Loop with a skill BOB owns')`).run();
+  db.prepare(`INSERT INTO sessions (id, status, claude_session_id, updated_at, created_at, workspace_id, agent_type, title)
+    VALUES ('s-cape', 'idle', 's-cape', ?, ?, 'w-cape', 'claude', ?)`).run(sqliteTime(MIN), iso(600 * MIN), title);
+  const result = (text) => ({ type: "user", session_id: "s-cape", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_x", content: text }] } });
+  addMessage(db, "s-cape", "user", "Ship https://github.com/buildbetter-app/buildbetter/pull/6817 first", iso(300 * MIN));
+  addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "Merged #6817."), iso(290 * MIN));
+  addMessage(db, "s-cape", "assistant", result("https://github.com/buildbetter-app/buildbetter/pull/7089\n"), iso(60 * MIN));
+  // A listing names many PRs, none as this chat's; a subagent reads others.
+  addMessage(db, "s-cape", "assistant", result("https://github.com/buildbetter-app/buildbetter/pull/7001 https://github.com/buildbetter-app/buildbetter/pull/7002"), iso(50 * MIN));
+  addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "Reviewing #7555 for you.", "toolu_sub"), iso(40 * MIN));
+  addMessage(db, "s-cape", "user", "[OpenAGI supervisor] Ready to merge? Left on #6817.", iso(30 * MIN));
+  addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "No change. #7089's full check and the #7063, #7065 and #7066 rechecks are still running."), iso(5 * MIN));
+  db.close();
+}
+
+test("a session's PR mentions are read newest first from the agent's words, its gh output and the owner's links", async (t) => {
+  const home = makeHome(t);
+  seedCapeTown(home);
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() });
+  assert.equal(thread.branch, "feature/bob-skills");
+  assert.deepEqual(thread.meta.prMentions, ["#7089", "#7063", "#7065", "#7066", "buildbetter-app/buildbetter#7089", "#6817", "buildbetter-app/buildbetter#6817"]);
+  assert.deepEqual(thread.prRefs, [], "a bare number waits for git to name the repo");
+});
+
+test("a Conductor session opened with the supervisor display prompt is the supervisor's own", async (t) => {
+  const home = makeHome(t);
+  seedCapeTown(home, "You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring Codex and Claude Code.");
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() });
+  assert.equal(thread.excluded, "self");
+});
