@@ -656,8 +656,13 @@ export class AbiRuntime {
           // Put body evidence first so a long summary cannot consume its
           // compression budget. Normalization may use the summary as the
           // body fallback; compare using the same normalization and length
-          // limit as integration summaries, while preserving the full body.
-          content: [signal.content, summarizeText(signal.content, 500) === summarizeText(signal.summary, 500) ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
+          // limit as integration summaries. Chat summaries can also be a
+          // shorter body prefix; omit that repetition to retain diagnostics.
+          // Preserve the full body regardless of the comparison.
+          content: [signal.content, (
+            summarizeText(signal.content, Infinity).startsWith(summarizeText(signal.summary, Infinity)) ||
+            summarizeText(signal.content, 500) === summarizeText(signal.summary, 500)
+          ) ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
             .filter((part) => part != null && part !== "")
             .join("\n"),
           tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],

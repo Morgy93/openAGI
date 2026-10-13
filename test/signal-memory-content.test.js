@@ -1,9 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createDefaultRuntime } from '../src/index.js';
 
-function fixture() {
-  const runtime = createDefaultRuntime();
+function fixture(t) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openagi-signal-memory-'));
+  const runtime = createDefaultRuntime({
+    dataDir, observationOptions: { dir: path.join(dataDir, 'observations') },
+  });
+  t.after(async () => {
+    await runtime.sessionIndex.rebuildPromise;
+    runtime.sessionIndex.db?.close();
+    runtime.observations.db?.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
   runtime.scrutiny.evaluate = () => ({ action: 'observe', score: 0.6, reasons: ['retain useful evidence'], dimensions: {} });
   runtime.propagation.shouldPropagate = () => ({ decision: false });
   return runtime;
@@ -13,8 +25,8 @@ function signal(content) {
     domain: 'general', taskType: 'update', tags: [], novelty: 0.6, risk: 0.2, repetition: 0.1 };
 }
 
-test('signal memory retains body and distinguishes facts sharing a summary', () => {
-  const runtime = fixture();
+test('signal memory retains body and distinguishes facts sharing a summary', (t) => {
+  const runtime = fixture(t);
   const first = runtime.processSignal(signal('Delivery moved to Tuesday.'));
   const second = runtime.processSignal(signal('Delivery moved to Friday.'));
   assert.match(first.memory.content, /Delivery moved to Tuesday\./);
@@ -23,8 +35,8 @@ test('signal memory retains body and distinguishes facts sharing a summary', () 
   assert.equal(runtime.memory.snapshot().medium.length, 2);
 });
 
-test('summary-only signals retain a clean memory and exact repeats still deduplicate', () => {
-  const runtime = fixture();
+test('summary-only signals retain a clean memory and exact repeats still deduplicate', (t) => {
+  const runtime = fixture(t);
   const first = runtime.processSignal(signal(undefined));
   const second = runtime.processSignal(signal(undefined));
   assert.match(first.memory.content, /Project update/);
@@ -34,16 +46,16 @@ test('summary-only signals retain a clean memory and exact repeats still dedupli
   assert.equal(runtime.processSignal(signal('Delivery moved to Tuesday.')).memory.id, repeated.memory.id);
 });
 
-test('ignored and ephemeral bodies are never committed to memory', () => {
-  const runtime = fixture();
+test('ignored and ephemeral bodies are never committed to memory', (t) => {
+  const runtime = fixture(t);
   assert.equal(runtime.processSignal(signal('Synthetic connectivity probe'), { ephemeral: true }).memory, null);
   runtime.scrutiny.evaluate = () => ({ action: 'ignore', score: 0, reasons: [], dimensions: {} });
   assert.equal(runtime.processSignal(signal('Synthetic low-signal noise')).memory, null);
   assert.equal(runtime.memory.items.size, 0);
 });
 
-test('normalized summary-only integration signals store text once and retain diagnostics', () => {
-  const runtime = fixture();
+test('normalized summary-only integration signals store text once and retain diagnostics', (t) => {
+  const runtime = fixture(t);
   const summary = 'Synthetic status detail. '.repeat(14).trim();
   const [output] = runtime.processIntegrationEvent('abi', { ...signal(undefined), summary });
   assert.equal(output.signal.content, output.signal.summary, 'exercise normalized fallback');
@@ -52,8 +64,8 @@ test('normalized summary-only integration signals store text once and retain dia
   assert.match(output.memory.content, /Reasons: retain useful evidence/);
 });
 
-test('long compressed memory retains distinct bodies behind a maximum-length summary', () => {
-  const runtime = fixture();
+test('long compressed memory retains distinct bodies behind a maximum-length summary', (t) => {
+  const runtime = fixture(t);
   const summary = 'Synthetic repeated project context. '.repeat(20);
   const input = { ...signal('Delivery moved to Tuesday.'), summary, risk: 0.7, novelty: 0.6, specificity: 0.45 };
   const [first] = runtime.processIntegrationEvent('abi', input);
@@ -72,8 +84,8 @@ for (const [label, summary] of [
   ['repeated whitespace', 'Synthetic   status\n\tdetail. '.repeat(16)],
   ['truncated summary', 'Synthetic status detail. '.repeat(29) + 'Final evidence.'],
 ]) {
-  test(`summary fallback with ${label} retains diagnostics without duplication`, () => {
-    const runtime = fixture();
+  test(`summary fallback with ${label} retains diagnostics without duplication`, (t) => {
+    const runtime = fixture(t);
     const [output] = runtime.processIntegrationEvent('abi', {
       ...signal(undefined), summary, risk: 0.1, novelty: 0.1, specificity: 0.45,
     });
@@ -86,3 +98,29 @@ for (const [label, summary] of [
     assert.match(output.memory.content, /Reasons: retain useful evidence/);
   });
 }
+
+for (const [label, text] of [
+  ['plain text', 'Synthetic project update with useful detail. '.repeat(9)],
+  ['normalized whitespace', 'Synthetic   project update\nwith useful detail. '.repeat(9)],
+]) {
+  test(`chat prefix summary with ${label} retains body and diagnostics`, async (t) => {
+    const runtime = fixture(t);
+    const chatSignal = await runtime.agentHost.messageToSignal({
+      text, channel: 'local', from: 'synthetic-owner', agent: { id: 'synthetic-agent' },
+      sessionId: 'synthetic-session', metadata: {},
+    });
+    assert.equal(chatSignal.summary, text.slice(0, 240), 'exercise the actual chat summary path');
+    const output = runtime.processSignal({ ...chatSignal, novelty: 0.6, risk: 0.2, specificity: 0.45 });
+    assert.equal(output.memory.tier, 'medium');
+    assert.equal(output.memory.fidelity, 'normal');
+    const body = text.replace(/\s+/g, ' ').trim();
+    assert.equal(output.memory.content,
+      `${body} Decision: observe Reasons: retain useful evidence`);
+  });
+}
+
+test('a distinct summary remains alongside body evidence', (t) => {
+  const runtime = fixture(t);
+  const output = runtime.processSignal(signal('Delivery moved to Tuesday.'));
+  assert.match(output.memory.content, /Delivery moved to Tuesday\. Project update Decision: observe/);
+});
