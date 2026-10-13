@@ -130,17 +130,23 @@ final class FleetWatchingTests: XCTestCase {
     threads += (0..<5).map { thread("work\($0)", "working", since: "2026-10-12T11:0\($0):00Z") }
     threads += (0..<4).map { thread("quiet\($0)", "quiet") }
 
+    // A few rows per group: ten waiting on the owner cannot hide the rest.
     let closed = FleetWatching.layout(threads, openGroups: [])
     XCTAssertEqual(closed.sections.map(\.group), ["you", "working", "quiet"])
-    XCTAssertEqual(closed.sections.map(\.rows.count), [10, 2, 0])
+    XCTAssertEqual(closed.sections.map(\.rows.count), [4, 4, 0])
     XCTAssertEqual(closed.sections.map(\.total), [10, 5, 4])
     XCTAssertEqual(closed.sections.map(\.collapsed), [false, false, true])
-    XCTAssertEqual(closed.hidden, 3)
+    XCTAssertEqual(closed.hidden, 7)
 
     let open = FleetWatching.layout(threads, openGroups: ["quiet"])
-    XCTAssertEqual(open.sections.map(\.rows.count), [10, 2, 0])
+    XCTAssertEqual(open.sections.map(\.rows.count), [4, 4, 4])
     XCTAssertFalse(open.sections[2].collapsed)
     XCTAssertEqual(open.hidden, 7)
+
+    // The overall cap still holds across groups.
+    let capped = FleetWatching.layout(threads, openGroups: ["quiet"], limit: 6)
+    XCTAssertEqual(capped.sections.map(\.rows.count), [4, 2, 0])
+    XCTAssertEqual(capped.hidden, 13)
 
     let few = FleetWatching.layout(Array(threads.suffix(4)), openGroups: ["quiet"])
     XCTAssertEqual(few.sections.map(\.rows.count), [4])
