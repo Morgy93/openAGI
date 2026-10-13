@@ -255,6 +255,61 @@ test("turn spend stop: a skill tool's nested model calls share the turn's one to
   assert.equal(context.__turnSpend, undefined, "the caller's context is not changed");
 });
 
+test("turn spend stop: calls later in the same batch are not run once a skill crosses the limit", async () => {
+  const { guard } = tmpGuard();
+  const provider = new OpenAIResponsesProvider({ apiKey: "k", model: "gpt-6-astra", budgetGuard: guard, turnUsdLimit: 2, maxToolHops: 10 });
+  let calls = 0;
+  const cheap = { input_tokens: 10_000, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 0 };
+  provider.postResponses = async (body) => {
+    calls += 1;
+    // The parent asks for a skill and then a side-effecting tool in one reply.
+    if (!body.instructions.includes("diagnose")) {
+      return { id: `r${calls}`, output: [
+        { type: "function_call", call_id: "c_skill", name: "skill_diagnose", arguments: "{}" },
+        { type: "function_call", call_id: "c_send", name: "send_message", arguments: "{}" }
+      ], usage: cheap };
+    }
+    return { id: `r${calls}`, output: [{ type: "message", content: [{ type: "output_text", text: "diagnosed" }] }], usage: { ...pricey, input_tokens: 250_000 } };
+  };
+  const invoked = [];
+  const toolRegistry = {
+    toOpenAITools: () => toolSchema,
+    invoke: async (name, args, context) => {
+      invoked.push(name);
+      return name === "skill_diagnose" ? { ok: true, result: await skills.run("diagnose", { input: "why" }, context) } : { ok: true, result: { sent: true } };
+    }
+  };
+  const skills = new SkillRegistry({ runtime: { agentHost: { modelProvider: provider } } });
+  skills.runtime.tools = toolRegistry;
+  skills.skills.set("diagnose", { name: "diagnose", description: "diagnose tool errors", body: "{{input}}", systemPrompt: "" });
+  const result = await provider.generate({ input: "fix it", agent, messages: [], tools: toolSchema, toolRegistry, context: { channel: "node" } });
+  assert.deepEqual(invoked, ["skill_diagnose"], "the send after the over-limit skill never runs");
+  assert.equal(result.stoppedAtUsdLimit, true);
+  assert.match(result.text, /Not run yet: send_message/);
+});
+
+test("turn spend stop: Anthropic skips the rest of a batch past the limit too", async () => {
+  const { guard } = tmpGuard();
+  const provider = new AnthropicProvider({ apiKey: "k", model: "claude-opus-4-7", budgetGuard: guard, turnUsdLimit: 2, maxToolHops: 10 });
+  provider.postMessages = async () => ({ id: "m1", content: [
+    { type: "tool_use", id: "t1", name: "spendy", input: {} },
+    { type: "tool_use", id: "t2", name: "send_message", input: {} }
+  ], usage: { input_tokens: 1_000, output_tokens: 0 } });
+  const invoked = [];
+  const toolRegistry = {
+    toAnthropicTools: () => [],
+    invoke: async (name, args, context) => {
+      invoked.push(name);
+      // A nested call that spends the limit, on the shared total.
+      if (name === "spendy") context.__turnSpend.usd += 5;
+      return { ok: true, result: {} };
+    }
+  };
+  const result = await provider.generate({ input: "go", agent, messages: [], toolRegistry });
+  assert.deepEqual(invoked, ["spendy"]);
+  assert.match(result.text, /Not run yet: send_message/);
+});
+
 test("turn spend stop: Anthropic tools share the total with nested calls too", async () => {
   const { guard } = tmpGuard();
   const provider = new AnthropicProvider({ apiKey: "k", model: "claude-opus-4-7", budgetGuard: guard, turnUsdLimit: 2, maxToolHops: 10 });

@@ -204,8 +204,15 @@ export class OpenAIResponsesProvider {
         }
       }
 
-      for (const call of calls) {
+      for (const [index, call] of calls.entries()) {
         context.signal?.throwIfAborted();
+        // A skill earlier in this batch can spend the rest of the limit on its
+        // nested generate: the calls after it are not run.
+        if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
+          overTurnLimit = true;
+          unrunCalls = calls.slice(index).map((pending) => pending.name);
+          break;
+        }
         notifyProgress(onProgress, { stage: "tool", provider: "openai", model, hop: hop + 1, tool: call.name });
         const parsedArgs = safeParseJson(call.arguments) ?? {};
         const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, toolContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
@@ -501,8 +508,14 @@ export class AnthropicProvider {
       }
 
       const toolResults = [];
-      for (const use of toolUses) {
+      for (const [index, use] of toolUses.entries()) {
         context.signal?.throwIfAborted();
+        // As on OpenAI: a nested skill earlier in the batch can spend the rest.
+        if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
+          overTurnLimit = true;
+          unrunCalls = toolUses.slice(index).map((pending) => pending.name);
+          break;
+        }
         notifyProgress(onProgress, { stage: "tool", provider: "anthropic", model, hop: hop + 1, tool: use.name });
         const invocation = await (toolRegistry?.invoke?.(use.name, use.input ?? {}, toolContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: use.name, arguments: use.input, result: invocation });
