@@ -296,6 +296,7 @@ export class FleetStore {
     };
     const head = typeof askedHead === "string" && askedHead ? askedHead : null;
     const key = String(dedupeKey ?? "").trim() || `${fields.threadKey ?? "fleet"}:${fields.title}`;
+    if (!this.state.questions.some((q) => q.status === "open" && q.dedupeKey === key)) this._adoptLegacyAsk(key, fields, origin);
     const existing = this.state.questions.find((q) => q.status === "open" && q.dedupeKey === key);
     if (existing) {
       // Not saved on its own: the next write (at least the tick's snapshot)
@@ -807,6 +808,56 @@ export class FleetStore {
     });
     this._save();
     return { ...older, superseded: true };
+  }
+
+  // Judge asks a build before 2026-10-12 saved under the judge's own key
+  // (judge:<thread>:<hash>, no askedBy) take the key a scan now gives the
+  // same ask (keyFor: policy's agentAskKey, on the agent message it came
+  // from) and say the judge asked them. Else an answer kept for typing is
+  // dropped as superseded on the first scan: the judge does not read a
+  // thread whose answer waits, so nothing asks that key again.
+  migrateJudgeAskKeys(keyFor) {
+    const openKeys = new Set(this.state.questions.filter((q) => q.status === "open").map((q) => q.dedupeKey));
+    let changed = false;
+    for (const question of this.state.questions) {
+      const key = String(question.dedupeKey ?? "");
+      if (question.kind !== "agent-ask" || !question.threadKey || !key.startsWith(`judge:${question.threadKey}:`)) continue;
+      if (!question.askedBy) {
+        question.askedBy = "judge";
+        changed = true;
+      }
+      if (!Number.isFinite(Date.parse(question.agentAskedAt ?? ""))) continue;
+      const next = keyFor(question.threadKey, { at: question.agentAskedAt });
+      // Never a second open question under one key.
+      if (!next || (question.status === "open" && openKeys.has(next))) continue;
+      if (question.status === "open") openKeys.add(next);
+      question.dedupeKey = next;
+      changed = true;
+    }
+    if (changed) this._save();
+    return changed;
+  }
+
+  // An agent ask a build before 2026-10-12 saved under its wording's key
+  // (ask:<thread>:<text hash>) is the same ask as one asked now about the
+  // same agent message: it takes the new key, whatever its status, so an
+  // open one is not asked twice, an answered or dismissed one holds, and an
+  // answer kept for typing is not dropped as superseded. Records saved since
+  // carry mergeAsk; a structured ask's key (its own id) never changed.
+  _adoptLegacyAsk(key, fields, origin) {
+    if (fields.kind !== "agent-ask" || !fields.threadKey) return;
+    const askedAt = toMs(origin.agentAskedAt, null);
+    if (askedAt === null) return;
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.kind !== "agent-ask" || question.threadKey !== fields.threadKey || Object.hasOwn(question, "mergeAsk")) continue;
+      if (question.dedupeKey === key || !String(question.dedupeKey ?? "").startsWith(`ask:${fields.threadKey}:`)) continue;
+      if (toMs(question.agentAskedAt, null) !== askedAt) continue;
+      if (!latest || toMs(question.updatedAt, 0) > toMs(latest.updatedAt, 0)) latest = question;
+    }
+    if (!latest) return;
+    latest.dedupeKey = key;
+    this._save();
   }
 
   _recentlyResolved(key, now) {

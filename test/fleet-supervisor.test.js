@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
+import { DEFAULTS, resolveFleetConfig, shortHash } from "../src/fleet/contracts.js";
 import { FleetSupervisor, groupQuestions, judgeAskKey, judgeCacheKey } from "../src/fleet/supervisor.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
@@ -4131,4 +4131,35 @@ test("a main-red hold closes once a scan decides its thread without it", async (
   await supervisor.tick();
   assert.equal(supervisor.store.question(held.id).status, "resolved");
   assert.deepEqual(supervisor.getState().questions.map((q) => q.dedupeKey.split(":")[0]), ["ready"]);
+});
+
+// Answers the owner gave before the 2026-10-12 build, kept for typing,
+// under the keys that build used (ask:<thread>:<text hash>, judge:<...>
+// with no askedBy). No scan makes those keys now: both were dropped as
+// superseded on the first scan, and the policy's ask was put to the owner
+// again.
+test("answers kept under keys an older build saved are still typed after the upgrade", async (t) => {
+  const askedAt = ago(60 * MIN);
+  const desktop = { originator: "Codex Desktop" };
+  const asking = makeThread({ writerLocked: true, lastAgentAt: askedAt, meta: { ...desktop, pendingQuestion: { text: "Merge despite behavior changes?", options: ["yes", "no"] } } });
+  const judged = makeThread({ key: "codex:t2", id: "t2", cwd: "/work/t2", title: "Fix uploads", writerLocked: true, lastAgentAt: askedAt, lastAgentText: "Should I cut the release now or wait for QA?", meta: desktop });
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking, judged], deps: { uiDriver: readyDriver() } });
+  const kept = (id, dedupeKey, threadKey, message) => ({
+    id, dedupeKey, threadKey, kind: "agent-ask", title: "acme #7: needs your call. Answer?", body: "b", options: ["yes", "no"], status: "answered", answer: "yes",
+    answeredAt: ago(10 * MIN), createdAt: ago(50 * MIN), updatedAt: ago(10 * MIN), lastAskedAt: ago(15 * MIN), expiresAt: ago(-23 * 60 * MIN),
+    askContext: "ctx", agentAskedAt: askedAt, pendingDelivery: { message, since: ago(10 * MIN) }
+  });
+  fs.mkdirSync(path.join(dataDir, "fleet"), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, "fleet", "state.json"), JSON.stringify({ version: 1, questions: [
+    kept("fq_old_ask", `ask:codex:t1:${shortHash("Merge despite behavior changes?")}`, "codex:t1", "Owner answer: yes. Merge it."),
+    kept("fq_old_judge", "judge:codex:t2:5f1c2a9b3d4e6f70", "codex:t2", "Owner answer: yes. Cut it now.")
+  ] }));
+  await supervisor.tick();
+  assert.deepEqual(delivered.filter((d) => d.playbook === "owner-answer").map((d) => [d.thread.key, d.message]).sort(),
+    [["codex:t1", "Owner answer: yes. Merge it."], ["codex:t2", "Owner answer: yes. Cut it now."]]);
+  assert.equal(supervisor.store.question("fq_old_ask").deliveredAnswer, "sent");
+  assert.equal(supervisor.store.question("fq_old_judge").deliveredAnswer, "sent");
+  assert.equal(supervisor.store.question("fq_old_judge").askedBy, "judge");
+  // The answered ask holds: not put to the owner again under its new key.
+  assert.deepEqual(supervisor.getState().questions.filter((q) => q.kind === "agent-ask"), []);
 });

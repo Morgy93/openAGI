@@ -504,6 +504,8 @@ export class FleetSupervisor {
       this._store = new FleetStore({
         dir: path.join(this.dataDir, "fleet"), defaultMode: this.config.mode, limits: this.config.limits, now: () => this.now()
       });
+      // Judge asks an older build keyed its own way take today's keys.
+      this._store.migrateJudgeAskKeys(agentAskKey);
     }
     return this._store;
   }
