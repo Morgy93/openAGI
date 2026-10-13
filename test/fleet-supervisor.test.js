@@ -3322,25 +3322,58 @@ test("an unchanged chat is not judged again; the agent speaking is", async (t) =
   assert.equal(delivered.length, 0);
 });
 
-test("a cached send is held by the same-message guard until the agent replies", async (t) => {
+test("a judged send is not read or resent while its PR, head and blockers stand unanswered", async (t) => {
   let clock = NOW;
   const judge = fakeJudge({ action: "send", reason: "CI red", message: "verification is red on head bbbbbbbbbb. Fix it." });
   const { supervisor, delivered } = fixture(t, { mode: "auto", now: () => clock, deps: { judge } });
   await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 1);
-  // Past the cooldown, no reply, same chat: the send is now an earlier
-  // nudge, so the chat is read again, and the same words are not resent.
+  // Past the cooldown, no reply, the same PR, head and blockers: the same
+  // nudge whatever words the judge would pick, so the chat is not read again.
   clock += 30 * MIN;
   await supervisor.tick({ reason: "test" });
-  assert.equal(judge.calls.length, 2);
+  assert.equal(judge.calls.length, 1);
   assert.equal(delivered.length, 1);
-  assert.match(judgeRow(supervisor).reason, /^judge: same message sent at \d\d:\d\d; no reply since$/);
-  // Nothing new since: the cached verdict is held the same way.
+  assert.match(judgeRow(supervisor).reason, /^same PR, head and blockers as the \d\d:\d\d nudge; no reply since$/);
   clock += 30 * MIN;
   await supervisor.tick({ reason: "test" });
-  assert.equal(judge.calls.length, 2);
+  assert.equal(judge.calls.length, 1);
   assert.equal(delivered.length, 1);
-  assert.match(judgeRow(supervisor).reason, /^judge: same message sent at \d\d:\d\d; no reply since$/);
+});
+
+test("an infra recovery's resume is read by the judge like any thread nudge", async (t) => {
+  // infra-recovered went out unread: it was decided after the judge ran.
+  const stalled = makeThread({ agentStatus: "aborted", error: null, prRefs: [] });
+  const judge = fakeJudge((input) => (input.decision.playbook === "infra-recovered" ? { action: "wait", reason: "the agent already retried" } : { action: "send", reason: "x", message: "y" }));
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [stalled], prs: new Map(), deps: { judge } });
+  supervisor.store.setInfraDown("lb", true);
+  supervisor.store.setInfraBlocked("lb", ["codex:t1"]);
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
+  assert.equal(judge.calls.length, 1);
+  assert.equal(judge.calls[0].decision.playbook, "infra-recovered");
+  assert.equal(judgeRow(supervisor).reason, "judge: the agent already retried");
+  // A send verdict goes out in the judge's words.
+  const sending = fakeJudge({ action: "send", reason: "LB back", message: "The LB is back; retry the failed push." });
+  const again = fixture(t, { mode: "auto", threads: [stalled], prs: new Map(), deps: { judge: sending } });
+  again.supervisor.store.setInfraDown("lb", true);
+  again.supervisor.store.setInfraBlocked("lb", ["codex:t1"]);
+  await again.supervisor.tick({ reason: "test" });
+  assert.deepEqual(again.delivered.map((item) => [item.playbook, item.message]), [["infra-recovered", "The LB is back; retry the failed push."]]);
+});
+
+test("the laptop-verify guard is read by the judge before it goes out", async (t) => {
+  // monterrey had just said "Nothing is verifying on the laptop" when the
+  // same "Stop. Don't verify locally" went in again.
+  const said = "Nothing is verifying on the laptop. The only process running is an ssh session executing a check on BuildBot3 slot 1.";
+  const thread = makeThread({ lastAgentText: said, lastAgentFull: said, lastAgentFullAt: ago(60 * MIN) });
+  const proc = { pid: 4242, command: "pnpm run build", cwd: "/work/t1", ageSec: 600 };
+  const judge = fakeJudge({ action: "wait", reason: "the agent says nothing runs locally" });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], deps: { judge, findLocalHeavyVerification: async () => [proc] } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(judge.calls.length, 1);
+  assert.equal(judge.calls[0].decision.playbook, "no-local-verify");
+  assert.equal(delivered.length, 0);
 });
 
 test("at most 6 judge calls per scan; the rest wait for the next", async (t) => {

@@ -259,6 +259,26 @@ test("CI summary picks the latest run per check and lists pending checks", async
   assert.deepEqual(pr.ci, { state: "PENDING", failing: ["lint", "ci/legacy"], pending: ["verification", "ci/pending"], failedAt: "2026-09-26T07:48:29.000Z" });
 });
 
+test("a cancelled duplicate check is no failure, and never hides the run it duplicated", async () => {
+  // The judge was told a cancelled duplicate run was a failing check
+  // (cd2c0072, "the canceled failure"). GitHub's rollup reads it as red too.
+  const response = capturedResponse();
+  const commit = response.data.r0.p6878.commits.nodes[0].commit;
+  commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+    { __typename: "CheckRun", name: "verification", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:58:00Z" },
+    { __typename: "CheckRun", name: "verification", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:40:02Z", completedAt: "2026-09-26T07:40:03Z" },
+    { __typename: "CheckRun", name: "deploy-preview", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:42:00Z" },
+    { __typename: "CheckRun", name: "Cursor Bugbot", status: "COMPLETED", conclusion: "SKIPPED", startedAt: "2026-09-26T07:38:29Z" }
+  ] } };
+  const { run } = fakeRun(() => ok(response));
+  const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.ci, { state: "SUCCESS", failing: [], pending: [] });
+  // A real failure beside it still makes the rollup red.
+  commit.statusCheckRollup.contexts.nodes.push({ __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:43:00Z" });
+  const red = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(red.ci, { state: "FAILURE", failing: ["lint"], pending: [], failedAt: "2026-09-26T07:43:00.000Z" });
+});
+
 test("CI is unknown when the last commit is not the PR head or has no checks", async () => {
   const stale = capturedResponse();
   stale.data.r0.p6878.commits.nodes[0].commit.oid = "1336362a18000000000000000000000000000000";

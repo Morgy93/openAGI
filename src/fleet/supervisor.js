@@ -1498,12 +1498,25 @@ export class FleetSupervisor {
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
-    // Automatic nudges are read by the judge before they go out (Auto only).
-    await this.judgeNudges(items, { started });
-
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
+    // Automatic nudges are read by the judge before they go out (Auto only),
+    // an infra recovery's resume too. It replaces its thread's own nudge
+    // (dedupeDecisions keeps it first anyway); beside an ask or a wait it is
+    // read as a decision of its own.
+    const itemOf = new Map(items.map((item) => [item.thread.key, item]));
+    const recoveries = [];
+    const replaced = new Set();
+    for (const [index, decision] of infraDecisions.entries()) {
+      const item = decision.action === "nudge" ? itemOf.get(decision.threadKey) : null;
+      if (!item) continue;
+      const own = item.decision.action === "nudge" && !replaced.has(item);
+      if (own) { item.decision = decision; replaced.add(item); }
+      recoveries.push({ index, item: own ? item : { ...item, decision }, extra: !own });
+    }
+    await this.judgeNudges([...items, ...recoveries.filter(({ extra }) => extra).map(({ item }) => item)], { started });
+    for (const { index, item } of recoveries) infraDecisions[index] = item.decision;
     // How long a nudge has waited on computer use, for telling the owner.
     // The live mode: the owner may have left Auto while this tick scanned.
     const queuedWaits = this.store.queuedAnswers().map((question) => ({ threadKey: question.threadKey, uiBlocked: true }));
@@ -1715,9 +1728,10 @@ export class FleetSupervisor {
           .map(({ thread }) => thread.key);
         this.store.setInfraBlocked(kind, [...previous[kind], ...current]);
       } else if (health[kind].up) {
+        // A resume the judge has not read yet (its cap, a failure) is still due.
         const pending = new Set(recovering
           .filter((decision) => !decision.threadKey.startsWith("infra:") && !attempted.has(decision.threadKey)
-            && decision.action === "nudge" && mode === "auto" && decision.route)
+            && ((decision.action === "nudge" && decision.route) || (decision.judgePending && decision.playbook === "infra-recovered")) && mode === "auto")
           .map((decision) => decision.threadKey));
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
         const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;

@@ -81,6 +81,16 @@ function eventText(event) {
     .map((block) => block.text).join("\n").trim();
 }
 
+// An answer the agent sent back over a session socket with SendMessage (to
+// a supervisor relay that has already exited) is its reply too: the
+// transcript is where it is read. A message to a subagent is not.
+function sentMessageText(event) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  const call = content.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
+    && typeof block.input?.message === "string");
+  return call ? call.input.message.trim() : "";
+}
+
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
@@ -120,7 +130,7 @@ function summarizeTail(rowsNewestFirst) {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
       const ask = askUserQuestion(event, at);
       if (ask) summary.pendingAsks.set(ask.id, ask);
-      const text = eventText(event);
+      const text = eventText(event) || sentMessageText(event);
       if (text) {
         summary.lastAgentText = text;
         summary.lastAgentAt = at;

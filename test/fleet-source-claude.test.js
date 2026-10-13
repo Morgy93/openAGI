@@ -595,3 +595,21 @@ test("an untitled thread is titled with its folder", async (t) => {
   assert.equal(thread.title, "g2");
   assert.equal(thread.lastUserText, "ship the mobile build to the distiller");
 });
+
+test("an answer the agent sent back to a relay with SendMessage is read as its reply", async (t) => {
+  // A supervisor relay exits once it delivers: the agent's SendMessage back
+  // fails (ENOENT /tmp/cc-socks/...), but its words are still its reply.
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/bbapp";
+  const r = rowsFor("relay-1", cwd);
+  const answer = "PR #7317 is ready on our side; main's red Testing CI is the only blocker.";
+  writeTranscript(home, cwd, "relay-1", [
+    ...r.history(60 * MIN),
+    r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)),
+    r.tool("SendMessage", "s1", { to: "uds:/tmp/cc-socks/48713.sock", summary: "status", message: answer }, iso(19 * MIN)),
+    r.result("s1", "{\"success\":false,\"message\":\"ENOENT\"}", iso(19 * MIN))
+  ], NOW - 19 * MIN);
+  const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(thread.lastAgentFull, answer);
+  assert.equal(thread.lastAgentFullAt, iso(19 * MIN));
+});

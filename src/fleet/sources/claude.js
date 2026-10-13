@@ -229,8 +229,13 @@ function onAssistant(summary, row) {
       if (taskId) summary.tasks.delete(String(taskId));
     }
   }
-  if (text) {
-    summary.lastAgentText = text;
+  // An answer sent back over a session socket with SendMessage (to a
+  // supervisor relay that has already exited) is the agent's reply too; a
+  // message to a subagent is not.
+  const said = text || blocks.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
+    && typeof block.input?.message === "string")?.input.message.trim();
+  if (said) {
+    summary.lastAgentText = said;
     summary.lastAgentAt = toIso(row.timestamp);
     summary.textTurns += 1;
   }

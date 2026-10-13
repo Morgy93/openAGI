@@ -597,6 +597,13 @@ export function shortHash(value) {
   return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 16);
 }
 
+// A check that reports main's own health ("main-health", "Reconcile main
+// health"): red on every PR while main is red. Shared infra, not the PR's
+// work, so no nudge to its agent clears it.
+export function isMainHealthCheck(name) {
+  return /\bmain[-_ ]?health\b/i.test(String(name ?? ""));
+}
+
 // Reads "export KEY=value" / "KEY=value" lines without touching process.env.
 export function parseEnvText(text) {
   const out = {};

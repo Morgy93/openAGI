@@ -60,7 +60,7 @@ test("findLocalHeavyVerification flags heavy local commands and skips remote or 
   const { run, calls } = fakeRun();
   const found = await findLocalHeavyVerification(config, { run });
   const pids = found.map((row) => row.pid).sort((a, b) => a - b);
-  assert.deepEqual(pids, [100, 200, 300, 400, 401, 402, 500], "one row per process tree, closest to the agent");
+  assert.deepEqual(pids, [100, 200, 300, 400, 401, 402], "one row per process tree, closest to the agent");
 
   const verify = found.find((row) => row.pid === 100);
   assert.equal(verify.ageSec, 600);
@@ -72,6 +72,22 @@ test("findLocalHeavyVerification flags heavy local commands and skips remote or 
   const lsofCalls = calls.filter(([cmd]) => cmd === "/fake/lsof");
   assert.equal(lsofCalls.length, 1, "one batched lsof call");
   assert.deepEqual(lsofCalls[0][1].slice(0, 4), ["-a", "-d", "cwd", "-Fn"]);
+});
+
+test("a laptop command naming bb-verify or bb-quick, or run under an ssh session, is BuildBot3 work", async () => {
+  // monterrey got three "Stop. Don't verify locally" while it only polled
+  // BuildBot3 ("Nothing is verifying on the laptop"). bb-verify and bb-quick
+  // exist only on that box: a local line naming them wraps or watches it.
+  const psOut = [
+    "  10     1    40:00 python3 /Users/me/bin/bb-verify --full --pr 7352",
+    "  11     1    40:00 /bin/zsh -c until bb-quick --status 7352 | grep -q done; do sleep 60; done",
+    "  20     1    40:00 /usr/bin/ssh -T dev@192.0.2.10",
+    "  21    20    39:00 pnpm run build",
+    "  30     1    40:00 pnpm run build"
+  ].join("\n");
+  const { run } = fakeRun({ psOut });
+  const found = await findLocalHeavyVerification(config, { run });
+  assert.deepEqual(found.map((row) => row.pid), [30]);
 });
 
 test("findLocalHeavyVerification honours minAgeSec and scrubs secrets", async () => {
