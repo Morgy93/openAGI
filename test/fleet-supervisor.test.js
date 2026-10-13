@@ -2174,8 +2174,9 @@ test("a thread nudges keep failing to reach backs off, then the owner is told on
     await supervisor.tick({ reason: "test" });
     now += 5 * MIN;
   }
-  // 0, 5 (backoff 5), 15 (backoff 10), then 30+ min in with 3 failures: ask.
-  assert.equal(delivered.length, 3);
+  // 0, 5 (backoff 5), then a Codex title the app cannot tell apart is the
+  // owner's on its second failure: no third send.
+  assert.equal(delivered.length, 2);
   const asks = supervisor.store.openQuestions().filter((q) => q.kind === "deliver");
   assert.equal(asks.length, 1);
   assert.equal(asks[0].dedupeKey, "deliver:group", "one grouped question, even for one thread");
@@ -2183,7 +2184,7 @@ test("a thread nudges keep failing to reach backs off, then the owner is told on
   assert.match(asks[0].body, /rename or archive one/);
   // One question, kept while it stays true (the notifier dedupes the push).
   assert.equal(new Set(notified.filter((q) => q.kind === "deliver").map((q) => q.id)).size, 1);
-  assert.equal(supervisor.store.ledgerFor("codex:t1").undelivered.count, 3);
+  assert.equal(supervisor.store.ledgerFor("codex:t1").undelivered.count, 2);
 });
 
 test("the owner at the keyboard or a running turn does not count as a failed send", async (t) => {
