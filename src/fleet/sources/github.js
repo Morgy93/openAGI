@@ -12,9 +12,9 @@ const GH_TIMEOUT_MS = 60_000;
 const GIT_TIMEOUT_MS = 10_000;
 const CODEX_SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->";
 const QA_EVIDENCE = /PR box `pr(\d+)` on `([0-9a-f]{7,40})`/i;
-// CANCELLED is no failure: a duplicate run cancelled for a newer one, or a
-// run stopped by hand. Like SKIPPED and NEUTRAL it is reported as itself.
-const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+// A cancelled run is red unless another run of its name replaced it
+// (newerCheck): one stopped by hand or by timeout-minutes never finished.
+const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const FAILED_STATUSES = new Set(["FAILURE", "ERROR"]);
 const PENDING_STATUSES = new Set(["PENDING", "EXPECTED"]);
 const NON_PR_BRANCHES = new Set(["HEAD", "main", "master"]);
@@ -146,18 +146,24 @@ function newerCheck(best, next) {
 }
 
 // The newest run of each check on the head, or null when the head's CI is
-// unknown.
+// unknown. replaced: cancelled runs another run of the same name replaced.
 function latestChecks(commit, headOid) {
   const rollup = commit?.statusCheckRollup ?? null;
   // A last commit that is not the head means GitHub has not caught up; the
   // head's CI is unknown rather than whatever the older commit reported.
   if (!rollup || (headOid && commit.oid && commit.oid !== headOid)) return null;
   const latest = new Map();
+  let replaced = 0;
   for (const node of rollup.contexts?.nodes ?? []) {
     const name = node?.name ?? node?.context;
     if (!name) continue;
-    latest.set(name, newerCheck(latest.get(name), node));
+    const best = latest.get(name);
+    const kept = newerCheck(best, node);
+    const dropped = !best ? null : kept === node ? best : node;
+    if (dropped?.conclusion === "CANCELLED" && kept?.conclusion !== "CANCELLED") replaced += 1;
+    latest.set(name, kept);
   }
+  latest.replaced = replaced;
   return latest;
 }
 
@@ -170,9 +176,7 @@ function summarizeChecks(commit, headOid) {
   // When the newest failure finished: a rerun that fails again on the same
   // head is a new result.
   let failedMs = 0;
-  let cancelled = 0;
   for (const [name, node] of latest) {
-    if (node.conclusion === "CANCELLED") cancelled += 1;
     if (node.__typename === "StatusContext") {
       if (FAILED_STATUSES.has(node.state)) failing.push(name);
       else if (PENDING_STATUSES.has(node.state)) pending.push(name);
@@ -183,11 +187,13 @@ function summarizeChecks(commit, headOid) {
     }
     if (failing.at(-1) === name) failedMs = Math.max(failedMs, Date.parse(node.completedAt ?? node.createdAt ?? "") || 0);
   }
-  // GitHub's rollup counts a cancelled run as a failure. When every context
-  // was read and a cancelled run is the only red, the rollup is not red.
+  // GitHub's rollup counts a cancelled run as a failure even when a rerun of
+  // that check passed. When every context was read and such a replaced run
+  // is the only red, the rollup is not red. A cancelled run nothing
+  // replaced is in failing, so the rollup stays red.
   let state = rollup.state ?? null;
   const allRead = (rollup.contexts?.nodes?.length ?? 0) < 100;
-  if (FAILED_STATUSES.has(state) && !failing.length && cancelled && allRead) state = pending.length ? "PENDING" : "SUCCESS";
+  if (FAILED_STATUSES.has(state) && !failing.length && latest.replaced && allRead) state = pending.length ? "PENDING" : "SUCCESS";
   return { state, failing, pending, ...(failedMs ? { failedAt: new Date(failedMs).toISOString() } : {}) };
 }
 

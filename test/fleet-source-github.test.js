@@ -267,7 +267,6 @@ test("a cancelled duplicate check is no failure, and never hides the run it dupl
   commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
     { __typename: "CheckRun", name: "verification", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:58:00Z" },
     { __typename: "CheckRun", name: "verification", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:40:02Z", completedAt: "2026-09-26T07:40:03Z" },
-    { __typename: "CheckRun", name: "deploy-preview", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:42:00Z" },
     { __typename: "CheckRun", name: "Cursor Bugbot", status: "COMPLETED", conclusion: "SKIPPED", startedAt: "2026-09-26T07:38:29Z" }
   ] } };
   const { run } = fakeRun(() => ok(response));
@@ -277,6 +276,26 @@ test("a cancelled duplicate check is no failure, and never hides the run it dupl
   commit.statusCheckRollup.contexts.nodes.push({ __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:43:00Z" });
   const red = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
   assert.deepEqual(red.ci, { state: "FAILURE", failing: ["lint"], pending: [], failedAt: "2026-09-26T07:43:00.000Z" });
+});
+
+// A check whose only run was cancelled (by hand, or at timeout-minutes)
+// never finished: nothing replaced it, so it is red. Read as green, an
+// ungated repo's PR became "ready. Merge?" with its tests never run.
+test("a check whose only run was cancelled stays red", async () => {
+  const response = capturedResponse();
+  const commit = response.data.r0.p6878.commits.nodes[0].commit;
+  commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+    { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:42:00Z" },
+    { __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:41:00Z" }
+  ] } };
+  const { run } = fakeRun(() => ok(response));
+  const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.ci, { state: "FAILURE", failing: ["test"], pending: [], failedAt: "2026-09-26T07:42:00.000Z" });
+  // Two runs of it, both cancelled: still nothing finished.
+  commit.statusCheckRollup.contexts.nodes.push({ __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:43:00Z", completedAt: "2026-09-26T07:44:00Z" });
+  const twice = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+  assert.equal(twice.ci.state, "FAILURE");
+  assert.deepEqual(twice.ci.failing, ["test"]);
 });
 
 test("CI is unknown when the last commit is not the PR head or has no checks", async () => {
