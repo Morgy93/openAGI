@@ -794,15 +794,31 @@ test("a different ask that supersedes an open one gets its own day and push", (t
   assert.deepEqual(store.openQuestions().map((q) => q.id), [coda.id], "not expired on the old ask's day");
   now.advance(22 * HOUR);
   assert.deepEqual(store.openQuestions(), []);
-  // The same question restated keeps its push and its day.
+  // The same question restated (the same ask) keeps its push and its day.
   const later = clock(Date.parse("2026-10-12T04:38:00.000Z"));
   const again = new FleetStore({ dir: tempDir(t), now: later });
-  const first = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:cccc", title: "milan: who gets the free Coda token?", body: "Who gets it?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  const first = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:cccc", title: "milan: who gets the free Coda token?", body: "Who gets the free Coda token?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
   again.markQuestionNotified(first.id, { outreachId: "out_2", pushedAt: new Date(later()).toISOString() });
   later.advance(23 * HOUR);
-  const restated = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:dddd", title: "milan: who gets the free Coda token?", body: "Still: who gets the token?", agentAskedAt: "2026-10-13T03:37:00.000Z" });
+  const restated = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:dddd", title: "milan: who gets the free Coda token?", body: "Who gets the free Coda token?", agentAskedAt: "2026-10-13T03:37:00.000Z" });
   assert.equal(restated.id, first.id);
   assert.ok(restated.pushedAt);
   later.advance(2 * HOUR);
   assert.deepEqual(again.openQuestions(), []);
+});
+
+// Titles are generic per topic: two different prod approvals on one PR both
+// read "wants a prod step. OK?". The second is a new decision for the owner.
+test("a different ask under the same generic title still gets its own push and day", (t) => {
+  const now = clock(Date.parse("2026-10-12T04:38:00.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:1941cea4", prRef: "buildbetter-app/buildbetter#7087", options: ["yes", "no"], title: "milan wants a prod step. OK?", askContext: "Blocked on: your call." };
+  const one = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:eeee", body: "Approve the production DB migration?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  store.markQuestionNotified(one.id, { outreachId: "out_3", pushedAt: new Date(now()).toISOString() });
+  now.advance(20 * HOUR);
+  const two = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:ffff", body: "Approve the production deploy of the web app?", agentAskedAt: "2026-10-13T00:37:00.000Z" });
+  assert.equal(two.id, one.id);
+  assert.equal(two.pushedAt, null, "pushed anew");
+  now.advance(10 * HOUR);
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [one.id], "its own day, not the old one's");
 });

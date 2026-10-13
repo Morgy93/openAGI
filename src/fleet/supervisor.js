@@ -62,6 +62,9 @@ const PR_PLAYBOOKS = new Set(["merge-ready", "ci-finished"]);
 // post-merge work may remain), so a settled PR never cancels one, even when
 // the judge's words name it ("PR: repo#7489 MERGED" is in its prompt).
 const POST_MERGE_PLAYBOOKS = new Set(["resume", "infra-recovered"]);
+// Nudges that are about the machine, not the PR: a PR number in their words
+// (the judge's "Stop local verification for #123") never makes them stale.
+const NOT_ABOUT_PR_PLAYBOOKS = new Set(["no-local-verify"]);
 // How long a remembered outage thread hidden by a failed source waits for it.
 const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
@@ -257,7 +260,7 @@ export function judgeAskKey(thread, _question = null) {
 
 // A judge question that asks to merge holds like the policy's merge asks.
 function asksToMerge(question) {
-  return asksToMergePr([question?.title, ...(question?.options ?? [])].join(" "));
+  return asksToMergePr([question?.title, question?.body, ...(question?.options ?? [])].join(" "));
 }
 
 // Asks that stand until settled, not while the thread's state reads a
@@ -1993,7 +1996,8 @@ export class FleetSupervisor {
     }
     if (!SETTLED_PR_STATES.has(fresh?.state)) return null;
     const since = !SETTLED_PR_STATES.has(pr?.state);
-    const about = PR_PLAYBOOKS.has(decision.playbook) || new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? ""));
+    const about = PR_PLAYBOOKS.has(decision.playbook)
+      || (!NOT_ABOUT_PR_PLAYBOOKS.has(decision.playbook) && new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? "")));
     if (!since && !about) return null;
     return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
   }

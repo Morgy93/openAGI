@@ -803,7 +803,12 @@ export class FleetStore {
     const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
     // A merge ask about another PR is a new question, whatever its words.
     const samePr = !older.prRef || !fields.prRef || older.prRef === fields.prRef;
-    const restated = samePr && ((older.mergeAsk && fields.mergeAsk) || norm(older.title) === norm(fields.title) || (Boolean(norm(fields.body)) && norm(older.body) === norm(fields.body)));
+    // Titles are generic per topic ("wants a prod step. OK?" for every prod
+    // approval), so only the ask itself counts: the same body, or both merge
+    // asks about the same PR. The title decides only when neither has a body.
+    const body = norm(fields.body);
+    const restated = samePr && ((older.mergeAsk && fields.mergeAsk)
+      || (body ? norm(older.body) === body : !norm(older.body) && norm(older.title) === norm(fields.title)));
     Object.assign(older, fields, origin, {
       dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),

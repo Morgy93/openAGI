@@ -3314,6 +3314,7 @@ test("judge ask-owner: an agent-ask question whose answer is relayed to the agen
   assert.match(question.title, /Merge with --admin\?$/);
   assert.equal(question.body, "Agent asks: --admin or wait for Nikhil.");
   assert.deepEqual(question.options, ["merge --admin", "wait for Nikhil"]);
+
   assert.equal(question.threadKey, "codex:t1");
   const result = await supervisor.answerQuestion(question.id, "wait for Nikhil");
   assert.equal(result.delivery.status, "sent");
@@ -3322,6 +3323,14 @@ test("judge ask-owner: an agent-ask question whose answer is relayed to the agen
   assert.equal(delivered[0].playbook, "owner-answer");
   // The owner's answer was never judged.
   assert.equal(judge.calls.length, 1);
+});
+
+test("judge ask-owner: a merge ask only in the body still holds as a merge ask", async (t) => {
+  const judge = fakeJudge({ action: "ask-owner", reason: "needs your call", question: { title: "Approval needed", body: "May I merge the PR?", options: ["yes", "no"] } });
+  const { supervisor } = fixture(t, { mode: "auto", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  assert.equal(question.mergeAsk, true);
 });
 
 test("judge failure waits, never a blind send", async (t) => {
@@ -4145,6 +4154,8 @@ test("the check before a send cancels a nudge about a settled PR only", async (t
   assert.equal(await supervisor.prSettledBeforeSend(thread, pr, statusCheck), "#7586 merged");
   assert.equal(await supervisor.prSettledBeforeSend(thread, pr, { playbook: "ci-finished", message: "CI finished on 1dc7949c4c: fail." }), "#7586 merged");
   assert.equal(await supervisor.prSettledBeforeSend(thread, pr, { playbook: "resume", message: "continue — pick up where you stopped." }), null);
+  // A laptop-verify stop names the PR but is about the machine: it still goes.
+  assert.equal(await supervisor.prSettledBeforeSend(thread, makePr({ ref, repo: BB, number: 7586, state: "MERGED" }), { playbook: "no-local-verify", message: "Stop local verification for #7586 on the laptop." }), null);
   answer = async () => { throw new Error("gh: timeout"); };
   assert.equal(await supervisor.prSettledBeforeSend(thread, makePr({ ref, repo: BB, number: 7586 }), statusCheck), null);
 });
