@@ -600,6 +600,17 @@ test("an answer the agent sent back with SendMessage is read as its reply", asyn
   const thread = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
   assert.equal(thread.lastAgentFull, answer);
   assert.equal(thread.lastAgentFullAt, iso(10 * MIN));
+  // A preamble in the same message is not the answer it relayed.
+  const more = new DatabaseSync(file);
+  const later = "Still ready; main's Testing CI went green, so #7317 can merge.";
+  addMessage(more, "s-idle", "assistant", {
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "text", text: "I'll send the status now." },
+      { type: "tool_use", id: "toolu_send2", name: "SendMessage", input: { to: "uds:/tmp/cc-socks/48713.sock", summary: "Reply", message: later } }] }
+  }, iso(5 * MIN));
+  more.close();
+  const again = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
+  assert.equal(again.lastAgentFull, later);
 });
 
 // A subagent's AskUserQuestion (342281f9, 2026-10-07 03:27:31): the card

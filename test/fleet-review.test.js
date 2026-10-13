@@ -392,3 +392,27 @@ test("done-elsewhere needs a related thread that names this PR, not a bare owner
   assert.equal((await review("Admin-merged #10 and #1234.")).decision, "keep");
   assert.equal((await review("Admin-merged #1 at f433206 as you asked.")).decision, "close");
 });
+
+// A related thread found by workspace or repo can talk about a dependency
+// PR with the same number in another repo: that is not this PR.
+test("done-elsewhere checks the repo of the PR a related thread names", async () => {
+  const asked = question({ id: "fq_repo", dedupeKey: "ask:conductor:a1:x", threadKey: "conductor:a1", prRef: "acme/app#42", title: "app #42: merge?", options: ["yes", "no"], agentAskedAt: "2026-10-13T00:00:00.000Z" });
+  const own = thread({ key: "conductor:a1", id: "a1", workspace: "w", repo: "acme/app", prRefs: ["acme/app#42"], lastAgentText: "Merge #42?", lastAgentAt: "2026-10-13T00:00:00.000Z" });
+  const pr = { ref: "acme/app#42", number: 42, state: "OPEN", isDraft: false, ci: { state: "SUCCESS" } };
+  const review = async (lastAgentText, repo = "acme/lib") => {
+    const sibling = thread({ key: "conductor:b2", id: "b2", workspace: "w", repo, prRefs: [], lastAgentText, lastAgentAt: "2026-10-13T01:00:00.000Z", lastActivityAt: "2026-10-13T01:00:00.000Z" });
+    const threads = new Map([[own.key, own], [sibling.key, sibling]]);
+    const [verdict] = await reviewQuestions({
+      questions: [asked], now: Date.parse("2026-10-13T01:10:00.000Z"),
+      contextFor: (q) => reviewContext(q, { threads, prs: new Map([[pr.ref, pr]]) }),
+      runModel: async () => ({ reviews: [{ id: asked.id, decision: "close", category: "done-elsewhere", reason: "A related thread merged #42." }] })
+    });
+    return verdict.decision;
+  };
+  assert.equal(await review("Merged acme/lib#42."), "keep");
+  assert.equal(await review("Merged https://github.com/acme/lib/pull/42."), "keep");
+  assert.equal(await review("Merged #42."), "keep", "a bare #42 from another repo's thread");
+  assert.equal(await review("Merged acme/app#42 for you."), "close");
+  assert.equal(await review("Merged https://github.com/acme/app/pull/42 as asked."), "close");
+  assert.equal(await review("Merged #42.", "acme/app"), "close");
+});

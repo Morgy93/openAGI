@@ -647,4 +647,10 @@ test("an answer the agent sent back to a relay with SendMessage is read as its r
   const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
   assert.equal(thread.lastAgentFull, answer);
   assert.equal(thread.lastAgentFullAt, iso(19 * MIN));
+  // A preamble in the same message is not the answer it relayed.
+  const mixed = { ...r.tool("SendMessage", "s2", { to: "uds:/tmp/cc-socks/48713.sock", summary: "status", message: answer }, iso(18 * MIN)) };
+  mixed.message = { ...mixed.message, content: [{ type: "text", text: "I'll send the status now." }, ...mixed.message.content] };
+  writeTranscript(home, cwd, "relay-1", [...r.history(60 * MIN), r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)), mixed], NOW - 18 * MIN);
+  const [again] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(again.lastAgentFull, answer);
 });

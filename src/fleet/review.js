@@ -313,13 +313,22 @@ function cleanVerdict(raw, entry, ids) {
   return verdict;
 }
 
-// A related thread's own text (owner or agent) names this question's PR. A
-// question with no PR cannot be checked this way.
+// A related thread's own text (owner or agent) names this question's PR:
+// "owner/name#42" or a /pull/42 link of the same repo, or a bare "#42" from a
+// thread on that repo. Another repo's #42 is not it. A question with no PR
+// cannot be checked this way.
 function relatedNamesPr(entry) {
   const ref = parsePrRef(entry.prRef) ?? parsePrRef(entry.prs?.[0]?.ref);
   if (!ref) return true;
-  const named = new RegExp(`(?:#|/pull/)${ref.number}(?!\\d)`);
-  return (entry.related ?? []).some((thread) => named.test(`${thread.lastAgentText ?? ""}\n${thread.lastUser?.text ?? ""}`));
+  const repo = ref.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const qualified = new RegExp(`(?:github\\.com/|(?<![\\w./-]))${repo}(?:#|/pull/)${ref.number}(?!\\d)`, "i");
+  const bare = new RegExp(`(?<![\\w./-])#${ref.number}(?!\\d)`);
+  return (entry.related ?? []).some((thread) => {
+    const words = `${thread.lastAgentText ?? ""}\n${thread.lastUser?.text ?? ""}`;
+    if (qualified.test(words)) return true;
+    const threadRepo = thread.repo ?? parsePrRef(thread.prRefs?.[0])?.repo ?? null;
+    return Boolean(threadRepo) && threadRepo.toLowerCase() === ref.repo.toLowerCase() && bare.test(words);
+  });
 }
 
 // A duplicate closes only when the question it points at, followed down

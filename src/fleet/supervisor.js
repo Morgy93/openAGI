@@ -14,7 +14,7 @@ import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
-import { agentAskKey, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
+import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
@@ -257,7 +257,7 @@ export function judgeAskKey(thread, _question = null) {
 
 // A judge question that asks to merge holds like the policy's merge asks.
 function asksToMerge(question) {
-  return /\bmerg/i.test([question?.title, ...(question?.options ?? [])].join(" "));
+  return asksToMergePr([question?.title, ...(question?.options ?? [])].join(" "));
 }
 
 // Asks that stand until settled, not while the thread's state reads a

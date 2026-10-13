@@ -238,10 +238,12 @@ function onAssistant(summary, row) {
     }
   }
   // An answer sent back over a session socket with SendMessage (to a
-  // supervisor relay that has already exited) is the agent's reply too; a
+  // supervisor relay that has already exited) is the agent's reply too, and
+  // beats any preamble text beside it ("I'll send the status now"); a
   // message to a subagent is not.
-  const said = text || blocks.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
+  const relayed = blocks.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
     && typeof block.input?.message === "string")?.input.message.trim();
+  const said = relayed || text;
   if (said) {
     summary.lastAgentText = said;
     summary.lastAgentAt = toIso(row.timestamp);

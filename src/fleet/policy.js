@@ -493,6 +493,19 @@ function cardIntent(ctx, card) {
 // agent says meanwhile ("Merges: need your explicit go." reads as a decision).
 const MERGE_TOPICS = new Set(["admin", "merge"]);
 const MERGE_WORDS = /\bmerg/i;
+// Merge words that ask nothing about merging the PR: a merge conflict, a
+// merge base or commit, merging main (or the base) into the branch.
+const NOT_MERGE_ASK = new RegExp([
+  String.raw`\bmerg\w*[\s-]+(?:conflicts?|base|commits?)\b`,
+  String.raw`\bmerg\w*\s+(?:in\s+)?(?:the\s+)?(?:latest\s+)?(?:origin\/|upstream\/)?(?:main|master|develop|upstream|base(?:\s+branch)?)\b`,
+  String.raw`\bmerg\w*\s+[^.?!\n]{0,40}?\binto\s+(?:this|the|my|our|your|its)?\s*(?:feature\s+|PR\s+)?branch\b`
+].join("|"), "gi");
+
+// An ask for the owner's go to merge the PR, not any mention of merging
+// ("How should I resolve the merge conflict?" moves on once resolved).
+export function asksToMergePr(text) {
+  return MERGE_WORDS.test(String(text ?? "").replace(NOT_MERGE_ASK, " "));
+}
 
 // An agent's own ask, keyed on its thread and the agent message it came from
 // (when it was written), never on its wording: a reread or a reworded judge
@@ -541,7 +554,7 @@ function agentAskIntent(ctx) {
     question: {
       ...question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
         agentAskKey(thread.key, { id: ask.key ?? null, at: thread.lastAgentAt, text: ask.text ?? "" }), "agent-ask"),
-      mergeAsk: MERGE_TOPICS.has(ask.topic) || MERGE_WORDS.test(ask.text ?? ""),
+      mergeAsk: MERGE_TOPICS.has(ask.topic) || asksToMergePr(ask.text),
       // The body is only the ask sentence; the review needs what it is about.
       askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
       agentAskedAt: thread.lastAgentAt ?? null

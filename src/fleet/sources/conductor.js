@@ -149,7 +149,8 @@ function summarizeTail(rowsNewestFirst) {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
       const ask = askUserQuestion(event, at);
       if (ask) summary.pendingAsks.set(ask.id, ask);
-      const text = eventText(event) || sentMessageText(event);
+      // The answer it relayed beats any preamble text beside it.
+      const text = sentMessageText(event) || eventText(event);
       if (text) {
         summary.lastAgentText = text;
         summary.lastAgentAt = at;

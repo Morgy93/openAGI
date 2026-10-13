@@ -6,7 +6,7 @@ import path from "node:path";
 import { classifyThread } from "../src/fleet/classify.js";
 import { DEFAULTS, shortHash } from "../src/fleet/contracts.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks } from "../src/fleet/playbooks.js";
-import { agentAskKey, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
+import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -1121,6 +1121,16 @@ test("an ask to merge is marked so it holds until answered or merged", () => {
   assert.equal(run(makeThread({ lastAgentText: "Merging still needs your explicit go, and #7352 needs \"admin merge\" because you authored it." })).decision.question.mergeAsk, true);
   assert.equal(run(makeThread({ lastAgentText: "Resumed. Wave 2 moves to acceptance.\n\n- **Merges:** need your explicit go. #7352 also needs \"admin merge\"." })).decision.question.mergeAsk, true);
   assert.equal(run(makeThread({ lastAgentText: "Want me to cut the production release?" })).decision.question.mergeAsk, false);
+  // Merge words about something else: no hold past the agent moving on.
+  for (const text of ["How should I resolve the merge conflict?", "Should I merge main into this branch?", "Merging origin/main again, or rebase?", "Which merge base should I use?", "Merge the latest main into the feature branch first?"]) {
+    assert.equal(asksToMergePr(text), false, text);
+    const question = run(makeThread({ lastAgentText: text })).decision.question;
+    if (question) assert.notEqual(question.mergeAsk, true, text);
+  }
+  assert.equal(run(makeThread({ lastAgentText: "Merges: need your explicit go. Resolve the merge conflict with theirs or ours?" })).decision.question.mergeAsk, true);
+  for (const text of ["OK to merge #7352 into main?", "Merged main in. Ready to merge?", "Should I merge it now?"]) {
+    assert.equal(asksToMergePr(text), true, text);
+  }
 });
 
 // Review 8: a PR done before the agent last spoke is not what it asks about.
