@@ -235,6 +235,13 @@ export function isCodexIdentityBlock(thread, delivery) {
   return CODEX_UNVERIFIED.test(detail) && !/left as a draft/.test(detail);
 }
 
+// Added to such a block when codex exec cannot take over either: the Codex
+// app holds the thread's writer lock, as it does for every thread it has
+// loaded (019fe344, #5557: lock held by "codex app-server"). Opening a thread
+// by its link loads it, so the threads that hit identity blocks are the
+// locked ones. Only the owner can send there; policy asks them sooner.
+export const CODEX_APP_HOLDS = "Codex holds the thread open, so codex exec cannot reach it";
+
 // The non-UI route a presence-blocked app send may take instead, if the owner
 // allowed it (config.backgroundRoutes) and it cannot fork or queue unseen:
 // codex-exec only for a Codex thread no app holds (no writer, so nothing
@@ -562,9 +569,13 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // The background route a presence-blocked app send takes, re-checked at
   // send time: the scan's lock, peer and chat reads are up to a tick old.
   // Anything unreadable now means no background route.
-  async function fallbackRoute(thread, target, deadlineAt) {
+  // why.locked: refused because a Codex writer holds the thread.
+  async function fallbackRoute(thread, target, deadlineAt, why = {}) {
     const route = backgroundRouteFor(thread, config);
-    if (!route) return null;
+    if (!route) {
+      if (thread?.kind === "codex" && thread.writerLocked) why.locked = true;
+      return null;
+    }
     // An earlier app send may sit in that composer unconfirmed.
     if (unconfirmed.has(target.targetKey)) return null;
     // A remote caller's deadline bounds the checks too, not only the send.
@@ -576,7 +587,9 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       if (!paths.codexHome) return null;
       let locked;
       try { locked = await readWriterLocks(config, [thread.id], { run: runner, isPidAlive }); } catch { return null; }
-      return locked.has(thread.id) ? null : route;
+      if (!locked.has(thread.id)) return route;
+      why.locked = true;
+      return null;
     }
     if (!readLivePeers || !refreshThread) return null;
     let peers = null;
@@ -635,8 +648,15 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       // open: a route that does not take the screen, if the owner allowed one
       // for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
-      if (!(isPresenceBlock(result) || isCodexIdentityBlock(thread, result)) || (queue && step.target?.app === "conductor")) return result;
-      const fallback = await fallbackRoute(thread, step.target, deadlineAt);
+      const identity = isCodexIdentityBlock(thread, result);
+      if (!(isPresenceBlock(result) || identity) || (queue && step.target?.app === "conductor")) return result;
+      const why = {};
+      const fallback = await fallbackRoute(thread, step.target, deadlineAt, why);
+      if (!fallback && identity && why.locked) {
+        const detail = detailText(`${result.detail}; ${CODEX_APP_HOLDS}`);
+        if (result.actionId) journal(result.actionId, { detail });
+        return { ...result, detail };
+      }
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };
       return deliver({ thread: { ...thread, live: via.live }, message, route: via.route, actionId: result.actionId ?? actionId, playbook, spentMs, deadlineAt, fallbackFrom: result.detail });

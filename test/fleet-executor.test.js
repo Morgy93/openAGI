@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { MESSAGE_PREFIX, RELAY_REPLY_NOTE, backgroundRouteFor, buildRelayPrompt, createExecutor, isCodexIdentityBlock, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { CODEX_APP_HOLDS, MESSAGE_PREFIX, RELAY_REPLY_NOTE, backgroundRouteFor, buildRelayPrompt, createExecutor, isCodexIdentityBlock, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
 import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
@@ -733,32 +733,30 @@ test("no background route unless allowed, safe and the block was only the owner'
   await stale.executor.whenIdle();
 });
 
-// codex:019fe344 (#5557): the approved BuildBot3-failure ping was blocked
-// twice because Codex could not show the thread was open, and a twin title
-// blocked 151 sends. Codex shows no id on screen; codex exec reaches the
-// thread by its id instead.
-test("a Codex send the app cannot verify goes by codex exec, addressed by the thread id", async (t) => {
+// A Codex app send that cannot prove which thread is open (a title two
+// threads share, or the app still on another thread after the id link) may
+// go by codex exec, which reaches the thread by its id, when no app holds
+// the thread's writer lock.
+test("a Codex send the app cannot verify goes by codex exec when no app holds the thread", async (t) => {
   withoutLbKey(t);
-  const thread = (cwd, extra = {}) => codexThread(cwd, { id: "019fe344-eb70-7da2-9186-62c55dbd61d2", title: "On top of PR #5544, I want to build a mock chat", agentStatus: "idle", ...extra });
+  const thread = (cwd, extra = {}) => codexThread(cwd, { id: "01a0df66-b269-7540-81f5-592808f2e1f1", title: "Fix uploads", agentStatus: "idle", ...extra });
   for (const detail of [
-    "could not verify thread: \"on top of pr #5544, i want to build a mo\" is not the open thread",
+    "could not verify thread: \"fix uploads\" is not the open thread",
     "ambiguous: two threads share this title",
     "ambiguous: two threads share this title; a thread with that title is already open"
   ]) {
     const { cwd, calls, store, executor } = fallbackSetup(t, { results: [{ status: "blocked", detail }] });
-    const result = await executor.deliver({ thread: thread(cwd), message: "BuildBot3 full run failed on 452084dce8", route: "computer-use", playbook: "merge-ready" });
+    const result = await executor.deliver({ thread: thread(cwd), message: "BuildBot3 full run failed", route: "computer-use", playbook: "merge-ready" });
     assert.equal(result.status, "sent", detail);
     assert.equal(result.route, "codex-exec", detail);
-    assert.deepEqual(calls.at(-1).args.slice(0, 3), ["exec", "resume", "019fe344-eb70-7da2-9186-62c55dbd61d2"], detail);
+    assert.deepEqual(calls.at(-1).args.slice(0, 3), ["exec", "resume", "01a0df66-b269-7540-81f5-592808f2e1f1"], detail);
     await executor.whenIdle();
     assert.equal(store.action(result.actionId).fallbackFrom, detail);
   }
-  // A live turn's writer lock, a send left unconfirmed in the composer, or a
-  // Conductor chat (its page names the session by id) gets no exec.
-  const verify = () => [{ status: "blocked", detail: "could not verify thread: another thread is open" }];
+  // A running turn, a send left unconfirmed in the composer, or a Conductor
+  // chat (its page names the session by id) gets no exec.
   for (const [label, extra, results] of [
-    ["writer-locked", { writerLocked: true }, verify()],
-    ["turn running", { agentStatus: "running" }, verify()],
+    ["turn running", { agentStatus: "running" }, [{ status: "blocked", detail: "could not verify thread: another thread is open" }]],
     ["unconfirmed", {}, [{ status: "blocked", detail: "could not verify thread: another thread is open", unconfirmed: true }]]
   ]) {
     const { cwd, calls, executor } = fallbackSetup(t, { results });
@@ -768,6 +766,37 @@ test("a Codex send the app cannot verify goes by codex exec, addressed by the th
   }
   assert.equal(isCodexIdentityBlock({ kind: "conductor" }, { status: "blocked", detail: "could not verify thread: another session is open" }), false);
   assert.equal(isCodexIdentityBlock({ kind: "codex" }, { status: "blocked", detail: "composer not found" }), false);
+});
+
+// codex:019fe344 (#5557), as it is: the approved BuildBot3-failure ping was
+// blocked ("on top of pr #5544, ..." is not the open thread) while the Codex
+// app-server (pid 17768) held the writer lock of this thread and of all 77
+// threads it had loaded. Opening a thread by its link loads it, so codex
+// exec can never take over here: the block stands, says why, and policy
+// asks the owner.
+test("019fe344: a Codex send the app cannot verify, on a thread the app holds, stays blocked and says why", async (t) => {
+  withoutLbKey(t);
+  const id = "019fe344-eb70-7da2-9186-62c55dbd61d2";
+  const detail = "could not verify thread: \"on top of pr #5544, i want to build a mo\" is not the open thread";
+  const thread = (cwd, extra = {}) => codexThread(cwd, { id, key: `codex:${id}`, title: "On top of PR #5544, I want to build a mock chat experience that we can pace on h", agentStatus: "idle", ...extra });
+  // The scan read the lock.
+  const scanned = fallbackSetup(t, { results: [{ status: "blocked", detail }] });
+  const blocked = await scanned.executor.deliver({ thread: thread(scanned.cwd, { writerLocked: true }), message: "BuildBot3 full run failed", route: "computer-use", playbook: "merge-ready" });
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.detail, `${detail}; ${CODEX_APP_HOLDS}`);
+  assert.equal(scanned.calls.length, 0, "no codex exec");
+  // The lock taken after the scan (the id link loaded the thread): read
+  // again at send time, held by a live process.
+  const lsofOut = [];
+  const lsof = fallbackSetup(t, { results: [{ status: "blocked", detail }], relay: lsofOut });
+  const lockFile = path.join(lsof.home, ".codex", "thread-writer-locks", `${id}.lock`);
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, "");
+  lsofOut.push({ code: 0, stdout: `p${process.pid}\nccodex\nf70\nn${lockFile}\n` });
+  const held = await lsof.executor.deliver({ thread: thread(lsof.cwd), message: "BuildBot3 full run failed", route: "computer-use", playbook: "merge-ready" });
+  assert.equal(held.status, "blocked");
+  assert.equal(held.detail, `${detail}; ${CODEX_APP_HOLDS}`);
+  assert.deepEqual(lsof.calls.map((call) => call.args[0]), ["-F"], "only the lock read ran");
 });
 
 test("a Conductor chat goes by peer relay to its live peer only when that peer is idle now", async (t) => {

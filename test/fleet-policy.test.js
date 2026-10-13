@@ -1836,3 +1836,31 @@ test("the laptop-verify guard waits out the owner hold and names the process it 
   assert.equal(held.action, "wait");
   assert.equal(held.reason, "owner is driving this thread");
 });
+
+// codex:019fe344 (#5557): the Codex app could not show the thread was open
+// ("on top of pr #5544, ..." is not the open thread) and holds its writer
+// lock, so codex exec cannot take over. The block repeats on every retry:
+// the owner hears it on the second one, not after 30 minutes.
+test("a Codex send the app cannot verify is the owner's after two failures", () => {
+  const reason = 'could not verify thread: "on top of pr #5544, i want to build a mo" is not the open thread; Codex holds the thread open, so codex exec cannot reach it';
+  const codex = makeThread({
+    key: "codex:019fe344-eb70-7da2-9186-62c55dbd61d2", kind: "codex", id: "019fe344-eb70-7da2-9186-62c55dbd61d2", title: "On top of PR #5544, I want to build a mock chat",
+    workspace: null, claudeSessionId: null, live: null, writerLocked: true, meta: { originator: "Codex Desktop" }, prRefs: ["acme/app#6522"],
+    lastAgentAt: ago(60 * MIN), lastActivityAt: ago(60 * MIN)
+  });
+  const pr = redPr({ ref: "acme/app#6522" });
+  const streak = (why, count = 2) => ({ nudges: [], attemptsWithoutProgress: 0, lastNudgeAt: null, lastProgressMark: null,
+    undelivered: { count, since: ago(12 * MIN), lastAt: ago(11 * MIN), reason: why, ackedAt: null } });
+  const asked = run(codex, { pr, ledger: streak(reason) }).decision;
+  assert.equal(asked.action, "ask-user");
+  assert.equal(asked.question.dedupeKey, `deliver:${codex.key}`);
+  assert.match(asked.reason, /Codex has it open under a title the supervisor cannot match: send it there yourself\.$/);
+  // Once: after the owner's answer it only retries.
+  assert.notEqual(run(codex, { pr, ledger: { ...streak(reason), undelivered: { ...streak(reason).undelivered, ackedAt: ago(MIN) } } }).decision.action, "ask-user");
+  // Any other failure, or a Conductor tab that showed another session, is
+  // asked about only after the usual streak (three over half an hour).
+  assert.notEqual(run(codex, { pr, ledger: streak("front app unknown") }).decision.action, "ask-user");
+  const tab = makeThread({ lastAgentAt: ago(60 * MIN), lastActivityAt: ago(60 * MIN) });
+  assert.notEqual(run(tab, { pr, ledger: streak("could not verify thread: another session is open") }).decision.action, "ask-user");
+  assert.equal(run(tab, { pr, ledger: { ...streak("could not verify thread: another session is open", 3), undelivered: { ...streak("x", 3).undelivered, reason: "could not verify thread: another session is open", since: ago(31 * MIN) } } }).decision.action, "ask-user");
+});

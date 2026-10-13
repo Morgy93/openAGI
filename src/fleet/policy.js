@@ -619,8 +619,7 @@ function resolveNudge(ctx, intent, base) {
   const undelivered = undeliveredStreak(ledger, thread);
   if (undelivered) {
     // Asked once per failure streak: after the owner's answer it only retries.
-    const due = !undelivered.ackedAt && undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS;
-    if (due) return undeliveredDecision(ctx, decision, undelivered);
+    if (undeliveredAskDue(ctx, undelivered)) return undeliveredDecision(ctx, decision, undelivered);
     const retryAt = addMs(undelivered.lastAt, Math.min(UNDELIVERED_BACKOFF_MS * 2 ** (undelivered.count - 1), UNDELIVERED_BACKOFF_MAX_MS));
     if (retryAt && Date.parse(retryAt) > now) {
       return { ...decision, action: "wait", reason: `can't deliver (${undelivered.reason}); retry after backoff`, notBefore: retryAt };
@@ -835,6 +834,16 @@ const UNDELIVERED_BACKOFF_MS = 5 * MIN;
 const UNDELIVERED_BACKOFF_MAX_MS = 60 * MIN;
 const UNDELIVERED_ASK_COUNT = 3;
 const UNDELIVERED_ASK_MS = 30 * MIN;
+// A Codex app that cannot show which thread is open fails the same way on
+// every retry, and the Codex app's writer lock leaves no other route: the
+// owner hears it on the second failure.
+const CODEX_IDENTITY_BLOCK = /^(?:could not verify thread|ambiguous: two threads share this title)/;
+const IDENTITY_ASK_COUNT = 2;
+function undeliveredAskDue(ctx, streak) {
+  if (streak.ackedAt) return false;
+  if (ctx.thread.kind === "codex" && CODEX_IDENTITY_BLOCK.test(String(streak.reason ?? ""))) return streak.count >= IDENTITY_ASK_COUNT;
+  return streak.count >= UNDELIVERED_ASK_COUNT && ctx.now - Date.parse(streak.since) >= UNDELIVERED_ASK_MS;
+}
 
 function undeliveredStreak(ledger, thread) {
   const streak = ledger?.undelivered;
@@ -847,6 +856,7 @@ function undeliveredStreak(ledger, thread) {
 function deliveryHint(reason) {
   const text = String(reason ?? "");
   if (/two threads share this title|two sessions share this title|two workspaces share this name/.test(text)) return " Two chats share its name: rename or archive one.";
+  if (/codex exec cannot reach it/.test(text)) return " Codex has it open under a title the supervisor cannot match: send it there yourself.";
   if (/could not verify thread|another (?:thread|session) is open|no session tab open/.test(text)) return " The app would not show this thread.";
   if (/not running/.test(text)) return " Its app is closed.";
   if (/computer use not ready/.test(text)) return " Computer use is not ready on this Mac.";
