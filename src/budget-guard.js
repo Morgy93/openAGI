@@ -23,6 +23,9 @@ const DEFAULT_PRICES = {
   // published, so it is not modelled here (the per-call input cap in the
   // providers keeps chat turns far below it).
   "gpt-6-astra": { in: 10, out: 50, cacheRead: 1, cacheWrite: 12.5 },
+  // gpt-6.1-sol (the owner's ceiling): past 272K input tokens the whole
+  // request bills at 2x input/cache and 1.5x output; the cap keeps calls under.
+  "gpt-6.1-sol": { in: 2, out: 10, cacheRead: 0.1, cacheWrite: 2.5 },
   "gpt-6-luna": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
   "gpt-5.6-terra": { in: 2, out: 12, cacheRead: 0.2, cacheWrite: 0 },
   "gpt-5.6-sol": { in: 5, out: 30, cacheRead: 0.5, cacheWrite: 0 },
