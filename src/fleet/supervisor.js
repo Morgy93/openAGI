@@ -2080,13 +2080,6 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; held: not judged this scan`;
         continue;
       }
-      // An owner answer that started after the judge read (during the
-      // review, the notifications, the kept answers or an earlier send)
-      // goes first: checked again right before each send.
-      if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
-        decision.reason = `${decision.reason}; held: owner answered`;
-        continue;
-      }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
       if (uiKey && typedInto.has(uiKey)) continue;
       if (decision.action === "nudge") {
@@ -2098,6 +2091,13 @@ export class FleetSupervisor {
           else store.recordAction({ ...record, status: "stale", detail, at });
           continue;
         }
+      }
+      // An owner answer that started after the judge read (during the
+      // review, the notifications, the kept answers, an earlier send or the
+      // PR read just above) goes first: checked again right before each send.
+      if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
+        decision.reason = `${decision.reason}; held: owner answered`;
+        continue;
       }
       if (uiKey) typedInto.add(uiKey);
       tries += 1;

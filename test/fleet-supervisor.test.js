@@ -4059,3 +4059,19 @@ test("a proposed nudge whose PR merged before the owner sent it is not sent", as
   assert.equal(result.action.status, "stale");
   assert.equal(result.action.detail, "not sent: #7 merged since the scan");
 });
+
+// The PR read right before a send can take up to 10 s: an owner message
+// that starts while it runs goes first, and the nudge is held.
+test("an owner message that starts during the PR read before a send holds the nudge", async (t) => {
+  const thread = makeThread();
+  let supervisor = null;
+  const lite = async (refs) => {
+    supervisor.ownerAnsweredAt.set(thread.key, NOW);
+    return new Map(refs.map((ref) => [ref, { state: "OPEN" }]));
+  };
+  const made = fixture(t, { mode: "auto", threads: [thread], deps: { fetchPrStateLite: lite } });
+  supervisor = made.supervisor;
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(made.delivered, []);
+  assert.match(snapshot.threads.find((row) => row.key === thread.key).decision.reason, /held: owner answered$/);
+});
