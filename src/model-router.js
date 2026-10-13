@@ -12,6 +12,10 @@
 //   • Tasks   — pin one job to an exact model.        e.g. OPENAI_MODEL_TASK_OBSERVER=gpt-5-mini
 //
 // Resolution for a task:  task pin  >  task's recommended tier  >  base model.
+//
+// Reasoning effort follows the same per-task pattern:
+//   OPENAI_REASONING_EFFORT_TASK_CHAT=high  overrides OPENAI_REASONING_EFFORT
+// for that one job (e.g. a cheap model thinking harder on user chat).
 
 // The "where" — every internal job that calls the model, with a recommended
 // tier and the reason it's safe to shrink. `chat` and `autopilot` intentionally
@@ -71,6 +75,15 @@ export class ModelRouter {
     return this.tierModel(profile?.tier ?? "base");
   }
 
+  // Reasoning effort pinned for one task, or null to use the provider's global
+  // effort. Same lookup as resolve(): override > <PREFIX>_REASONING_EFFORT_TASK_<TASK>.
+  reasoningEffort(task) {
+    if (!task) return null;
+    return this.overrides.reasoningEffort?.[task] ||
+      this.env[`${this.envPrefix}_REASONING_EFFORT_TASK_${task.toUpperCase()}`] ||
+      null;
+  }
+
   // Which models are actually wired up (base + any configured tiers).
   tierModels() {
     const out = { base: this.baseModel };
@@ -92,6 +105,7 @@ export class ModelRouter {
         label: p.label,
         tier: p.tier,
         model,
+        reasoningEffort: this.reasoningEffort(task),
         why: p.why,
         onBase: model === this.baseModel
       };
@@ -115,7 +129,8 @@ export function renderModelPlan(router, { provider } = {}) {
   for (const row of router.describe()) {
     const arrow = row.onBase && row.tier !== "base" ? "  ⚠ still on base" : "";
     const tag = row.tier === "base" ? "[base]" : `[${row.tier}]`;
-    lines.push(`  ${tag.padEnd(7)} ${row.label.padEnd(22)} ${row.model}${arrow}`);
+    const effort = row.reasoningEffort ? `  (effort ${row.reasoningEffort})` : "";
+    lines.push(`  ${tag.padEnd(7)} ${row.label.padEnd(22)} ${row.model}${effort}${arrow}`);
     lines.push(`          ${row.why}`);
   }
   const onBase = router.describe().filter((r) => r.onBase && r.tier !== "base");

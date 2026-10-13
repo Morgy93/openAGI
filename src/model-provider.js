@@ -1,4 +1,5 @@
 import { ModelRouter } from "./model-router.js";
+import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -14,6 +15,7 @@ const FINAL_ANSWER_INSTRUCTION = [
   "Return a user-visible final answer now and do not call any tools.",
   "Summarize what was completed; if anything could not be completed, say so explicitly."
 ].join(" ");
+const DEFAULT_TURN_USD_LIMIT = 2;
 
 export class DeterministicModelProvider {
   constructor(options = {}) {
@@ -80,6 +82,8 @@ export class OpenAIResponsesProvider {
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
+    this.turnUsdLimit = turnUsdLimit(options.turnUsdLimit);
+    this.maxInputTokens = options.maxInputTokens ?? maxInputTokensFromEnv();
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.streamLimits = normalizeSseLimits(options.streamLimits);
     // Per-task model tiering. Defaults to base for everything until tier env
@@ -113,28 +117,37 @@ export class OpenAIResponsesProvider {
     // `instructions` stays byte-stable across turns (mirrors the Anthropic
     // path; no cache markers here — OpenAI caching is implicit).
     const contextBlock = turnContext ?? buildTurnContext({ scrutiny, memoryHits });
+    // Every item is tagged so the context cap knows what it may trim: history
+    // turns can be dropped, tool outputs stubbed, the latest user message and
+    // function_call items never touched.
+    const contextWindow = new ToolLoopContext({ maxInputTokens: this.maxInputTokens });
     const conversationInput = [
-      ...messages.slice(-12).map((message) => ({
+      ...messages.slice(-12).map((message) => contextWindow.mark({
         role: message.role === "assistant" ? "assistant" : "user",
         content: message.content
-      })),
-      { role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : input }
+      }, { kind: "history" })),
+      contextWindow.mark({ role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : input }, { kind: "anchor" })
     ];
 
     const baseInstructions = instructions ?? buildDefaultInstructions({ agent });
     const toolList = tools.length > 0 ? tools : toolRegistry?.toOpenAITools?.() ?? [];
+    const fixedChars = baseInstructions.length + JSON.stringify(toolList).length;
+    const reasoningEffort = this.router?.reasoningEffort?.(task) || this.reasoningEffort;
     const toolCalls = [];
+    let turnUsd = 0;
+    let overTurnLimit = false;
 
     let response;
     let needsFinalAnswer = false;
     for (let hop = 0; hop < maxToolHops; hop += 1) {
       notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop: hop + 1, maxToolHops });
+      contextWindow.fit(conversationInput, { fixedChars });
       const body = {
         model,
         instructions: baseInstructions,
         input: conversationInput
       };
-      if (this.reasoningEffort) body.reasoning = { effort: this.reasoningEffort };
+      if (reasoningEffort) body.reasoning = { effort: reasoningEffort };
       if (toolList.length > 0) body.tools = toolList;
       // Route requests that share a prefix to the same cache. The prefix is
       // `instructions` (which embeds the agent name) plus the tool block, so
@@ -157,6 +170,7 @@ export class OpenAIResponsesProvider {
       response = emitText
         ? await this.postResponsesStream(body, context, emitText)
         : await this.postResponses(body, context);
+      turnUsd += turnCost(this.budgetGuard, response?.usage, model);
 
       const calls = extractFunctionCalls(response);
       if (calls.length === 0) {
@@ -167,17 +181,24 @@ export class OpenAIResponsesProvider {
         needsFinalAnswer = !extractResponseText(response);
         break;
       }
+      // Per-turn spend stop: the model wants another round but this reply has
+      // already cost the limit. Its pending calls are not run, so nothing
+      // happens that the model would never get to report.
+      if (this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit) {
+        overTurnLimit = true;
+        break;
+      }
 
       // Append the assistant's function_call items so the model can see its own
       // last turn on the next hop (replaces what previous_response_id would've done).
       for (const item of response.output ?? []) {
         if (item.type === "function_call") {
-          conversationInput.push({
+          conversationInput.push(contextWindow.mark({
             type: "function_call",
             call_id: item.call_id,
             name: item.name,
             arguments: item.arguments
-          });
+          }, { kind: "call", tool: item.name, hop }));
         }
       }
 
@@ -194,24 +215,24 @@ export class OpenAIResponsesProvider {
         // a real input_image in a following user turn so the model can ground on it.
         const image = invocation.ok ? toolResultImage(result) : null;
         if (image) {
-          conversationInput.push({
+          conversationInput.push(contextWindow.mark({
             type: "function_call_output",
             call_id: call.call_id,
             output: JSON.stringify({ ...image.meta, image: "[attached as image below]" })
-          });
-          conversationInput.push({
+          }, { kind: "output", tool: call.name, hop }));
+          conversationInput.push(contextWindow.mark({
             role: "user",
             content: [
               { type: "input_text", text: `Screenshot (${image.meta.width}×${image.meta.height}, click coordinates are in this image's space):` },
               { type: "input_image", image_url: `data:image/${image.format};base64,${image.data}` }
             ]
-          });
+          }, { kind: "image", tool: call.name, hop }));
         } else {
-          conversationInput.push({
+          conversationInput.push(contextWindow.mark({
             type: "function_call_output",
             call_id: call.call_id,
-            output: JSON.stringify(result)
-          });
+            output: clipToolOutput(JSON.stringify(result), call.name)
+          }, { kind: "output", tool: call.name, hop }));
         }
       }
 
@@ -223,16 +244,23 @@ export class OpenAIResponsesProvider {
       if (hop === maxToolHops - 1) needsFinalAnswer = true;
     }
 
+    // The no-tools summary call is one more paid call; past the limit the
+    // owner gets the plain stop notice instead.
+    if (overTurnLimit || ((!response || needsFinalAnswer) && this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit)) {
+      return turnSpendStopResult({ provider: "openai", model, id: response?.id, toolCalls, turnUsd, limit: this.turnUsdLimit });
+    }
+
     if (!response || needsFinalAnswer) {
       const hop = maxToolHops + 1;
       notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop, maxToolHops: hop });
+      contextWindow.fit(conversationInput, { fixedChars: fixedChars + FINAL_ANSWER_INSTRUCTION.length });
       const body = {
         model,
         instructions: `${baseInstructions}\n\n${FINAL_ANSWER_INSTRUCTION}`,
         input: conversationInput,
         prompt_cache_key: `openagi:${agent?.name ?? "default"}`
       };
-      if (this.reasoningEffort) body.reasoning = { effort: this.reasoningEffort };
+      if (reasoningEffort) body.reasoning = { effort: reasoningEffort };
       let firstVisibleDelta = true;
       const emitText = typeof onTextDelta === "function"
         ? (text) => {
@@ -368,6 +396,7 @@ export class AnthropicProvider {
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
+    this.turnUsdLimit = turnUsdLimit(options.turnUsdLimit);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.streamLimits = normalizeSseLimits(options.streamLimits);
     this.router = options.router ?? new ModelRouter({ envPrefix: "ANTHROPIC", baseModel: this.model });
@@ -414,6 +443,8 @@ export class AnthropicProvider {
     const toolCalls = [];
     let response;
     let needsFinalAnswer = false;
+    let turnUsd = 0;
+    let overTurnLimit = false;
 
     for (let hop = 0; hop < maxToolHops; hop += 1) {
       notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop: hop + 1, maxToolHops });
@@ -440,6 +471,7 @@ export class AnthropicProvider {
       response = emitText
         ? await this.postMessagesStream(body, context, emitText)
         : await this.postMessages(body, context);
+      turnUsd += turnCost(this.budgetGuard, response?.usage, model);
 
       const responseContent = Array.isArray(response.content) ? response.content : [];
       // Do not echo a malformed empty assistant turn into the no-tools retry.
@@ -450,6 +482,10 @@ export class AnthropicProvider {
       const toolUses = responseContent.filter((c) => c.type === "tool_use");
       if (toolUses.length === 0) {
         needsFinalAnswer = !responseContent.some((c) => c.type === "text" && String(c.text ?? "").trim());
+        break;
+      }
+      if (this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit) {
+        overTurnLimit = true;
         break;
       }
 
@@ -476,7 +512,7 @@ export class AnthropicProvider {
                 }
               }
             ]
-          : JSON.stringify(result);
+          : clipToolOutput(JSON.stringify(result), use.name);
         toolResults.push({
           type: "tool_result",
           tool_use_id: use.id,
@@ -487,6 +523,10 @@ export class AnthropicProvider {
       convo.push({ role: "user", content: toolResults });
       maxToolHops = extendedToolHops(extendToolHops, maxToolHops);
       if (hop === maxToolHops - 1) needsFinalAnswer = true;
+    }
+
+    if (overTurnLimit || ((!response || needsFinalAnswer) && this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit)) {
+      return turnSpendStopResult({ provider: "anthropic", model, id: response?.id, toolCalls, turnUsd, limit: this.turnUsdLimit });
     }
 
     if (!response || needsFinalAnswer) {
@@ -793,6 +833,41 @@ function toolResultImage(result) {
   if (!["png", "jpeg", "gif", "webp"].includes(format)) return null;
   const { image, format: _format, ...meta } = result;
   return { data: image, format, meta };
+}
+
+// OPENAGI_TURN_USD_LIMIT caps what one reply may spend across all its tool
+// hops. Unset or invalid falls back to the default; 0 turns the stop off.
+function turnUsdLimit(value) {
+  const raw = value ?? process.env.OPENAGI_TURN_USD_LIMIT;
+  const limit = Number(raw);
+  return raw !== undefined && raw !== "" && Number.isFinite(limit) && limit >= 0 ? limit : DEFAULT_TURN_USD_LIMIT;
+}
+
+// Estimated cost of one call for the per-turn total. Metering is best-effort:
+// a guard without costOf, or odd usage, counts as free rather than failing the reply.
+function turnCost(budgetGuard, usage, model) {
+  try {
+    const usd = Number(budgetGuard?.costOf?.(usage, model));
+    return Number.isFinite(usd) && usd > 0 ? usd : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function turnSpendStopMessage(turnUsd, limit) {
+  return `I stopped this turn at $${turnUsd.toFixed(2)} of model spend (the per-turn limit is $${limit.toFixed(2)}). Say "continue" and I'll keep going.`;
+}
+
+function turnSpendStopResult({ provider, model, id, toolCalls, turnUsd, limit }) {
+  return {
+    provider,
+    model,
+    id,
+    text: turnSpendStopMessage(turnUsd, limit),
+    toolCalls,
+    turnUsd,
+    stoppedAtUsdLimit: true
+  };
 }
 
 function emptyModelResponseError(provider) {
