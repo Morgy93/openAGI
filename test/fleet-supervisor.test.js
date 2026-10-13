@@ -899,16 +899,24 @@ test("cached PR refs survive a git failure and a spent lookup budget", async (t)
 test("a no-PR thread counts as having no PR only once GitHub answered", async (t) => {
   // Past the lookup budget, or on a failed lookup, a branch's PR is unknown:
   // policy must not read the thread as PR-less (idle-report, error paths).
-  const ids = Array.from({ length: 10 }, (_, i) => `n${i}`);
+  const ids = Array.from({ length: 50 }, (_, i) => `n${i}`);
   const seen = [];
   const threads = ids.map((id) => makeThread({ key: `codex:${id}`, id, cwd: `/work/${id}`, branch: `spencer/${id}`, prRefs: [] }));
   const supervisor = { skip: {}, deps: { findPrForBranch: async (repo, branch) => { seen.push(branch); if (branch === "spencer/n1") throw new Error("gh timed out"); return null; } }, branchLookups: new Map(), now: () => NOW };
   const sourceErrors = {};
   await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, threads, new Map(), {}, null, sourceErrors);
   const looked = threads.filter((thread) => thread.prLookedUp === true).map((thread) => thread.id);
-  assert.equal(seen.length, 8, "lookup budget");
+  assert.equal(seen.length, 48, "first-lookup budget");
   assert.ok(!looked.includes("n1"), "a failed lookup is unknown");
-  assert.ok(looked.length === 7 && !looked.includes("n8") && !looked.includes("n9"), "past the budget is unknown");
+  assert.ok(looked.length === 47 && !looked.includes("n48") && !looked.includes("n49"), "past the budget is unknown");
+  // Known branches refresh eight a scan; past that an expired "no PR" is unknown.
+  seen.length = 0;
+  for (const thread of threads) delete thread.prLookedUp;
+  supervisor.now = () => NOW + 31 * MIN;
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, threads, new Map(), {}, null, sourceErrors);
+  assert.equal(seen.filter((branch) => !["spencer/n1", "spencer/n48", "spencer/n49"].includes(branch)).length, 8, "refresh budget");
+  assert.equal(seen.length, 11, "plus the three never answered");
+  supervisor.now = () => NOW;
   // Nothing to look up (trunk, no branch) is known to have no PR.
   const trunk = [makeThread({ key: "codex:m", id: "m", branch: "main", prRefs: [] }), makeThread({ key: "codex:z", id: "z", branch: null, prRefs: [] })];
   await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, trunk, new Map(), {}, null, sourceErrors);
@@ -925,6 +933,49 @@ test("a no-PR thread counts as having no PR only once GitHub answered", async (t
   const gitFailed = [makeThread({ key: "codex:c", id: "c", cwd: "/work/c", branch: "spencer/c", prRefs: [] })];
   await FleetSupervisor.prototype.resolvePrRefs.call(cachedSup, gitFailed, new Map(), {}, null, sourceErrors);
   assert.notEqual(gitFailed[0].prLookedUp, true, "git failed: the cached answer was for a known head");
+});
+
+// 10-12 replay: the first scan after a restart spent its eight lookups on
+// other chats, so a93b6870 (Feedback portal) was mapped to bb-website#280,
+// a PR it created in another repo, not its branch's open #7621, and
+// 01a0f89f read as having no PR until #7163 was looked up two scans later.
+test("the first scan after a restart looks up every branch, a few at a time", async (t) => {
+  const others = Array.from({ length: 30 }, (_, i) => makeThread({ key: `codex:o${i}`, kind: "codex", id: `o${i}`, cwd: `/work/o${i}`, branch: `spencer/o${i}`, prRefs: [] }));
+  const portal = makeThread({ key: "conductor:a93b6870", kind: "conductor", id: "a93b6870", title: "Feedback portal & boards", workspace: "portal",
+    cwd: "/work/portal", branch: "feature/portal-ai-subdomains", repo: null, prRefs: [], meta: { prCreated: ["buildbetter-app/bb-website#280"] } });
+  const audio = makeThread({ key: "codex:01a0f89f", kind: "codex", id: "01a0f89f", cwd: "/work/audio", branch: "codex/bob-adhoc-setting", prRefs: [] });
+  const branchPrs = new Map([["feature/portal-ai-subdomains", `${BB}#7621`], ["codex/bob-adhoc-setting", `${BB}#7163`]]);
+  const states = new Map([[`${BB}#7621`, "OPEN"], ["buildbetter-app/bb-website#280", "OPEN"], [`${BB}#7163`, "MERGED"]]);
+  let inFlight = 0;
+  let most = 0;
+  const looked = [];
+  const { supervisor } = fixture(t, {
+    threads: [...others, portal, audio],
+    deps: {
+      readLocalGit: async (cwd) => {
+        const thread = [...others, portal, audio].find((one) => one.cwd === cwd);
+        return { head: HEAD, branch: thread.branch, upstream: null, ahead: 0, remote: BB };
+      },
+      findPrForBranch: async (repo, branch) => {
+        looked.push(branch);
+        inFlight += 1;
+        most = Math.max(most, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        inFlight -= 1;
+        return branchPrs.get(branch) ?? null;
+      },
+      fetchPrStates: async (refs) => new Map(refs.filter((ref) => states.get(ref)).map((ref) => [ref, makePr({ ref, repo: ref.split("#")[0], number: Number(ref.split("#")[1]), state: states.get(ref) })]))
+    }
+  });
+  const rows = (await supervisor.tick({ reason: "test" })).threads;
+  assert.equal(looked.length, 32, "every unseen branch on the first scan");
+  assert.ok(most > 1 && most <= 6, `lookups run a few at a time (${most})`);
+  assert.equal(rows.find((row) => row.key === portal.key).pr.ref, `${BB}#7621`);
+  assert.equal(rows.find((row) => row.key === audio.key).pr.ref, `${BB}#7163`);
+  // The next scan reads the cache, not GitHub.
+  looked.length = 0;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(looked.length, 0);
 });
 
 test("a failed source never splits its open group into a second question", async (t) => {

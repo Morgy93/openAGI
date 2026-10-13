@@ -372,7 +372,15 @@ function waitingIntent(ctx) {
     if (wait.taskKind || age < limits.waitingTaskMaxMs) return { type: "wait", reason: wait.reason ?? "waiting on a background task" };
     if (ciDone) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
     const blockers = classified.readiness?.blockers ?? [];
-    if (pr?.state === "OPEN" && blockers.length && !blockers.some(ciRunning) && !blockers.every(passiveAmong(blockers))) {
+    // An agent that spoke within the idle window, or whose last words are
+    // about other PRs, is not stuck behind its task: a loop wakes it
+    // (cape-town merging #7063, #7091 and #7089 spoke seconds before the
+    // scan, 247 min into the wait). A merge-ready nudge would talk over
+    // that work, about a side PR it is not on.
+    const awake = quietMs !== null && quietMs < limits.idleBeforeNudgeMs;
+    const named = [...String(thread.lastAgentText ?? "").matchAll(/#(\d+)\b/g)].map((match) => Number(match[1]));
+    const elsewhere = Number.isInteger(pr?.number) && named.length > 0 && !named.includes(pr.number);
+    if (pr?.state === "OPEN" && blockers.length && !awake && !elsewhere && !blockers.some(ciRunning) && !blockers.every(passiveAmong(blockers))) {
       return nudge("merge-ready", `waiting ${minutes(age)}m; not ready: ${blockers.join("; ")}`, { immediate: true });
     }
     if (silent) return statusCheck("a background task", quietMs);
@@ -391,7 +399,11 @@ function waitingIntent(ctx) {
   if (pr?.state === "OPEN" && (missing || (!gates.length && !ci.state)) && age >= limits.waitingTaskMaxMs) {
     return nudge("merge-ready", `${missing ? `${missing.label || missing.name} missing` : "no CI on head"} after waiting`);
   }
-  if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
+  // Nothing visible only once the PR is known to be none: a branch not yet
+  // looked up (past the lookup budget, a failed read) or a PR not read is
+  // unknown, and the agent may well be on it (01a0f89f on #7163).
+  const prNone = !thread.prRefs?.length && (!thread.branch || thread.prLookedUp === true);
+  if (!pr && prNone && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
   // The PR it is tracked by already merged or closed, so the CI it waits on
   // is another PR's (it opened a new one): ask where it is, once the usual
   // idle window passed. Not a note that nothing is left ("Merged. CI runs on

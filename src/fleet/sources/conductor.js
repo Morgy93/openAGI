@@ -183,6 +183,16 @@ function summarizeTail(rowsNewestFirst) {
   return summary;
 }
 
+// A gh pr create in any string of a tool call's input (a Bash command, an
+// ssh line). Read raw, never as JSON: there a newline is the two characters
+// backslash and n, so a gh pr create after a heredoc body has no word
+// boundary before it (madrid's #7586 went unseen).
+function createsPr(value, depth = 0) {
+  if (typeof value === "string") return /\bgh\s+pr\s+create\b/.test(value);
+  if (!value || typeof value !== "object" || depth > 4) return false;
+  return Object.values(value).some((item) => createsPr(item, depth + 1));
+}
+
 // The PRs this session created, newest first: each gh pr create call's
 // result, when it names one PR (the new one, or the one its branch already
 // has). A PR the chat only viewed, checked, listed, commented on or named
@@ -209,7 +219,7 @@ function readCreatedPrs(db, sessionId, dbPath, readTo = null) {
     atRows.add(row.row_id);
     const content = parseEvent(row.content)?.message?.content;
     for (const block of Array.isArray(content) ? content : []) {
-      if (block?.type === "tool_use" && block.id && /\bgh\s+pr\s+create\b/.test(JSON.stringify(block.input ?? {}))) calls.add(block.id);
+      if (block?.type === "tool_use" && block.id && createsPr(block.input)) calls.add(block.id);
       if (block?.type !== "tool_result" || !calls.has(block.tool_use_id)) continue;
       const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
       const links = new Set([...text.matchAll(new RegExp(PR_URL.source, "g"))].map((match) => prRefKey(`${match[1]}/${match[2]}`, Number(match[3]))));

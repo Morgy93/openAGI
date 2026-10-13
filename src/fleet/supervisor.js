@@ -30,6 +30,8 @@ const MIN = 60_000;
 const SOURCE_TIMEOUT_MS = 90_000;
 const GIT_CONCURRENCY = 8;
 const MAX_BRANCH_LOOKUPS = 8;
+const MAX_NEW_BRANCH_LOOKUPS = 48;
+const BRANCH_LOOKUP_CONCURRENCY = 6;
 const BRANCH_LOOKUP_TTL_MS = 30 * MIN;
 const START_DELAY_MS = 5_000;
 // The idle watcher: a scan starts once the owner has been away long enough
@@ -1841,25 +1843,32 @@ export class FleetSupervisor {
     if (this.skip.github) return;
     const find = this.deps.findPrForBranch ?? github.findPrForBranch;
     const now = this.now();
-    let lookups = 0;
-    // Unseen branches precede expired negative results, then oldest first.
-    const candidates = [...inScope].sort((a, b) => (this.branchLookups.get(`${a.repo}:${a.branch}`)?.at ?? -Infinity) - (this.branchLookups.get(`${b.repo}:${b.branch}`)?.at ?? -Infinity));
+    // prLookedUp: this thread's PR is known to be none (nothing to look up,
+    // or GitHub answered no PR). Policy judges no-PR threads only then.
+    // A Conductor chat's created PRs may all be done: its workspace
+    // branch's PR joins them as a candidate (pickConductorPr). Whether
+    // that branch has none is noted (branchNoPr) for when none of the
+    // created ones is a PR either.
+    const noPr = (thread) => {
+      if (thread.prRefs?.length) thread.branchNoPr = true;
+      else thread.prLookedUp = true;
+    };
+    // A branch never looked up since start (all of them on the first scan
+    // after a restart) has its own budget, so a restart is not two scans of
+    // threads with no PR (a93b6870's #7621, 01a0f89f's #7163 on the 10-12
+    // replay). Refreshes of a known branch share the smaller one.
+    const spent = { first: 0, refresh: 0 };
+    const lastAt = (thread) => this.branchLookups.get(`${thread.repo}:${thread.branch}`)?.at ?? -Infinity;
+    const hasRefs = (thread) => (thread.prRefs?.length ? 1 : 0);
+    // Unseen branches precede expired negative results, then oldest first;
+    // a thread with no PR at all before a chat whose created PRs stand in.
+    const candidates = [...inScope].sort((a, b) => lastAt(a) - lastAt(b) || hasRefs(a) - hasRefs(b));
+    const jobs = new Map();
     for (const thread of candidates) {
-      // prLookedUp: this thread's PR is known to be none (nothing to look up,
-      // or GitHub answered no PR). Policy judges no-PR threads only then.
-      // A Conductor chat's created PRs may all be done: its workspace
-      // branch's PR joins them as a candidate (pickConductorPr). Whether
-      // that branch has none is noted (branchNoPr) for when none of the
-      // created ones is a PR either.
-      const mentioned = Boolean(thread.prRefs?.length);
-      if (mentioned && thread.kind !== "conductor") continue;
-      const noPr = () => {
-        if (mentioned) thread.branchNoPr = true;
-        else thread.prLookedUp = true;
-      };
+      if (thread.prRefs?.length && thread.kind !== "conductor") continue;
       // No branch, or a trunk one: no PR to find. A missing repo (git could
       // not be read) leaves it unknown.
-      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { noPr(); continue; }
+      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { noPr(thread); continue; }
       if (!thread.repo) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
@@ -1868,26 +1877,45 @@ export class FleetSupervisor {
       const head = git?.branch === thread.branch ? (git.head ?? null) : null;
       const cached = this.branchLookups.get(cacheKey);
       const fresh = cached && now - cached.at < BRANCH_LOOKUP_TTL_MS;
+      const kind = cached ? "refresh" : "first";
+      const spentOut = spent[kind] >= (cached ? MAX_BRANCH_LOOKUPS : MAX_NEW_BRANCH_LOOKUPS);
       // An unknown head (git failed) keeps the cached answer, and so does a
       // thread past this tick's lookup budget: the last answer beats none.
-      if (fresh && (head === null || cached.head === head || lookups >= MAX_BRANCH_LOOKUPS)) {
+      if (fresh && (head === null || cached.head === head || spentOut)) {
         if (cached.ref) withBranchRef(thread, cached.ref);
         // No PR for this same head only (both unknown counts as the same):
         // a git failure after a known head, or a spent budget with a newer
         // head, leaves the answer unknown.
-        else if (cached.head === head) noPr();
+        else if (cached.head === head) noPr(thread);
         continue;
       }
-      if (lookups >= MAX_BRANCH_LOOKUPS) continue;
-      lookups += 1;
-      try {
-        const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head, cwd: head ? thread.cwd : null })), 20_000, "pr lookup");
-        this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now, head });
-        if (ref) withBranchRef(thread, ref);
-        else noPr();
-      } catch (error) {
-        sourceErrors.prLookup = clampText(error?.message, 200);
+      // Another thread on the same branch and head already asks.
+      const lookupKey = `${cacheKey}\n${head ?? ""}`;
+      if (jobs.has(lookupKey)) { jobs.get(lookupKey).threads.push(thread); continue; }
+      if (spentOut) {
+        // An expired PR still beats none; an expired "no PR" is unknown.
         if (cached?.ref) withBranchRef(thread, cached.ref);
+        continue;
+      }
+      spent[kind] += 1;
+      jobs.set(lookupKey, { repo: thread.repo, branch: thread.branch, head, cwd: head ? thread.cwd : null, cacheKey, cached, threads: [thread] });
+    }
+    const list = [...jobs.values()];
+    await mapLimit(list, BRANCH_LOOKUP_CONCURRENCY, async (job) => {
+      try {
+        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd })), 20_000, "pr lookup")) ?? null;
+        job.ok = true;
+      } catch (error) {
+        job.error = error;
+      }
+    });
+    for (const job of list) {
+      if (job.ok) this.branchLookups.set(job.cacheKey, { ref: job.ref, at: now, head: job.head });
+      else sourceErrors.prLookup = clampText(job.error?.message, 200);
+      const ref = job.ok ? job.ref : job.cached?.ref;
+      for (const thread of job.threads) {
+        if (ref) withBranchRef(thread, ref);
+        else if (job.ok) noPr(thread);
       }
     }
   }

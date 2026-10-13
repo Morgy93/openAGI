@@ -178,6 +178,41 @@ test("row: a Conductor wait on a non-verify task is idle after 45 min", () => {
   assert.equal(run(thread).decision.playbook, "ci-finished");
 });
 
+// cape-town 10-12: 247 min into a background merge loop (#7063, #7091 and
+// #7089), it spoke seconds before the scan. #7345, an older side PR it
+// created, had blockers: a merge-ready nudge about it would talk over the loop.
+test("an agent that just spoke from a long background wait is not told to fix a side PR", () => {
+  const loop = { id: "b7", description: "Merge #7063, #7091 and #7089 once their full checks pass", kind: "local_bash", startedAt: ago(247 * MIN) };
+  const capeTown = { key: "conductor:342281f9", id: "342281f9", workspace: "cape-town", branch: "feature/bob-skills", agentStatus: "waiting", openTasks: [loop],
+    prRefs: ["buildbetter-app/buildbetter#7345"], lastAgentText: "#7063 is updated with main and its brief tests pass. Its full check is running and it merges right after, then #7091 and #7217. #7089 is still in its full check.",
+    lastAgentAt: ago(0.2 * MIN), lastActivityAt: ago(0.2 * MIN) };
+  const side = makePr({ ref: "buildbetter-app/buildbetter#7345", number: 7345, headRef: "chore/bob-spec-followups", ci: { state: null, failing: [], pending: [] }, unresolvedThreads: 37 });
+  const busy = run(makeThread(capeTown), { pr: side }).decision;
+  assert.equal(busy.action, "wait");
+  assert.notEqual(busy.playbook, "merge-ready");
+  // Quiet 20 min on, its last words are still about the other PRs.
+  const later = { ...capeTown, lastAgentAt: ago(20 * MIN), lastActivityAt: ago(20 * MIN) };
+  assert.notEqual(run(makeThread(later), { pr: side }).decision.playbook, "merge-ready");
+  // Quiet, with words about this PR or none, the wait still hears about it.
+  for (const lastAgentText of ["#7345 still needs its full run.", "Waiting on the loop."]) {
+    const quiet = run(makeThread({ ...later, lastAgentText }), { pr: side }).decision;
+    assert.equal(quiet.playbook, "merge-ready", lastAgentText);
+    assert.match(quiet.message, /37 open threads/);
+  }
+});
+
+// 01a0f89f on the 10-12 replay: its branch's #7163 was not looked up yet
+// (the lookup budget was spent), so it read as "nothing visible".
+test("a stopped waiter whose PR is not looked up yet is not told nothing is visible", () => {
+  const waiter = { key: "codex:01a0f89f", kind: "codex", id: "01a0f89f", branch: "codex/bob-adhoc-setting", prRefs: [], lastAgentText: "Waiting for CI.",
+    lastActivityAt: ago(60 * MIN), lastAgentAt: ago(60 * MIN), lastUserAt: ago(120 * MIN) };
+  const unknown = run(makeThread(waiter), { pr: null }).decision;
+  assert.notEqual(unknown.playbook, "resume");
+  const none = run(makeThread({ ...waiter, prLookedUp: true }), { pr: null }).decision;
+  assert.equal(none.playbook, "resume");
+  assert.match(none.reason, /nothing visible/);
+});
+
 test("row: an agent silent an hour on a background wait is asked for a status", () => {
   // The #6470 case: bb-quick queued behind a blocked BuildBot3 gate for four
   // hours. The manager escalation never landed and the agent never heard.

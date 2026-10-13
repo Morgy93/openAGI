@@ -804,6 +804,23 @@ test("a session's own PRs are the ones its gh pr create calls made, newest first
   assert.deepEqual(again.meta.prCreated.slice(0, 2), ["buildbetter-app/buildbetter#7580", "buildbetter-app/buildbetter#7573"]);
 });
 
+test("a gh pr create on the line after a heredoc body is the chat's PR", async (t) => {
+  // madrid wrote its #7586 body with cat <<'EOF' and ran gh pr create on the
+  // next line. Read as JSON, that newline is backslash-n with no word
+  // boundary before gh: #7586 went unseen and the old #7185 led.
+  const home = makeHome(t);
+  const file = seedCapeTown(home);
+  const db = new DatabaseSync(file);
+  const command = "cd /Users/shooby/Dev/bbapp/.worktrees/proposal-expiry && cat > /tmp/proposal-expiry-pr-body.md <<'EOF'\nChat inbox and triage proposals now last 24 hours.\nEOF\ngh pr create --repo buildbetter-app/buildbetter --base main --title \"Proposals last 24 hours\" --body-file /tmp/proposal-expiry-pr-body.md";
+  addMessage(db, "s-cape", "assistant", { type: "assistant", session_id: "s-cape", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "toolu_heredoc", name: "Bash", input: { command } }] } }, iso(2 * MIN));
+  addMessage(db, "s-cape", "assistant", { type: "user", session_id: "s-cape", parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_heredoc", content: `${BB_PULL}/7586\n` }] } }, iso(1.5 * MIN));
+  db.close();
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() });
+  assert.equal(thread.meta.prCreated[0], "buildbetter-app/buildbetter#7586");
+});
+
 test("a Conductor session opened with the supervisor display prompt is the supervisor's own", async (t) => {
   const home = makeHome(t);
   seedCapeTown(home, "You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring Codex and Claude Code.");
