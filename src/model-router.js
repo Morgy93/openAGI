@@ -16,6 +16,11 @@
 // Reasoning effort follows the same per-task pattern:
 //   OPENAI_REASONING_EFFORT_TASK_CHAT=high  overrides OPENAI_REASONING_EFFORT
 // for that one job (e.g. a cheap model thinking harder on user chat).
+// The value is trimmed and lowercased; anything outside REASONING_EFFORTS is
+// ignored with a warning (the task falls back to the global effort) so a typo
+// cannot 400 every call for that task.
+
+export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
 // The "where" — every internal job that calls the model, with a recommended
 // tier and the reason it's safe to shrink. `chat` and `autopilot` intentionally
@@ -52,6 +57,7 @@ export class ModelRouter {
     this.baseModel = baseModel;
     this.env = env;
     this.overrides = overrides;
+    this.warnedEfforts = new Set();
   }
 
   // Model for a tier name. Unset tiers fall back to base, so an undefined
@@ -78,10 +84,24 @@ export class ModelRouter {
   // Reasoning effort pinned for one task, or null to use the provider's global
   // effort. Same lookup as resolve(): override > <PREFIX>_REASONING_EFFORT_TASK_<TASK>.
   reasoningEffort(task) {
-    if (!task) return null;
-    return this.overrides.reasoningEffort?.[task] ||
-      this.env[`${this.envPrefix}_REASONING_EFFORT_TASK_${task.toUpperCase()}`] ||
-      null;
+    const setting = this.reasoningEffortSetting(task);
+    if (setting.invalid != null && !this.warnedEfforts.has(setting.key)) {
+      this.warnedEfforts.add(setting.key);
+      console.warn(`[model-router] ${setting.key}=${JSON.stringify(setting.invalid)} is not a reasoning effort (${REASONING_EFFORTS.join("/")}); using the global effort.`);
+    }
+    return setting.effort;
+  }
+
+  // { effort, invalid, key }: effort is the normalized value or null; invalid
+  // holds the raw value when one was set but is not a known effort.
+  reasoningEffortSetting(task) {
+    if (!task) return { effort: null, invalid: null, key: null };
+    const key = `${this.envPrefix}_REASONING_EFFORT_TASK_${task.toUpperCase()}`;
+    const raw = this.overrides.reasoningEffort?.[task] || this.env[key] || null;
+    if (raw == null) return { effort: null, invalid: null, key };
+    const effort = String(raw).trim().toLowerCase();
+    if (!effort) return { effort: null, invalid: null, key };
+    return REASONING_EFFORTS.includes(effort) ? { effort, invalid: null, key } : { effort: null, invalid: String(raw), key };
   }
 
   // Which models are actually wired up (base + any configured tiers).
@@ -100,12 +120,14 @@ export class ModelRouter {
   describe() {
     return Object.entries(TASK_PROFILES).map(([task, p]) => {
       const model = this.resolve(task);
+      const effort = this.reasoningEffortSetting(task);
       return {
         task,
         label: p.label,
         tier: p.tier,
         model,
-        reasoningEffort: this.reasoningEffort(task),
+        reasoningEffort: effort.effort,
+        invalidReasoningEffort: effort.invalid,
         why: p.why,
         onBase: model === this.baseModel
       };
@@ -129,7 +151,9 @@ export function renderModelPlan(router, { provider } = {}) {
   for (const row of router.describe()) {
     const arrow = row.onBase && row.tier !== "base" ? "  ⚠ still on base" : "";
     const tag = row.tier === "base" ? "[base]" : `[${row.tier}]`;
-    const effort = row.reasoningEffort ? `  (effort ${row.reasoningEffort})` : "";
+    const effort = row.invalidReasoningEffort != null
+      ? `  (⚠ effort ${JSON.stringify(row.invalidReasoningEffort)} is invalid, using global)`
+      : row.reasoningEffort ? `  (effort ${row.reasoningEffort})` : "";
     lines.push(`  ${tag.padEnd(7)} ${row.label.padEnd(22)} ${row.model}${effort}${arrow}`);
     lines.push(`          ${row.why}`);
   }

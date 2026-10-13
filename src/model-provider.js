@@ -134,8 +134,9 @@ export class OpenAIResponsesProvider {
     const fixedChars = baseInstructions.length + JSON.stringify(toolList).length;
     const reasoningEffort = this.router?.reasoningEffort?.(task) || this.reasoningEffort;
     const toolCalls = [];
-    let turnUsd = 0;
+    const { turnSpend, toolContext } = shareTurnSpend(context);
     let overTurnLimit = false;
+    let unrunCalls = [];
 
     let response;
     let needsFinalAnswer = false;
@@ -170,7 +171,7 @@ export class OpenAIResponsesProvider {
       response = emitText
         ? await this.postResponsesStream(body, context, emitText)
         : await this.postResponses(body, context);
-      turnUsd += turnCost(this.budgetGuard, response?.usage, model);
+      turnSpend.usd += turnCost(this.budgetGuard, response?.usage, model);
 
       const calls = extractFunctionCalls(response);
       if (calls.length === 0) {
@@ -184,8 +185,9 @@ export class OpenAIResponsesProvider {
       // Per-turn spend stop: the model wants another round but this reply has
       // already cost the limit. Its pending calls are not run, so nothing
       // happens that the model would never get to report.
-      if (this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit) {
+      if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
         overTurnLimit = true;
+        unrunCalls = calls.map((call) => call.name);
         break;
       }
 
@@ -206,7 +208,7 @@ export class OpenAIResponsesProvider {
         context.signal?.throwIfAborted();
         notifyProgress(onProgress, { stage: "tool", provider: "openai", model, hop: hop + 1, tool: call.name });
         const parsedArgs = safeParseJson(call.arguments) ?? {};
-        const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
+        const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, toolContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: call.name, arguments: parsedArgs, result: invocation });
         const result = invocation.ok ? invocation.result : { error: invocation.error };
         // A tool that returns a screenshot (computer_screenshot) carries the PNG
@@ -235,6 +237,12 @@ export class OpenAIResponsesProvider {
           }, { kind: "output", tool: call.name, hop }));
         }
       }
+      // A skill tool runs a nested generate on the same shared total; if it
+      // spent the rest of the limit, stop before paying for another hop.
+      if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
+        overTurnLimit = true;
+        break;
+      }
 
       // maxToolHops caps tool-use rounds, not the final prose answer. The old
       // loop stopped here with the last function_call response and persisted
@@ -246,8 +254,8 @@ export class OpenAIResponsesProvider {
 
     // The no-tools summary call is one more paid call; past the limit the
     // owner gets the plain stop notice instead.
-    if (overTurnLimit || ((!response || needsFinalAnswer) && this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit)) {
-      return turnSpendStopResult({ provider: "openai", model, id: response?.id, toolCalls, turnUsd, limit: this.turnUsdLimit });
+    if (overTurnLimit || ((!response || needsFinalAnswer) && this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit)) {
+      return turnSpendStopResult({ provider: "openai", model, id: response?.id, toolCalls, unrunCalls, turnUsd: turnSpend.usd, limit: this.turnUsdLimit });
     }
 
     if (!response || needsFinalAnswer) {
@@ -277,6 +285,7 @@ export class OpenAIResponsesProvider {
       response = emitText
         ? await this.postResponsesStream(body, context, emitText)
         : await this.postResponses(body, context);
+      turnSpend.usd += turnCost(this.budgetGuard, response?.usage, model);
     }
 
     const finalText = extractResponseText(response);
@@ -443,8 +452,9 @@ export class AnthropicProvider {
     const toolCalls = [];
     let response;
     let needsFinalAnswer = false;
-    let turnUsd = 0;
+    const { turnSpend, toolContext } = shareTurnSpend(context);
     let overTurnLimit = false;
+    let unrunCalls = [];
 
     for (let hop = 0; hop < maxToolHops; hop += 1) {
       notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop: hop + 1, maxToolHops });
@@ -471,7 +481,7 @@ export class AnthropicProvider {
       response = emitText
         ? await this.postMessagesStream(body, context, emitText)
         : await this.postMessages(body, context);
-      turnUsd += turnCost(this.budgetGuard, response?.usage, model);
+      turnSpend.usd += turnCost(this.budgetGuard, response?.usage, model);
 
       const responseContent = Array.isArray(response.content) ? response.content : [];
       // Do not echo a malformed empty assistant turn into the no-tools retry.
@@ -484,8 +494,9 @@ export class AnthropicProvider {
         needsFinalAnswer = !responseContent.some((c) => c.type === "text" && String(c.text ?? "").trim());
         break;
       }
-      if (this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit) {
+      if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
         overTurnLimit = true;
+        unrunCalls = toolUses.map((use) => use.name);
         break;
       }
 
@@ -493,7 +504,7 @@ export class AnthropicProvider {
       for (const use of toolUses) {
         context.signal?.throwIfAborted();
         notifyProgress(onProgress, { stage: "tool", provider: "anthropic", model, hop: hop + 1, tool: use.name });
-        const invocation = await (toolRegistry?.invoke?.(use.name, use.input ?? {}, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
+        const invocation = await (toolRegistry?.invoke?.(use.name, use.input ?? {}, toolContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: use.name, arguments: use.input, result: invocation });
         const result = invocation.ok ? invocation.result : { error: invocation.error };
         const image = invocation.ok ? toolResultImage(result) : null;
@@ -521,12 +532,16 @@ export class AnthropicProvider {
         });
       }
       convo.push({ role: "user", content: toolResults });
+      if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
+        overTurnLimit = true;
+        break;
+      }
       maxToolHops = extendedToolHops(extendToolHops, maxToolHops);
       if (hop === maxToolHops - 1) needsFinalAnswer = true;
     }
 
-    if (overTurnLimit || ((!response || needsFinalAnswer) && this.turnUsdLimit > 0 && turnUsd >= this.turnUsdLimit)) {
-      return turnSpendStopResult({ provider: "anthropic", model, id: response?.id, toolCalls, turnUsd, limit: this.turnUsdLimit });
+    if (overTurnLimit || ((!response || needsFinalAnswer) && this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit)) {
+      return turnSpendStopResult({ provider: "anthropic", model, id: response?.id, toolCalls, unrunCalls, turnUsd: turnSpend.usd, limit: this.turnUsdLimit });
     }
 
     if (!response || needsFinalAnswer) {
@@ -554,6 +569,7 @@ export class AnthropicProvider {
       response = emitText
         ? await this.postMessagesStream(body, context, emitText)
         : await this.postMessages(body, context);
+      turnSpend.usd += turnCost(this.budgetGuard, response?.usage, model);
     }
 
     const text = (response?.content ?? [])
@@ -854,16 +870,59 @@ function turnCost(budgetGuard, usage, model) {
   }
 }
 
-export function turnSpendStopMessage(turnUsd, limit) {
-  return `I stopped this turn at $${turnUsd.toFixed(2)} of model spend (the per-turn limit is $${limit.toFixed(2)}). Say "continue" and I'll keep going.`;
+// One owner turn has one spend total. The outermost generate creates it; skill
+// tools call generate again with the tool context, and those nested calls add
+// to the same total instead of each starting at $0 with their own limit. The
+// tool context is a shallow copy, so the caller's object is never changed and
+// nested objects like __turn stay shared.
+function shareTurnSpend(context) {
+  const shared = context?.__turnSpend;
+  if (shared && typeof shared === "object" && Number.isFinite(shared.usd)) return { turnSpend: shared, toolContext: context };
+  const turnSpend = { usd: 0 };
+  return { turnSpend, toolContext: { ...context, __turnSpend: turnSpend } };
 }
 
-function turnSpendStopResult({ provider, model, id, toolCalls, turnUsd, limit }) {
+const STOP_PROGRESS_MAX = 12;
+
+// The stop text is what agent-host saves as the assistant turn, and history
+// keeps only role and content. Listing the tools already run (and the ones
+// the model asked for but did not get) lets a "continue" pick up from there
+// instead of redoing the same reads and side effects, and tells the owner
+// what happened before the stop.
+export function turnSpendStopMessage(turnUsd, limit, { toolCalls = [], unrunCalls = [] } = {}) {
+  const lines = [`I stopped this turn at $${turnUsd.toFixed(2)} of model spend (the per-turn limit is $${limit.toFixed(2)}).`];
+  const done = toolCalls.map((call) => `${call.name} (${toolCallStatus(call.result)})`);
+  if (done.length > 0) lines.push(`Done so far: ${collapseRepeats(done).join(", ")}.`);
+  if (unrunCalls.length > 0) lines.push(`Not run yet: ${collapseRepeats(unrunCalls).join(", ")}.`);
+  lines.push(`Say "continue" and I'll keep going.`);
+  return lines.join(lines.length > 2 ? "\n" : " ");
+}
+
+function toolCallStatus(invocation) {
+  if (!invocation?.ok) return "failed";
+  return invocation.result?.status === "awaiting_confirmation" ? "awaiting approval" : "ok";
+}
+
+// "fleet_screen (ok), fleet_screen (ok)" -> "fleet_screen (ok) x2", in order,
+// capped so a long turn stays one readable line.
+function collapseRepeats(items) {
+  const out = [];
+  for (const item of items) {
+    const last = out.at(-1);
+    if (last && last.item === item) last.count += 1;
+    else out.push({ item, count: 1 });
+  }
+  const shown = out.slice(0, STOP_PROGRESS_MAX).map(({ item, count }) => (count > 1 ? `${item} x${count}` : item));
+  if (out.length > STOP_PROGRESS_MAX) shown.push(`${out.length - STOP_PROGRESS_MAX} more`);
+  return shown;
+}
+
+function turnSpendStopResult({ provider, model, id, toolCalls, unrunCalls = [], turnUsd, limit }) {
   return {
     provider,
     model,
     id,
-    text: turnSpendStopMessage(turnUsd, limit),
+    text: turnSpendStopMessage(turnUsd, limit, { toolCalls, unrunCalls }),
     toolCalls,
     turnUsd,
     stoppedAtUsdLimit: true

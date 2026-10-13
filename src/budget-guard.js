@@ -127,12 +127,16 @@ export class BudgetGuard {
     return this.usdFor(normalizeUsage(usage), model);
   }
 
+  // A row with no cache-write rate (cacheWrite 0 or missing, as on the gpt-5
+  // rows) bills written tokens as normal input: normalizeUsage has already
+  // taken them out of input, so a 0 rate would make them free.
   usdFor(tokens, model) {
     const price = this.priceFor(model);
+    const cacheWrite = price.cacheWrite > 0 ? price.cacheWrite : price.in;
     return (tokens.input / 1e6) * price.in +
       (tokens.output / 1e6) * price.out +
       (tokens.cacheRead / 1e6) * price.cacheRead +
-      (tokens.cacheWrite / 1e6) * price.cacheWrite;
+      (tokens.cacheWrite / 1e6) * cacheWrite;
   }
 
   priceFor(model) {

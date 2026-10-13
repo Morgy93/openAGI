@@ -12,6 +12,7 @@ import { CreditLedger } from "../src/credit-ledger.js";
 import { ModelRouter, renderModelPlan } from "../src/model-router.js";
 import { AnthropicProvider, OpenAIResponsesProvider, turnSpendStopMessage } from "../src/model-provider.js";
 import { itemChars } from "../src/context-trim.js";
+import { SkillRegistry } from "../src/skills.js";
 
 function tmpGuard() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cost-"));
@@ -52,6 +53,16 @@ test("Responses usage on gpt-6-astra bills cached input at the cached price", ()
   // 1k fresh x $10 + 100 out x $50 + 8k cached x $1 + 1k write x $12.5, per 1M.
   assert.ok(Math.abs(res.added - 0.0355) < 1e-9, `got ${res.added}`);
   assert.equal(ledger.query({ days: 1 })[0].tokens.cacheRead, 8_000);
+});
+
+test("cache-write tokens on a row with no cache-write rate bill as normal input, not free", () => {
+  const { guard } = tmpGuard();
+  const usage = { input_tokens: 100_000, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 100_000 }, output_tokens: 0 };
+  assert.ok(Math.abs(guard.costOf(usage, "gpt-5.5") - 0.5) < 1e-9, `got ${guard.costOf(usage, "gpt-5.5")}`);
+  // Rows with a published write rate still use it.
+  assert.ok(Math.abs(guard.costOf(usage, "gpt-6-astra") - 1.25) < 1e-9);
+  const custom = new BudgetGuard({ storePath: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cost-")), "u.json"), prices: { "my-model": { in: 2, out: 0, cacheRead: 0.2 } } });
+  assert.ok(Math.abs(custom.costOf(usage, "my-model") - 0.2) < 1e-9, "a row without cacheWrite bills at input, not NaN");
 });
 
 test("Chat Completions usage: cached prompt tokens are not double-counted", () => {
@@ -210,8 +221,84 @@ test("turn spend stop: the loop stops past the limit with a plain message and pe
   assert.equal(calls, 2, "no call after the limit is crossed, not even the summary call");
   assert.equal(invoked, 1, "the over-limit hop's tool calls are not executed");
   assert.equal(result.stoppedAtUsdLimit, true);
-  assert.equal(result.text, turnSpendStopMessage(3, 2));
+  assert.equal(result.text, turnSpendStopMessage(3, 2, { toolCalls: result.toolCalls, unrunCalls: ["big_tool"] }));
   assert.match(result.text, /\$3\.00/);
+});
+
+test("turn spend stop: a skill tool's nested model calls share the turn's one total", async () => {
+  const { guard } = tmpGuard();
+  const provider = new OpenAIResponsesProvider({ apiKey: "k", model: "gpt-6-astra", budgetGuard: guard, turnUsdLimit: 2, maxToolHops: 10 });
+  let calls = 0;
+  provider.postResponses = async (body) => {
+    calls += 1;
+    const name = body.instructions.includes("diagnose") ? "big_tool" : "skill_diagnose";
+    return { id: `r${calls}`, output: [{ type: "function_call", call_id: `c${calls}`, name, arguments: "{}" }], usage: pricey };
+  };
+  const toolRegistry = {
+    toOpenAITools: () => toolSchema,
+    invoke: async (name, args, context) => (name === "skill_diagnose"
+      ? { ok: true, result: await skills.run("diagnose", { input: "why" }, context) }
+      : { ok: true, result: {} })
+  };
+  const skills = new SkillRegistry({ runtime: { agentHost: { modelProvider: provider } } });
+  skills.runtime.tools = toolRegistry;
+  skills.skills.set("diagnose", { name: "diagnose", description: "diagnose tool errors", body: "{{input}}", systemPrompt: "" });
+  const context = { channel: "node" };
+  const result = await provider.generate({ input: "fix it", agent, messages: [], tools: toolSchema, toolRegistry, context });
+  // Parent hop ($1.50) runs the skill; the skill's first hop ($1.50) crosses
+  // the one $2 limit, so the skill stops and the parent stops right after it.
+  assert.equal(calls, 2, "no second $2 for the nested call, no parent hop after it");
+  assert.equal(result.stoppedAtUsdLimit, true);
+  assert.equal(result.turnUsd, 3);
+  assert.match(result.text, /^I stopped this turn at \$3\.00/);
+  assert.match(result.text, /Done so far: skill_diagnose \(ok\)/);
+  assert.equal(context.__turnSpend, undefined, "the caller's context is not changed");
+});
+
+test("turn spend stop: Anthropic tools share the total with nested calls too", async () => {
+  const { guard } = tmpGuard();
+  const provider = new AnthropicProvider({ apiKey: "k", model: "claude-opus-4-7", budgetGuard: guard, turnUsdLimit: 2, maxToolHops: 10 });
+  let calls = 0;
+  provider.postMessages = async () => {
+    calls += 1;
+    return { id: `m${calls}`, content: [{ type: "tool_use", id: `t${calls}`, name: "nested", input: {} }], usage: { input_tokens: 100_000, output_tokens: 0 } };
+  };
+  const toolRegistry = {
+    toAnthropicTools: () => [],
+    invoke: async (name, args, context) => ({ ok: true, result: (await provider.generate({ input: "inner", agent, messages: [], toolRegistry, context })).text })
+  };
+  const result = await provider.generate({ input: "go", agent, messages: [], toolRegistry });
+  assert.equal(calls, 2);
+  assert.match(result.text, /stopped this turn at \$3\.00/);
+});
+
+test("turn spend stop text lists the tools already run and the ones not run, so continue has the progress", async () => {
+  const { guard } = tmpGuard();
+  const provider = new OpenAIResponsesProvider({ apiKey: "k", model: "gpt-6-astra", budgetGuard: guard, turnUsdLimit: 2, maxToolHops: 10 });
+  let calls = 0;
+  provider.postResponses = async () => {
+    calls += 1;
+    const output = calls === 1
+      ? [
+          { type: "function_call", call_id: "a", name: "fleet_screen", arguments: "{}" },
+          { type: "function_call", call_id: "b", name: "fleet_screen", arguments: "{}" },
+          { type: "function_call", call_id: "c", name: "computer_click", arguments: "{}" }
+        ]
+      : [{ type: "function_call", call_id: "d", name: "fleet_thread", arguments: "{}" }];
+    return { id: `r${calls}`, output, usage: pricey };
+  };
+  const toolRegistry = { invoke: async (name) => (name === "computer_click" ? { ok: false, error: "denied" } : { ok: true, result: {} }) };
+  const result = await provider.generate({ input: "fix it", agent, messages: [], tools: toolSchema, toolRegistry });
+  assert.equal(result.text, [
+    "I stopped this turn at $3.00 of model spend (the per-turn limit is $2.00).",
+    "Done so far: fleet_screen (ok) x2, computer_click (failed).",
+    "Not run yet: fleet_thread.",
+    'Say "continue" and I\'ll keep going.'
+  ].join("\n"));
+  assert.match(
+    turnSpendStopMessage(2.5, 2, { toolCalls: [{ name: "send", result: { ok: true, result: { status: "awaiting_confirmation" } } }] }),
+    /Done so far: send \(awaiting approval\)\./
+  );
 });
 
 test("turn spend stop message is plain and says how to continue", () => {
@@ -270,6 +357,32 @@ test("router resolves OPENAI_REASONING_EFFORT_TASK_<TASK> and shows it in the pl
   assert.match(renderModelPlan(router, { provider: "openai" }), /User chat\s+gpt-6-luna  \(effort high\)/);
   const pinned = new ModelRouter({ envPrefix: "OPENAI", baseModel: "x", env: {}, overrides: { reasoningEffort: { chat: "low" } } });
   assert.equal(pinned.reasoningEffort("chat"), "low");
+});
+
+test("per-task reasoning effort is trimmed and lowercased; an unknown value falls back to global, warns once, and is flagged", async () => {
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (message) => warnings.push(message);
+  try {
+    const router = new ModelRouter({ envPrefix: "OPENAI", baseModel: "gpt-6-luna", env: { OPENAI_REASONING_EFFORT_TASK_CHAT: " High ", OPENAI_REASONING_EFFORT_TASK_OBSERVER: "hgih" } });
+    assert.equal(router.reasoningEffort("chat"), "high");
+    assert.equal(router.reasoningEffort("observer"), null);
+    assert.equal(router.reasoningEffort("observer"), null);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /OPENAI_REASONING_EFFORT_TASK_OBSERVER="hgih"/);
+    const plan = renderModelPlan(router, { provider: "openai" });
+    assert.match(plan, /User chat\s+gpt-6-luna  \(effort high\)/);
+    assert.match(plan, /\(⚠ effort "hgih" is invalid, using global\)/);
+
+    const provider = new OpenAIResponsesProvider({ apiKey: "k", model: "gpt-6-luna", router, reasoningEffort: "medium" });
+    const efforts = [];
+    provider.postResponses = async (body) => { efforts.push(body.reasoning?.effort ?? null); return { id: "r", output_text: "ok", output: [] }; };
+    await provider.generate({ input: "hi", agent, messages: [], task: "observer" });
+    await provider.generate({ input: "hi", agent, messages: [], task: "chat" });
+    assert.deepEqual(efforts, ["medium", "high"]);
+  } finally {
+    console.warn = warn;
+  }
 });
 
 test("provider sends the task's reasoning effort, falling back to the global one", async () => {
