@@ -9,7 +9,7 @@
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
 import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
-import { WATCH_GROUPS, classifyThread, mergeThreads, threadHealth, watchOf } from "./classify.js";
+import { WATCH_GROUPS, classifyThread, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
@@ -239,16 +239,30 @@ function asksToMerge(question) {
 }
 
 // Asks that stand until settled, not while the thread's state reads a
-// certain way: a waiting-ci <-> needs-human flicker leaves them open.
+// certain way: a waiting-ci <-> needs-human flicker leaves them open. A
+// policy hold ("main CI red blocks it", "waits on your go": held:) is not
+// one: it closes once a scan decides its thread without asking it.
 const STANDING_KINDS = new Set(["agent-ask", "ready"]);
+const standing = (question) => STANDING_KINDS.has(question.kind) && !String(question.dedupeKey ?? "").startsWith("held:");
+
+// What makes an open PR asked as ready no longer ready, read from the PR
+// alone, or null. Only what the PR itself says for certain: CI running again,
+// an unread gate or unknown mergeability is no news.
+const NOT_READY = /^(?:CI red: |\d+ open threads$|changes requested$|merge conflicts$|branch behind base$|draft$)|\S failed$/;
+function notReadyBlocker(pr) {
+  if (pr?.state !== "OPEN") return null;
+  return prReadiness(pr, null).blockers.find((blocker) => NOT_READY.test(blocker)) ?? null;
+}
 
 // Why an open standing ask no longer needs the owner, or null. The owner's
-// answer closes it elsewhere. A ready PR settles when it merges, closes or
-// moves past the asked head. An agent's ask also settles when its thread is
-// gone or muted, or (unless it asks to merge) when the agent spoke since and
-// no longer asks: it withdrew or answered it itself.
-// prMissing: GitHub answered and has no such PR.
-export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false } = {}) {
+// answer closes it elsewhere. A ready PR settles when it merges, closes,
+// moves past the asked head or stops being ready on it (notReady). An
+// agent's ask also settles when its thread is gone or muted, or (unless it
+// asks to merge) when the agent spoke since and no longer asks: it withdrew
+// or answered it itself.
+// prMissing: GitHub answered and has no such PR. notReady: a blocker this
+// scan read on the PR (notReadyBlocker).
+export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false, notReady = null } = {}) {
   const askedAt = Date.parse(question.agentAskedAt ?? question.createdAt ?? "");
   if (question.kind === "ready" && prMissing) return "PR not found";
   if (pr && SETTLED_PR_STATES.has(pr.state)) {
@@ -258,6 +272,7 @@ export function settledAsk(question, { thread = null, pr = null, prMissing = fal
     if (after) return `${parsePrRef(pr.ref)?.number ? `#${parsePrRef(pr.ref).number}` : "PR"} ${pr.state === "MERGED" ? "merged" : "closed"}`;
   }
   if (pr?.state === "OPEN" && question.askedHead && pr.headOid && pr.headOid !== question.askedHead) return `PR head moved past ${String(question.askedHead).slice(0, 10)}`;
+  if (question.kind === "ready" && notReady) return `PR no longer ready: ${notReady}`;
   if (question.kind !== "agent-ask") return null;
   if (muted) return "muted by owner";
   if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
@@ -2144,10 +2159,12 @@ export class FleetSupervisor {
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       // A group member a capped scan left out may still be failing.
       if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;
-      if (STANDING_KINDS.has(question.kind)) {
+      if (standing(question)) {
         const ref = question.prRef ?? known?.prRefs?.[0] ?? null;
         const prMissing = Boolean(parsePrRef(ref)) && !this.skip.github && !prs.has(ref) && !unreadPrs.has(ref);
-        const reason = settledAsk(question, { thread: known, pr: prs.get(ref), prMissing, threadGone, muted: decided?.reason === "muted by owner" });
+        // A PR this scan could not read keeps its last settled read only.
+        const notReady = unreadPrs.has(ref) ? null : notReadyBlocker(prs.get(ref));
+        const reason = settledAsk(question, { thread: known, pr: prs.get(ref), prMissing, threadGone, muted: decided?.reason === "muted by owner", notReady });
         if (reason) {
           store.resolveQuestion(question.id, reason);
           this.resolveOutreach(question, "resolved", "dismissed");

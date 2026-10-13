@@ -4091,3 +4091,44 @@ test("a judged resume naming the merged PR of a stopped turn is still sent", asy
   assert.match(delivered[0].message, /#7489 merged/);
   assert.equal(await supervisor.prSettledBeforeSend(thread, merged, { playbook: "infra-recovered", message: "BuildBot3 is up. #7489 merged; continue." }), null);
 });
+
+// bb-recorder #279: "ready. Merge?" stayed open from 2026-10-10 after the PR
+// stopped being ready on the same head. A rerun still running is no news.
+test("a ready question closes once the PR stops being ready on the same head", async (t) => {
+  const green = makePr({ ref: "acme/app#7", ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  for (const [change, reason] of [
+    [{ reviewDecision: "CHANGES_REQUESTED" }, "PR no longer ready: changes requested"],
+    [{ mergeState: "DIRTY", mergeable: "CONFLICTING" }, "PR no longer ready: merge conflicts"],
+    [{ ci: { state: "FAILURE", failing: ["test"], pending: [] } }, "PR no longer ready: CI red: test"],
+    [{ unresolvedThreads: 2 }, "PR no longer ready: 2 open threads"],
+    [{ isDraft: true }, "PR no longer ready: draft"]
+  ]) {
+    let pr = green;
+    const { supervisor } = fixture(t, { deps: { fetchPrStates: async () => new Map([["acme/app#7", pr]]) } });
+    await supervisor.tick();
+    const [ready] = supervisor.getState().questions;
+    assert.match(ready.dedupeKey, /^ready:acme\/app#7:/);
+    pr = { ...green, ci: { state: "PENDING", failing: [], pending: ["test"] } };
+    await supervisor.tick();
+    assert.equal(supervisor.store.question(ready.id).status, "open", "a rerun running is no news");
+    pr = { ...green, ...change };
+    await supervisor.tick();
+    assert.equal(supervisor.store.question(ready.id).status, "resolved", reason);
+    assert.equal(supervisor.store.question(ready.id).resolveReason, reason);
+  }
+});
+
+// dakar #7317: "main CI red blocks it. Help?" stayed open beside the PR's
+// "ready. Merge?" once main went green on the same head.
+test("a main-red hold closes once a scan decides its thread without it", async (t) => {
+  let pr = makePr({ ci: { state: "FAILURE", failing: ["main-health"], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const { supervisor } = fixture(t, { deps: { fetchPrStates: async () => new Map([["acme/app#7", pr]]) } });
+  await supervisor.tick();
+  const [held] = supervisor.getState().questions;
+  assert.match(held.dedupeKey, /^held:codex:t1:/);
+  assert.match(held.title, /main CI red blocks it/);
+  pr = { ...pr, ci: { state: "SUCCESS", failing: [], pending: [] } };
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(held.id).status, "resolved");
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.dedupeKey.split(":")[0]), ["ready"]);
+});
