@@ -73,7 +73,7 @@ test("OPENAGI_MODEL_DENY: a denied model never reaches a call, whatever asks for
   const { ModelRouter, deniedModel } = await import("../src/model-router.js");
   const { OpenAIResponsesProvider } = await import("../src/model-provider.js");
   const env = {
-    OPENAGI_MODEL_DENY: "gpt-6-astra*, gpt-5.5", OPENAGI_MODEL_DENY_FALLBACK: "gpt-6.1-sol",
+    OPENAGI_MODEL_DENY: "gpt-6-astra*, gpt-5.5", OPENAI_MODEL_DENY_FALLBACK: "gpt-6.1-sol",
     OPENAI_MODEL_TASK_CHAT: "gpt-6-astra", OPENAI_MODEL_MINI: "gpt-5.5"
   };
   assert.equal(deniedModel("gpt-6-astra", env), true);
@@ -94,6 +94,16 @@ test("OPENAGI_MODEL_DENY: a denied model never reaches a call, whatever asks for
   assert.equal(noFallback.allowed("gpt-6-astra"), "gpt-6-luna");
   const stuck = new ModelRouter({ envPrefix: "OPENAI", baseModel: "gpt-6-astra", env: { OPENAGI_MODEL_DENY: "gpt-6-astra" } });
   assert.throws(() => stuck.allowed("gpt-6-astra"), /denied by OPENAGI_MODEL_DENY/);
+  // The plan reports what runs: the effective base, and tasks on it count as on base.
+  const plan = router.describe();
+  assert.equal(router.tierModels().base, "gpt-6.1-sol");
+  assert.equal(router.tierModels().mini, "gpt-6.1-sol");
+  assert.equal(plan.find((row) => row.task === "observer").onBase, true, "an unconfigured tier still shows as on base");
+  // A fallback for the other provider is never sent to this one.
+  const claude = new ModelRouter({ envPrefix: "ANTHROPIC", baseModel: "claude-sonnet-4-6", env: { OPENAGI_MODEL_DENY: "claude-opus*", OPENAGI_MODEL_DENY_FALLBACK: "gpt-6.1-sol" } });
+  assert.equal(claude.allowed("claude-opus-4-7"), "claude-sonnet-4-6");
+  const shared = new ModelRouter({ envPrefix: "OPENAI", baseModel: "gpt-6-astra", env: { OPENAGI_MODEL_DENY: "gpt-6-astra", OPENAGI_MODEL_DENY_FALLBACK: "gpt-6.1-sol" } });
+  assert.equal(shared.allowed("gpt-6-astra"), "gpt-6.1-sol", "the shared fallback still works for its own provider");
   // Unset, nothing changes.
   assert.equal(new ModelRouter({ envPrefix: "OPENAI", baseModel: "gpt-6-astra", env: {} }).allowed("gpt-6-astra"), "gpt-6-astra");
 });

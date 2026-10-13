@@ -50,9 +50,11 @@ export function agentTurnTask(input = {}) {
 
 // Models the owner never wants used, whatever a tier, task pin or caller asks
 // for: OPENAGI_MODEL_DENY, comma-separated, exact names or a prefix ending in
-// "*" ("gpt-6-astra*"). A denied model becomes OPENAGI_MODEL_DENY_FALLBACK, or
-// the base model when that is allowed; with neither allowed the call fails
-// rather than quietly using the denied model.
+// "*" ("gpt-6-astra*"). A denied model becomes the provider's own fallback
+// (<PREFIX>_MODEL_DENY_FALLBACK, e.g. OPENAI_MODEL_DENY_FALLBACK), else
+// OPENAGI_MODEL_DENY_FALLBACK when it is this provider's kind of model, else
+// the base model when that is allowed; with none allowed the call fails rather
+// than quietly using the denied model.
 export function deniedModel(model, env = process.env) {
   const name = String(model ?? "").trim();
   if (!name) return false;
@@ -76,15 +78,23 @@ export class ModelRouter {
   // The model a call may really use: `model` unless OPENAGI_MODEL_DENY names it.
   allowed(model) {
     if (!deniedModel(model, this.env)) return model;
-    const fallback = String(this.env.OPENAGI_MODEL_DENY_FALLBACK ?? "").trim();
-    const to = fallback && !deniedModel(fallback, this.env) ? fallback
-      : (this.baseModel && !deniedModel(this.baseModel, this.env) ? this.baseModel : null);
-    if (!to) throw new Error(`Model ${model} is denied by OPENAGI_MODEL_DENY and no allowed fallback is set (OPENAGI_MODEL_DENY_FALLBACK).`);
+    const own = String(this.env[`${this.envPrefix}_MODEL_DENY_FALLBACK`] ?? "").trim();
+    const shared = String(this.env.OPENAGI_MODEL_DENY_FALLBACK ?? "").trim();
+    const to = [own, this.ownKind(shared) ? shared : "", this.baseModel]
+      .find((candidate) => candidate && !deniedModel(candidate, this.env)) ?? null;
+    if (!to) throw new Error(`Model ${model} is denied by OPENAGI_MODEL_DENY and no allowed fallback is set (${this.envPrefix}_MODEL_DENY_FALLBACK).`);
     if (!this.warnedDenied.has(model)) {
       this.warnedDenied.add(model);
       console.warn(`[model-router] ${model} is denied by OPENAGI_MODEL_DENY; using ${to}.`);
     }
     return to;
+  }
+
+  // Whether a model name belongs to this provider: a Claude model never goes
+  // to the OpenAI API, nor an OpenAI model to Anthropic's.
+  ownKind(model) {
+    if (!model) return false;
+    return this.envPrefix === "ANTHROPIC" ? /^claude/i.test(model) : !/^claude/i.test(model);
   }
 
   // Model for a tier name. Unset tiers fall back to base, so an undefined
@@ -133,10 +143,10 @@ export class ModelRouter {
 
   // Which models are actually wired up (base + any configured tiers).
   tierModels() {
-    const out = { base: this.baseModel };
+    const out = { base: this.allowed(this.baseModel) };
     for (const tier of TIERS) {
       if (tier === "base") continue;
-      out[tier] = this.tierModel(tier);
+      out[tier] = this.allowed(this.tierModel(tier));
     }
     return out;
   }
@@ -145,6 +155,7 @@ export class ModelRouter {
   // to right now, and why. `onBase` flags tasks that are NOT yet saving (still
   // on the base model because their tier isn't configured).
   describe() {
+    const base = this.allowed(this.baseModel);
     return Object.entries(TASK_PROFILES).map(([task, p]) => {
       const model = this.allowed(this.resolve(task));
       const effort = this.reasoningEffortSetting(task);
@@ -156,7 +167,7 @@ export class ModelRouter {
         reasoningEffort: effort.effort,
         invalidReasoningEffort: effort.invalid,
         why: p.why,
-        onBase: model === this.baseModel
+        onBase: model === base
       };
     });
   }
