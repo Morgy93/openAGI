@@ -77,6 +77,7 @@ struct WatchingList: View {
 
   private func row(_ thread: FleetThread, now: Date) -> some View {
     let wait = thread.watch.flatMap { FleetWatching.rowText($0, now: now) }
+    let label = thread.watch.flatMap { FleetWatching.shortRowText($0, now: now) }
     return Button { openFleetPage() } label: {
       HStack(spacing: 6) {
         Text(thread.name)
@@ -87,8 +88,8 @@ struct WatchingList: View {
         if let pr = thread.prShortRef {
           Text(pr).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).fixedSize()
         }
-        if let wait {
-          Text(wait).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
+        if let label {
+          Text(label).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
         }
       }
       .padding(.leading, 10)

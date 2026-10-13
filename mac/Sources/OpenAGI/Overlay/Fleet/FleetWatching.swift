@@ -248,6 +248,25 @@ enum FleetWatching {
     return on.map { "\($0) \(text)" } ?? text
   }
 
+  /// The row's visible label, short so the chat name keeps its room:
+  /// "task 6h", "CI 12m", "BB3 full 23m" while waiting, "2h" otherwise.
+  /// rowText stays the full sentence for the tooltip and VoiceOver.
+  static func shortRowText(_ watch: FleetWatch, now: Date = Date()) -> String? {
+    let waitingOn = watch.waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let on = watch.group == "waiting" && !waitingOn.isEmpty ? shortWaitingOn(waitingOn) : nil
+    guard let since = watch.since.flatMap(parseDate) else { return on }
+    let text = duration(now.timeIntervalSince(since))
+    return on.map { "\($0) \(text)" } ?? text
+  }
+
+  static func shortWaitingOn(_ value: String) -> String {
+    switch value {
+    case "a background task": return "task"
+    case "BuildBot3 full run": return "BB3 full"
+    default: return value
+    }
+  }
+
   /// "45s", "23m", "2h", "3d": the /fleet page's secs(), rounding included.
   static func duration(_ seconds: TimeInterval) -> String {
     let s = max(0, seconds)
