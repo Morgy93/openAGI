@@ -584,6 +584,24 @@ test("the agent's whole last message is kept with its lines; a synthetic limit r
   assert.equal(thread.lastAgentAt, iso(14 * MIN));
 });
 
+test("an answer the agent sent back with SendMessage is read as its reply", async (t) => {
+  // dakar, 2026-10-12 15:53:54Z: it answered a supervisor relay with
+  // SendMessage to /tmp/cc-socks/48713.sock, which had already closed.
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-idle", "assistant", sdk.text("s-idle", "Older status."), iso(30 * MIN));
+  const answer = "PR #7317 is ready on our side but not merged; main's red Testing CI is the only blocker.";
+  addMessage(db, "s-idle", "assistant", {
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "toolu_send", name: "SendMessage", input: { to: "uds:/tmp/cc-socks/48713.sock", summary: "Reply PR 7317 status", message: answer } }] }
+  }, iso(10 * MIN));
+  db.close();
+  const thread = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
+  assert.equal(thread.lastAgentFull, answer);
+  assert.equal(thread.lastAgentFullAt, iso(10 * MIN));
+});
+
 // A subagent's AskUserQuestion (342281f9, 2026-10-07 03:27:31): the card
 // shows to the owner like the agent's own.
 const subagentAsk = (id) => ({ ...cardCall(id), parent_tool_use_id: "toolu_bg" });

@@ -13,12 +13,13 @@ const HEAVY_PATTERNS = [
   /\bpnpm\s+(?:run\s+)?build(?=\s|$|["'])/,
   /\bdocker\s+compose\s+up\b/,
   /\bdocker-compose\s+up\b/,
-  /\blocal-stack:up\b/,
-  /\bbb-verify\b/
+  /\blocal-stack:up\b/
 ];
 
-// Work shipped to BuildBot3 is fine.
-const REMOTE_PATTERN = /\bbb-remote\b|\bbb-ci-remote\b/;
+// Work shipped to BuildBot3 is fine. bb-verify and bb-quick exist only on
+// BuildBot3: a laptop command naming them is a wrapper or a watcher polling
+// that box (monterrey's "ssh session executing a check on BuildBot3").
+const REMOTE_PATTERN = /\bbb-remote\b|\bbb-ci-remote\b|\bbb-verify\b|\bbb-quick\b/;
 
 // Agent CLIs and text tools carry these words in prompts or search patterns
 // without running anything heavy.
@@ -45,8 +46,30 @@ function parsePsLine(line) {
   return { pid: Number(match[1]), ppid: Number(match[2]), ageSec: parseEtime(match[3]), command: match[4] };
 }
 
+function remoteCommand(command) {
+  return command.includes("ssh ") || REMOTE_PATTERN.test(command);
+}
+
+// Started by an ssh client or a BuildBot3 wrapper (its program, not a shell
+// line that merely mentions one): the work runs on that box.
+function remoteProgram(command) {
+  const [program = "", script = ""] = command.trim().split(/\s+/);
+  return path.basename(program) === "ssh" || REMOTE_PATTERN.test(`${path.basename(program)} ${path.basename(script)}`);
+}
+
+function underRemote(row, byPid) {
+  const seen = new Set();
+  let parent = byPid.get(row.ppid);
+  while (parent && !seen.has(parent.pid)) {
+    if (remoteProgram(parent.command)) return true;
+    seen.add(parent.pid);
+    parent = byPid.get(parent.ppid);
+  }
+  return false;
+}
+
 function heavyMatchIndex(command) {
-  if (command.includes("ssh ") || REMOTE_PATTERN.test(command) || AGENT_CLI_PATTERN.test(command)) return -1;
+  if (remoteCommand(command) || AGENT_CLI_PATTERN.test(command)) return -1;
   const binary = path.basename(command.split(/\s+/)[0] ?? "").toLowerCase();
   if (IGNORED_BINARIES.has(binary)) return -1;
   for (const pattern of HEAVY_PATTERNS) {
@@ -112,7 +135,7 @@ export async function findLocalHeavyVerification(config, options = {}) {
     for (const row of rows) {
       if (row.pid === process.pid) continue;
       const index = heavyMatchIndex(row.command);
-      if (index >= 0) matches.push({ ...row, index });
+      if (index >= 0 && !underRemote(row, byPid)) matches.push({ ...row, index });
     }
     const roots = rootMatches(matches, byPid).filter((row) => row.ageSec >= minAgeSec);
     const cwds = await readCwds(config, roots.map((row) => row.pid), run);

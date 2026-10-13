@@ -33,8 +33,9 @@ function within(promise, ms) {
   const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), ms); });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
-// A resumed turn can run for an hour (CI waits, bb-quick). Only the child we
-// spawned is ever killed, and only after this ceiling.
+// A resumed turn can run for hours (CI waits, a full verify). Past this
+// ceiling the send stops waiting on it and leaves it running: killing it
+// killed a live Codex turn (019fe344, 21:08Z).
 const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 // After the ceiling, SIGTERM gets this long before SIGKILL settles the send.
 const KILL_GRACE_MS = 10_000;
@@ -68,6 +69,12 @@ export function fleetChildEnv(env = process.env, { bins } = {}) {
   out.PATH = childPath(env?.PATH, bins);
   return out;
 }
+
+// The relay is a claude -p that exits once the message is delivered, so an
+// answer sent back to it lands on a closed socket (9 of 16 relays: "ENOENT
+// /tmp/cc-socks/..."). The agent answers in its own chat, where the
+// supervisor reads its transcript.
+export const RELAY_REPLY_NOTE = "Answer in your own chat as a normal reply, not with SendMessage: this sender exits right after delivering, so a reply sent to it is lost.";
 
 // Mirrors relayToPeer in g2 scripts/agent-supervisor/attach.mjs so the relay
 // model sees the same, already-proven instruction.
@@ -137,7 +144,10 @@ function withPrefix(message) {
 }
 
 // Spawns a long-running child without holding its whole output. Never throws.
-export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND_TIMEOUT_MS, killGraceMs = KILL_GRACE_MS } = {}) {
+// detach: at timeoutMs the promise settles ({ detached: true }) and the
+// child keeps running (an agent turn is never killed); its output is still
+// drained so it never blocks, and onExit gets its result when it ends.
+export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND_TIMEOUT_MS, killGraceMs = KILL_GRACE_MS, detach = false, onExit = null } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -154,7 +164,13 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
       tail += chunk.toString("utf8");
       if (tail.length > TAIL_CHARS * 2) tail = tail.slice(-TAIL_CHARS);
     };
+    let detached = false;
     const finish = (result) => {
+      if (detached) {
+        detached = false;
+        try { onExit?.({ ...result, tail: tail.slice(-TAIL_CHARS) }); } catch { /* best-effort */ }
+        return;
+      }
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -162,6 +178,13 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
       resolve({ ...result, tail: tail.slice(-TAIL_CHARS) });
     };
     const timer = setTimeout(() => {
+      if (detach) {
+        // The turn may still be working: stop waiting, never kill it.
+        settled = true;
+        detached = true;
+        resolve({ code: null, timedOut: false, detached: true, error: null, tail: tail.slice(-TAIL_CHARS) });
+        return;
+      }
       timedOut = true;
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
       // A child that ignores SIGTERM, or a descendant still holding the
@@ -319,7 +342,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     return {
       cmd: bins.claude ?? "claude",
       args: [
-        "-p", buildRelayPrompt(peerName, text),
+        "-p", buildRelayPrompt(peerName, `${text}\n${RELAY_REPLY_NOTE}`),
         // bypassPermissions ignores --allowedTools as a limit, so --tools and
         // --strict-mcp-config leave SendMessage as the only tool.
         "--tools", "SendMessage",
@@ -448,32 +471,52 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   const launch = (thread, step, base, actionId, env) => {
     const id = journal(actionId, { ...base, status: "sent", running: true, detail: "started", startedAt: new Date().toISOString() });
     let reached = true;
+    // The child's end, journaled: at once, or when a detached turn ends.
+    const settle = (result) => {
+      const ok = !result?.error && !result?.timedOut && result?.code === 0;
+      if (!id) return;
+      const output = result?.tail ?? `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`;
+      const detail = ok
+        ? lastLine(output) || "finished"
+        : summariseExecFailure(output) || (result?.timedOut ? "timed out" : "") || firstLine(result?.error) || lastLine(output) || `exit ${result?.code}`;
+      journal(id, {
+        status: ok ? "done" : "failed",
+        running: false,
+        exitCode: result?.code ?? null,
+        detail,
+        logFile: writeLog(thread, output),
+        finishedAt: new Date().toISOString()
+      });
+    };
+    // A turn still running at the ceiling is left running, never killed: the
+    // thread stays in flight until it ends.
+    let detached = false;
+    let exited = false;
+    const ended = () => active.delete(thread.key);
+    const onExit = (result) => {
+      exited = true;
+      try { settle(result); } catch { /* journaling is best-effort */ }
+      ended();
+    };
     const task = Promise.resolve()
-      .then(() => background(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: BACKGROUND_TIMEOUT_MS }))
+      .then(() => background(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: BACKGROUND_TIMEOUT_MS, detach: true, onExit }))
       .catch((error) => ({ code: null, timedOut: false, error: error?.message ?? String(error) }))
       .then((result) => {
+        if (result?.detached) {
+          detached = true;
+          if (id && !exited) journal(id, { running: true, detail: `still running after ${Math.round(BACKGROUND_TIMEOUT_MS / 60_000)} min: left running, not killed` });
+          return;
+        }
         const ok = !result?.error && !result?.timedOut && result?.code === 0;
         // Spawn errors and non-zero exits never reached the agent; a timeout
         // did. Only the caller knows whether this send was a counted nudge,
         // so it gives the attempt back from done, not the executor.
         if (!ok && !result?.timedOut) reached = false;
-        if (!id) return;
-        const output = result?.tail ?? `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`;
-        const detail = ok
-          ? lastLine(output) || "finished"
-          : summariseExecFailure(output) || (result?.timedOut ? "timed out" : "") || firstLine(result?.error) || lastLine(output) || `exit ${result?.code}`;
-        journal(id, {
-          status: ok ? "done" : "failed",
-          running: false,
-          exitCode: result?.code ?? null,
-          detail,
-          logFile: writeLog(thread, output),
-          finishedAt: new Date().toISOString()
-        });
+        settle(result);
       })
       .catch(() => { /* journaling is best-effort */ })
       .finally(() => {
-        active.delete(thread.key);
+        if (!detached) ended();
         pending.delete(task);
       });
     pending.add(task);

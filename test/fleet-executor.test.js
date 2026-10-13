@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { MESSAGE_PREFIX, backgroundRouteFor, buildRelayPrompt, createExecutor, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { MESSAGE_PREFIX, RELAY_REPLY_NOTE, backgroundRouteFor, buildRelayPrompt, createExecutor, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
 import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
@@ -184,7 +184,10 @@ test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) 
   assert.equal(call.cwd, config.paths.relayCwd);
   assert.ok(fs.statSync(config.paths.relayCwd).isDirectory());
   assert.equal(call.timeoutMs, 180_000);
-  const expectedPrompt = buildRelayPrompt("cairo-1f", `${MESSAGE_PREFIX}CI finished on abc1234: green.`);
+  // The relay exits once it delivers: the agent is told to answer in its own
+  // chat (dakar's three replies went to a closed /tmp/cc-socks socket).
+  const expectedPrompt = buildRelayPrompt("cairo-1f", `${MESSAGE_PREFIX}CI finished on abc1234: green.\n${RELAY_REPLY_NOTE}`);
+  assert.match(RELAY_REPLY_NOTE, /^Answer in your own chat\b.*not with SendMessage/);
   assert.deepEqual(call.args, [
     "-p", expectedPrompt,
     "--tools", "SendMessage",
@@ -195,7 +198,7 @@ test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) 
   ]);
   assert.match(expectedPrompt, /^Use the SendMessage tool to send a message to the peer named "cairo-1f"\./);
   assert.match(expectedPrompt, /Then reply with only the word DONE\.\n\n--- message starts ---\n\[OpenAGI supervisor\] CI finished/);
-  assert.match(expectedPrompt, /\n--- message ends ---$/);
+  assert.match(expectedPrompt, /green\.\nAnswer in your own chat[^\n]*\n--- message ends ---$/);
   assert.equal(call.env?.CODEX_LB_API_KEY, undefined);
   assert.deepEqual(executor.inFlight(), []);
   const action = store.action(result.actionId);
@@ -379,6 +382,25 @@ test("spawnWithTail settles after a timeout even if SIGTERM is ignored or a desc
   const grandchild = Number(held.tail.trim().split("\n")[0]);
   t.after(() => { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } });
   assert.ok(grandchild > 0);
+});
+
+test("a background resume still running at the ceiling stays in flight, journaled as left running", async (t) => {
+  const { home, cwd, config, store } = setup(t);
+  let options = null;
+  const run = (cmd, args, opts = {}) => { options = opts; return Promise.resolve({ code: null, timedOut: false, detached: true, error: null, tail: "working" }); };
+  const executor = createExecutor({ config, run, store, logDir: path.join(home, "fleet", "logs") });
+  const sent = await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec", playbook: "resume" });
+  assert.equal(options.detach, true);
+  assert.equal(await sent.done, true);
+  await executor.whenIdle();
+  assert.deepEqual(executor.inFlight(), ["codex:t1"], "no second send starts beside the running turn");
+  const running = store.action(sent.actionId);
+  assert.equal(running.running, true);
+  assert.match(running.detail, /left running, not killed/);
+  options.onExit({ code: 0, timedOut: false, error: null, tail: "working\nPushed the fix." });
+  assert.equal(store.action(sent.actionId).status, "done");
+  assert.equal(store.action(sent.actionId).detail, "Pushed the fix.");
+  assert.deepEqual(executor.inFlight(), []);
 });
 
 test("a background send reports later whether it reached the agent", async (t) => {
@@ -811,4 +833,18 @@ test("queue is Conductor's: a Codex thread asked to queue still falls back while
   assert.equal(result.route, "codex-exec");
   assert.equal(calls.length, 1);
   await executor.whenIdle();
+});
+
+test("spawnWithTail with detach leaves a turn running past the ceiling and reports its end later", async () => {
+  // Codex 019fe344: the codex-exec route hit its 2 h ceiling at 21:08Z and
+  // killed a live turn. A detached child is never killed.
+  let exited = null;
+  const ended = new Promise((resolve) => { exited = resolve; });
+  const script = "process.stdout.write('working\\n'); setTimeout(() => process.stdout.write('pushed the fix\\n'), 400)";
+  const result = await spawnWithTail(process.execPath, ["-e", script], { timeoutMs: 100, killGraceMs: 50, detach: true, onExit: exited });
+  assert.equal(result.detached, true);
+  assert.equal(result.timedOut, false);
+  const late = await ended;
+  assert.equal(late.code, 0, "the turn ran to its end");
+  assert.match(late.tail, /pushed the fix/);
 });

@@ -5,8 +5,8 @@
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
 import {
-  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, liveCardItems, msSince, parsePrRef, redactSecrets, shortHash,
-  uiTargetFor
+  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isMainHealthCheck, liveCardItems, msSince, parsePrRef,
+  redactSecrets, shortHash, uiTargetFor
 } from "./contracts.js";
 import { blockedOnSection, deliberateStop, ownerStoppedNudge } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
@@ -19,6 +19,9 @@ const UNREACHABLE_ASK_MS = 90 * MIN;
 const LONG_DOWN_MS = HOUR;
 // LB log rows older than this say nothing about the LB now.
 const LB_ERROR_FRESH_MS = 15 * MIN;
+// The LB watcher writes a line about every half hour; one this recent still
+// vouches for the LB.
+const LB_WATCH_FRESH_MS = 45 * MIN;
 
 const LIMIT_KINDS = new Set(["session-limit", "usage-limit"]);
 const BACKOFF_KINDS = new Set(["overloaded", "network"]);
@@ -193,7 +196,7 @@ function intentFor(ctx) {
   switch (classified.state) {
     case "infra-blocked": return infraIntent(ctx);
     case "waiting-ci": return waitingIntent(ctx);
-    case "local-verify": return nudge("no-local-verify", "heavy verification on the laptop", { immediate: true });
+    case "local-verify": return nudge("no-local-verify", "heavy verification on the laptop", { immediate: true, vars: localVerifyVars(classified.localVerify) });
     case "needs-human": return agentAskIntent(ctx);
     // The manager's asks are about shared infra: the owner answers them.
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
@@ -226,6 +229,13 @@ function idleIntent(ctx) {
 
 function nudge(playbook, reason, extra = {}) {
   return { type: "nudge", playbook, reason, ...extra };
+}
+
+// Which process the laptop check saw, so the agent can look at that one.
+function localVerifyVars(proc) {
+  const pid = Number(proc?.pid);
+  const ageSec = Number(proc?.ageSec);
+  return { pid: Number.isInteger(pid) && pid > 0 ? String(pid) : "?", age: Number.isFinite(ageSec) ? String(Math.round(ageSec / 60)) : "?" };
 }
 
 function infraIntent(ctx) {
@@ -347,6 +357,13 @@ function waitingIntent(ctx) {
     if (slowMs !== null) return escalateIntent(ctx, "bb-verify --full", slowMs);
   }
   if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) {
+    // The full-run gate already reported on the head: the bb-quick wait
+    // outlived it (#7352 drew three manager alerts after its full run
+    // passed). Not BuildBot3 being slow, so not the manager's.
+    if (pr?.state === "OPEN" && fullRunGateDone(pr)) {
+      if (ciDone) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
+      return silent ? statusCheck("bb-quick", quietMs) : { type: "wait", reason: "full-run gate done; bb-quick task still open" };
+    }
     return silent ? statusCheck("bb-quick", quietMs) : escalateIntent(ctx, "bb-quick", age);
   }
   if (wait.source === "task") {
@@ -417,7 +434,9 @@ function escalatedWait(classified, pr, limits, bb3, thread = null, config = null
   const counts = wait.taskKind === "full" && !fullRunGateDone(pr) && (fullRunGated(pr, thread, config) || ciFailing(pr));
   const slowMs = counts ? slowFullWait(age, pr, bb3, limits) : null;
   if (slowMs !== null) return { what: "bb-verify --full", age: slowMs };
-  if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return { what: "bb-quick", age };
+  // A bb-quick wait that outlived the full-run gate is not BuildBot3's.
+  const quickCounts = !(pr?.state === "OPEN" && fullRunGateDone(pr));
+  if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs && quickCounts) return { what: "bb-quick", age };
   return null;
 }
 
@@ -547,7 +566,7 @@ function resolveNudge(ctx, intent, base) {
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   if (deliberateStop(thread)) return { ...decision, reason: "owner stopped this turn" };
-  const drivenUntil = ownerDrivenUntil(ctx, intent);
+  const drivenUntil = ownerDrivenUntil(ctx);
   if (drivenUntil) return { ...decision, action: "wait", reason: "owner is driving this thread", notBefore: drivenUntil };
   const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.nudgeCooldownMs;
   const attempts = attemptsWithoutProgress(ledger, ctx.progressMark);
@@ -559,10 +578,21 @@ function resolveNudge(ctx, intent, base) {
   const heldOut = (entry) => now - Date.parse(sentAtOf(entry) ?? "") >= holdMs;
   const reply = replyCheck(ctx, intent.playbook);
   // The owner's "keep going" after that nudge lifts the hold on its answer.
-  const lifted = Date.parse(ledger?.keepGoingAt ?? "") > Date.parse(sentAtOf(reply.last) ?? "");
+  const lifted = Date.parse(ledger?.keepGoingAt ?? "") > Date.parse(sentAtOf(reply.last ?? lastSent(ledger, intent.playbook)) ?? "");
+  const hold = REPLY_AWARE.has(intent.playbook) && !lifted ? ownerHold(ctx, Boolean(reply.wait)) : null;
+  if (hold) return ownerHoldDecision(ctx, decision, hold);
   if (reply.wait && !lifted) {
     if (attempts >= maxAttempts || heldOut(reply.last)) return stuckDecision(ctx, playbook, vars, attempts, decision, `answered the ${clock(sentAtOf(reply.last))} nudge; nothing new since`);
     return { ...decision, action: "wait", reason: reply.wait };
+  }
+  // The same PR, head and blockers as this playbook's last nudge, with no
+  // reply since, is the same nudge whatever its words (dakar got nine
+  // merge-ready nudges on one head): wait, then the owner hears it once.
+  const prior = REPLY_AWARE.has(intent.playbook) && !lifted ? lastSent(ledger, intent.playbook) : null;
+  if (prior && Array.isArray(prior.facts) && sameBlockerSet(prior.facts, reply.facts) && !repliedAfter(thread, prior)) {
+    const why = `same PR, head and blockers as the ${clock(sentAtOf(prior))} nudge; no reply since`;
+    if (heldOut(prior)) return stuckDecision(ctx, playbook, vars, attempts, decision, why);
+    return { ...decision, action: "wait", reason: why };
   }
   if (!intent.immediate) {
     const idleUntil = addMs(latest(thread.lastAgentAt, thread.lastActivityAt), limits.idleBeforeNudgeMs);
@@ -637,13 +667,83 @@ function nudgeFacts(ctx) {
   const failing = (pr?.ci?.failing ?? []).map((name) => fact(name, 60)).filter(Boolean);
   const out = blockers.filter((blocker) => !passiveAmong(blockers)(blocker) && !(failing.length && /^CI red:/.test(blocker))).map((blocker) => fact(blocker, 80));
   for (const name of failing) out.push(`${name} failing`);
-  // A rerun that fails again on the same head is news, even within a minute.
+  // A rerun that fails again on the same head is news, even within a minute;
+  // main's health check failing again on its own schedule is not.
   const failedAt = Date.parse(pr?.ci?.failedAt ?? "");
-  if (failing.length && Number.isFinite(failedAt)) out.push(`checks failed at ${new Date(failedAt).toISOString().slice(11, 19)}Z`);
+  const ownFailure = (pr?.ci?.failing ?? []).some((name) => !isMainHealthCheck(name));
+  if (failing.length && ownFailure && Number.isFinite(failedAt)) out.push(`checks failed at ${new Date(failedAt).toISOString().slice(11, 19)}Z`);
   // The head always counts: a push is news however many checks fail.
   const head = shortSha(pr?.headOid);
   const kept = [...new Set(out)].sort().slice(0, head ? FACTS_KEPT - 1 : FACTS_KEPT);
   return head ? [...kept, `head ${head}`].sort() : kept;
+}
+
+// Two nudges' facts name the same head and blockers (a rerun's time aside).
+const RERUN_FACT = /^checks failed at /;
+function sameBlockerSet(a, b) {
+  const set = (facts) => JSON.stringify((facts ?? []).filter((item) => !RERUN_FACT.test(item)).sort());
+  return Array.isArray(b) && set(a) === set(b);
+}
+
+// A blocker shared with every PR: main's own health check red here. A
+// required gate is named by its label, any other red check by "CI red:".
+function sharedBlocker(blocker, pr) {
+  const text = String(blocker ?? "");
+  const gates = pr?.gates ?? [];
+  const gate = gates.find((item) => text.startsWith(`${item.label || item.name} `));
+  if (gate) return isMainHealthCheck(gate.name) || isMainHealthCheck(gate.label);
+  if (!text.startsWith("CI red: ")) return false;
+  const gateNames = new Set(gates.map((item) => item.name));
+  const failing = (pr?.ci?.failing ?? []).filter((name) => !gateNames.has(name));
+  return failing.length > 0 && failing.every(isMainHealthCheck);
+}
+
+// "Blocked on: your go", "--admin merge", "ready to merge": the owner's step.
+const OWNER_GO = /\byour go\b|--admin\b|\badmin[- ]merg\w*|\bready to merge\b/i;
+
+// A PR no nudge moves: every blocker the agent could clear is shared infra
+// (main red), or the agent answered the last nudge and says it waits on the
+// owner (their go, the merge, an admin merge). One owner question then,
+// keyed on the PR, its head and that blocker set; no nudge until one changes.
+function ownerHold(ctx, answered) {
+  const { pr, thread, classified } = ctx;
+  if (pr?.state !== "OPEN") return null;
+  const blockers = (classified.blockers?.length ? classified.blockers : classified.readiness?.blockers) ?? [];
+  const active = blockers.filter((blocker) => !passiveAmong(blockers)(blocker));
+  const key = shortHash([pr.ref ?? "", pr.headOid ?? "", ...[...active].sort()].join("\n"));
+  // Checks still running may add work of its own: wait for them first.
+  const running = blockers.some(ciRunning) || Boolean(pr.ci?.pending?.length);
+  if (active.length && active.every((blocker) => sharedBlocker(blocker, pr))) return { kind: running ? "wait" : "shared", blockers: active, key };
+  if (!answered) return null;
+  const section = blockedOnSection(thread.lastAgentFull || thread.lastAgentText || "");
+  const onOwner = (section?.items ?? []).some((item) => item.tag === "owner" || OWNER_GO.test(item.text));
+  return onOwner ? { kind: "owner", blockers: active, key } : null;
+}
+
+function ownerHoldDecision(ctx, decision, hold) {
+  const { facts, thread } = ctx;
+  const left = hold.blockers.map((blocker) => fact(blocker, 80)).join("; ");
+  const says = blockedOnLine(thread);
+  const agent = says ? ` Agent: blocked on ${says}.` : "";
+  const dedupeKey = `held:${thread.key}:${hold.key}`;
+  if (hold.kind === "wait") return { ...decision, action: "wait", reason: `only shared blockers left (${left}); checks still running` };
+  if (hold.kind === "shared") {
+    return {
+      ...decision, action: "ask-user", reason: `only shared blockers left: ${left}`,
+      question: question(ctx, `${facts.label}: main CI red blocks it. Help?`,
+        `${facts.prRef} at ${facts.head}: only ${left} left. Main's own health is red for every PR; nudging the agent can't clear it.${agent}`,
+        ["on it", "later"], dedupeKey, "ready")
+    };
+  }
+  return {
+    ...decision, action: "ask-user", reason: `agent answered; waits on the owner${says ? `: ${says}` : ""}`,
+    question: {
+      ...question(ctx, `${facts.label}: waits on your go. OK?`, `${facts.prRef} at ${facts.head}: the agent answered and waits on you.${agent} Left: ${left || "nothing"}.`,
+        ["go ahead", "wait"], dedupeKey, "agent-ask"),
+      askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
+      agentAskedAt: thread.lastAgentAt ?? null
+    }
+  };
 }
 
 function lastSent(ledger, playbookId) {
@@ -800,25 +900,17 @@ function baseDecision(ctx) {
 // The owner wrote in a thread after the supervisor had nudged it, and not
 // just "continue": they took it over, often for something other than its PR.
 // Their conversation outranks the supervisor's agenda for a while. A fresh
-// task the owner starts (no nudge before it) is still followed through. A
-// turn that died mid-work still gets its resume after the short owner-active
-// window, and the laptop-verify guard is the owner's own rule, so both go.
-// So does "CI done" for a run the agent started after the owner's last word:
-// that run is the thread's current work, and the ping is what wakes the
-// agent. If the owner spoke after the wait began, their word holds.
+// task the owner starts (no nudge before it) is still followed through.
+// Every thread nudge waits it out: a resume, the laptop-verify guard and "CI
+// done" too (the audit found five sends inside the hold, the closest 15 min
+// after the owner's word). Only the owner's own "continue" lifts it.
 const CARRY_ON = /^(continue|keep going|go( on| ahead)?|yes|yep|ok(ay)?|proceed|do it|finish( it| up)?|merge( it)?|ship it|get (it|this) (merged|done|across the finish line))\b[\s.!]*$/i;
-function ownerDrivenUntil(ctx, intent) {
-  const { thread, limits, now, classified, ledger } = ctx;
-  if (classified.state === "stopped" || intent.playbook === "no-local-verify") return null;
+function ownerDrivenUntil(ctx) {
+  const { thread, limits, now, ledger } = ctx;
   const text = String(thread.lastUserText ?? "").trim();
   if (text.startsWith(SUPERVISOR_PREFIX) || CARRY_ON.test(text)) return null;
   const at = Date.parse(thread.lastUserAt ?? "");
   if (!Number.isFinite(at)) return null;
-  // The wait began when its oldest open task started (classify's wait age),
-  // not at the agent's last words: it may have acknowledged the owner since.
-  const waitAge = classified.wait?.ageMs;
-  const waitStart = Number.isFinite(waitAge) ? now - waitAge : Date.parse(thread.lastAgentAt ?? "");
-  if (intent.playbook === "ci-finished" && waitStart > at) return null;
   if (!(lastNudgeStart(ledger) < at)) return null;
   const until = at + limits.ownerDrivenMs;
   return until > now ? new Date(until).toISOString() : null;
@@ -883,13 +975,26 @@ function lastPlaybookAt(ledger, playbookId) {
 // with store.setInfraDown so the next tick can see a recovery).
 // Transient kinds, taken together, need several hits or more than one thread
 // inside the fresh window, unless the LB's own probe already says it is
-// unhealthy. no-accounts and auth are never noise.
-function transientCorroborated(entries, lb, limits) {
-  if (lb?.healthy === false) return true;
+// unhealthy. While the LB's watcher vouches for it (a fresh line that reads
+// healthy with no failed requests) they never alarm: the 00:30Z "3x
+// connection" alarm's own watch line read "healthy=yes ... problems: none".
+// no-accounts and auth are never noise.
+function transientCorroborated(entries, probe, vouched, limits) {
+  if (vouched) return false;
+  if (probe === false) return true;
   // An entry without fresh counts (an older reader) counts its hour.
   const count = entries.reduce((sum, entry) => sum + Number(entry.freshCount ?? entry.count), 0);
   const threads = new Set(entries.flatMap((entry) => entry.freshThreadIds ?? entry.threadIds ?? []));
   return count >= (limits.lbTransientErrorMin ?? LB_TRANSIENT_MIN) || threads.size >= 2;
+}
+
+// The LB watcher's last line ("<iso> healthy=yes 280 req ..., problems:
+// none"), written in the last LB_WATCH_FRESH_MS, says the LB is fine.
+function watchVouches(lb, now, limits) {
+  const match = /^(\S+)\s+healthy=(yes|no)\b.*?\bproblems:\s*(.*)$/.exec(String(lb?.watchLine ?? "").trim());
+  const at = Date.parse(match?.[1] ?? "");
+  if (!match || !Number.isFinite(at) || Math.abs(now - at) > (limits.lbWatchFreshMs ?? LB_WATCH_FRESH_MS)) return false;
+  return match[2] === "yes" && /^none\b/i.test(match[3].trim());
 }
 
 export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
@@ -908,15 +1013,21 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   if (slow.quick.length) bb3Problems.push(`${slow.quick.length} bb-quick >${minutes(limits.quickVerifyEscalateMs)}m`);
   if (bb3?.timersDead?.length) bb3Problems.push(`timers dead: ${bb3.timersDead.map((name) => fact(name, 40)).join(", ")}`);
 
+  // The supervisor's own /health probe timing out while the watcher vouches
+  // for the LB is the probe's problem, not the LB's (five "LB unhealthy
+  // (timed out after 5000 ms)" alarms beside "healthy=yes ... problems:
+  // none"): unknown, never an outage.
+  const vouched = watchVouches(lb, now, limits);
+  const probe = lb?.healthy === false && vouched && /^timed out\b/.test(String(lb?.detail ?? "")) ? null : (lb?.healthy ?? null);
   // The log window is an hour; only recent rows say the LB is down now.
   const freshMs = limits.lbErrorFreshMs ?? LB_ERROR_FRESH_MS;
   const freshErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0
     && isFresh(entry.lastAt, freshMs, now));
   const transient = freshErrors.filter((entry) => LB_TRANSIENT_KINDS.has(entry.kind));
-  const keepTransient = transientCorroborated(transient, lb, limits);
+  const keepTransient = transientCorroborated(transient, probe, vouched, limits);
   const lbErrors = freshErrors.filter((entry) => keepTransient || !LB_TRANSIENT_KINDS.has(entry.kind));
   const lbProblems = [];
-  if (lb?.healthy === false) lbProblems.push(`LB unhealthy${lb.detail ? ` (${fact(lb.detail, 80)})` : ""}`);
+  if (probe === false) lbProblems.push(`LB unhealthy${lb.detail ? ` (${fact(lb.detail, 80)})` : ""}`);
   for (const entry of lbErrors) lbProblems.push(`${Number(entry.count)}x ${entry.kind}`);
 
   return {
@@ -927,8 +1038,8 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
       slow
     },
     lb: {
-      down: lb?.healthy === false || lbErrors.some((entry) => entry.kind !== "auth"),
-      up: lb?.healthy === true && lbErrors.length === 0 && lb?.errorsUnknown !== true,
+      down: probe === false || lbErrors.some((entry) => entry.kind !== "auth"),
+      up: probe === true && lbErrors.length === 0 && lb?.errorsUnknown !== true,
       problems: lbProblems
     }
   };
