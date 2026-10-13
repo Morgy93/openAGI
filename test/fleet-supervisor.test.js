@@ -4075,3 +4075,19 @@ test("an owner message that starts during the PR read before a send holds the nu
   assert.deepEqual(made.delivered, []);
   assert.match(snapshot.threads.find((row) => row.key === thread.key).decision.reason, /held: owner answered$/);
 });
+
+// A turn that crashed after its PR merged is resumed on purpose: the judge's
+// words name the merged PR ("PR: repo#7489 MERGED" is in its prompt), which
+// must not make the check before the send cancel it every tick.
+test("a judged resume naming the merged PR of a stopped turn is still sent", async (t) => {
+  const BB = "buildbetter-app/buildbetter";
+  const ref = `${BB}#7489`;
+  const thread = makeThread({ key: "codex:t1", prRefs: [ref], agentStatus: "stalled", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const merged = makePr({ ref, repo: BB, number: 7489, state: "MERGED", mergedAt: ago(60 * MIN) });
+  const judge = fakeJudge({ action: "send", reason: "post-merge cleanup left", message: "#7489 merged; finish the release notes you started, then report." });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map([[ref, merged]]), deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(delivered.map((d) => d.playbook), ["resume"]);
+  assert.match(delivered[0].message, /#7489 merged/);
+  assert.equal(await supervisor.prSettledBeforeSend(thread, merged, { playbook: "infra-recovered", message: "BuildBot3 is up. #7489 merged; continue." }), null);
+});

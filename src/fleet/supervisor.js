@@ -56,6 +56,10 @@ const MAX_MERGED_KEPT = 2_000;
 const PRE_SEND_PR_MS = 10_000;
 // Nudges about the thread's PR itself: one whose PR merged or closed is moot.
 const PR_PLAYBOOKS = new Set(["merge-ready", "ci-finished"]);
+// A stopped or blocked turn's resume goes out whatever its PR says (classify:
+// post-merge work may remain), so a settled PR never cancels one, even when
+// the judge's words name it ("PR: repo#7489 MERGED" is in its prompt).
+const POST_MERGE_PLAYBOOKS = new Set(["resume", "infra-recovered"]);
 // How long a remembered outage thread hidden by a failed source waits for it.
 const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
@@ -1893,7 +1897,7 @@ export class FleetSupervisor {
   async prSettledBeforeSend(thread, pr, decision) {
     const ref = pr?.ref ?? thread?.prRefs?.[0] ?? null;
     const parsed = parsePrRef(ref);
-    if (!parsed || this.skip.github) return null;
+    if (!parsed || this.skip.github || POST_MERGE_PLAYBOOKS.has(decision.playbook)) return null;
     let fresh;
     try {
       const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
