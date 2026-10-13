@@ -154,8 +154,11 @@ enum FleetWatching {
   ]
   /// Collapsed until the owner opens it.
   static let collapsedByDefault: Set<String> = ["quiet"]
-  /// Rows shown before "N more".
-  static let rowLimit = 12
+  /// Rows shown in each open group, so one busy group (16 questions waiting
+  /// on the owner) cannot push the CI and BuildBot3 waits out of sight.
+  static let perGroupLimit = 4
+  /// Rows shown in all before "N more".
+  static let rowLimit = 20
 
   static func label(_ group: String) -> String { labels[group] ?? group }
 
@@ -220,15 +223,15 @@ enum FleetWatching {
     let hidden: Int
   }
 
-  /// At most `limit` rows across open groups, in group order. A collapsed
-  /// group shows only its header and does not use up the limit.
-  static func layout(_ threads: [FleetThread], openGroups: Set<String>, limit: Int = rowLimit) -> Layout {
+  /// At most `perGroup` rows in each open group and `limit` in all, in group
+  /// order. A collapsed group shows only its header and uses up nothing.
+  static func layout(_ threads: [FleetThread], openGroups: Set<String>, limit: Int = rowLimit, perGroup: Int = perGroupLimit) -> Layout {
     var budget = max(0, limit)
     var hidden = 0
     let sections = groups(threads).map { g -> Section in
       let collapsed = collapsedByDefault.contains(g.group) && !openGroups.contains(g.group)
       if collapsed { return Section(group: g.group, label: g.label, total: g.threads.count, collapsed: true, rows: []) }
-      let shown = Array(g.threads.prefix(budget))
+      let shown = Array(g.threads.prefix(min(budget, max(0, perGroup))))
       budget -= shown.count
       hidden += g.threads.count - shown.count
       return Section(group: g.group, label: g.label, total: g.threads.count, collapsed: false, rows: shown)

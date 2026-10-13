@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// "Watching": every coding thread the supervisor watches, grouped by what it
-/// waits on, with how long. One line per thread, at most a dozen, so the
+/// waits on, with how long. One line per thread, a few per group, so the
 /// panel stays short; the rest are on the /fleet page.
 ///
 /// Like SupervisorSection, nothing that changes this view's height is
@@ -92,6 +92,8 @@ struct WatchingList: View {
         }
       }
       .padding(.leading, 10)
+      // Clear of the overlay scroller, which otherwise covers the durations.
+      .padding(.trailing, 14)
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
