@@ -77,6 +77,19 @@ function makeHome(t) {
   return { home, codexHome, config, db, repoDir };
 }
 
+// codex:01a0df66 is the G2 display chat the supervisor opened itself: it got
+// 54 blocked "LB is up" nudges and showed in Watching.
+test("listCodexThreads excludes the supervisor's own display thread", async (t) => {
+  const ctx = makeHome(t);
+  const idleLines = [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "Agent Supervisor connected — monitoring Codex and Claude Code.")];
+  const display = "You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring Codex and Claude Code.";
+  addThread(ctx, { id: "01a0df66-b269-7540-81f5-592808f2e1f1", title: display, firstUserMessage: display, branch: "codex/checkpoint-before-openagi-redesign-20260912", lines: idleLines });
+  addThread(ctx, { id: "t-real", name: "Improve Slack huddle detection", lines: idleLines });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["01a0df66-b269-7540-81f5-592808f2e1f1"].excluded, "self");
+  assert.equal(map["t-real"].excluded, null);
+});
+
 function addThread(ctx, spec) {
   const {
     id, lines = null, mtimeAgo = 30 * MIN, updatedAgo = mtimeAgo, cwd = ctx.repoDir, archived = 0,

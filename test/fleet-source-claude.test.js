@@ -359,6 +359,21 @@ test("exclusions: sidechain, relay, tmp, self, too-short, no-repo", async (t) =>
   assert.equal(threads["nocwd-1"].excluded, "no-repo");
 });
 
+// The G2 display opens Claude chats in ~/Dev/g2 with this prompt; they are
+// the supervisor's own, whatever their history.
+test("a transcript opened with the supervisor display prompt is the supervisor's own", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const display = rowsFor("display-1", cwd, { branch: "main" });
+  writeTranscript(home, cwd, "display-1", [display.prompt("You are the Agent Supervisor display. Reply with exactly: Claude supervisor connected.", iso(31 * MIN)),
+    display.text("Claude supervisor connected.", iso(30 * MIN)), ...display.history(29 * MIN)], NOW - 20 * MIN);
+  const work = rowsFor("work-1", cwd);
+  writeTranscript(home, cwd, "work-1", [work.prompt("Do you have access to all of my sessions?", iso(31 * MIN)), ...work.history(29 * MIN)], NOW - 20 * MIN);
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.equal(threads["display-1"].excluded, "self");
+  assert.equal(threads["work-1"].excluded, null);
+});
+
 test("Conductor-hosted transcripts are flagged", async (t) => {
   const home = makeHome(t);
   for (const [id, cwd, entrypoint] of [

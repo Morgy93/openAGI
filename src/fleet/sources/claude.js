@@ -7,8 +7,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, isPidAlive as defaultIsPidAlive, parseJsonLines, parsePrRef, prRefKey, readTail,
-  redactSecrets, threadKey, toIso
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, isPidAlive as defaultIsPidAlive, isSupervisorOwnPrompt, parseJsonLines, parsePrRef, prRefKey,
+  readTail, redactSecrets, threadKey, toIso
 } from "../contracts.js";
 
 const DEFAULT_TAIL_BYTES = 2 * 1024 * 1024;
@@ -156,7 +156,7 @@ function emptySummary() {
     customTitle: null, aiTitle: null, agentName: null,
     prRefs: [], textTurns: 0, phase: null, model: null,
     lastAgentText: "", lastAgentAt: null, lastUserText: "", lastUserAt: null, turnStartedAt: null, lastSupervisorAt: null,
-    lastTurnAt: null, abortedAt: null, apiError: null, retryError: null,
+    lastTurnAt: null, abortedAt: null, apiError: null, retryError: null, firstUserText: null,
     toolDescriptions: new Map(), tasks: new Map()
   };
 }
@@ -197,6 +197,8 @@ function onUser(summary, row) {
   if (/^<(command-name|local-command-)/.test(text)) return;
   summary.phase = "in-progress";
   summary.turnStartedAt = toIso(row.timestamp);
+  // The first prompt read names a supervisor display chat.
+  summary.firstUserText ??= text;
   if (isOwnerText(row, text)) {
     summary.lastUserText = text;
     summary.lastUserAt = toIso(row.timestamp);
@@ -276,7 +278,7 @@ function newestFirstUnique(refs) {
 
 function exclusionReason(id, summary, prRefs, config) {
   if (summary.sidechain) return "sidechain";
-  if ((config.selfSessionIds ?? []).includes(id)) return "self";
+  if ((config.selfSessionIds ?? []).includes(id) || isSupervisorOwnPrompt(summary.firstUserText)) return "self";
   const { cwd } = summary;
   if (cwd && (isUnder(cwd, config.paths.relayCwd) || cwd.includes("/.agent-supervisor/"))) return "relay";
   if (cwd && TMP_ROOTS.some((root) => isUnder(cwd, root))) return "tmp";

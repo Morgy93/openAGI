@@ -333,6 +333,61 @@ export async function fetchPrStates(refs, config, { run = runCommand, unread = n
   return out;
 }
 
+const LITE_BATCH_SIZE = 50;
+
+export function buildPrStateQuery(refs) {
+  const byRepo = new Map();
+  for (const { repo, number } of refs) {
+    if (!byRepo.has(repo)) byRepo.set(repo, []);
+    byRepo.get(repo).push(number);
+  }
+  const repos = [...byRepo].map(([repo, numbers], index) => {
+    const [owner, name] = repo.split("/");
+    const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){number state mergedAt closedAt updatedAt}`).join(" ");
+    return `r${index}: repository(owner:"${owner}",name:"${name}"){ ${pulls} }`;
+  });
+  return `query { rateLimit{cost remaining}\n${repos.join("\n")} }`;
+}
+
+// Just each PR's state, for choosing among a thread's PRs and for the
+// check right before a send. ref -> { state, mergedAt, closedAt, updatedAt },
+// or null when GitHub answered that the number is no PR (an issue, or a
+// "#123" that never was one). A ref GitHub could not answer is left out and
+// added to unread.
+export async function fetchPrStateLite(refs, config, { run = runCommand, unread = null } = {}) {
+  const out = new Map();
+  const parsed = uniqueRefs(refs);
+  for (let index = 0; index < parsed.length; index += LITE_BATCH_SIZE) {
+    const batch = parsed.slice(index, index + LITE_BATCH_SIZE);
+    const miss = (list) => { for (const ref of list) unread?.add(prRefKey(ref.repo, ref.number)); };
+    let result;
+    try {
+      result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrStateQuery(batch)}`], { timeoutMs: GH_TIMEOUT_MS });
+    } catch {
+      miss(batch);
+      continue;
+    }
+    // A number that is no PR fails only its own alias: gh exits non-zero
+    // but still prints the rest.
+    const data = parseJson(result?.stdout)?.data;
+    if (!data || typeof data !== "object") {
+      miss(batch);
+      continue;
+    }
+    const aliases = new Map();
+    for (const ref of batch) if (!aliases.has(ref.repo)) aliases.set(ref.repo, `r${aliases.size}`);
+    for (const ref of batch) {
+      const repoNode = data[aliases.get(ref.repo)];
+      if (!repoNode || typeof repoNode !== "object") { miss([ref]); continue; }
+      const node = repoNode[`p${ref.number}`];
+      const key = prRefKey(ref.repo, ref.number);
+      if (!node || typeof node !== "object") { out.set(key, null); continue; }
+      out.set(key, { state: node.state ?? null, mergedAt: node.mergedAt ?? null, closedAt: node.closedAt ?? null, updatedAt: node.updatedAt ?? null });
+    }
+  }
+  return out;
+}
+
 // Exit 0: the local head is inside the PR (later commits came from GitHub).
 // Exit 1: the local head has work the PR lacks. Anything else is unknown.
 async function headInPr(run, config, cwd, head, prHead) {

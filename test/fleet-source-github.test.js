@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
-  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
+  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStateLite, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
 } from "../src/fleet/sources/github.js";
 
 const BBAPP = "buildbetter-app/buildbetter";
@@ -610,4 +610,24 @@ test("a status with no matching time never loses to a stale green check run", as
   assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "FAILURE", createdAt: "2026-09-26T06:00:00Z" })), "SUCCESS");
   // No time on the status: the non-passing result wins.
   assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "PENDING" })), "PENDING");
+});
+
+test("fetchPrStateLite reads only states, tells a number that is no PR from an unread one", async () => {
+  const calls = [];
+  const run = async (cmd, args) => {
+    calls.push(args.at(-1));
+    // gh exits 1 on the partial error for #9 (an issue) but prints the rest.
+    return { code: 1, stdout: JSON.stringify({ data: { r0: { p7089: { number: 7089, state: "OPEN", mergedAt: null, closedAt: null, updatedAt: "2026-10-12T17:54:01Z" }, p9: null }, r1: null } }) };
+  };
+  const unread = new Set();
+  const states = await fetchPrStateLite(["buildbetter-app/buildbetter#7089", "buildbetter-app/buildbetter#9", "acme/gone#1"], { bins: { gh: "gh" } }, { run, unread });
+  assert.deepEqual(states.get("buildbetter-app/buildbetter#7089"), { state: "OPEN", mergedAt: null, closedAt: null, updatedAt: "2026-10-12T17:54:01Z" });
+  assert.equal(states.get("buildbetter-app/buildbetter#9"), null);
+  assert.equal(states.has("acme/gone#1"), false);
+  assert.deepEqual([...unread], ["acme/gone#1"]);
+  assert.doesNotMatch(calls[0], /comments|files|reviewThreads/);
+  const failed = new Set();
+  const none = await fetchPrStateLite(["buildbetter-app/buildbetter#7089"], { bins: { gh: "gh" } }, { run: async () => { throw new Error("timeout"); }, unread: failed });
+  assert.equal(none.size, 0);
+  assert.deepEqual([...failed], ["buildbetter-app/buildbetter#7089"]);
 });
