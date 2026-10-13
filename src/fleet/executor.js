@@ -37,6 +37,11 @@ function within(promise, ms) {
 // ceiling the send stops waiting on it and leaves it running: killing it
 // killed a live Codex turn (019fe344, 21:08Z).
 const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// A turn left running past the ceiling holds its thread this much longer at
+// most. One that never exits (a stalled network read, a prompt nobody sees)
+// would otherwise block every later send to it until the supervisor
+// restarted; it is still never killed.
+const DETACHED_RELEASE_MS = 4 * 60 * 60 * 1000;
 // After the ceiling, SIGTERM gets this long before SIGKILL settles the send.
 const KILL_GRACE_MS = 10_000;
 // Codex exec echoes everything it runs (logs reached 168 MB), so only the
@@ -283,7 +288,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
 // the supervisor saw, to spot shared titles; uiLock: one UI send at a time.
 // refreshThread: (thread) => the same thread read again now, or null; a
 // background route after a presence block needs it for Conductor chats.
-export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK } = {}) {
+export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK, detachedReleaseMs = DETACHED_RELEASE_MS } = {}) {
   const runner = run ?? runCommand;
   // An injected run (tests, dry harnesses) also serves the background routes.
   const background = spawnBackground ?? (run ? run : spawnWithTail);
@@ -502,13 +507,24 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       });
     };
     // A turn still running at the ceiling is left running, never killed: the
-    // thread stays in flight until it ends.
+    // thread stays in flight until it ends, or at most detachedReleaseMs.
     let detached = false;
     let exited = false;
+    let released = false;
+    let releaseTimer = null;
     const ended = () => active.delete(thread.key);
     const onExit = (result) => {
       exited = true;
+      clearTimeout(releaseTimer);
       try { settle(result); } catch { /* journaling is best-effort */ }
+      // Released earlier: a newer send may hold the thread now.
+      if (!released) ended();
+    };
+    const release = () => {
+      if (exited) return;
+      released = true;
+      const hours = Math.round((BACKGROUND_TIMEOUT_MS + detachedReleaseMs) / 3_600_000);
+      if (id) journal(id, { running: true, detail: `still running after ${hours} h: left running, no longer holds the thread` });
       ended();
     };
     const task = Promise.resolve()
@@ -517,7 +533,10 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       .then((result) => {
         if (result?.detached) {
           detached = true;
-          if (id && !exited) journal(id, { running: true, detail: `still running after ${Math.round(BACKGROUND_TIMEOUT_MS / 60_000)} min: left running, not killed` });
+          if (exited) return;
+          if (id) journal(id, { running: true, detail: `still running after ${Math.round(BACKGROUND_TIMEOUT_MS / 60_000)} min: left running, not killed` });
+          releaseTimer = setTimeout(release, detachedReleaseMs);
+          releaseTimer.unref?.();
           return;
         }
         const ok = !result?.error && !result?.timedOut && result?.code === 0;

@@ -403,6 +403,31 @@ test("a background resume still running at the ceiling stays in flight, journale
   assert.deepEqual(executor.inFlight(), []);
 });
 
+// A codex exec or claude resume that never exits (a stalled network read,
+// a prompt nobody sees) held its thread "in flight" until the supervisor
+// restarted: every resume, CI-done ping and owner answer was refused.
+test("a detached turn that never exits stops holding its thread after a second ceiling", async (t) => {
+  const { home, cwd, config, store } = setup(t);
+  const runs = [];
+  const run = (cmd, args, opts = {}) => { runs.push(opts); return Promise.resolve({ code: null, timedOut: false, detached: true, error: null, tail: "working" }); };
+  const executor = createExecutor({ config, run, store, logDir: path.join(home, "fleet", "logs"), detachedReleaseMs: 30 });
+  const sent = await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec", playbook: "resume" });
+  await executor.whenIdle();
+  assert.deepEqual(executor.inFlight(), ["codex:t1"]);
+  assert.match((await executor.deliver({ thread: codexThread(cwd), message: "CI done", route: "codex-exec" })).detail, /^in flight/);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(executor.inFlight(), [], "released, never killed");
+  assert.equal(store.action(sent.actionId).running, true);
+  assert.match(store.action(sent.actionId).detail, /no longer holds the thread/);
+  const next = await executor.deliver({ thread: codexThread(cwd), message: "CI done", route: "codex-exec" });
+  assert.equal(next.status, "sent");
+  await executor.whenIdle();
+  // The old turn ending later leaves the newer send in flight.
+  runs[0].onExit({ code: 0, timedOut: false, error: null, tail: "done" });
+  assert.equal(store.action(sent.actionId).status, "done");
+  assert.deepEqual(executor.inFlight(), ["codex:t1"]);
+});
+
 test("a background send reports later whether it reached the agent", async (t) => {
   const failed = setup(t, { results: [{ code: 1, stderr: "error: thread has an active writer" }] });
   const sent = await failed.executor.deliver({ thread: codexThread(failed.cwd), message: "Owner answer: Starter.", route: "codex-exec" });
