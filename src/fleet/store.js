@@ -786,8 +786,11 @@ export class FleetStore {
   }
 
   // An open agent ask on the same thread from an older agent message takes
-  // this newer ask in place. Its review and wording start over; its expiry
-  // does not (one question per agent per day at most).
+  // this newer ask in place. Its review and wording start over. The same
+  // question restated (both ask to merge, or the same words) keeps its push
+  // and its expiry; a different one is put to the owner anew, with its own
+  // day and push (milan: a new decision 23 h into an old ask would expire
+  // an hour later, never pushed, then stay quiet a day).
   _supersedeAgentAsk(key, fields, origin, head, now) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
     const askedAt = toMs(origin.agentAskedAt, null);
@@ -795,9 +798,12 @@ export class FleetStore {
     const older = this.state.questions.find((q) => q.status === "open" && q.kind === "agent-ask" && q.threadKey === fields.threadKey
       && toMs(q.agentAskedAt, null) !== null && toMs(q.agentAskedAt, 0) < askedAt);
     if (!older) return null;
+    const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+    const restated = (older.mergeAsk && fields.mergeAsk) || norm(older.title) === norm(fields.title) || (Boolean(norm(fields.body)) && norm(older.body) === norm(fields.body));
     Object.assign(older, fields, origin, {
       dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
-      supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {})
+      supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
+      ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
     });
     this._save();
     return { ...older, superseded: true };

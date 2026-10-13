@@ -737,3 +737,35 @@ test("a newer ask from the same agent takes its open question in place", (t) => 
   assert.notEqual(store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:9953b207:cccc", title: "old", agentAskedAt: "2026-10-12T15:00:00.000Z" }).id, first.id);
   assert.notEqual(store.upsertQuestion({ ...base, threadKey: "conductor:other", dedupeKey: "ask:conductor:other:dddd", title: "other", agentAskedAt: "2026-10-12T18:00:00.000Z" }).id, first.id);
 });
+
+// milan 1941cea4 asked "who gets the free Coda token?" at 04:38Z. A new
+// decision from the same agent 23 h later took that open question over with
+// its push spent and its day nearly gone: it expired an hour later, never
+// pushed, then stayed quiet a day.
+test("a different ask that supersedes an open one gets its own day and push", (t) => {
+  const now = clock(Date.parse("2026-10-12T04:38:00.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:1941cea4", options: ["yes", "no"], askContext: "Blocked on: your call." };
+  const coda = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:aaaa", title: "milan: who gets the free Coda token?", body: "Who gets the free Coda token?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  store.markQuestionNotified(coda.id, { outreachId: "out_1", pushedAt: new Date(now()).toISOString() });
+  now.advance(23 * HOUR);
+  const deploy = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:bbbb", title: "milan: approve production deploy?", body: "Approve the production deploy?", agentAskedAt: "2026-10-13T03:37:00.000Z" });
+  assert.equal(deploy.id, coda.id);
+  assert.equal(deploy.superseded, true);
+  assert.equal(deploy.pushedAt, null, "the new decision is pushed");
+  now.advance(2 * HOUR);
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [coda.id], "not expired on the old ask's day");
+  now.advance(22 * HOUR);
+  assert.deepEqual(store.openQuestions(), []);
+  // The same question restated keeps its push and its day.
+  const later = clock(Date.parse("2026-10-12T04:38:00.000Z"));
+  const again = new FleetStore({ dir: tempDir(t), now: later });
+  const first = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:cccc", title: "milan: who gets the free Coda token?", body: "Who gets it?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  again.markQuestionNotified(first.id, { outreachId: "out_2", pushedAt: new Date(later()).toISOString() });
+  later.advance(23 * HOUR);
+  const restated = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:dddd", title: "milan: who gets the free Coda token?", body: "Still: who gets the token?", agentAskedAt: "2026-10-13T03:37:00.000Z" });
+  assert.equal(restated.id, first.id);
+  assert.ok(restated.pushedAt);
+  later.advance(2 * HOUR);
+  assert.deepEqual(again.openQuestions(), []);
+});
