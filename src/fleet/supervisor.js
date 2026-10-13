@@ -14,7 +14,7 @@ import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
+import { agentAskKey, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
@@ -186,14 +186,46 @@ function replyMark(thread) {
   return shortHash(`${reply.at ?? ""}\n${reply.text}`);
 }
 
-// The judge's question: its title and choices, for the agent message it
-// was read from. Not the free-text body, which a re-read words differently:
-// the same ask for the same reply stays one question (and an answer to it
-// keeps it quiet), while a new reply may ask anew.
-export function judgeAskKey(thread, question) {
-  const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
-  const options = (question.options ?? []).map(norm).sort();
-  return `judge:${thread.key}:${shortHash([norm(question.title), options.join("|"), replyMark(thread)].join("\n"))}`;
+// The judge's question is the agent's ask, keyed like the policy's own
+// (agentAskKey): on the agent message it was read from, never its wording.
+// A reread that words it differently updates the same question in place
+// (and an answer to it keeps it quiet), while a new reply may ask anew.
+export function judgeAskKey(thread, _question = null) {
+  const reply = agentReply(thread);
+  return agentAskKey(thread.key, { at: reply.at, text: reply.text });
+}
+
+// A judge question that asks to merge holds like the policy's merge asks.
+function asksToMerge(question) {
+  return /\bmerg/i.test([question?.title, ...(question?.options ?? [])].join(" "));
+}
+
+// Asks that stand until settled, not while the thread's state reads a
+// certain way: a waiting-ci <-> needs-human flicker leaves them open.
+const STANDING_KINDS = new Set(["agent-ask", "ready"]);
+
+// Why an open standing ask no longer needs the owner, or null. The owner's
+// answer closes it elsewhere. A ready PR settles when it merges, closes or
+// moves past the asked head. An agent's ask also settles when its thread is
+// gone or muted, or (unless it asks to merge) when the agent spoke since and
+// no longer asks: it withdrew or answered it itself.
+// prMissing: GitHub answered and has no such PR.
+export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false } = {}) {
+  const askedAt = Date.parse(question.agentAskedAt ?? question.createdAt ?? "");
+  if (question.kind === "ready" && prMissing) return "PR not found";
+  if (pr && SETTLED_PR_STATES.has(pr.state)) {
+    // An ask made after the merge (a release, QA on it) is not about it.
+    const settledAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+    const after = question.kind === "ready" || !Number.isFinite(settledAt) || !Number.isFinite(askedAt) || settledAt >= askedAt;
+    if (after) return `${parsePrRef(pr.ref)?.number ? `#${parsePrRef(pr.ref).number}` : "PR"} ${pr.state === "MERGED" ? "merged" : "closed"}`;
+  }
+  if (pr?.state === "OPEN" && question.askedHead && pr.headOid && pr.headOid !== question.askedHead) return `PR head moved past ${String(question.askedHead).slice(0, 10)}`;
+  if (question.kind !== "agent-ask") return null;
+  if (muted) return "muted by owner";
+  if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
+  const spokeAt = Date.parse(agentReply(thread).at ?? "");
+  if (!question.mergeAsk && thread && Number.isFinite(spokeAt) && Number.isFinite(askedAt) && spokeAt > askedAt) return "agent moved on: no longer asks";
+  return null;
 }
 
 // pending: the judge has not read the chat (a failure, the per-scan cap), so
@@ -841,7 +873,7 @@ export class FleetSupervisor {
       const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
       // The judge does not read a thread whose answer waits (judgeNudges),
       // so its ask is not asked again: it stands until the agent speaks.
-      const judgeAsk = String(question.dedupeKey ?? "").startsWith("judge:");
+      const judgeAsk = question.askedBy === "judge";
       const stale = (question.kind === "agent-ask" || question.kind === "agent-card") && !judgeAsk ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
@@ -1403,7 +1435,10 @@ export class FleetSupervisor {
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
     const unreadPrs = new Set();
-    const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs), unreadPrs);
+    // An open question's PR is read too, even once its thread moved to
+    // another PR or left the scan: its merge settles the question.
+    const askedPrs = this.store.openQuestions().map((question) => question.prRef);
+    const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs, askedPrs), unreadPrs);
 
     const infra = {
       bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
@@ -1498,7 +1533,7 @@ export class FleetSupervisor {
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1634,6 +1669,8 @@ export class FleetSupervisor {
         options: verdict.question.options,
         dedupeKey: judgeAskKey(thread, verdict.question),
         kind: "agent-ask",
+        mergeAsk: asksToMerge(verdict.question),
+        askedBy: "judge",
         askContext: clampTail(redactSecrets(reply.text), limits.excerptMax),
         agentAskedAt: reply.at ?? null
       }
@@ -1754,9 +1791,9 @@ export class FleetSupervisor {
     }
   }
 
-  async fetchPrs(inScope, config, run, sourceErrors, unread = new Set()) {
+  async fetchPrs(inScope, config, run, sourceErrors, unread = new Set(), extraRefs = []) {
     if (this.skip.github) return new Map();
-    const refs = [...new Set(inScope.map((thread) => thread.prRefs?.[0]).filter((ref) => parsePrRef(ref)))];
+    const refs = [...new Set([...inScope.map((thread) => thread.prRefs?.[0]), ...extraRefs].filter((ref) => parsePrRef(ref)))];
     if (!refs.length) return new Map();
     try {
       const fetch = this.deps.fetchPrStates ?? github.fetchPrStates;
@@ -1785,7 +1822,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1825,7 +1862,8 @@ export class FleetSupervisor {
       const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
-      const question = store.upsertQuestion(fields);
+      // The head it is asked at: a move past it settles the ask (settledAsk).
+      const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
@@ -1953,15 +1991,17 @@ export class FleetSupervisor {
       if (action.kind !== "storage" && !seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
-    // decided again this tick without asking.
+    // decided again this tick without asking. An agent's own ask and a
+    // ready PR stand until settled (settledAsk), whatever the state reads.
     for (const question of store.openQuestions()) {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
       // A failed disk read is unknown: its questions wait for a good one.
       if (storageUnknown && String(question.dedupeKey ?? "").startsWith("infra:storage:")) continue;
       const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
-      // The judge has not read this chat again yet: its question stands.
-      if (decided?.judgePending && String(question.dedupeKey ?? "").startsWith("judge:")) continue;
+      // The judge has not read this chat again yet: whether the agent still
+      // asks is unknown, so its question stands.
+      if (decided?.judgePending && question.askedBy === "judge") continue;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
@@ -1973,6 +2013,16 @@ export class FleetSupervisor {
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       // A group member a capped scan left out may still be failing.
       if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;
+      if (STANDING_KINDS.has(question.kind)) {
+        const ref = question.prRef ?? known?.prRefs?.[0] ?? null;
+        const prMissing = Boolean(parsePrRef(ref)) && !this.skip.github && !prs.has(ref) && !unreadPrs.has(ref);
+        const reason = settledAsk(question, { thread: known, pr: prs.get(ref), prMissing, threadGone, muted: decided?.reason === "muted by owner" });
+        if (reason) {
+          store.resolveQuestion(question.id, reason);
+          this.resolveOutreach(question, "resolved", "dismissed");
+        }
+        continue;
+      }
       if (decided || supervisorOwned || threadGone) {
         const reason = decided ? `${decided.state}: ${decided.reason}` : threadGone ? `thread ${known?.excluded ?? "left the scan"}` : "no longer asked";
         store.resolveQuestion(question.id, reason);
@@ -2172,7 +2222,8 @@ export class FleetSupervisor {
         sources,
         byState,
         byWatch,
-        needsYou: this.store.openQuestions().length,
+        // Only questions the owner can see (getState hides ones held for review).
+        needsYou: this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id)).length,
         actions: decisions.filter((decision) => SENDING.has(decision.action)).length
       },
       manager: manager ? { key: manager.key, title: clampText(manager.title, 80), live: Boolean(manager.live), agentStatus: manager.agentStatus, error: manager.error?.kind ?? null } : null,

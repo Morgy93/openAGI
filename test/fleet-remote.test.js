@@ -333,13 +333,14 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
   glance();
   assert.deepEqual(pings, [copy.id]);
 
-  // Blip: the ask drops out for one tick, then is back within the hour.
+  // Blip: the ask drops out of the read for one tick (the agent wrote
+  // nothing new), then is back. The agent's ask stands throughout.
   lastAgentText = 'Pushed.';
   now += 10 * 60_000;
   await mac.tick();
-  assert.deepEqual(mac.getState().questions, []);
+  assert.deepEqual(mac.getState().questions.map(q => q.id), [question.id]);
   await remote.refresh();
-  assert.equal(outreach.get(copy.id).status, 'dismissed');
+  assert.notEqual(outreach.get(copy.id).status, 'dismissed');
   glance();
 
   lastAgentText = ask;
@@ -348,8 +349,8 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
   const [back] = mac.getState().questions;
   assert.equal(back.id, question.id);
   await remote.refresh();
-  assert.deepEqual(outreach.list().map(item => [item.id, item.status]), [[copy.id, 'seen']]);
-  assert.deepEqual(events.filter(([name]) => name === 'outreach'), [['outreach', copy.id], ['outreach', copy.id]], 'appended, then reopened for the Mac overlay');
+  assert.deepEqual(outreach.list().map(item => [item.id, item.status]), [[copy.id, 'unseen']]);
+  assert.deepEqual(events.filter(([name]) => name === 'outreach'), [['outreach', copy.id]], 'appended once, never closed and reopened');
   glance();
   assert.deepEqual(pings, [copy.id], 'no second ping on the glasses');
   assert.deepEqual(g2.dispatch('glasses', { op: 'feed' }).items.map(item => [item.id, item.notified]), [[copy.id, true]]);

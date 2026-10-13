@@ -6,7 +6,7 @@ import path from "node:path";
 import { classifyThread } from "../src/fleet/classify.js";
 import { DEFAULTS, shortHash } from "../src/fleet/contracts.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks } from "../src/fleet/playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
+import { agentAskKey, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -1065,13 +1065,27 @@ test("owner labels use repo and PR, then the folder, then the Codex app name", (
 });
 
 // Review 7: a structured ask with its own key is deduped on it, so a new
-// stand-in text still matches the owner's dismissal. Others keep text keys.
-test("a keyed structured ask dedupes on its key; the rest on their text", () => {
+// stand-in text still matches the owner's dismissal. The rest key on the
+// agent message they came from, never on its words (audit 2026-10-12:
+// TitansRTS #3 got 10 question ids for one unchanged ask at 05:47Z).
+test("a keyed structured ask dedupes on its key; the rest on when the agent asked", () => {
   const pending = (extra) => makeThread({ meta: { pendingQuestion: { text: "Checked the notes. Should I fix it?", options: ["open thread"], at: ago(20 * MIN), ...extra } } });
   assert.equal(run(pending({ key: "45673228c2da450b" })).decision.question.dedupeKey, "ask:conductor:s1:45673228c2da450b");
-  assert.equal(run(pending({})).decision.question.dedupeKey, `ask:conductor:s1:${shortHash("Checked the notes. Should I fix it?")}`);
+  const asked = `ask:conductor:s1:${shortHash(`at:${ago(30 * MIN)}`)}`;
+  assert.equal(run(pending({})).decision.question.dedupeKey, asked);
   const text = "Want me to cut the production release?";
-  assert.equal(run(makeThread({ lastAgentText: text })).decision.question.dedupeKey, `ask:conductor:s1:${shortHash(text)}`);
+  assert.equal(run(makeThread({ lastAgentText: text })).decision.question.dedupeKey, asked);
+  assert.equal(run(makeThread({ lastAgentText: "Should I cut the production release now?" })).decision.question.dedupeKey, asked, "reworded, same message time: same ask");
+  assert.notEqual(run(makeThread({ lastAgentText: text, lastAgentAt: ago(5 * MIN) })).decision.question.dedupeKey, asked, "a newer message is a new ask");
+  assert.equal(run(makeThread({ lastAgentText: text, lastAgentAt: null })).decision.question.dedupeKey, `ask:conductor:s1:${shortHash(text)}`, "no time known: its text");
+  assert.equal(agentAskKey("conductor:s1", { at: ago(30 * MIN), text: "anything" }), asked, "the judge keys the same ask the same way");
+});
+
+// Audit 2026-10-12: #7352 "admin merge ok?" closed twice on CI flicker.
+test("an ask to merge is marked so it holds until answered or merged", () => {
+  assert.equal(run(makeThread({ lastAgentText: "Merging still needs your explicit go, and #7352 needs \"admin merge\" because you authored it." })).decision.question.mergeAsk, true);
+  assert.equal(run(makeThread({ lastAgentText: "Resumed. Wave 2 moves to acceptance.\n\n- **Merges:** need your explicit go. #7352 also needs \"admin merge\"." })).decision.question.mergeAsk, true);
+  assert.equal(run(makeThread({ lastAgentText: "Want me to cut the production release?" })).decision.question.mergeAsk, false);
 });
 
 // Review 8: a PR done before the agent last spoke is not what it asks about.

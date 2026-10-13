@@ -458,6 +458,21 @@ function cardIntent(ctx, card) {
   return { type: "ask", reason: "agent asks: question card", question, card: true };
 }
 
+// Asks to merge hold until the owner answers or the PR merges, whatever the
+// agent says meanwhile ("Merges: need your explicit go." reads as a decision).
+const MERGE_TOPICS = new Set(["admin", "merge"]);
+const MERGE_WORDS = /\bmerg/i;
+
+// An agent's own ask, keyed on its thread and the agent message it came from
+// (when it was written), never on its wording: a reread or a reworded judge
+// question for the same ask stays one question. A structured ask brings its
+// own id; with no time known, the ask's text stands in.
+export function agentAskKey(threadKey, { id = null, at = null, text = "" } = {}) {
+  const atMs = Date.parse(at ?? "");
+  const which = id ?? (Number.isFinite(atMs) ? shortHash(`at:${new Date(atMs).toISOString()}`) : shortHash(String(text ?? "")));
+  return `ask:${threadKey}:${which}`;
+}
+
 function agentAskIntent(ctx) {
   const { classified, thread } = ctx;
   const ask = classified.ask ?? {};
@@ -494,7 +509,8 @@ function agentAskIntent(ctx) {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
     question: {
       ...question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
-        `ask:${thread.key}:${ask.key ?? shortHash(ask.text ?? "")}`, "agent-ask"),
+        agentAskKey(thread.key, { id: ask.key ?? null, at: thread.lastAgentAt, text: ask.text ?? "" }), "agent-ask"),
+      mergeAsk: MERGE_TOPICS.has(ask.topic) || MERGE_WORDS.test(ask.text ?? ""),
       // The body is only the ask sentence; the review needs what it is about.
       askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
       agentAskedAt: thread.lastAgentAt ?? null

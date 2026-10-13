@@ -360,3 +360,35 @@ test("the owner's workspace notes go into the review's instructions, not the dat
   await reviewQuestions({ questions: [question()], now: NOW, runModel });
   assert.equal(requests[1].system.includes("owner's notes"), false);
 });
+
+// Audit 2026-10-12: remote-dev-setup #1's "merge now or wait clean review?"
+// (conductor:d1dbe71a, asked 19:27Z) was closed as done-elsewhere on the
+// owner's "admin merge" at 00:35:59Z in sibling session conductor:0056f770,
+// which was about #7611.
+test("done-elsewhere needs a related thread that names this PR, not a bare owner reply there", async () => {
+  const asked = question({
+    id: "fq_73d009284867404c", dedupeKey: "ask:conductor:d1dbe71a:62f2845cb64abc40", threadKey: "conductor:d1dbe71a", prRef: "buildbetter-app/remote-dev-setup#1",
+    title: "remote-dev-setup #1: merge now or wait clean review?", body: "Merge now, or wait for a clean Codex review?", options: ["merge now", "wait"],
+    agentAskedAt: "2026-10-13T00:27:48.881Z", createdAt: "2026-10-13T00:29:58.790Z"
+  });
+  const own = thread({ key: "conductor:d1dbe71a", id: "d1dbe71a", workspace: "remote-dev", repo: "buildbetter-app/remote-dev-setup", prRefs: ["buildbetter-app/remote-dev-setup#1"],
+    lastAgentText: "Merge now, or wait for a clean Codex review?", lastAgentAt: "2026-10-13T00:27:48.881Z", lastUserText: "fix the P1s", lastUserAt: "2026-10-12T15:11:00.000Z" });
+  const sibling = (lastAgentText) => thread({ key: "conductor:0056f770", id: "0056f770", workspace: "remote-dev", repo: "buildbetter-app/remote-dev-setup", prRefs: ["buildbetter-app/remote-dev-setup#1"],
+    lastAgentText, lastAgentAt: "2026-10-13T01:28:23.917Z", lastUserText: "admin merge", lastUserAt: "2026-10-13T00:35:59.732Z", lastActivityAt: "2026-10-13T01:28:23.917Z" });
+  const pr = { ref: "buildbetter-app/remote-dev-setup#1", number: 1, state: "OPEN", isDraft: false, ci: { state: "SUCCESS" } };
+  const review = async (siblingText) => {
+    const threads = new Map([[own.key, own], ["conductor:0056f770", sibling(siblingText)]]);
+    const [verdict] = await reviewQuestions({
+      questions: [asked], now: Date.parse("2026-10-13T01:34:00.000Z"),
+      contextFor: (q) => reviewContext(q, { threads, prs: new Map([[pr.ref, pr]]) }),
+      runModel: async () => ({ reviews: [{ id: asked.id, decision: "close", category: "done-elsewhere", reason: "Related remote-dev-setup#1 thread (conductor:0056f770) shows the owner replying 'admin merge' at 2026-10-13T00:35:59Z, after this ask." }] })
+    });
+    return verdict;
+  };
+  const kept = await review("**01:27 UTC:** #7584's re-verify passed, but it still took 42 minutes even with the builder test down to 4. Something else is slow. Want either, or both?");
+  assert.equal(kept.decision, "keep");
+  assert.match(kept.reason, /^no related thread names this PR/);
+  // A sibling whose own words name #1 can settle it; #10 or #1234 do not.
+  assert.equal((await review("Admin-merged #10 and #1234.")).decision, "keep");
+  assert.equal((await review("Admin-merged #1 at f433206 as you asked.")).decision, "close");
+});
