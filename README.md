@@ -489,6 +489,7 @@ Run `openagi models` to see the plan — which job runs on which model, why each
 | `OPENAI_MODEL_MINI` / `ANTHROPIC_MODEL_MINI` | Mini tier — memory condensing, session mining, daily recap. e.g. `gpt-5-mini`. |
 | `OPENAI_MODEL_NANO` / `ANTHROPIC_MODEL_NANO` | Nano tier — proactive observer, scrutiny judges (short, very frequent). e.g. `gpt-5-nano`. |
 | `OPENAI_MODEL_TASK_<JOB>` | Pin one job to an exact model (wins over its tier). Jobs: `OBSERVER`, `SCRUTINY`, `CONDENSE`, `MINE`, `PLAN`, `CHAT`, `AUTOPILOT`. |
+| `OPENAI_REASONING_EFFORT_TASK_<JOB>` | Reasoning effort for one job (wins over `OPENAI_REASONING_EFFORT`). e.g. `OPENAI_REASONING_EFFORT_TASK_CHAT=high`. |
 
 Recommended starting point for OpenAI: `OPENAI_MODEL=gpt-5`, `OPENAI_MODEL_MINI=gpt-5-mini`, `OPENAI_MODEL_NANO=gpt-5-nano`. The ledger records the **actual** model each call used, so `openagi status` / `/budget` show where the money really goes.
 

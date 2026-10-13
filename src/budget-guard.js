@@ -16,6 +16,14 @@ const DEFAULT_PRICES = {
   // 25x luna's real input price, against a daily cap that silences the agent
   // when it trips.
   "gpt-5.6-luna": { in: 0.2, out: 1.2, cacheRead: 0.02, cacheWrite: 0 },
+  // gpt-6 pairs a flagship (astra) with a cheap variant (luna) at 100x apart.
+  // Neither key is a prefix of the other, so a dated suffix like
+  // "gpt-6-luna-2026-10-01" can only land on its own row. Prompts past 272K
+  // input tokens are repriced for the whole request; that multiplier is not
+  // published, so it is not modelled here (the per-call input cap in the
+  // providers keeps chat turns far below it).
+  "gpt-6-astra": { in: 10, out: 50, cacheRead: 1, cacheWrite: 12.5 },
+  "gpt-6-luna": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
   "gpt-5.6-terra": { in: 2, out: 12, cacheRead: 0.2, cacheWrite: 0 },
   "gpt-5.6-sol": { in: 5, out: 30, cacheRead: 0.5, cacheWrite: 0 },
   "gpt-5.5": { in: 5, out: 30, cacheRead: 0.5, cacheWrite: 0 },
@@ -84,12 +92,7 @@ export class BudgetGuard {
     if (!this.state.days[today]) this.state.days[today] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
 
     const tokens = normalizeUsage(usage);
-    const price = this.priceFor(model);
-    const usd =
-      (tokens.input / 1e6) * price.in +
-      (tokens.output / 1e6) * price.out +
-      (tokens.cacheRead / 1e6) * price.cacheRead +
-      (tokens.cacheWrite / 1e6) * price.cacheWrite;
+    const usd = this.usdFor(tokens, model);
 
     const day = this.state.days[today];
     day.input += tokens.input;
@@ -117,6 +120,25 @@ export class BudgetGuard {
     return { added: usd, today: day.usd, limit: this.dailyUsdLimit };
   }
 
+  // Estimated USD for one call's usage, without recording it. Providers use
+  // this to total a single agent turn across its tool hops.
+  costOf(usage, model) {
+    if (!usage) return 0;
+    return this.usdFor(normalizeUsage(usage), model);
+  }
+
+  // A row with no cache-write rate (cacheWrite 0 or missing, as on the gpt-5
+  // rows) bills written tokens as normal input: normalizeUsage has already
+  // taken them out of input, so a 0 rate would make them free.
+  usdFor(tokens, model) {
+    const price = this.priceFor(model);
+    const cacheWrite = price.cacheWrite > 0 ? price.cacheWrite : price.in;
+    return (tokens.input / 1e6) * price.in +
+      (tokens.output / 1e6) * price.out +
+      (tokens.cacheRead / 1e6) * price.cacheRead +
+      (tokens.cacheWrite / 1e6) * cacheWrite;
+  }
+
   priceFor(model) {
     if (!model) return this.prices.default;
     const exact = this.prices[model];
@@ -135,11 +157,32 @@ export class BudgetGuard {
   }
 }
 
-function normalizeUsage(usage) {
+// Three usage shapes reach the meter:
+//   Anthropic          input_tokens EXCLUDES cache reads/writes, which arrive
+//                      as cache_read_input_tokens / cache_creation_input_tokens.
+//   OpenAI Responses   input_tokens INCLUDES input_tokens_details.cached_tokens
+//                      and .cache_write_tokens.
+//   Chat Completions   prompt_tokens INCLUDES prompt_tokens_details.cached_tokens.
+// The OpenAI totals are split so cached tokens bill once, at the cached price,
+// instead of at the full input price (and again as a cache read).
+export function normalizeUsage(usage) {
+  const details = usage.input_tokens_details ?? usage.prompt_tokens_details ?? null;
+  const output = usage.output_tokens ?? usage.completion_tokens ?? 0;
+  if (details || usage.prompt_tokens != null) {
+    const total = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+    const cacheRead = details?.cached_tokens ?? 0;
+    const cacheWrite = details?.cache_write_tokens ?? 0;
+    return {
+      input: Math.max(0, total - cacheRead - cacheWrite),
+      output,
+      cacheRead,
+      cacheWrite
+    };
+  }
   return {
-    input: usage.input_tokens ?? usage.prompt_tokens ?? 0,
-    output: usage.output_tokens ?? usage.completion_tokens ?? 0,
-    cacheRead: usage.cache_read_input_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0,
+    input: usage.input_tokens ?? 0,
+    output,
+    cacheRead: usage.cache_read_input_tokens ?? 0,
     cacheWrite: usage.cache_creation_input_tokens ?? 0
   };
 }
