@@ -3958,53 +3958,88 @@ test("needsYou and the Watching you group count only questions the owner can see
 });
 
 // cape-town: the workspace sat on feature/bob-skills (#6817, merged Sep 27)
-// while its chat pushed #7063-#7066 and #7089 from other branches, so the
+// while its chat opened #7063 and #7089 from other branches, so the
 // supervisor showed and nudged the merged #6817.
-test("a chat that names several PRs is mapped to its newest open one, not its branch's merged PR", async (t) => {
-  const BB = "buildbetter-app/buildbetter";
-  const cape = makeThread({
+const BB = "buildbetter-app/buildbetter";
+function conductorChat(meta, extra = {}) {
+  return makeThread({
     key: "conductor:342281f9", kind: "conductor", id: "342281f9", title: "BOB briefs stale data fix", workspace: "cape-town", repo: null,
-    cwd: "/work/cape-town", branch: "feature/bob-skills", prRefs: [],
-    // Newest first, as the Conductor source reads them; #9 is an issue.
-    meta: { prMentions: ["#9", "#7089", "#7063", `${BB}#7089`, "openai/codex#4242", "#6817"] }
+    cwd: "/work/cape-town", branch: "feature/bob-skills", prRefs: [], meta, ...extra
   });
-  const states = new Map([[`${BB}#7089`, "OPEN"], [`${BB}#7063`, "OPEN"], [`${BB}#6817`, "MERGED"]]);
+}
+function prMapFixture(t, thread, states, branchPr) {
   const lite = [];
   const fetched = [];
-  const { supervisor } = fixture(t, {
-    threads: [cape],
+  const made = fixture(t, {
+    threads: [thread],
     deps: {
-      readLocalGit: async () => ({ head: HEAD, branch: "feature/bob-skills", upstream: "origin/feature/bob-skills", ahead: 0, remote: BB }),
-      findPrForBranch: async () => `${BB}#6817`,
+      readLocalGit: async () => ({ head: HEAD, branch: thread.branch, upstream: `origin/${thread.branch}`, ahead: 0, remote: BB }),
+      findPrForBranch: async () => branchPr,
       fetchPrStateLite: async (refs) => {
-        lite.push([...refs]);
-        return new Map(refs.map((ref) => [ref, states.has(ref) ? { state: states.get(ref) } : null]));
+        lite.push(...refs);
+        return new Map(refs.map((ref) => [ref, states.has(ref) ? (states.get(ref) ? { state: states.get(ref) } : null) : null]));
       },
       fetchPrStates: async (refs) => {
         fetched.push(...refs);
-        return new Map(refs.map((ref) => [ref, makePr({ ref, repo: BB, number: Number(ref.split("#")[1]), state: states.get(ref) })]));
+        return new Map(refs.filter((ref) => states.get(ref)).map((ref) => [ref, makePr({ ref, repo: BB, number: Number(ref.split("#")[1]), state: states.get(ref) })]));
       }
     }
   });
-  const snapshot = await supervisor.tick({ reason: "test" });
-  const row = snapshot.threads.find((thread) => thread.key === "conductor:342281f9");
-  assert.equal(row.pr.ref, `${BB}#7089`);
+  const row = async () => (await made.supervisor.tick({ reason: "test" })).threads.find((one) => one.key === thread.key);
+  return { ...made, lite, fetched, row };
+}
+
+test("a chat that created several PRs is mapped to its newest open one, not its branch's merged PR", async (t) => {
+  const cape = conductorChat({ prCreated: [`${BB}#7089`, `${BB}#7063`] });
+  const states = new Map([[`${BB}#7089`, "OPEN"], [`${BB}#7063`, "OPEN"], [`${BB}#6817`, "MERGED"]]);
+  const { supervisor, lite, fetched, row } = prMapFixture(t, cape, states, `${BB}#6817`);
+  assert.equal((await row()).pr.ref, `${BB}#7089`);
   assert.deepEqual(fetched, [`${BB}#7089`]);
-  // Another repo's PR is not this chat's; the branch PR is a candidate too.
-  assert.ok(!lite.flat().includes("openai/codex#4242"));
-  assert.ok(lite.flat().includes(`${BB}#6817`));
+  assert.ok(lite.includes(`${BB}#6817`), "the branch PR is a candidate too");
   // Merged is final: the next scan does not read #6817 again.
   lite.length = 0;
   await supervisor.tick({ reason: "test" });
-  assert.ok(!lite.flat().includes(`${BB}#6817`));
+  assert.ok(!lite.includes(`${BB}#6817`));
 
-  // Every PR it named merged, its branch PR open: the branch PR.
+  // Every PR it created merged, its branch PR open: the branch PR.
   states.set(`${BB}#7089`, "MERGED");
   states.set(`${BB}#7063`, "MERGED");
   states.set(`${BB}#6817`, "OPEN");
-  const again = fixture(t, { threads: [cape], deps: { ...supervisor.deps } });
-  const reread = await again.supervisor.tick({ reason: "test" });
-  assert.equal(reread.threads.find((thread) => thread.key === "conductor:342281f9").pr.ref, `${BB}#6817`);
+  assert.equal((await prMapFixture(t, cape, states, `${BB}#6817`).row()).pr.ref, `${BB}#6817`);
+});
+
+// meta.prMentions is what the 2026-10-12 build's source read from the same
+// transcript (every PR the chat named, viewed or checked); meta.prCreated is
+// what it reads now. Neither a stack base nor another agent's PR is the chat's.
+test("a PR the chat only named or viewed never becomes its PR, nor beats its own", async (t) => {
+  // Its own newest PR merged; #5544 it builds on is still open.
+  const merged = conductorChat({ prMentions: ["#5544", "#7580"], prCreated: [`${BB}#7580`] }, { branch: "spencer/mock-chat" });
+  const done = await prMapFixture(t, merged, new Map([[`${BB}#5544`, "OPEN"], [`${BB}#7580`, "MERGED"]]), `${BB}#7580`).row();
+  assert.equal(done.pr.ref, `${BB}#7580`);
+  assert.equal(done.state, "done");
+  // No PR of its own yet ("building on top of #5544"): it has no PR.
+  const none = await prMapFixture(t, conductorChat({ prMentions: ["#5544"], prCreated: [] }, { branch: "spencer/mock-chat" }), new Map([[`${BB}#5544`, "OPEN"]]), null).row();
+  assert.equal(none.pr, null);
+  assert.equal(none.state, "idle-no-pr");
+  assert.equal(none.reason, "no PR");
+  // Another agent's open PR it viewed by URL, beside its own open branch PR
+  // and a newer open PR it created: the branch PR leads.
+  const viewed = conductorChat({ prMentions: [`${BB}#7010`, `${BB}#7600`, "#7547"], prCreated: [`${BB}#7600`] }, { branch: "spencer/inbox" });
+  const fx = prMapFixture(t, viewed, new Map([[`${BB}#7010`, "OPEN"], [`${BB}#7600`, "OPEN"], [`${BB}#7547`, "OPEN"]]), `${BB}#7547`);
+  assert.equal((await fx.row()).pr.ref, `${BB}#7547`);
+  assert.ok(!fx.lite.includes(`${BB}#7010`));
+});
+
+// "issue #4321" in the agent's words kept prRefs = ["repo#4321"] on a branch
+// with no PR: "PR state unknown" forever, so idle and promised-work checks
+// never ran. A created ref GitHub says is no PR is dropped the same way.
+test("a chat whose only candidates are no PR, on a branch with none, has no PR", async (t) => {
+  for (const meta of [{ prMentions: ["#4321"], prCreated: [] }, { prCreated: [`${BB}#4321`] }]) {
+    const fx = prMapFixture(t, conductorChat(meta, { branch: "spencer/fix-4321" }), new Map([[`${BB}#4321`, null]]), null);
+    const row = await fx.row();
+    assert.equal(row.pr, null, JSON.stringify(meta));
+    assert.equal(row.reason, "no PR", JSON.stringify(meta));
+  }
 });
 
 // monrovia was told "Ready to merge? ... Left on #7589" 2 s after #7589

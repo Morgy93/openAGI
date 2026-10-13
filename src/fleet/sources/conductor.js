@@ -14,11 +14,24 @@ const STATUS_MAP = Object.freeze({ working: "running", waiting: "waiting", idle:
 const TAIL_ROWS = 400;
 const MAX_STALE_MANAGER_ROWS = 10;
 const MIN_REF_PREFIX = 8;
-// The PRs a session named, newest first, at most this many.
-const MAX_PR_MENTIONS = 12;
-const PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
-// "#7089" in the agent's own words; the repo comes from the workspace's git.
-const PR_NUMBER = /(?<![\w/#&;-])#(\d{3,7})\b/g;
+// The PRs a session created, newest first, at most this many.
+const MAX_PRS_CREATED = 12;
+// A PR's own link, not a comment or file link inside it.
+const PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?![\d#/])/;
+// The PRs a session created: its gh pr create calls (its own or a
+// subagent's, local or over ssh) and the results that answer them, which
+// fall out of the tail. Read by LIKE over the session's rows once, then only
+// over rows sent since (the (session_id, sent_at) index): the whole of
+// cape-town (14,571 rows, 22 MB) takes ~35 ms, every session ~1.8 s.
+const PR_CREATE_SQL = `
+  SELECT content, sent_at, rowid AS row_id FROM session_messages
+  WHERE session_id = ? AND sent_at >= ? AND role = 'assistant'
+    AND (content LIKE '%gh pr create%' OR (content LIKE '%"tool_result"%' AND content LIKE '%github.com/%/pull/%'))
+  ORDER BY sent_at, rowid`;
+const CREATED_CACHE_MAX = 1_000;
+const CALLS_KEPT = 200;
+// "<db path>\n<session id>" -> { at, atRows, calls, refs }: what was read.
+const createdCache = new Map();
 
 const SESSIONS_SQL = `
   SELECT s.id, s.status, s.claude_session_id, s.title, s.model, s.updated_at, s.unread_count,
@@ -99,10 +112,8 @@ function sentMessageText(event) {
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null, firstUserText: null, prMentions: []
+    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null, firstUserText: null
   };
-  // Per row, the PRs it names in reading order; rows oldest first.
-  const mentions = [];
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
     if (row.role === "user") {
@@ -115,14 +126,11 @@ function summarizeTail(rowsNewestFirst) {
       else if (text) {
         summary.lastUserText = text;
         summary.lastUserAt = at;
-        mentions.push(prMentions(text, false));
       }
       continue;
     }
     const event = parseEvent(row.content);
     if (!event) continue;
-    // A subagent's rows name the PRs it was sent to look at, not this chat's.
-    if (!event.parent_tool_use_id) mentions.push(eventPrMentions(event));
     // System rows (commands_changed and other state broadcasts) also land
     // on idle tabs; only turn rows are activity.
     if (event.type !== "system") summary.lastAt = latestIso(summary.lastAt, at);
@@ -172,38 +180,55 @@ function summarizeTail(rowsNewestFirst) {
       for (const id of summary.pendingAsks.keys()) if (answersTool(event, id)) summary.pendingAsks.delete(id);
     }
   }
-  summary.prMentions = [...new Set(mentions.reverse().flat())].slice(0, MAX_PR_MENTIONS);
   return summary;
 }
 
-// "owner/repo#n" for a PR link; "#n" for a bare number (bare: the agent's
-// own words only, where "#7089" means its PR).
-function prMentions(text, bare) {
-  const source = String(text ?? "");
-  const found = [];
-  for (const match of source.matchAll(PR_URL)) found.push({ index: match.index, ref: prRefKey(`${match[1]}/${match[2]}`, Number(match[3])) });
-  if (bare) for (const match of source.matchAll(PR_NUMBER)) found.push({ index: match.index, ref: `#${Number(match[1])}` });
-  return found.sort((a, b) => a.index - b.index).map((entry) => entry.ref);
-}
-
-// The PRs one stream event names: the agent's text and tool calls, and a
-// tool result that prints exactly one PR link (gh pr create). A result
-// listing several (gh pr list, a search) names none of them as this chat's.
-function eventPrMentions(event) {
-  const content = Array.isArray(event.message?.content) ? event.message.content : [];
-  if (event.type === "assistant") {
-    return content.flatMap((block) => {
-      if (block?.type === "text") return prMentions(block.text, true);
-      if (block?.type === "tool_use") return prMentions(JSON.stringify(block.input ?? {}), false);
-      return [];
-    });
+// The PRs this session created, newest first: each gh pr create call's
+// result, when it names one PR (the new one, or the one its branch already
+// has). A PR the chat only viewed, checked, listed, commented on or named
+// is not its own: another agent's PR, a stack base, one it reviewed.
+// readTo: the newest sent_at the tail already read; every row up to it was
+// in this read, so the next one starts there even when none matched.
+function readCreatedPrs(db, sessionId, dbPath, readTo = null) {
+  const key = `${dbPath ?? ""}\n${sessionId}`;
+  const seen = createdCache.get(key) ?? { at: "", atRows: new Set(), calls: [], refs: [] };
+  let rows;
+  try {
+    rows = db.prepare(PR_CREATE_SQL).all(sessionId, seen.at);
+  } catch {
+    // An older schema or a locked read: what was read before stands.
+    return [...seen.refs].reverse();
   }
-  if (event.type !== "user") return [];
-  return content.filter((block) => block?.type === "tool_result").flatMap((block) => {
-    const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
-    const refs = [...new Set(prMentions(text, false))];
-    return refs.length === 1 ? refs : [];
-  });
+  const calls = new Set(seen.calls);
+  const refs = [...seen.refs];
+  let { at, atRows } = seen;
+  for (const row of rows) {
+    const sentAt = String(row.sent_at ?? "");
+    if (sentAt === at && atRows.has(row.row_id)) continue;
+    if (sentAt !== at) { at = sentAt; atRows = new Set(); }
+    atRows.add(row.row_id);
+    const content = parseEvent(row.content)?.message?.content;
+    for (const block of Array.isArray(content) ? content : []) {
+      if (block?.type === "tool_use" && block.id && /\bgh\s+pr\s+create\b/.test(JSON.stringify(block.input ?? {}))) calls.add(block.id);
+      if (block?.type !== "tool_result" || !calls.has(block.tool_use_id)) continue;
+      const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
+      const links = new Set([...text.matchAll(new RegExp(PR_URL.source, "g"))].map((match) => prRefKey(`${match[1]}/${match[2]}`, Number(match[3]))));
+      if (links.size !== 1) continue;
+      const [ref] = links;
+      const index = refs.indexOf(ref);
+      if (index >= 0) refs.splice(index, 1);
+      refs.push(ref);
+    }
+  }
+  const tailAt = String(readTo ?? "");
+  if (tailAt > at) {
+    at = tailAt;
+    atRows = new Set(rows.filter((row) => String(row.sent_at ?? "") === tailAt).map((row) => row.row_id));
+  }
+  createdCache.delete(key);
+  if (createdCache.size >= CREATED_CACHE_MAX) createdCache.delete(createdCache.keys().next().value);
+  createdCache.set(key, { at, atRows, calls: [...calls].slice(-CALLS_KEPT), refs: refs.slice(-MAX_PRS_CREATED) });
+  return refs.slice(-MAX_PRS_CREATED).reverse();
 }
 
 // Conductor's AskUserQuestion: the tool call blocks the turn on the owner's
@@ -445,11 +470,10 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
         ? { text: clampText(redactSecrets(pendingAsk.text), limits.bodyMax), options: pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pendingAsk.at }
         : null,
       pendingCard: card,
-      // The PRs the chat named, newest first: "owner/repo#n", or "#n" for the
-      // workspace's own repo (resolved once git names it). The workspace
-      // branch alone goes stale: cape-town sat on merged #6817 while it
-      // pushed #7063-#7066 and #7089 from other branches.
-      prMentions: summary.prMentions,
+      // The PRs the chat created ("owner/repo#n"), newest first. The
+      // workspace branch alone goes stale: cape-town sat on merged #6817
+      // while its subagents opened #7089, #7343 and #7573 from other branches.
+      prCreated: readCreatedPrs(db, row.id, config.paths?.conductorDb, rows[0]?.sent_at ?? null),
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,

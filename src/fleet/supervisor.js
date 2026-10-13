@@ -114,30 +114,41 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
-// A Conductor chat's PR mentions (meta.prMentions, newest first) as refs,
-// once git named the workspace's repo: "#7089" is that repo's, and a link
-// to another repo's PR is not this chat's work. They lead the refs a
-// Claude transcript linked (pr-link rows), which carry no time.
-function resolvePrMentions(threads) {
+// A Conductor chat's own PRs: the ones it created (meta.prCreated, newest
+// first), then any a Claude transcript linked (pr-link rows, also created
+// there). Only these and the workspace branch's PR are ever its PR: a PR it
+// only named, viewed or checked (a stack base, one it reviewed, another
+// agent's) never is, nor stands alone as one.
+function resolveCreatedPrs(threads) {
   for (const thread of threads) {
-    const mentions = thread.meta?.prMentions;
-    if (!Array.isArray(mentions) || !mentions.length) continue;
-    const repo = thread.repo ? String(thread.repo).toLowerCase() : null;
-    const refs = mentions.map((mention) => {
-      const text = String(mention ?? "");
-      if (text.startsWith("#")) return repo ? `${thread.repo}${text}` : null;
-      const parsed = parsePrRef(text);
-      return parsed && (!repo || parsed.repo.toLowerCase() === repo) ? text : null;
-    }).filter(Boolean);
-    thread.prRefs = [...new Set([...refs, ...(thread.prRefs ?? [])])];
+    if (thread.kind !== "conductor") continue;
+    const created = Array.isArray(thread.meta?.prCreated) ? thread.meta.prCreated.filter((ref) => parsePrRef(ref)) : [];
+    thread.createdPrRefs = [...new Set([...created, ...(thread.prRefs ?? [])])];
+    thread.prRefs = [...thread.createdPrRefs];
   }
 }
 
-// The workspace branch's PR joins a chat's mentioned PRs as a candidate.
+// The workspace branch's PR leads a chat's created PRs as a candidate.
 function withBranchRef(thread, ref) {
   thread.branchPrRef = ref;
-  const refs = thread.prRefs ?? [];
-  thread.prRefs = refs.includes(ref) ? refs : [...refs, ref];
+  thread.prRefs = [ref, ...(thread.prRefs ?? []).filter((other) => other !== ref)];
+}
+
+// A Conductor chat's PR among its candidates (state: ref -> "OPEN",
+// "MERGED", ..., null for no PR, undefined unread): the workspace branch's
+// PR while it is open; else the newest open PR the chat created; else the
+// newest it created, then the branch PR. An older open PR never beats the
+// branch's open one, and a PR the chat did not create is never a candidate.
+function pickConductorPr(thread, state) {
+  const branch = thread.branchPrRef ?? null;
+  const created = thread.createdPrRefs.slice(0, MAX_PR_CANDIDATES);
+  const real = (ref) => state(ref) !== null;
+  const pick = branch && state(branch) === "OPEN" ? branch
+    : created.find((ref) => state(ref) === "OPEN") ?? created.find(real) ?? (branch && real(branch) ? branch : null);
+  const rest = [...new Set([...(branch ? [branch] : []), ...thread.createdPrRefs])].filter((ref) => ref !== pick && real(ref));
+  thread.prRefs = pick ? [pick, ...rest] : rest;
+  // None of them is a PR, and the branch has none: the chat has no PR.
+  if (!thread.prRefs.length && thread.branchNoPr) thread.prLookedUp = true;
 }
 
 function emptyBb3() {
@@ -1496,7 +1507,7 @@ export class FleetSupervisor {
     const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && hasCard(thread));
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
-    resolvePrMentions(inScope);
+    resolveCreatedPrs(inScope);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
     await this.preferOpenPrs(inScope, config, run);
     const unreadPrs = new Set();
@@ -1836,13 +1847,19 @@ export class FleetSupervisor {
     for (const thread of candidates) {
       // prLookedUp: this thread's PR is known to be none (nothing to look up,
       // or GitHub answered no PR). Policy judges no-PR threads only then.
-      // A Conductor chat's mentions may all be other PRs ("on top of #5544"):
-      // its workspace branch's PR joins them as one more candidate.
+      // A Conductor chat's created PRs may all be done: its workspace
+      // branch's PR joins them as a candidate (pickConductorPr). Whether
+      // that branch has none is noted (branchNoPr) for when none of the
+      // created ones is a PR either.
       const mentioned = Boolean(thread.prRefs?.length);
       if (mentioned && thread.kind !== "conductor") continue;
+      const noPr = () => {
+        if (mentioned) thread.branchNoPr = true;
+        else thread.prLookedUp = true;
+      };
       // No branch, or a trunk one: no PR to find. A missing repo (git could
       // not be read) leaves it unknown.
-      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { if (!mentioned) thread.prLookedUp = true; continue; }
+      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { noPr(); continue; }
       if (!thread.repo) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
@@ -1858,7 +1875,7 @@ export class FleetSupervisor {
         // No PR for this same head only (both unknown counts as the same):
         // a git failure after a known head, or a spent budget with a newer
         // head, leaves the answer unknown.
-        else if (cached.head === head && !mentioned) thread.prLookedUp = true;
+        else if (cached.head === head) noPr();
         continue;
       }
       if (lookups >= MAX_BRANCH_LOOKUPS) continue;
@@ -1867,7 +1884,7 @@ export class FleetSupervisor {
         const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head, cwd: head ? thread.cwd : null })), 20_000, "pr lookup");
         this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now, head });
         if (ref) withBranchRef(thread, ref);
-        else if (!mentioned) thread.prLookedUp = true;
+        else noPr();
       } catch (error) {
         sourceErrors.prLookup = clampText(error?.message, 200);
         if (cached?.ref) withBranchRef(thread, cached.ref);
@@ -1875,15 +1892,18 @@ export class FleetSupervisor {
     }
   }
 
-  // A thread naming several PRs is about the newest open one: a merged PR
-  // it named before is done (cape-town showed merged #6817 while #7089 was
-  // open). Each thread's newest MAX_PR_CANDIDATES are read for state only;
-  // a number GitHub says is no PR is dropped. With nothing open, or GitHub
-  // unreadable, the newest stays first.
+  // A thread linking several PRs is about the newest open one: a merged PR
+  // it linked before is done. Each thread's newest MAX_PR_CANDIDATES are
+  // read for state only; a number GitHub says is no PR is dropped. With
+  // nothing open, or GitHub unreadable, the newest stays first. A Conductor
+  // chat that created a PR is read even for one (pickConductorPr): its
+  // branch PR may lead, or the one it created may be no PR.
   async preferOpenPrs(inScope, config, run) {
     if (this.skip.github) return;
-    const several = inScope.filter((thread) => (thread.prRefs?.length ?? 0) > 1);
-    const wanted = [...new Set(several.flatMap((thread) => [...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef]))]
+    const conductorOwn = (thread) => thread.kind === "conductor" && (thread.createdPrRefs?.length ?? 0) > 0;
+    const several = inScope.filter((thread) => conductorOwn(thread) || (thread.prRefs?.length ?? 0) > 1);
+    const candidatesOf = (thread) => (conductorOwn(thread) ? [thread.branchPrRef, ...thread.createdPrRefs.slice(0, MAX_PR_CANDIDATES)] : [...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef]);
+    const wanted = [...new Set(several.flatMap(candidatesOf))]
       .filter((ref) => parsePrRef(ref) && !this.mergedPrs.has(ref));
     let states = new Map();
     if (wanted.length) {
@@ -1899,6 +1919,7 @@ export class FleetSupervisor {
     for (const thread of several) {
       const candidates = [...new Set([...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef].filter(Boolean))];
       const state = (ref) => (this.mergedPrs.has(ref) ? "MERGED" : states.has(ref) ? (states.get(ref)?.state ?? null) : undefined);
+      if (conductorOwn(thread)) { pickConductorPr(thread, state); continue; }
       const open = candidates.find((ref) => state(ref) === "OPEN");
       // null: GitHub answered that the number is no PR.
       const kept = thread.prRefs.filter((ref) => state(ref) !== null);
