@@ -584,6 +584,35 @@ test("the agent's whole last message is kept with its lines; a synthetic limit r
   assert.equal(thread.lastAgentAt, iso(14 * MIN));
 });
 
+test("an answer the agent sent back with SendMessage is read as its reply", async (t) => {
+  // dakar, 2026-10-12 15:53:54Z: it answered a supervisor relay with
+  // SendMessage to /tmp/cc-socks/48713.sock, which had already closed.
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-idle", "assistant", sdk.text("s-idle", "Older status."), iso(30 * MIN));
+  const answer = "PR #7317 is ready on our side but not merged; main's red Testing CI is the only blocker.";
+  addMessage(db, "s-idle", "assistant", {
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "toolu_send", name: "SendMessage", input: { to: "uds:/tmp/cc-socks/48713.sock", summary: "Reply PR 7317 status", message: answer } }] }
+  }, iso(10 * MIN));
+  db.close();
+  const thread = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
+  assert.equal(thread.lastAgentFull, answer);
+  assert.equal(thread.lastAgentFullAt, iso(10 * MIN));
+  // A preamble in the same message is not the answer it relayed.
+  const more = new DatabaseSync(file);
+  const later = "Still ready; main's Testing CI went green, so #7317 can merge.";
+  addMessage(more, "s-idle", "assistant", {
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "text", text: "I'll send the status now." },
+      { type: "tool_use", id: "toolu_send2", name: "SendMessage", input: { to: "uds:/tmp/cc-socks/48713.sock", summary: "Reply", message: later } }] }
+  }, iso(5 * MIN));
+  more.close();
+  const again = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }))["s-idle"];
+  assert.equal(again.lastAgentFull, later);
+});
+
 // A subagent's AskUserQuestion (342281f9, 2026-10-07 03:27:31): the card
 // shows to the owner like the agent's own.
 const subagentAsk = (id) => ({ ...cardCall(id), parent_tool_use_id: "toolu_bg" });
@@ -723,4 +752,107 @@ test("a working session's card dies with its process: a peer started after the c
   const asker = new Map([["s-run", { peerName: "madrid", pid: 902, status: "idle", waitingFor: null, startedAt: iso(10 * MIN) }]]);
   threads = byId(await listConductorThreads(config, { now: later, peers: asker }));
   assert.equal(threads["s-run"].meta.pendingCard?.cardId, "toolu_card");
+});
+
+// cape-town sat on feature/bob-skills (#6817, merged Sep 27) while its
+// subagents opened #7089 (over ssh: "ok https://.../pull/7089"), #7343 and
+// #7573 from other branches. What the chat only named, viewed, checked,
+// listed or commented on is not its PR: "#7555" it reviewed, #5544 it
+// builds on, another agent's #7010.
+const BB_PULL = "https://github.com/buildbetter-app/buildbetter/pull";
+function seedCapeTown(home, title = "BOB briefs stale data fix") {
+  const file = path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db");
+  const db = createDb(file);
+  db.exec(`INSERT INTO repos (id, remote_url, name) VALUES ('r1', 'https://github.com/buildbetter-app/buildbetter.git', 'bbapp')`);
+  db.prepare(`INSERT INTO workspaces (local_id, repository_id, directory_name, active_session_id, branch, state, derived_status, workspace_path, pr_title)
+    VALUES ('w-cape', 'r1', 'cape-town', 's-cape', 'feature/bob-skills', 'ready', 'in-progress', '/Users/x/Dev/bbapp/.conductor/cape-town', 'Back every BOB Loop with a skill BOB owns')`).run();
+  db.prepare(`INSERT INTO sessions (id, status, claude_session_id, updated_at, created_at, workspace_id, agent_type, title)
+    VALUES ('s-cape', 'idle', 's-cape', ?, ?, 'w-cape', 'claude', ?)`).run(sqliteTime(MIN), iso(600 * MIN), title);
+  const call = (id, command, parent = null) => ({ type: "assistant", session_id: "s-cape", parent_tool_use_id: parent,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id, name: "Bash", input: { command } }] } });
+  const result = (id, text, parent = null) => ({ type: "user", session_id: "s-cape", parent_tool_use_id: parent, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] } });
+  addMessage(db, "s-cape", "user", `Ship ${BB_PULL}/6817 first, then build on top of #5544`, iso(300 * MIN));
+  addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "Merged #6817. Building on top of #5544."), iso(290 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_m4", "ssh dev@100.99.3.113 'cd ~/scratch/bob-fresh && gh pr create -R buildbetter-app/buildbetter --draft --base feature/bob-brief-skill'", "toolu_sub1"), iso(200 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_m4", `ok ${BB_PULL}/7089\n`, "toolu_sub1"), iso(199 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_cm", "gh pr comment 7089 --body-file /tmp/c.md", "toolu_sub1"), iso(198 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_cm", `${BB_PULL}/7089#issuecomment-5939150350`, "toolu_sub1"), iso(197 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_view", `gh pr view ${BB_PULL}/7010 --json url`), iso(150 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_view", `${BB_PULL}/7010`), iso(149 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_base", "gh pr view 5544 --json url,state"), iso(140 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_base", `{"url":"${BB_PULL}/5544","state":"OPEN"}`), iso(139 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_m5", "cd .context/bob-fresh-redraft && gh pr create --repo buildbetter-app/buildbetter --draft", "toolu_sub2"), iso(100 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_m5", `${BB_PULL}/7343\n`, "toolu_sub2"), iso(99 * MIN));
+  // A listing names many PRs; a subagent reads one it was sent to review.
+  addMessage(db, "s-cape", "assistant", call("toolu_list", "gh pr list --repo buildbetter-app/buildbetter"), iso(60 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_list", `${BB_PULL}/7001 ${BB_PULL}/7002`), iso(59 * MIN));
+  addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "Reviewing #7555 for you.", "toolu_sub3"), iso(40 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_fu", "cd /tmp && gh pr create -R buildbetter-app/buildbetter --base main --head chore/bob-spec-followups", "toolu_sub4"), iso(20 * MIN));
+  addMessage(db, "s-cape", "assistant", result("toolu_fu", `${BB_PULL}/7573`, "toolu_sub4"), iso(19 * MIN));
+  addMessage(db, "s-cape", "user", "[OpenAGI supervisor] Ready to merge? Left on #6817.", iso(10 * MIN));
+  addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "No change. #7089's full check and the #7063, #7065 and #7066 rechecks are still running."), iso(5 * MIN));
+  db.close();
+  return file;
+}
+
+test("a session's own PRs are the ones its gh pr create calls made, newest first", async (t) => {
+  const home = makeHome(t);
+  const file = seedCapeTown(home);
+  const config = makeConfig(home);
+  const [thread] = await listConductorThreads(config, { now: NOW, peers: new Map() });
+  assert.equal(thread.branch, "feature/bob-skills");
+  assert.deepEqual(thread.meta.prCreated, ["buildbetter-app/buildbetter#7573", "buildbetter-app/buildbetter#7343", "buildbetter-app/buildbetter#7089"]);
+  assert.equal(thread.meta.prMentions, undefined, "a PR it only named, viewed or listed is not its own");
+  assert.deepEqual(thread.prRefs, []);
+  // The next scan reads only rows sent since, and a new PR leads.
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-cape", "assistant", { type: "assistant", session_id: "s-cape", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "toolu_new", name: "Bash", input: { command: "gh pr create --fill" } }] } }, iso(2 * MIN));
+  addMessage(db, "s-cape", "assistant", { type: "user", session_id: "s-cape", parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_new", content: `${BB_PULL}/7580` }] } }, iso(1.5 * MIN));
+  db.close();
+  const [again] = await listConductorThreads(config, { now: NOW, peers: new Map() });
+  assert.deepEqual(again.meta.prCreated.slice(0, 2), ["buildbetter-app/buildbetter#7580", "buildbetter-app/buildbetter#7573"]);
+});
+
+test("a gh pr create on the line after a heredoc body is the chat's PR", async (t) => {
+  // madrid wrote its #7586 body with cat <<'EOF' and ran gh pr create on the
+  // next line. Read as JSON, that newline is backslash-n with no word
+  // boundary before gh: #7586 went unseen and the old #7185 led.
+  const home = makeHome(t);
+  const file = seedCapeTown(home);
+  const db = new DatabaseSync(file);
+  const command = "cd /Users/shooby/Dev/bbapp/.worktrees/proposal-expiry && cat > /tmp/proposal-expiry-pr-body.md <<'EOF'\nChat inbox and triage proposals now last 24 hours.\nEOF\ngh pr create --repo buildbetter-app/buildbetter --base main --title \"Proposals last 24 hours\" --body-file /tmp/proposal-expiry-pr-body.md";
+  addMessage(db, "s-cape", "assistant", { type: "assistant", session_id: "s-cape", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "toolu_heredoc", name: "Bash", input: { command } }] } }, iso(2 * MIN));
+  addMessage(db, "s-cape", "assistant", { type: "user", session_id: "s-cape", parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_heredoc", content: `${BB_PULL}/7586\n` }] } }, iso(1.5 * MIN));
+  db.close();
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() });
+  assert.equal(thread.meta.prCreated[0], "buildbetter-app/buildbetter#7586");
+});
+
+test("a Conductor session opened with the supervisor display prompt is the supervisor's own", async (t) => {
+  const home = makeHome(t);
+  seedCapeTown(home, "You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring Codex and Claude Code.");
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() });
+  assert.equal(thread.excluded, "self");
+});
+
+// A long display chat: its opening prompt falls out of the 400-row tail and
+// the tail's earliest prompt is an ordinary later one. Still its own.
+test("a Conductor display session stays excluded once its opening prompt is out of the tail", async (t) => {
+  const home = makeHome(t);
+  seedCapeTown(home);
+  const db = new DatabaseSync(path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db"));
+  db.prepare("UPDATE session_messages SET content = ? WHERE session_id = 's-cape' AND role = 'user' AND sent_at = ?")
+    .run("You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring Codex and Claude Code.", iso(300 * MIN));
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-cape", i % 2 ? "assistant" : "user", i % 2 ? sdk.text("s-cape", `ok ${i}`) : `status ${i}`, new Date(NOW - 4 * MIN + i * 100).toISOString());
+  db.close();
+  const cache = new Map();
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map(), firstPrompts: cache });
+  assert.equal(thread.excluded, "self");
+  assert.equal(cache.size, 1);
+  const [again] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map(), firstPrompts: cache });
+  assert.equal(again.excluded, "self");
 });

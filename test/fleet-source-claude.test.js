@@ -359,6 +359,41 @@ test("exclusions: sidechain, relay, tmp, self, too-short, no-repo", async (t) =>
   assert.equal(threads["nocwd-1"].excluded, "no-repo");
 });
 
+// The G2 display opens Claude chats in ~/Dev/g2 with this prompt; they are
+// the supervisor's own, whatever their history.
+test("a transcript opened with the supervisor display prompt is the supervisor's own", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const display = rowsFor("display-1", cwd, { branch: "main" });
+  writeTranscript(home, cwd, "display-1", [display.prompt("You are the Agent Supervisor display. Reply with exactly: Claude supervisor connected.", iso(31 * MIN)),
+    display.text("Claude supervisor connected.", iso(30 * MIN)), ...display.history(29 * MIN)], NOW - 20 * MIN);
+  const work = rowsFor("work-1", cwd);
+  writeTranscript(home, cwd, "work-1", [work.prompt("Do you have access to all of my sessions?", iso(31 * MIN)), ...work.history(29 * MIN)], NOW - 20 * MIN);
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.equal(threads["display-1"].excluded, "self");
+  assert.equal(threads["work-1"].excluded, null);
+});
+
+// A long-running display chat: its opening prompt falls out of the bounded
+// tail, and the tail's earliest prompt is an ordinary later one. It is still
+// the supervisor's own, read from the transcript's head once per session.
+test("a display transcript stays excluded once its opening prompt is out of the tail", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const display = rowsFor("display-2", cwd, { branch: "main" });
+  const filler = [];
+  for (let i = 0; i < 40; i += 1) {
+    filler.push(display.prompt(`status ${i} ${"x".repeat(200)}`, iso(60 * MIN - i * 1000)), display.text(`ok ${i} ${"y".repeat(200)}`, iso(60 * MIN - i * 1000 - 500)));
+  }
+  writeTranscript(home, cwd, "display-2", [display.prompt("You are the Agent Supervisor display. Reply with exactly: Claude supervisor connected.", iso(61 * MIN)),
+    display.text("Claude supervisor connected.", iso(61 * MIN - 500)), ...filler, ...display.history(29 * MIN)], NOW - 20 * MIN);
+  const cache = new Map();
+  const read = async () => byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false, tailBytes: 8 * 1024, firstPrompts: cache }))["display-2"];
+  assert.equal((await read()).excluded, "self");
+  assert.match(cache.get("display-2"), /Agent Supervisor display/);
+  assert.equal((await read()).excluded, "self", "the cached opening prompt still excludes it");
+});
+
 test("Conductor-hosted transcripts are flagged", async (t) => {
   const home = makeHome(t);
   for (const [id, cwd, entrypoint] of [
@@ -594,4 +629,28 @@ test("an untitled thread is titled with its folder", async (t) => {
   const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
   assert.equal(thread.title, "g2");
   assert.equal(thread.lastUserText, "ship the mobile build to the distiller");
+});
+
+test("an answer the agent sent back to a relay with SendMessage is read as its reply", async (t) => {
+  // A supervisor relay exits once it delivers: the agent's SendMessage back
+  // fails (ENOENT /tmp/cc-socks/...), but its words are still its reply.
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/bbapp";
+  const r = rowsFor("relay-1", cwd);
+  const answer = "PR #7317 is ready on our side; main's red Testing CI is the only blocker.";
+  writeTranscript(home, cwd, "relay-1", [
+    ...r.history(60 * MIN),
+    r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)),
+    r.tool("SendMessage", "s1", { to: "uds:/tmp/cc-socks/48713.sock", summary: "status", message: answer }, iso(19 * MIN)),
+    r.result("s1", "{\"success\":false,\"message\":\"ENOENT\"}", iso(19 * MIN))
+  ], NOW - 19 * MIN);
+  const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(thread.lastAgentFull, answer);
+  assert.equal(thread.lastAgentFullAt, iso(19 * MIN));
+  // A preamble in the same message is not the answer it relayed.
+  const mixed = { ...r.tool("SendMessage", "s2", { to: "uds:/tmp/cc-socks/48713.sock", summary: "status", message: answer }, iso(18 * MIN)) };
+  mixed.message = { ...mixed.message, content: [{ type: "text", text: "I'll send the status now." }, ...mixed.message.content] };
+  writeTranscript(home, cwd, "relay-1", [...r.history(60 * MIN), r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)), mixed], NOW - 18 * MIN);
+  const [again] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(again.lastAgentFull, answer);
 });

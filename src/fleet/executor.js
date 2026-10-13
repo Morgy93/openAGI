@@ -33,9 +33,15 @@ function within(promise, ms) {
   const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), ms); });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
-// A resumed turn can run for an hour (CI waits, bb-quick). Only the child we
-// spawned is ever killed, and only after this ceiling.
+// A resumed turn can run for hours (CI waits, a full verify). Past this
+// ceiling the send stops waiting on it and leaves it running: killing it
+// killed a live Codex turn (019fe344, 21:08Z).
 const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// A turn left running past the ceiling holds its thread this much longer at
+// most. One that never exits (a stalled network read, a prompt nobody sees)
+// would otherwise block every later send to it until the supervisor
+// restarted; it is still never killed.
+const DETACHED_RELEASE_MS = 4 * 60 * 60 * 1000;
 // After the ceiling, SIGTERM gets this long before SIGKILL settles the send.
 const KILL_GRACE_MS = 10_000;
 // Codex exec echoes everything it runs (logs reached 168 MB), so only the
@@ -68,6 +74,12 @@ export function fleetChildEnv(env = process.env, { bins } = {}) {
   out.PATH = childPath(env?.PATH, bins);
   return out;
 }
+
+// The relay is a claude -p that exits once the message is delivered, so an
+// answer sent back to it lands on a closed socket (9 of 16 relays: "ENOENT
+// /tmp/cc-socks/..."). The agent answers in its own chat, where the
+// supervisor reads its transcript.
+export const RELAY_REPLY_NOTE = "Answer in your own chat as a normal reply, not with SendMessage: this sender exits right after delivering, so a reply sent to it is lost.";
 
 // Mirrors relayToPeer in g2 scripts/agent-supervisor/attach.mjs so the relay
 // model sees the same, already-proven instruction.
@@ -137,7 +149,10 @@ function withPrefix(message) {
 }
 
 // Spawns a long-running child without holding its whole output. Never throws.
-export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND_TIMEOUT_MS, killGraceMs = KILL_GRACE_MS } = {}) {
+// detach: at timeoutMs the promise settles ({ detached: true }) and the
+// child keeps running (an agent turn is never killed); its output is still
+// drained so it never blocks, and onExit gets its result when it ends.
+export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND_TIMEOUT_MS, killGraceMs = KILL_GRACE_MS, detach = false, onExit = null } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -154,7 +169,13 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
       tail += chunk.toString("utf8");
       if (tail.length > TAIL_CHARS * 2) tail = tail.slice(-TAIL_CHARS);
     };
+    let detached = false;
     const finish = (result) => {
+      if (detached) {
+        detached = false;
+        try { onExit?.({ ...result, tail: tail.slice(-TAIL_CHARS) }); } catch { /* best-effort */ }
+        return;
+      }
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -162,6 +183,13 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
       resolve({ ...result, tail: tail.slice(-TAIL_CHARS) });
     };
     const timer = setTimeout(() => {
+      if (detach) {
+        // The turn may still be working: stop waiting, never kill it.
+        settled = true;
+        detached = true;
+        resolve({ code: null, timedOut: false, detached: true, error: null, tail: tail.slice(-TAIL_CHARS) });
+        return;
+      }
       timedOut = true;
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
       // A child that ignores SIGTERM, or a descendant still holding the
@@ -193,6 +221,26 @@ export const PRESENCE_BLOCK = /^(?:owner using [^;]+|waiting for idle: [^;]+)$/;
 export function isPresenceBlock(delivery) {
   return delivery?.status === "blocked" && PRESENCE_BLOCK.test(String(delivery.detail ?? ""));
 }
+
+// A Codex app send that could not prove which thread is open: a title two
+// threads share, or the app still on another thread after the id link.
+// Codex shows no thread id on screen, so only codex exec, addressed by the
+// thread's id, can reach it (#5557's approved ping was blocked twice so).
+// Nothing was typed: these blocks come before the composer.
+const CODEX_UNVERIFIED = /^(?:ambiguous: two threads share this title|could not verify thread: )/;
+
+export function isCodexIdentityBlock(thread, delivery) {
+  if (thread?.kind !== "codex" || delivery?.status !== "blocked" || delivery.unconfirmed) return false;
+  const detail = String(delivery.detail ?? "");
+  return CODEX_UNVERIFIED.test(detail) && !/left as a draft/.test(detail);
+}
+
+// Added to such a block when codex exec cannot take over either: the Codex
+// app holds the thread's writer lock, as it does for every thread it has
+// loaded (019fe344, #5557: lock held by "codex app-server"). Opening a thread
+// by its link loads it, so the threads that hit identity blocks are the
+// locked ones. Only the owner can send there; policy asks them sooner.
+export const CODEX_APP_HOLDS = "Codex holds the thread open, so codex exec cannot reach it";
 
 // The non-UI route a presence-blocked app send may take instead, if the owner
 // allowed it (config.backgroundRoutes) and it cannot fork or queue unseen:
@@ -247,7 +295,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
 // the supervisor saw, to spot shared titles; uiLock: one UI send at a time.
 // refreshThread: (thread) => the same thread read again now, or null; a
 // background route after a presence block needs it for Conductor chats.
-export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK } = {}) {
+export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK, detachedReleaseMs = DETACHED_RELEASE_MS } = {}) {
   const runner = run ?? runCommand;
   // An injected run (tests, dry harnesses) also serves the background routes.
   const background = spawnBackground ?? (run ? run : spawnWithTail);
@@ -319,7 +367,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     return {
       cmd: bins.claude ?? "claude",
       args: [
-        "-p", buildRelayPrompt(peerName, text),
+        "-p", buildRelayPrompt(peerName, `${text}\n${RELAY_REPLY_NOTE}`),
         // bypassPermissions ignores --allowedTools as a limit, so --tools and
         // --strict-mcp-config leave SendMessage as the only tool.
         "--tools", "SendMessage",
@@ -448,32 +496,66 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   const launch = (thread, step, base, actionId, env) => {
     const id = journal(actionId, { ...base, status: "sent", running: true, detail: "started", startedAt: new Date().toISOString() });
     let reached = true;
+    // The child's end, journaled: at once, or when a detached turn ends.
+    const settle = (result) => {
+      const ok = !result?.error && !result?.timedOut && result?.code === 0;
+      if (!id) return;
+      const output = result?.tail ?? `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`;
+      const detail = ok
+        ? lastLine(output) || "finished"
+        : summariseExecFailure(output) || (result?.timedOut ? "timed out" : "") || firstLine(result?.error) || lastLine(output) || `exit ${result?.code}`;
+      journal(id, {
+        status: ok ? "done" : "failed",
+        running: false,
+        exitCode: result?.code ?? null,
+        detail,
+        logFile: writeLog(thread, output),
+        finishedAt: new Date().toISOString()
+      });
+    };
+    // A turn still running at the ceiling is left running, never killed: the
+    // thread stays in flight until it ends, or at most detachedReleaseMs.
+    let detached = false;
+    let exited = false;
+    let released = false;
+    let releaseTimer = null;
+    const ended = () => active.delete(thread.key);
+    const onExit = (result) => {
+      exited = true;
+      clearTimeout(releaseTimer);
+      try { settle(result); } catch { /* journaling is best-effort */ }
+      // Released earlier: a newer send may hold the thread now.
+      if (!released) ended();
+    };
+    const release = () => {
+      if (exited) return;
+      released = true;
+      const hours = Math.round((BACKGROUND_TIMEOUT_MS + detachedReleaseMs) / 3_600_000);
+      if (id) journal(id, { running: true, detail: `still running after ${hours} h: left running, no longer holds the thread` });
+      ended();
+    };
     const task = Promise.resolve()
-      .then(() => background(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: BACKGROUND_TIMEOUT_MS }))
+      .then(() => background(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: BACKGROUND_TIMEOUT_MS, detach: true, onExit }))
       .catch((error) => ({ code: null, timedOut: false, error: error?.message ?? String(error) }))
       .then((result) => {
+        if (result?.detached) {
+          detached = true;
+          if (exited) return;
+          if (id) journal(id, { running: true, detail: `still running after ${Math.round(BACKGROUND_TIMEOUT_MS / 60_000)} min: left running, not killed` });
+          releaseTimer = setTimeout(release, detachedReleaseMs);
+          releaseTimer.unref?.();
+          return;
+        }
         const ok = !result?.error && !result?.timedOut && result?.code === 0;
         // Spawn errors and non-zero exits never reached the agent; a timeout
         // did. Only the caller knows whether this send was a counted nudge,
         // so it gives the attempt back from done, not the executor.
         if (!ok && !result?.timedOut) reached = false;
-        if (!id) return;
-        const output = result?.tail ?? `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`;
-        const detail = ok
-          ? lastLine(output) || "finished"
-          : summariseExecFailure(output) || (result?.timedOut ? "timed out" : "") || firstLine(result?.error) || lastLine(output) || `exit ${result?.code}`;
-        journal(id, {
-          status: ok ? "done" : "failed",
-          running: false,
-          exitCode: result?.code ?? null,
-          detail,
-          logFile: writeLog(thread, output),
-          finishedAt: new Date().toISOString()
-        });
+        settle(result);
       })
       .catch(() => { /* journaling is best-effort */ })
       .finally(() => {
-        active.delete(thread.key);
+        if (!detached) ended();
         pending.delete(task);
       });
     pending.add(task);
@@ -487,9 +569,13 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // The background route a presence-blocked app send takes, re-checked at
   // send time: the scan's lock, peer and chat reads are up to a tick old.
   // Anything unreadable now means no background route.
-  async function fallbackRoute(thread, target, deadlineAt) {
+  // why.locked: refused because a Codex writer holds the thread.
+  async function fallbackRoute(thread, target, deadlineAt, why = {}) {
     const route = backgroundRouteFor(thread, config);
-    if (!route) return null;
+    if (!route) {
+      if (thread?.kind === "codex" && thread.writerLocked) why.locked = true;
+      return null;
+    }
     // An earlier app send may sit in that composer unconfirmed.
     if (unconfirmed.has(target.targetKey)) return null;
     // A remote caller's deadline bounds the checks too, not only the send.
@@ -501,7 +587,9 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       if (!paths.codexHome) return null;
       let locked;
       try { locked = await readWriterLocks(config, [thread.id], { run: runner, isPidAlive }); } catch { return null; }
-      return locked.has(thread.id) ? null : route;
+      if (!locked.has(thread.id)) return route;
+      why.locked = true;
+      return null;
     }
     if (!readLivePeers || !refreshThread) return null;
     let peers = null;
@@ -556,11 +644,19 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         active.delete(thread.key);
         active.delete(step.target.targetKey);
       }
-      // The owner is at the Mac: a route that does not take the screen, if
-      // the owner allowed one for this thread. Otherwise it waits for idle.
+      // The owner is at the Mac, or the Codex app cannot show which thread is
+      // open: a route that does not take the screen, if the owner allowed one
+      // for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
-      if (!isPresenceBlock(result) || (queue && step.target?.app === "conductor")) return result;
-      const fallback = await fallbackRoute(thread, step.target, deadlineAt);
+      const identity = isCodexIdentityBlock(thread, result);
+      if (!(isPresenceBlock(result) || identity) || (queue && step.target?.app === "conductor")) return result;
+      const why = {};
+      const fallback = await fallbackRoute(thread, step.target, deadlineAt, why);
+      if (!fallback && identity && why.locked) {
+        const detail = detailText(`${result.detail}; ${CODEX_APP_HOLDS}`);
+        if (result.actionId) journal(result.actionId, { detail });
+        return { ...result, detail };
+      }
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };
       return deliver({ thread: { ...thread, live: via.live }, message, route: via.route, actionId: result.actionId ?? actionId, playbook, spentMs, deadlineAt, fallbackFrom: result.detail });

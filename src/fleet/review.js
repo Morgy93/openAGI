@@ -75,7 +75,7 @@ export const REVIEW_SYSTEM_PROMPT = [
   "Weighing the evidence:",
   "- An owner message answers a question only if it came after the ask (lastUser.at later than the question's askedAt) and speaks to that exact thing. A yes to an earlier ask is not an answer.",
   "- askContext is the agent message the ask came from; the thread's lastAgentText may be newer.",
-  "- related lists OTHER sessions, even when they share a workspace, repo or PR. Their activity never means this thread moved on. Close as answered or done-elsewhere only when a related thread's own text shows this exact work done or this exact question answered.",
+  "- related lists OTHER sessions, even when they share a workspace, repo or PR. Their activity never means this thread moved on. Close as answered or done-elsewhere only when a related thread's own text shows this exact work done or this exact question answered, naming this question's PR (#number). A bare owner reply there (\"yes\", \"admin merge\") answers that thread's own conversation, not this question.",
   "- kind ready asks the owner to merge a green PR: keep it while that PR is OPEN, not draft, CI green and at the head named in the body, whatever its thread is doing now (the thread may be on another branch).",
   "",
   "For every agent-ask you keep, also write:",
@@ -291,6 +291,11 @@ function cleanVerdict(raw, entry, ids) {
   if (close && entry.pinned) return { id: entry.id, decision: "keep", category: "live", reason: text(`pinned by the owner; review said: ${reason}`, REASON_MAX) };
   // A close with no evidence is a guess.
   if (close && !reason) return { id: entry.id, decision: "keep", category: "live", reason: "close without a reason" };
+  // Done elsewhere only on a related thread that names this PR: an owner's
+  // "admin merge" about another PR in a sibling session answers nothing here.
+  if (close && raw.category === "done-elsewhere" && !relatedNamesPr(entry)) {
+    return { id: entry.id, decision: "keep", category: "live", reason: text(`no related thread names this PR; review said: ${reason}`, REASON_MAX) };
+  }
   if (close) {
     const duplicateOf = raw.category === "duplicate" && ids.has(raw.duplicateOf) && raw.duplicateOf !== entry.id ? raw.duplicateOf : null;
     // A duplicate of nothing it can name is a guess: keep.
@@ -306,6 +311,24 @@ function cleanVerdict(raw, entry, ids) {
   const options = cleanOptions(raw.options);
   if (options) verdict.options = options;
   return verdict;
+}
+
+// A related thread's own text (owner or agent) names this question's PR:
+// "owner/name#42" or a /pull/42 link of the same repo, or a bare "#42" from a
+// thread on that repo. Another repo's #42 is not it. A question with no PR
+// cannot be checked this way.
+function relatedNamesPr(entry) {
+  const ref = parsePrRef(entry.prRef) ?? parsePrRef(entry.prs?.[0]?.ref);
+  if (!ref) return true;
+  const repo = ref.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const qualified = new RegExp(`(?:github\\.com/|(?<![\\w./-]))${repo}(?:#|/pull/)${ref.number}(?!\\d)`, "i");
+  const bare = new RegExp(`(?<![\\w./-])#${ref.number}(?!\\d)`);
+  return (entry.related ?? []).some((thread) => {
+    const words = `${thread.lastAgentText ?? ""}\n${thread.lastUser?.text ?? ""}`;
+    if (qualified.test(words)) return true;
+    const threadRepo = thread.repo ?? parsePrRef(thread.prRefs?.[0])?.repo ?? null;
+    return Boolean(threadRepo) && threadRepo.toLowerCase() === ref.repo.toLowerCase() && bare.test(words);
+  });
 }
 
 // A duplicate closes only when the question it points at, followed down

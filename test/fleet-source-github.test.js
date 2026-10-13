@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
-  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
+  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStateLite, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
 } from "../src/fleet/sources/github.js";
 
 const BBAPP = "buildbetter-app/buildbetter";
@@ -227,6 +227,28 @@ test("fetchPrStates marks a null repository alias unread, not missing", async ()
   assert.deepEqual([...unread], [`${BBAPP}#6878`]);
 });
 
+// A null PR alias with a resolver error on it (not NOT_FOUND) is a partial
+// GitHub failure: the PR is unread, never read as no PR and dropped.
+test("a null PR alias with a resolver error is unread, not proof the number is no PR", async () => {
+  const body = {
+    data: { r0: { p7089: null, p9: null } },
+    errors: [
+      { type: "INTERNAL", path: ["r0", "p7089"], message: "Something went wrong while executing your query." },
+      { type: "NOT_FOUND", path: ["r0", "p9"], message: "Could not resolve to a PullRequest with the number of 9." }
+    ]
+  };
+  const run = async () => ({ code: 1, stdout: JSON.stringify(body), stderr: "" });
+  const unread = new Set();
+  const states = await fetchPrStateLite([`${BBAPP}#7089`, `${BBAPP}#9`], { bins: { gh: "gh" } }, { run, unread });
+  assert.equal(states.has(`${BBAPP}#7089`), false);
+  assert.equal(states.get(`${BBAPP}#9`), null, "NOT_FOUND is GitHub's answer");
+  assert.deepEqual([...unread], [`${BBAPP}#7089`]);
+  const fullUnread = new Set();
+  const prs = await fetchPrStates([`${BBAPP}#7089`, `${BBAPP}#9`], config(), { run, unread: fullUnread });
+  assert.equal(prs.size, 0);
+  assert.deepEqual([...fullUnread], [`${BBAPP}#7089`]);
+});
+
 test("fetchPrStates degrades to an empty map on failures", async () => {
   const refs = [`${BBAPP}#6878`];
   for (const result of [
@@ -257,6 +279,65 @@ test("CI summary picks the latest run per check and lists pending checks", async
   const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run })).get(`${BBAPP}#6878`);
   // When the newest failure finished: a rerun failing again is news.
   assert.deepEqual(pr.ci, { state: "PENDING", failing: ["lint", "ci/legacy"], pending: ["verification", "ci/pending"], failedAt: "2026-09-26T07:48:29.000Z" });
+});
+
+test("a cancelled duplicate check is no failure, and never hides the run it duplicated", async () => {
+  // The judge was told a cancelled duplicate run was a failing check
+  // (cd2c0072, "the canceled failure"). GitHub's rollup reads it as red too.
+  const response = capturedResponse();
+  const commit = response.data.r0.p6878.commits.nodes[0].commit;
+  commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+    { __typename: "CheckRun", name: "verification", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:58:00Z" },
+    { __typename: "CheckRun", name: "verification", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:40:02Z", completedAt: "2026-09-26T07:40:03Z" },
+    { __typename: "CheckRun", name: "Cursor Bugbot", status: "COMPLETED", conclusion: "SKIPPED", startedAt: "2026-09-26T07:38:29Z" }
+  ] } };
+  const { run } = fakeRun(() => ok(response));
+  const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.ci, { state: "SUCCESS", failing: [], pending: [] });
+  // A real failure beside it still makes the rollup red.
+  commit.statusCheckRollup.contexts.nodes.push({ __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:43:00Z" });
+  const red = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(red.ci, { state: "FAILURE", failing: ["lint"], pending: [], failedAt: "2026-09-26T07:43:00.000Z" });
+});
+
+// A check whose only run was cancelled (by hand, or at timeout-minutes)
+// never finished: nothing replaced it, so it is red. Read as green, an
+// ungated repo's PR became "ready. Merge?" with its tests never run.
+test("a check whose only run was cancelled stays red", async () => {
+  const response = capturedResponse();
+  const commit = response.data.r0.p6878.commits.nodes[0].commit;
+  commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+    { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:41:00Z", completedAt: "2026-09-26T07:42:00Z" },
+    { __typename: "CheckRun", name: "lint", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:41:00Z" }
+  ] } };
+  const { run } = fakeRun(() => ok(response));
+  const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.ci, { state: "FAILURE", failing: ["test"], pending: [], failedAt: "2026-09-26T07:42:00.000Z" });
+  // Two runs of it, both cancelled: still nothing finished.
+  commit.statusCheckRollup.contexts.nodes.push({ __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-09-26T07:43:00Z", completedAt: "2026-09-26T07:44:00Z" });
+  const twice = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+  assert.equal(twice.ci.state, "FAILURE");
+  assert.deepEqual(twice.ci.failing, ["test"]);
+});
+
+// A check that passed, then a rerun on the same head that was cancelled or
+// timed out: the rerun is the latest result, so the check and the rollup
+// stay red rather than reading the earlier pass as the answer.
+test("a rerun cancelled or timed out after a pass keeps the check red", async () => {
+  for (const conclusion of ["CANCELLED", "TIMED_OUT"]) {
+    const response = capturedResponse();
+    const commit = response.data.r0.p6878.commits.nodes[0].commit;
+    commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+      { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:50:00Z" },
+      { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion, startedAt: "2026-09-26T08:10:00Z", completedAt: "2026-09-26T08:40:00Z" }
+    ] } };
+    const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+    assert.deepEqual(pr.ci, { state: "FAILURE", failing: ["test"], pending: [], failedAt: "2026-09-26T08:40:00.000Z" }, conclusion);
+    // Listed the other way round, the same answer.
+    commit.statusCheckRollup.contexts.nodes.reverse();
+    const reversed = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+    assert.deepEqual(reversed.ci.failing, ["test"], conclusion);
+  }
 });
 
 test("CI is unknown when the last commit is not the PR head or has no checks", async () => {
@@ -610,4 +691,24 @@ test("a status with no matching time never loses to a stale green check run", as
   assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "FAILURE", createdAt: "2026-09-26T06:00:00Z" })), "SUCCESS");
   // No time on the status: the non-passing result wins.
   assert.equal(await gateOf(withStatus({ __typename: "StatusContext", context: name, state: "PENDING" })), "PENDING");
+});
+
+test("fetchPrStateLite reads only states, tells a number that is no PR from an unread one", async () => {
+  const calls = [];
+  const run = async (cmd, args) => {
+    calls.push(args.at(-1));
+    // gh exits 1 on the partial error for #9 (an issue) but prints the rest.
+    return { code: 1, stdout: JSON.stringify({ data: { r0: { p7089: { number: 7089, state: "OPEN", mergedAt: null, closedAt: null, updatedAt: "2026-10-12T17:54:01Z" }, p9: null }, r1: null } }) };
+  };
+  const unread = new Set();
+  const states = await fetchPrStateLite(["buildbetter-app/buildbetter#7089", "buildbetter-app/buildbetter#9", "acme/gone#1"], { bins: { gh: "gh" } }, { run, unread });
+  assert.deepEqual(states.get("buildbetter-app/buildbetter#7089"), { state: "OPEN", mergedAt: null, closedAt: null, updatedAt: "2026-10-12T17:54:01Z" });
+  assert.equal(states.get("buildbetter-app/buildbetter#9"), null);
+  assert.equal(states.has("acme/gone#1"), false);
+  assert.deepEqual([...unread], ["acme/gone#1"]);
+  assert.doesNotMatch(calls[0], /comments|files|reviewThreads/);
+  const failed = new Set();
+  const none = await fetchPrStateLite(["buildbetter-app/buildbetter#7089"], { bins: { gh: "gh" } }, { run: async () => { throw new Error("timeout"); }, unread: failed });
+  assert.equal(none.size, 0);
+  assert.deepEqual([...failed], ["buildbetter-app/buildbetter#7089"]);
 });

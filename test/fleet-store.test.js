@@ -203,7 +203,7 @@ test("question text is redacted before storage", (t) => {
   assert.doesNotMatch(JSON.stringify(question), /abcdefghijklmnop|supersecret/);
 });
 
-test("questions expire after 24 hours", (t) => {
+test("questions expire after 24 hours, and the same ask stays quiet a day more", (t) => {
   const now = clock();
   const store = new FleetStore({ dir: tempDir(t), now });
   const question = store.upsertQuestion({ dedupeKey: "k", title: "Merge #6522?" });
@@ -213,31 +213,42 @@ test("questions expire after 24 hours", (t) => {
   assert.deepEqual(store.openQuestions(), []);
   assert.equal(store.question(question.id).status, "expired");
   assert.equal(store.answerQuestion(question.id, "yes"), null);
+  const held = store.upsertQuestion({ dedupeKey: "k", title: "Merge #6522?" });
+  assert.equal(held.id, question.id);
+  assert.equal(held.suppressed, true);
+  now.advance(24 * HOUR);
   const fresh = store.upsertQuestion({ dedupeKey: "k", title: "Merge #6522?" });
   assert.notEqual(fresh.id, question.id);
 });
 
-test("a question asked every tick keeps its id past 24 hours and expires a TTL after the last ask", (t) => {
+// Audit 2026-10-12: questions from Oct 9-11 were still open, refreshed by
+// every scan that asked them again.
+test("a question asked every tick keeps its id but expires a day after it was first asked", (t) => {
   const now = clock();
   const store = new FleetStore({ dir: tempDir(t), now });
   const first = store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" });
   store.markQuestionNotified(first.id, { outreachId: "out_1" });
-  for (let hour = 5; hour <= 40; hour += 5) {
+  for (let hour = 5; hour <= 20; hour += 5) {
     now.advance(5 * HOUR);
     assert.equal(store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" }).id, first.id);
   }
-  assert.equal(store.question(first.id).lastAskedAt, new Date(T0 + 40 * HOUR).toISOString());
-  assert.deepEqual(store.takeExpired(), []);
-
-  now.advance(23 * HOUR);
+  assert.equal(store.question(first.id).lastAskedAt, new Date(T0 + 20 * HOUR).toISOString());
+  now.advance(3 * HOUR);
   assert.equal(store.openQuestions().length, 1);
+  assert.deepEqual(store.takeExpired(), []);
   now.advance(HOUR);
   assert.deepEqual(store.openQuestions(), []);
   assert.equal(store.question(first.id).status, "expired");
   // Handed out once, so the supervisor closes the outreach copy once.
   assert.deepEqual(store.takeExpired().map((q) => [q.id, q.outreachId]), [[first.id, "out_1"]]);
   assert.deepEqual(store.takeExpired(), []);
-  // Asked again after a full TTL of silence: a new question.
+  // Still asked: quiet for a day after it expired, no new question or push.
+  for (let hour = 5; hour < 24; hour += 5) {
+    now.advance(5 * HOUR);
+    assert.equal(store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" }).suppressed, true);
+  }
+  assert.deepEqual(store.openQuestions(), []);
+  now.advance(5 * HOUR);
   assert.notEqual(store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" }).id, first.id);
 });
 
@@ -682,4 +693,132 @@ test("an 'open thread' tap on a card holds while the card is still asked, past t
     now.advance(HOUR);
     assert.equal(ask().suppressed, true);
   }
+});
+
+// Audit 2026-10-12: the live list still held "4 stopped. Nudges can't get
+// through" from 2026-10-09T07:34Z, its expiry pushed back by every scan.
+test("an open question saved by an older build expires a day after it was created", (t) => {
+  const dir = tempDir(t);
+  const now = Date.parse("2026-10-13T04:53:00.000Z");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({
+    version: 1,
+    questions: [
+      { id: "fq_6516028b7a83443b", dedupeKey: "deliver:group", kind: "deliver", threadKeys: ["codex:a", "codex:b"], title: "4 stopped. Nudges can't get through. Nudge them?", options: ["nudge", "skip"],
+        status: "open", createdAt: "2026-10-09T07:34:05.695Z", updatedAt: "2026-10-13T04:48:00.000Z", lastAskedAt: "2026-10-13T04:48:00.000Z", expiresAt: "2026-10-14T04:48:00.000Z", outreachId: "out_old" },
+      { id: "fq_a9b2b47748584a67", dedupeKey: "ask:conductor:ad4e780b:f72523c2360d0211", kind: "agent-ask", threadKey: "conductor:ad4e780b", title: "buildbetter #7633: merge once checks pass?", options: ["yes", "no"],
+        status: "open", createdAt: "2026-10-13T04:48:37.020Z", updatedAt: "2026-10-13T04:48:37.020Z", lastAskedAt: "2026-10-13T04:48:37.020Z", expiresAt: "2026-10-14T04:48:37.020Z" }
+    ]
+  }));
+  const store = new FleetStore({ dir, now: () => now });
+  assert.deepEqual(store.openQuestions().map((q) => q.id), ["fq_a9b2b47748584a67"]);
+  assert.equal(store.question("fq_6516028b7a83443b").status, "expired");
+  assert.deepEqual(store.takeExpired().map((q) => [q.id, q.outreachId]), [["fq_6516028b7a83443b", "out_old"]]);
+});
+
+// Audit 2026-10-12: #7352 asked "admin merge ok?" at 15:07:54Z and again in
+// a new message at 17:25:12Z; each message became its own question.
+test("a newer ask from the same agent takes its open question in place", (t) => {
+  const now = clock(Date.parse("2026-10-12T16:47:33.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:9953b207", prRef: "buildbetter-app/buildbetter#7352", options: ["yes", "no"], mergeAsk: true };
+  const first = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:9953b207:aaaa", title: "buildbetter #7352: wants an --admin merge. OK?", agentAskedAt: "2026-10-12T15:07:54.712Z", askContext: "Merging still needs your explicit go" });
+  store.markQuestionNotified(first.id, { outreachId: "out_1", pushedAt: new Date(now()).toISOString() });
+  store.recordReview(first.id, { title: "buildbetter #7352: admin merge ok?", fingerprint: "f1", reason: "still open" });
+  now.advance(HOUR);
+  const again = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:9953b207:bbbb", title: "buildbetter #7352: needs your call. Answer?", agentAskedAt: "2026-10-12T17:25:12.159Z", askContext: "Merges: need your explicit go." });
+  assert.equal(again.id, first.id);
+  assert.equal(again.superseded, true);
+  const stored = store.question(first.id);
+  assert.deepEqual([stored.dedupeKey, stored.agentAskedAt, stored.title, stored.outreachId, stored.reviewedAt, stored.createdAt],
+    ["ask:conductor:9953b207:bbbb", "2026-10-12T17:25:12.159Z", "buildbetter #7352: needs your call. Answer?", "out_1", null, first.createdAt]);
+  assert.equal(store.openQuestions().length, 1);
+  // An older message, or another thread, never takes it over.
+  assert.notEqual(store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:9953b207:cccc", title: "old", agentAskedAt: "2026-10-12T15:00:00.000Z" }).id, first.id);
+  assert.notEqual(store.upsertQuestion({ ...base, threadKey: "conductor:other", dedupeKey: "ask:conductor:other:dddd", title: "other", agentAskedAt: "2026-10-12T18:00:00.000Z" }).id, first.id);
+});
+
+// A long Conductor chat that opens several PRs: its merge ask about a new PR
+// is not a restatement of the old PR's, so it is pushed and gets its own day.
+test("a merge ask about another PR in the same thread gets its own day and push", (t) => {
+  const now = clock(Date.parse("2026-10-12T04:00:00.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:cape", options: ["yes", "no"], mergeAsk: true, askContext: "Merging needs your go." };
+  const first = store.upsertQuestion({ ...base, prRef: "buildbetter-app/buildbetter#7063", dedupeKey: "ask:conductor:cape:aaaa", title: "buildbetter #7063: merge it?", agentAskedAt: "2026-10-12T03:59:00.000Z" });
+  store.markQuestionNotified(first.id, { outreachId: "out_1", pushedAt: new Date(now()).toISOString() });
+  now.advance(23 * HOUR);
+  const next = store.upsertQuestion({ ...base, prRef: "buildbetter-app/buildbetter#7089", dedupeKey: "ask:conductor:cape:bbbb", title: "buildbetter #7089: merge it?", agentAskedAt: "2026-10-13T02:59:00.000Z" });
+  assert.equal(next.id, first.id);
+  assert.equal(next.pushedAt, null, "the new PR's ask is pushed");
+  now.advance(2 * HOUR);
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [first.id], "not expired on the old PR's day");
+  // The same PR asked again keeps its push and its day.
+  store.markQuestionNotified(first.id, { outreachId: "out_2", pushedAt: new Date(now()).toISOString() });
+  now.advance(HOUR);
+  const same = store.upsertQuestion({ ...base, prRef: "buildbetter-app/buildbetter#7089", dedupeKey: "ask:conductor:cape:cccc", title: "buildbetter #7089: ready, merge?", agentAskedAt: "2026-10-13T06:00:00.000Z" });
+  assert.ok(same.pushedAt);
+});
+
+// An owner answer whose background send failed near the end of the
+// question's day is put back with a day of its own, not expired at once.
+test("a question reopened after a failed answer delivery gets a fresh day", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const q = store.upsertQuestion({ dedupeKey: "ask:conductor:x:aaaa", kind: "agent-ask", threadKey: "conductor:x", title: "Ship it?", options: ["yes", "no"], agentAskedAt: new Date(T0 - 1000).toISOString() });
+  now.advance(23 * HOUR + 50 * 60 * 1000);
+  store.queueAnswer(q.id, "yes", "Yes, ship it.");
+  now.advance(20 * 60 * 1000);
+  const back = store.reopenQuestion(q.id, ["conductor:x"], { answer: "yes" });
+  assert.equal(back.status, "open");
+  assert.deepEqual(store.openQuestions().map((one) => one.id), [q.id], "still open after the old day ended");
+  now.advance(23 * HOUR);
+  assert.deepEqual(store.openQuestions().map((one) => one.id), [q.id]);
+});
+
+// milan 1941cea4 asked "who gets the free Coda token?" at 04:38Z. A new
+// decision from the same agent 23 h later took that open question over with
+// its push spent and its day nearly gone: it expired an hour later, never
+// pushed, then stayed quiet a day.
+test("a different ask that supersedes an open one gets its own day and push", (t) => {
+  const now = clock(Date.parse("2026-10-12T04:38:00.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:1941cea4", options: ["yes", "no"], askContext: "Blocked on: your call." };
+  const coda = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:aaaa", title: "milan: who gets the free Coda token?", body: "Who gets the free Coda token?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  store.markQuestionNotified(coda.id, { outreachId: "out_1", pushedAt: new Date(now()).toISOString() });
+  now.advance(23 * HOUR);
+  const deploy = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:bbbb", title: "milan: approve production deploy?", body: "Approve the production deploy?", agentAskedAt: "2026-10-13T03:37:00.000Z" });
+  assert.equal(deploy.id, coda.id);
+  assert.equal(deploy.superseded, true);
+  assert.equal(deploy.pushedAt, null, "the new decision is pushed");
+  now.advance(2 * HOUR);
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [coda.id], "not expired on the old ask's day");
+  now.advance(22 * HOUR);
+  assert.deepEqual(store.openQuestions(), []);
+  // The same question restated (the same ask) keeps its push and its day.
+  const later = clock(Date.parse("2026-10-12T04:38:00.000Z"));
+  const again = new FleetStore({ dir: tempDir(t), now: later });
+  const first = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:cccc", title: "milan: who gets the free Coda token?", body: "Who gets the free Coda token?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  again.markQuestionNotified(first.id, { outreachId: "out_2", pushedAt: new Date(later()).toISOString() });
+  later.advance(23 * HOUR);
+  const restated = again.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:dddd", title: "milan: who gets the free Coda token?", body: "Who gets the free Coda token?", agentAskedAt: "2026-10-13T03:37:00.000Z" });
+  assert.equal(restated.id, first.id);
+  assert.ok(restated.pushedAt);
+  later.advance(2 * HOUR);
+  assert.deepEqual(again.openQuestions(), []);
+});
+
+// Titles are generic per topic: two different prod approvals on one PR both
+// read "wants a prod step. OK?". The second is a new decision for the owner.
+test("a different ask under the same generic title still gets its own push and day", (t) => {
+  const now = clock(Date.parse("2026-10-12T04:38:00.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:1941cea4", prRef: "buildbetter-app/buildbetter#7087", options: ["yes", "no"], title: "milan wants a prod step. OK?", askContext: "Blocked on: your call." };
+  const one = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:eeee", body: "Approve the production DB migration?", agentAskedAt: "2026-10-12T04:37:40.000Z" });
+  store.markQuestionNotified(one.id, { outreachId: "out_3", pushedAt: new Date(now()).toISOString() });
+  now.advance(20 * HOUR);
+  const two = store.upsertQuestion({ ...base, dedupeKey: "ask:conductor:1941cea4:ffff", body: "Approve the production deploy of the web app?", agentAskedAt: "2026-10-13T00:37:00.000Z" });
+  assert.equal(two.id, one.id);
+  assert.equal(two.pushedAt, null, "pushed anew");
+  now.advance(10 * HOUR);
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [one.id], "its own day, not the old one's");
 });

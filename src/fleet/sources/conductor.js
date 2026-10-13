@@ -5,8 +5,8 @@
 import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
-  threadKey, toIso
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, isSupervisorOwnPrompt, openReadOnlyDb, prRefKey,
+  redactSecrets, repoFromRemote, threadKey, toIso
 } from "../contracts.js";
 import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
 
@@ -14,6 +14,24 @@ const STATUS_MAP = Object.freeze({ working: "running", waiting: "waiting", idle:
 const TAIL_ROWS = 400;
 const MAX_STALE_MANAGER_ROWS = 10;
 const MIN_REF_PREFIX = 8;
+// The PRs a session created, newest first, at most this many.
+const MAX_PRS_CREATED = 12;
+// A PR's own link, not a comment or file link inside it.
+const PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?![\d#/])/;
+// The PRs a session created: its gh pr create calls (its own or a
+// subagent's, local or over ssh) and the results that answer them, which
+// fall out of the tail. Read by LIKE over the session's rows once, then only
+// over rows sent since (the (session_id, sent_at) index): the whole of
+// cape-town (14,571 rows, 22 MB) takes ~35 ms, every session ~1.8 s.
+const PR_CREATE_SQL = `
+  SELECT content, sent_at, rowid AS row_id FROM session_messages
+  WHERE session_id = ? AND sent_at >= ? AND role = 'assistant'
+    AND (content LIKE '%gh pr create%' OR (content LIKE '%"tool_result"%' AND content LIKE '%github.com/%/pull/%'))
+  ORDER BY sent_at, rowid`;
+const CREATED_CACHE_MAX = 1_000;
+const CALLS_KEPT = 200;
+// "<db path>\n<session id>" -> { at, atRows, calls, refs }: what was read.
+const createdCache = new Map();
 
 const SESSIONS_SQL = `
   SELECT s.id, s.status, s.claude_session_id, s.title, s.model, s.updated_at, s.unread_count,
@@ -81,10 +99,20 @@ function eventText(event) {
     .map((block) => block.text).join("\n").trim();
 }
 
+// An answer the agent sent back over a session socket with SendMessage (to
+// a supervisor relay that has already exited) is its reply too: the
+// transcript is where it is read. A message to a subagent is not.
+function sentMessageText(event) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  const call = content.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
+    && typeof block.input?.message === "string");
+  return call ? call.input.message.trim() : "";
+}
+
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null
+    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null, firstUserText: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
@@ -93,6 +121,7 @@ function summarizeTail(rowsNewestFirst) {
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
+      summary.firstUserText ??= text || null;
       if (text.startsWith(SUPERVISOR_PREFIX)) summary.lastSupervisorAt = at;
       else if (text) {
         summary.lastUserText = text;
@@ -120,7 +149,8 @@ function summarizeTail(rowsNewestFirst) {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
       const ask = askUserQuestion(event, at);
       if (ask) summary.pendingAsks.set(ask.id, ask);
-      const text = eventText(event);
+      // The answer it relayed beats any preamble text beside it.
+      const text = sentMessageText(event) || eventText(event);
       if (text) {
         summary.lastAgentText = text;
         summary.lastAgentAt = at;
@@ -154,6 +184,64 @@ function summarizeTail(rowsNewestFirst) {
   return summary;
 }
 
+// A gh pr create in any string of a tool call's input (a Bash command, an
+// ssh line). Read raw, never as JSON: there a newline is the two characters
+// backslash and n, so a gh pr create after a heredoc body has no word
+// boundary before it (madrid's #7586 went unseen).
+function createsPr(value, depth = 0) {
+  if (typeof value === "string") return /\bgh\s+pr\s+create\b/.test(value);
+  if (!value || typeof value !== "object" || depth > 4) return false;
+  return Object.values(value).some((item) => createsPr(item, depth + 1));
+}
+
+// The PRs this session created, newest first: each gh pr create call's
+// result, when it names one PR (the new one, or the one its branch already
+// has). A PR the chat only viewed, checked, listed, commented on or named
+// is not its own: another agent's PR, a stack base, one it reviewed.
+// readTo: the newest sent_at the tail already read; every row up to it was
+// in this read, so the next one starts there even when none matched.
+function readCreatedPrs(db, sessionId, dbPath, readTo = null) {
+  const key = `${dbPath ?? ""}\n${sessionId}`;
+  const seen = createdCache.get(key) ?? { at: "", atRows: new Set(), calls: [], refs: [] };
+  let rows;
+  try {
+    rows = db.prepare(PR_CREATE_SQL).all(sessionId, seen.at);
+  } catch {
+    // An older schema or a locked read: what was read before stands.
+    return [...seen.refs].reverse();
+  }
+  const calls = new Set(seen.calls);
+  const refs = [...seen.refs];
+  let { at, atRows } = seen;
+  for (const row of rows) {
+    const sentAt = String(row.sent_at ?? "");
+    if (sentAt === at && atRows.has(row.row_id)) continue;
+    if (sentAt !== at) { at = sentAt; atRows = new Set(); }
+    atRows.add(row.row_id);
+    const content = parseEvent(row.content)?.message?.content;
+    for (const block of Array.isArray(content) ? content : []) {
+      if (block?.type === "tool_use" && block.id && createsPr(block.input)) calls.add(block.id);
+      if (block?.type !== "tool_result" || !calls.has(block.tool_use_id)) continue;
+      const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
+      const links = new Set([...text.matchAll(new RegExp(PR_URL.source, "g"))].map((match) => prRefKey(`${match[1]}/${match[2]}`, Number(match[3]))));
+      if (links.size !== 1) continue;
+      const [ref] = links;
+      const index = refs.indexOf(ref);
+      if (index >= 0) refs.splice(index, 1);
+      refs.push(ref);
+    }
+  }
+  const tailAt = String(readTo ?? "");
+  if (tailAt > at) {
+    at = tailAt;
+    atRows = new Set(rows.filter((row) => String(row.sent_at ?? "") === tailAt).map((row) => row.row_id));
+  }
+  createdCache.delete(key);
+  if (createdCache.size >= CREATED_CACHE_MAX) createdCache.delete(createdCache.keys().next().value);
+  createdCache.set(key, { at, atRows, calls: [...calls].slice(-CALLS_KEPT), refs: refs.slice(-MAX_PRS_CREATED) });
+  return refs.slice(-MAX_PRS_CREATED).reverse();
+}
+
 // Conductor's AskUserQuestion: the tool call blocks the turn on the owner's
 // pick, so the session reads "working" the whole time, and the questions are
 // in the call, not the text.
@@ -184,6 +272,26 @@ function answersTool(event, id) {
 
 function readRecentMessages(db, sessionId, turnColumn) {
   return db.prepare(tailSql(turnColumn)).all(sessionId, TAIL_ROWS);
+}
+
+// A session's opening prompt, which names a supervisor display chat. The
+// tail's earliest prompt is it only while the tail holds the whole session;
+// past that it is read once per session (it never changes), so a long
+// display chat stays excluded.
+const FIRST_PROMPT_SQL = `
+  SELECT content FROM session_messages
+  WHERE session_id = ? AND role = 'user' AND cancelled_at IS NULL AND sender_session_id IS NULL AND sender_api_key_name IS NULL
+  ORDER BY sent_at, rowid LIMIT 1`;
+const FIRST_PROMPTS_KEPT = 2000;
+const firstPrompts = new Map();
+
+function firstPromptOf(db, sessionId, rows, summary, cache, cacheKey) {
+  if (rows.length < TAIL_ROWS) return summary.firstUserText;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const text = String(db.prepare(FIRST_PROMPT_SQL).get(sessionId)?.content ?? "").trim() || null;
+  if (cache.size >= FIRST_PROMPTS_KEPT) cache.delete(cache.keys().next().value);
+  cache.set(cacheKey, text);
+  return text;
 }
 
 // The open AskUserQuestion calls (the agent's or a subagent's) of the
@@ -300,10 +408,11 @@ function askOutlivedBy(ask, peer) {
   return !(Number.isFinite(since) && Date.parse(ask.at ?? "") < since);
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id" }) {
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id", prompts = firstPrompts, dbFile = "" }) {
   const { limits } = config;
   const rows = readRecentMessages(db, row.id, turnColumn);
   const summary = summarizeTail(rows);
+  summary.firstUserText = firstPromptOf(db, row.id, rows, summary, prompts, `${dbFile}\n${row.id}`);
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // An errored session lost its card, so it reads as stopped instead. Only a
@@ -346,7 +455,8 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const title = row.title && row.title !== "Untitled" ? row.title : row.pr_title || row.directory_name || row.id;
   const selfIds = config.selfSessionIds ?? [];
-  const excluded = selfIds.includes(row.id) || (claudeSessionId && selfIds.includes(claudeSessionId)) ? "self"
+  const ownPrompt = isSupervisorOwnPrompt(row.title) || isSupervisorOwnPrompt(summary.firstUserText);
+  const excluded = ownPrompt || selfIds.includes(row.id) || (claudeSessionId && selfIds.includes(claudeSessionId)) ? "self"
     : !row.workspace_path ? "no-repo"
     : stale ? "stale"
     : null;
@@ -392,6 +502,10 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
         ? { text: clampText(redactSecrets(pendingAsk.text), limits.bodyMax), options: pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pendingAsk.at }
         : null,
       pendingCard: card,
+      // The PRs the chat created ("owner/repo#n"), newest first. The
+      // workspace branch alone goes stale: cape-town sat on merged #6817
+      // while its subagents opened #7089, #7343 and #7573 from other branches.
+      prCreated: readCreatedPrs(db, row.id, config.paths?.conductorDb, rows[0]?.sent_at ?? null),
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,
@@ -451,7 +565,7 @@ export async function listConductorThreads(config, options = {}) {
       for (const { row } of list) {
         // A query failure means the source is unknown this tick. Returning a
         // partial catalog would close questions from sessions we failed to read.
-        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn }));
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file }));
       }
     }
     return threads;

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
-import { JUDGE_FEATURES_OFF, JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFeaturesList, parseFirstJson, validateVerdict, judgeCodexConfig } from "../src/fleet/judge.js";
+import { JUDGED_PLAYBOOKS, JUDGE_FEATURES_OFF, JUDGE_INSTRUCTIONS, JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFeaturesList, parseFirstJson, validateVerdict, judgeCodexConfig } from "../src/fleet/judge.js";
 
 const NOW = Date.parse("2026-10-11T12:00:00.000Z");
 
@@ -126,6 +126,39 @@ test("the prompt carries the chat, PR facts, earlier nudges and the plan", () =>
   const long = buildJudgePrompt({ ...INPUT, thread: thread({ lastAgentFull: `${"old ".repeat(3000)}NEWEST` }) });
   assert.match(long, /NEWEST/);
   assert.ok(long.length < 9000);
+});
+
+test("the judge reads a skipped gate and main's health check as what they are, not failures", () => {
+  // 243310e7 and f207436c: the judge sent "inspect the failures" for a red
+  // main-health; cd2c0072's cancelled duplicate was read as a failure.
+  const pr = {
+    ...INPUT.pr, ci: { state: "FAILURE", failing: ["Reconcile main health", "lint"], pending: [] },
+    gates: [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: "SKIPPED" }]
+  };
+  const prompt = buildJudgePrompt({ ...INPUT, pr });
+  assert.match(prompt, /failing: Reconcile main health \(main's own health, shared by every PR\), lint/);
+  assert.match(prompt, /BuildBot3 full run: skipped \(not a failure; not run to a verdict\)/);
+  assert.match(prompt, /neither is a run a newer one replaced/);
+});
+
+// A cancelled gate nothing replaced is red in github.js; the judge must not
+// read it as harmless and wait instead of asking for the rerun.
+test("the judge reads a lone cancelled or timed-out gate as a failure", () => {
+  for (const state of ["CANCELLED", "TIMED_OUT"]) {
+    const pr = { ...INPUT.pr, gates: [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }] };
+    const prompt = buildJudgePrompt({ ...INPUT, pr });
+    assert.match(prompt, new RegExp(`BuildBot3 full run: ${state.toLowerCase()} \\(a failure: never run to a verdict, needs a rerun\\)`));
+    assert.doesNotMatch(prompt, /full run: \w+ \(not a failure/);
+  }
+  assert.doesNotMatch(JUDGE_INSTRUCTIONS, /A cancelled[^.]*is not a failure/);
+  assert.match(JUDGE_INSTRUCTIONS, /A cancelled or timed-out check nothing replaced never reached a verdict: it is red/);
+});
+
+test("every playbook that goes to a thread is judged; a limit resume stays mechanical in the supervisor", () => {
+  for (const id of ["merge-ready", "ci-finished", "status-check", "idle-report", "bb3-slow-agent", "resume", "no-local-verify", "infra-recovered", "in-scope-yes"]) {
+    assert.ok(JUDGED_PLAYBOOKS.has(id), id);
+  }
+  for (const id of ["manager-bb3", "manager-lb", "owner-answer", "owner-message"]) assert.equal(JUDGED_PLAYBOOKS.has(id), false, id);
 });
 
 test("judge runs codex exec read-only with the LB key and parses the doubled file", async (t) => {

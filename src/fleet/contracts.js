@@ -36,6 +36,16 @@ export const DELIVERY_MODES = Object.freeze(["cli", "computer-use", "computer-us
 // to tell the supervisor's own sends apart from the owner typing.
 export const SUPERVISOR_PREFIX = "[OpenAGI supervisor]";
 
+// The supervisor's own chats: the G2 display thread opens with this prompt
+// (g2 agentctl.mjs). They are never watched or nudged (codex:01a0df66 got
+// 54 "LB is up" nudges).
+const SUPERVISOR_OWN_PROMPTS = [/^\s*You are the Agent Supervisor display\b/i];
+
+export function isSupervisorOwnPrompt(text) {
+  const head = String(text ?? "");
+  return SUPERVISOR_OWN_PROMPTS.some((pattern) => pattern.test(head));
+}
+
 const MIN = 60_000;
 
 export const DEFAULTS = Object.freeze({
@@ -252,7 +262,10 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
   const mode = MODES.includes(overrides.mode) ? overrides.mode
     : MODES.includes(String(env.OPENAGI_FLEET_MODE ?? "").trim()) ? String(env.OPENAGI_FLEET_MODE).trim()
     : "observe";
-  const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...(overrides.selfSessionIds ?? [])]
+  // OPENAGI_FLEET_SELF_SESSION_IDS: more of the supervisor's own sessions
+  // (comma or space separated), for ones no prompt marker names.
+  const configuredSelf = String(env.OPENAGI_FLEET_SELF_SESSION_IDS ?? "").split(/[\s,]+/);
+  const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...configuredSelf, ...(overrides.selfSessionIds ?? [])]
     .filter(Boolean);
   const enabled = overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR);
   return {
@@ -595,6 +608,13 @@ export function msSince(iso, now = Date.now()) {
 
 export function shortHash(value) {
   return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 16);
+}
+
+// A check that reports main's own health ("main-health", "Reconcile main
+// health"): red on every PR while main is red. Shared infra, not the PR's
+// work, so no nudge to its agent clears it.
+export function isMainHealthCheck(name) {
+  return /\bmain[-_ ]?health\b/i.test(String(name ?? ""));
 }
 
 // Reads "export KEY=value" / "KEY=value" lines without touching process.env.

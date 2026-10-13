@@ -6,7 +6,7 @@ import path from "node:path";
 import { classifyThread } from "../src/fleet/classify.js";
 import { DEFAULTS, shortHash } from "../src/fleet/contracts.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks } from "../src/fleet/playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
+import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -176,6 +176,41 @@ test("row: a Conductor wait on a non-verify task is idle after 45 min", () => {
   assert.equal(stale.playbook, "merge-ready");
   assert.match(stale.message, /no CI on head; 2 open threads/);
   assert.equal(run(thread).decision.playbook, "ci-finished");
+});
+
+// cape-town 10-12: 247 min into a background merge loop (#7063, #7091 and
+// #7089), it spoke seconds before the scan. #7345, an older side PR it
+// created, had blockers: a merge-ready nudge about it would talk over the loop.
+test("an agent that just spoke from a long background wait is not told to fix a side PR", () => {
+  const loop = { id: "b7", description: "Merge #7063, #7091 and #7089 once their full checks pass", kind: "local_bash", startedAt: ago(247 * MIN) };
+  const capeTown = { key: "conductor:342281f9", id: "342281f9", workspace: "cape-town", branch: "feature/bob-skills", agentStatus: "waiting", openTasks: [loop],
+    prRefs: ["buildbetter-app/buildbetter#7345"], lastAgentText: "#7063 is updated with main and its brief tests pass. Its full check is running and it merges right after, then #7091 and #7217. #7089 is still in its full check.",
+    lastAgentAt: ago(0.2 * MIN), lastActivityAt: ago(0.2 * MIN) };
+  const side = makePr({ ref: "buildbetter-app/buildbetter#7345", number: 7345, headRef: "chore/bob-spec-followups", ci: { state: null, failing: [], pending: [] }, unresolvedThreads: 37 });
+  const busy = run(makeThread(capeTown), { pr: side }).decision;
+  assert.equal(busy.action, "wait");
+  assert.notEqual(busy.playbook, "merge-ready");
+  // Quiet 20 min on, its last words are still about the other PRs.
+  const later = { ...capeTown, lastAgentAt: ago(20 * MIN), lastActivityAt: ago(20 * MIN) };
+  assert.notEqual(run(makeThread(later), { pr: side }).decision.playbook, "merge-ready");
+  // Quiet, with words about this PR or none, the wait still hears about it.
+  for (const lastAgentText of ["#7345 still needs its full run.", "Waiting on the loop."]) {
+    const quiet = run(makeThread({ ...later, lastAgentText }), { pr: side }).decision;
+    assert.equal(quiet.playbook, "merge-ready", lastAgentText);
+    assert.match(quiet.message, /37 open threads/);
+  }
+});
+
+// 01a0f89f on the 10-12 replay: its branch's #7163 was not looked up yet
+// (the lookup budget was spent), so it read as "nothing visible".
+test("a stopped waiter whose PR is not looked up yet is not told nothing is visible", () => {
+  const waiter = { key: "codex:01a0f89f", kind: "codex", id: "01a0f89f", branch: "codex/bob-adhoc-setting", prRefs: [], lastAgentText: "Waiting for CI.",
+    lastActivityAt: ago(60 * MIN), lastAgentAt: ago(60 * MIN), lastUserAt: ago(120 * MIN) };
+  const unknown = run(makeThread(waiter), { pr: null }).decision;
+  assert.notEqual(unknown.playbook, "resume");
+  const none = run(makeThread({ ...waiter, prLookedUp: true }), { pr: null }).decision;
+  assert.equal(none.playbook, "resume");
+  assert.match(none.reason, /nothing visible/);
 });
 
 test("row: an agent silent an hour on a background wait is asked for a status", () => {
@@ -1065,13 +1100,37 @@ test("owner labels use repo and PR, then the folder, then the Codex app name", (
 });
 
 // Review 7: a structured ask with its own key is deduped on it, so a new
-// stand-in text still matches the owner's dismissal. Others keep text keys.
-test("a keyed structured ask dedupes on its key; the rest on their text", () => {
+// stand-in text still matches the owner's dismissal. The rest key on the
+// agent message they came from, never on its words (audit 2026-10-12:
+// TitansRTS #3 got 10 question ids for one unchanged ask at 05:47Z).
+test("a keyed structured ask dedupes on its key; the rest on when the agent asked", () => {
   const pending = (extra) => makeThread({ meta: { pendingQuestion: { text: "Checked the notes. Should I fix it?", options: ["open thread"], at: ago(20 * MIN), ...extra } } });
   assert.equal(run(pending({ key: "45673228c2da450b" })).decision.question.dedupeKey, "ask:conductor:s1:45673228c2da450b");
-  assert.equal(run(pending({})).decision.question.dedupeKey, `ask:conductor:s1:${shortHash("Checked the notes. Should I fix it?")}`);
+  const asked = `ask:conductor:s1:${shortHash(`at:${ago(30 * MIN)}`)}`;
+  assert.equal(run(pending({})).decision.question.dedupeKey, asked);
   const text = "Want me to cut the production release?";
-  assert.equal(run(makeThread({ lastAgentText: text })).decision.question.dedupeKey, `ask:conductor:s1:${shortHash(text)}`);
+  assert.equal(run(makeThread({ lastAgentText: text })).decision.question.dedupeKey, asked);
+  assert.equal(run(makeThread({ lastAgentText: "Should I cut the production release now?" })).decision.question.dedupeKey, asked, "reworded, same message time: same ask");
+  assert.notEqual(run(makeThread({ lastAgentText: text, lastAgentAt: ago(5 * MIN) })).decision.question.dedupeKey, asked, "a newer message is a new ask");
+  assert.equal(run(makeThread({ lastAgentText: text, lastAgentAt: null })).decision.question.dedupeKey, `ask:conductor:s1:${shortHash(text)}`, "no time known: its text");
+  assert.equal(agentAskKey("conductor:s1", { at: ago(30 * MIN), text: "anything" }), asked, "the judge keys the same ask the same way");
+});
+
+// Audit 2026-10-12: #7352 "admin merge ok?" closed twice on CI flicker.
+test("an ask to merge is marked so it holds until answered or merged", () => {
+  assert.equal(run(makeThread({ lastAgentText: "Merging still needs your explicit go, and #7352 needs \"admin merge\" because you authored it." })).decision.question.mergeAsk, true);
+  assert.equal(run(makeThread({ lastAgentText: "Resumed. Wave 2 moves to acceptance.\n\n- **Merges:** need your explicit go. #7352 also needs \"admin merge\"." })).decision.question.mergeAsk, true);
+  assert.equal(run(makeThread({ lastAgentText: "Want me to cut the production release?" })).decision.question.mergeAsk, false);
+  // Merge words about something else: no hold past the agent moving on.
+  for (const text of ["How should I resolve the merge conflict?", "Should I merge main into this branch?", "Merging origin/main again, or rebase?", "Which merge base should I use?", "Merge the latest main into the feature branch first?"]) {
+    assert.equal(asksToMergePr(text), false, text);
+    const question = run(makeThread({ lastAgentText: text })).decision.question;
+    if (question) assert.notEqual(question.mergeAsk, true, text);
+  }
+  assert.equal(run(makeThread({ lastAgentText: "Merges: need your explicit go. Resolve the merge conflict with theirs or ours?" })).decision.question.mergeAsk, true);
+  for (const text of ["OK to merge #7352 into main?", "Merged main in. Ready to merge?", "Should I merge it now?"]) {
+    assert.equal(asksToMergePr(text), true, text);
+  }
 });
 
 // Review 8: a PR done before the agent last spoke is not what it asks about.
@@ -1385,38 +1444,34 @@ test("d1dbe71a, 2026-10-12: the owner took the thread over for other work, so it
   assert.notEqual(run(carryOn, { pr, ledger: sentLedger(fresh, 23 * 60 * MIN) }).decision.reason, "owner is driving this thread");
 });
 
-test("CI done still reaches a thread the owner took over: the agent is waiting on that run", () => {
-  // The owner wrote in the thread after a nudge ("run the full verify and
-  // merge when green"), then the agent started BuildBot3 and waited.
+test("CI done waits out the owner hold like every thread nudge", () => {
+  // monterrey: the owner wrote "finish all waves" after a nudge; 159 min
+  // later a ci-finished nudge went in anyway, because CI done was exempt.
   const thread = makeThread({
-    lastUserText: "run the full verify and merge when green", lastUserAt: ago(40 * MIN),
+    lastUserText: "finish all waves", lastUserAt: ago(40 * MIN),
     lastAgentText: "Full BuildBot3 run started on aaaaaaaaaa. I'll report the verdict when it lands.", lastAgentAt: ago(35 * MIN)
   });
-  const red = run(thread, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }) }).decision;
-  assert.equal(red.playbook, "ci-finished");
-  const ledger = sentLedger({ ...red, playbook: "merge-ready" }, 5 * 60 * MIN);
-  const decision = run(thread, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }), ledger }).decision;
-  assert.equal(decision.action, "nudge");
-  assert.equal(decision.playbook, "ci-finished");
-  assert.notEqual(decision.reason, "owner is driving this thread");
-  // The owner spoke after the wait began ("stop that PR; switch tasks"): their word holds.
-  const switched = makeThread({ ...thread, lastUserText: "stop that PR; switch tasks", lastUserAt: ago(20 * MIN) });
-  const held = run(switched, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }), ledger }).decision;
+  const pr = makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } });
+  const fresh = run(thread, { pr }).decision;
+  assert.equal(fresh.playbook, "ci-finished");
+  assert.equal(fresh.action, "nudge", "a task the owner started with no nudge before it is still followed through");
+  const ledger = sentLedger({ ...fresh, playbook: "merge-ready" }, 5 * 60 * MIN);
+  const held = run(thread, { pr, ledger }).decision;
   assert.equal(held.action, "wait");
   assert.equal(held.reason, "owner is driving this thread");
-  // A BuildBot3 task started before the owner's "switch tasks"; the agent only
-  // acknowledged it since. The wait began with the task: the owner's word holds.
-  const fullRun = { id: "t9", description: "bb-verify --full --pr 1", kind: "local_bash", startedAt: ago(50 * MIN) };
+  // A BuildBot3 task the agent started after the owner's word waits too.
+  const fullRun = { id: "t9", description: "bb-verify --full --pr 1", kind: "local_bash", startedAt: ago(30 * MIN) };
   const gateDone = makePr({ gates: [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: "SUCCESS" }], ci: { state: "SUCCESS", failing: [], pending: [] } });
-  const waiting = (extra) => makeThread({ ...switched, agentStatus: "waiting", openTasks: [fullRun], lastAgentText: "Full run going.", lastAgentAt: ago(48 * MIN), ...extra });
-  // Control: the run started after the owner's word; its CI-done ping goes through.
-  const ownRun = run(waiting({ lastUserText: "run the full verify", lastUserAt: ago(55 * MIN) }), { pr: gateDone, ledger }).decision;
-  assert.equal(ownRun.playbook, "ci-finished");
-  assert.equal(ownRun.action, "nudge");
-  const acked = run(waiting({ lastAgentText: "Switching tasks.", lastAgentAt: ago(15 * MIN) }), { pr: gateDone, ledger }).decision;
-  assert.equal(acked.action, "wait");
-  assert.equal(acked.reason, "owner is driving this thread");
+  const waiting = makeThread({ ...thread, agentStatus: "waiting", openTasks: [fullRun], lastAgentText: "Full run going.", lastAgentAt: ago(30 * MIN) });
+  const ownRun = run(waiting, { pr: gateDone, ledger }).decision;
+  assert.equal(ownRun.action, "wait");
+  assert.equal(ownRun.reason, "owner is driving this thread");
+  // The owner's own "continue" lifts the hold.
+  const carryOn = run(makeThread({ ...waiting, lastUserText: "continue" }), { pr: gateDone, ledger }).decision;
+  assert.equal(carryOn.playbook, "ci-finished");
+  assert.equal(carryOn.action, "nudge");
 });
+
 
 test("d1dbe71a, 2026-10-12: the owner stopping the supervisor's own turn is a no, not a crash to resume", () => {
   // As the readers report it: the supervisor's message is kept out of
@@ -1500,10 +1555,10 @@ test("the same nudge is never sent twice in a row without a reply between", () =
   const ledger = sentLedger(first, 20 * MIN);
   const again = run(makeThread(), { pr: redPr(), ledger }).decision;
   assert.equal(again.action, "wait");
-  assert.match(again.reason, /^same message sent at \d\d:\d\d; no reply since$/);
+  assert.match(again.reason, /^same PR, head and blockers as the \d\d:\d\d nudge; no reply since$/);
   // A synthetic limit notice after the send is not a reply.
   const notice = makeThread({ lastAgentText: "You've hit your session limit", lastAgentAt: ago(16 * MIN), lastAgentFullAt: ago(30 * MIN) });
-  assert.match(run(notice, { pr: redPr(), ledger }).decision.reason, /^same message sent at/);
+  assert.match(run(notice, { pr: redPr(), ledger }).decision.reason, /^same PR, head and blockers as the/);
   // A reply that lands before delivery returns still counts: sentAt is the send's start.
   const quick = run(makeThread({ lastAgentAt: ago(19.5 * MIN), lastActivityAt: ago(19.5 * MIN) }), { pr: redPr(), ledger: { ...ledger, nudges: [{ ...ledger.nudges[0], sentAt: ago(20 * MIN), at: ago(19 * MIN) }] } }).decision;
   assert.match(quick.reason, /^agent answered the/);
@@ -1584,7 +1639,7 @@ test("the same message with no reply is refused only so long, then the owner hea
   const decision = run(quiet, { pr: redPr(), ledger }).decision;
   assert.equal(decision.action, "ask-user");
   assert.equal(decision.question.kind, "stuck");
-  assert.match(decision.question.body, /same message sent at \d\d:\d\d; no reply since/);
+  assert.match(decision.question.body, /same PR, head and blockers as the \d\d:\d\d nudge; no reply since/);
 });
 
 test("'Blocked on: your merge decision' on an open PR is the ready or not-ready flow", () => {
@@ -1665,4 +1720,203 @@ test("the owner's keep going lifts the hold on an answered nudge, so the next ti
   const kept = run(thread, { pr, ledger: { ...ledger, attemptsWithoutProgress: 0, keepGoingAt: ago(MIN) } }).decision;
   assert.equal(kept.action, "nudge");
   assert.equal(kept.playbook, "merge-ready");
+});
+
+// --- Audit of 2026-10-12: nudge decisions and alerts --------------------------
+
+const DAKAR_HEAD = "99cacf5f3b5d2c9b1e0a8f7d6c5b4a3928170615";
+const fullGate = (state = "SUCCESS") => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state }];
+// dakar, buildbetter #7317: green full run, 0 threads, QA done; only main's
+// own health check red on the PR.
+function dakarPr(overrides = {}) {
+  return makePr({
+    ref: "buildbetter-app/buildbetter#7317", repo: "buildbetter-app/buildbetter", number: 7317, headOid: DAKAR_HEAD, gates: fullGate(),
+    ci: { state: "FAILURE", failing: ["Reconcile main health", "main-health"], pending: [], failedAt: "2026-09-26T11:20:00.000Z" }, ...overrides
+  });
+}
+const dakarReport = "PR #7317 is ready on its side but not merged.\n\n- BuildBot3 full verification is green on this exact head.\n- 0 review threads are open.\n\nBlocked on: main's own Testing CI is red. Until main is green, only PRs that fix main can merge.";
+const dakarThread = (extra = {}) => makeThread({
+  prRefs: ["buildbetter-app/buildbetter#7317"], repo: "buildbetter-app/buildbetter", workspace: "dakar",
+  lastAgentText: dakarReport, lastAgentFull: dakarReport, lastAgentFullAt: ago(30 * MIN), ...extra
+});
+const dakarGit = { ...cleanGit, head: DAKAR_HEAD, remote: "buildbetter-app/buildbetter" };
+
+test("dakar #7317: main's red health check alone is one owner question, never a merge-ready nudge", () => {
+  const first = run(dakarThread(), { pr: dakarPr(), localGit: dakarGit });
+  assert.equal(first.classified.state, "pr-not-ready");
+  assert.equal(first.decision.action, "ask-user");
+  assert.equal(first.decision.message, null);
+  assert.equal(first.decision.question.kind, "ready");
+  assert.match(first.decision.question.title, /^buildbetter #7317: main CI red blocks it/);
+  assert.match(first.decision.question.body, /99cacf5f3b: only CI red: Reconcile main health, main-health left/);
+  // main-health reruns on its own schedule: the same question, not a new one.
+  const rerun = run(dakarThread(), { pr: dakarPr({ ci: { ...dakarPr().ci, failedAt: "2026-09-26T11:50:00.000Z" } }), localGit: dakarGit }).decision;
+  assert.equal(rerun.question.dedupeKey, first.decision.question.dedupeKey);
+  // A fact changes (a push): a new question.
+  const pushed = "c".repeat(40);
+  const moved = run(dakarThread(), { pr: dakarPr({ headOid: pushed }), localGit: { ...dakarGit, head: pushed } }).decision;
+  assert.equal(moved.action, "ask-user");
+  assert.notEqual(moved.question.dedupeKey, first.decision.question.dedupeKey);
+  // A check still running may bring work of its own: wait, no question yet.
+  const running = run(dakarThread(), { pr: dakarPr({ ci: { state: "PENDING", failing: ["main-health"], pending: ["Testing"] } }), localGit: dakarGit }).decision;
+  assert.equal(running.action, "wait");
+  // Work the agent can do beside it is still nudged.
+  const qa = run(dakarThread(), { pr: dakarPr({ qa: { required: true, freshOnHead: false, sha: null } }), localGit: dakarGit }).decision;
+  assert.equal(qa.action, "nudge");
+  assert.equal(qa.playbook, "merge-ready");
+});
+
+test("dakar #7317: a nudge on the same PR, head and blockers is not resent in new words", () => {
+  // Nine merge-ready nudges on head 99cacf5f3b: their hashes differed
+  // (851ba4, 458635, 582aed, ...) because their words did, not their facts.
+  const pr = redPr();
+  const first = run(makeThread(), { pr }).decision;
+  assert.equal(first.action, "nudge");
+  const reworded = sentLedger({ ...first, messageHash: "4586350000000000" }, 20 * MIN);
+  const again = run(makeThread(), { pr, ledger: reworded }).decision;
+  assert.equal(again.action, "wait");
+  assert.match(again.reason, /^same PR, head and blockers as the \d\d:\d\d nudge; no reply since$/);
+  // Past the hold the owner hears it once, instead of another nudge.
+  const quiet = makeThread({ lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN), lastAgentFullAt: ago(3 * 60 * MIN) });
+  const stuck = run(quiet, { pr, ledger: sentLedger({ ...first, messageHash: "582aed0000000000" }, 2 * 60 * MIN) }).decision;
+  assert.equal(stuck.action, "ask-user");
+  assert.equal(stuck.question.kind, "stuck");
+  // A new head is a new fact: nudged again.
+  const pushed = "c".repeat(40);
+  const moved = run(makeThread(), { pr: redPr({ headOid: pushed }), localGit: { ...cleanGit, head: pushed }, ledger: reworded }).decision;
+  assert.equal(moved.action, "nudge");
+});
+
+test("an agent that answered it waits on the owner's go is asked about once, not nudged until the hold runs out", () => {
+  // "Blocked on: your go to merge" after a merge-ready nudge, with GitHub
+  // still showing work: the owner hears it now, keyed on PR, head and blockers.
+  const pr = redPr();
+  const first = run(makeThread(), { pr }).decision;
+  const answer = "Lint is a flake on main, not this PR.\n\nBlocked on: your go to merge.";
+  const answered = makeThread({ lastAgentText: answer, lastAgentFull: answer, lastAgentAt: ago(30 * MIN), lastAgentFullAt: ago(30 * MIN) });
+  const ledger = sentLedger(first, 40 * MIN);
+  const decision = run(answered, { pr, ledger }).decision;
+  assert.equal(decision.action, "ask-user");
+  assert.equal(decision.message, null);
+  assert.equal(decision.question.kind, "agent-ask");
+  assert.deepEqual(decision.question.options, ["go ahead", "wait"]);
+  assert.match(decision.question.title, /waits on your go/);
+  assert.match(decision.question.body, /Agent: blocked on your go to merge\. Left: CI red: lint\./);
+  assert.match(decision.question.dedupeKey, /^held:conductor:s1:/);
+  // An answer about something else waits as before.
+  const other = "Fixing lint now.\n\nBlocked on: nothing.";
+  const busy = makeThread({ lastAgentText: other, lastAgentFull: other, lastAgentAt: ago(30 * MIN), lastAgentFullAt: ago(30 * MIN) });
+  assert.equal(run(busy, { pr, ledger }).decision.action, "wait");
+});
+
+test("a relay's reply is read from the target thread's own transcript", () => {
+  // dakar answered each 15:53Z relay 7 s later in its own chat while its
+  // SendMessage back hit a closed socket. That chat reply holds the nudge.
+  const pr = redPr();
+  const first = run(makeThread(), { pr }).decision;
+  const relayed = { ...sentLedger(first, 40 * MIN), nudges: [{ ...sentLedger(first, 40 * MIN).nudges[0], route: "peer-relay" }] };
+  const reply = makeThread({ lastAgentText: "Lint is red on main too; rerunning.", lastAgentFull: "Lint is red on main too; rerunning.", lastAgentAt: ago(40 * MIN - 7_000), lastAgentFullAt: ago(40 * MIN - 7_000) });
+  const decision = run(reply, { pr, ledger: relayed }).decision;
+  assert.equal(decision.action, "wait");
+  assert.match(decision.reason, /^agent answered the \d\d:\d\d nudge; nothing new$/);
+});
+
+test("the LB is not paged while its watcher says healthy with no problems", () => {
+  // Seven manager-lb alarms the manager called false: five "LB unhealthy
+  // (timed out after 5000 ms)" and a "3x connection", each beside a watch
+  // line reading "healthy=yes ... problems: none".
+  const watch = (minAgo, tail = "problems: none") => `${ago(minAgo * MIN).replace(/\.\d+Z$/, "Z")} healthy=yes 280 req since start, v1.24.0, ${tail}`;
+  const timedOut = (watchLine) => ({ healthy: false, detail: "timed out after 5000 ms", watchLine, recentErrors: [] });
+  const health = (lb) => infraHealth({ bb3: bb3Base, lb }, { config, now: NOW }).lb;
+  const vouched = health(timedOut(watch(21)));
+  assert.deepEqual(vouched.problems, []);
+  assert.equal(vouched.down, false);
+  assert.equal(vouched.up, false, "a probe that timed out proves nothing either way");
+  // Errors from before the line are what it vouches for.
+  const connection = { kind: "connection", count: 3, lastAt: ago(10 * MIN), threadIds: ["x1"] };
+  assert.deepEqual(health({ ...lbOk, watchLine: watch(5), recentErrors: [connection] }).problems, []);
+  assert.deepEqual(health({ ...timedOut(watch(5)), recentErrors: [connection] }).problems, []);
+  // Corroborated errors since the line are news it cannot answer, and a
+  // probe timing out beside them counts too.
+  const since = { ...connection, lastAt: ago(2 * MIN) };
+  assert.deepEqual(health({ ...lbOk, watchLine: watch(24), recentErrors: [since] }).problems, ["3x connection"]);
+  const outage = health({ ...timedOut(watch(24)), recentErrors: [since] });
+  assert.deepEqual(outage.problems, ["LB unhealthy (timed out after 5000 ms)", "3x connection"]);
+  assert.equal(outage.down, true);
+  // One error since the line, not corroborated, leaves it vouching.
+  assert.deepEqual(health({ ...timedOut(watch(24)), recentErrors: [{ ...since, count: 1 }] }).problems, []);
+  const decisions = decideInfra({ bb3: bb3Base, lb: timedOut(watch(21)) }, { playbooks, config, now: NOW, manager, mode: "auto" });
+  assert.equal(decisions.some((decision) => decision.playbook === "manager-lb"), false);
+  // A stale watch line, or one with problems, vouches for nothing.
+  assert.deepEqual(health(timedOut(watch(120))).problems, ["LB unhealthy (timed out after 5000 ms)"]);
+  assert.deepEqual(health(timedOut(watch(10, "problems: 2 failed requests in the last hour"))).problems, ["LB unhealthy (timed out after 5000 ms)"]);
+  assert.deepEqual(health({ ...lbOk, watchLine: watch(24, "problems: 2 failed"), recentErrors: [connection] }).problems, ["3x connection"]);
+  // A probe that answered unhealthy is believed whatever the watcher said.
+  assert.equal(health({ healthy: false, detail: "HTTP 503", watchLine: watch(5), recentErrors: [] }).down, true);
+});
+
+test("#7352: a bb-quick wait after the full run passed on the head never pages the manager", () => {
+  // Its full run passed at 11:07Z; bb-quick alerts followed at 83m, 258m and 20m.
+  const quick = { id: "t1", description: "Run bb-quick on #7352", kind: "local_bash", startedAt: ago(83 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [quick], lastAgentAt: ago(20 * MIN), lastActivityAt: ago(5 * MIN) });
+  const passed = makePr({ gates: fullGate("SUCCESS"), ci: { state: "PENDING", failing: [], pending: ["Testing"] } });
+  const infra = { bb3: bb3Base, lb: lbOk, localVerify: [] };
+  const decision = run(thread, { pr: passed, infra }).decision;
+  assert.notEqual(decision.action, "escalate-manager");
+  assert.equal(decision.action, "wait");
+  // Nor does the infra escalation list it among the waiting threads.
+  const classified = classifyThread(thread, { pr: passed, localGit: cleanGit, infra, now: NOW, config });
+  const slowBb3 = { ...bb3Base, runs: [{ pid: 9, kind: "full", pr: 1, head: null, ageSec: 90 * 60, owner: null }] };
+  const infraDecisions = decideInfra({ bb3: slowBb3, lb: lbOk }, { playbooks, config, now: NOW, manager, mode: "auto", threads: [{ thread, classified, pr: passed }] });
+  const escalation = infraDecisions.find((item) => item.playbook === "manager-bb3");
+  assert.doesNotMatch(escalation.message, /#6522.*bb-quick/);
+  // With hosted CI done too, the agent hears CI is done instead.
+  const done = run(thread, { pr: makePr({ gates: fullGate("SUCCESS") }), infra }).decision;
+  assert.equal(done.playbook, "ci-finished");
+  // Before the full run reported, a slow bb-quick still goes to the manager.
+  const pending = run(thread, { pr: makePr({ gates: fullGate("PENDING"), ci: { state: "PENDING", failing: [], pending: ["Testing"] } }), infra }).decision;
+  assert.equal(pending.action, "escalate-manager");
+});
+
+test("the laptop-verify guard waits out the owner hold and names the process it saw", () => {
+  // monterrey: "Stop. Don't verify locally" went in while the owner was driving it.
+  const proc = { pid: 4242, command: "pnpm run build", cwd: "/work/madrid", ageSec: 600, threadKey: "conductor:s1" };
+  const infra = { bb3: bb3Base, lb: lbOk, localVerify: [proc] };
+  const thread = makeThread({ lastUserText: "finish all waves", lastUserAt: ago(60 * MIN) });
+  const fresh = run(thread, { infra }).decision;
+  assert.equal(fresh.playbook, "no-local-verify");
+  assert.equal(fresh.action, "nudge");
+  assert.match(fresh.message, /process 4242 in your worktree looks like a local build or verify \(10 min\)/);
+  assert.match(fresh.message, /If it is not a local build or verify, say so in one line/);
+  const held = run(thread, { infra, ledger: sentLedger(fresh, 90 * MIN) }).decision;
+  assert.equal(held.action, "wait");
+  assert.equal(held.reason, "owner is driving this thread");
+});
+
+// codex:019fe344 (#5557): the Codex app could not show the thread was open
+// ("on top of pr #5544, ..." is not the open thread) and holds its writer
+// lock, so codex exec cannot take over. The block repeats on every retry:
+// the owner hears it on the second one, not after 30 minutes.
+test("a Codex send the app cannot verify is the owner's after two failures", () => {
+  const reason = 'could not verify thread: "on top of pr #5544, i want to build a mo" is not the open thread; Codex holds the thread open, so codex exec cannot reach it';
+  const codex = makeThread({
+    key: "codex:019fe344-eb70-7da2-9186-62c55dbd61d2", kind: "codex", id: "019fe344-eb70-7da2-9186-62c55dbd61d2", title: "On top of PR #5544, I want to build a mock chat",
+    workspace: null, claudeSessionId: null, live: null, writerLocked: true, meta: { originator: "Codex Desktop" }, prRefs: ["acme/app#6522"],
+    lastAgentAt: ago(60 * MIN), lastActivityAt: ago(60 * MIN)
+  });
+  const pr = redPr({ ref: "acme/app#6522" });
+  const streak = (why, count = 2) => ({ nudges: [], attemptsWithoutProgress: 0, lastNudgeAt: null, lastProgressMark: null,
+    undelivered: { count, since: ago(12 * MIN), lastAt: ago(11 * MIN), reason: why, ackedAt: null } });
+  const asked = run(codex, { pr, ledger: streak(reason) }).decision;
+  assert.equal(asked.action, "ask-user");
+  assert.equal(asked.question.dedupeKey, `deliver:${codex.key}`);
+  assert.match(asked.reason, /Codex has it open under a title the supervisor cannot match: send it there yourself\.$/);
+  // Once: after the owner's answer it only retries.
+  assert.notEqual(run(codex, { pr, ledger: { ...streak(reason), undelivered: { ...streak(reason).undelivered, ackedAt: ago(MIN) } } }).decision.action, "ask-user");
+  // Any other failure, or a Conductor tab that showed another session, is
+  // asked about only after the usual streak (three over half an hour).
+  assert.notEqual(run(codex, { pr, ledger: streak("front app unknown") }).decision.action, "ask-user");
+  const tab = makeThread({ lastAgentAt: ago(60 * MIN), lastActivityAt: ago(60 * MIN) });
+  assert.notEqual(run(tab, { pr, ledger: streak("could not verify thread: another session is open") }).decision.action, "ask-user");
+  assert.equal(run(tab, { pr, ledger: { ...streak("could not verify thread: another session is open", 3), undelivered: { ...streak("x", 3).undelivered, reason: "could not verify thread: another session is open", since: ago(31 * MIN) } } }).decision.action, "ask-user");
 });

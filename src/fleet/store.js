@@ -8,6 +8,8 @@ import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "../file-utils.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
 
+// A question lives this long from when it was first put to the owner, asked
+// again or not; then it expires, and the same ask stays quiet as long again.
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
 // A question the supervisor closed and that is asked again this soon was a
 // blip: the same record comes back instead of a new one.
@@ -129,6 +131,12 @@ function keepReviewWording(question, fields) {
   const same = question.askedAs.title === fields.title && JSON.stringify(question.askedAs.options ?? []) === JSON.stringify(fields.options);
   if (same) Object.assign(fields, { title: question.title, options: question.options });
   else fields.askedAs = null;
+}
+
+// When the question was put to the owner (a reopen by the owner, or an
+// answer handed back, puts it again): its expiry runs from here.
+function liveSinceMs(question) {
+  return toMs(question.liveSince ?? question.createdAt, 0);
 }
 
 // Start of an owner close's TTL.
@@ -262,7 +270,11 @@ export class FleetStore {
   // permission card's stateId, an app and the chats running in it).
   // baseKey: an owner close of that ask holds this one too (a card item
   // asked once more under a new key).
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null } = {}) {
+  // askedHead: the PR head the ask was made at (a move past it settles it).
+  // An agent's own ask (agent-ask) also carries mergeAsk (it asks to merge,
+  // so it holds until answered or merged) and askedBy ("judge" when the
+  // judge raised it, which reads the chat only before a nudge).
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
@@ -279,16 +291,22 @@ export class FleetStore {
       kind: kind ?? null,
       // Grouped questions ("5 threads capped") cover several threads.
       threadKeys: Array.isArray(threadKeys) && threadKeys.length ? threadKeys.slice(0, 50) : null,
-      ...(questionMeta(meta) ? { meta: questionMeta(meta) } : {})
+      ...(questionMeta(meta) ? { meta: questionMeta(meta) } : {}),
+      ...(kind === "agent-ask" ? { mergeAsk: Boolean(mergeAsk), askedBy: askedBy ?? null } : {})
     };
+    const head = typeof askedHead === "string" && askedHead ? askedHead : null;
     const key = String(dedupeKey ?? "").trim() || `${fields.threadKey ?? "fleet"}:${fields.title}`;
+    if (!this.state.questions.some((q) => q.status === "open" && q.dedupeKey === key)) this._adoptLegacyAsk(key, fields, origin);
     const existing = this.state.questions.find((q) => q.status === "open" && q.dedupeKey === key);
     if (existing) {
-      // Still asked, so it has not expired. Not saved on its own: the next
-      // write (at least the tick's snapshot) carries it.
+      // Not saved on its own: the next write (at least the tick's snapshot)
+      // carries it.
       // scanAskedAt: only a scan asking it sets this (a reopen does not).
-      Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS) });
+      // Asking again does not push its expiry back (liveSinceMs).
+      Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now) });
       if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
+      // Asked again at a new head: the ask stands at that head.
+      if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
@@ -307,13 +325,24 @@ export class FleetStore {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
     }
+    // It expired while still asked: quiet for a TTL, then asked anew.
+    const expired = this._expiredHold(key, now, fields);
+    if (expired) {
+      expired.lastAskedAt = iso(now);
+      return { ...expired, suppressed: true };
+    }
+    // The agent asks again in a newer message while its last ask is still
+    // open: one question per agent, so the open one takes the new ask in
+    // place (same id, same outreach copy, no second push).
+    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now);
+    if (superseded) return superseded;
     // Same record, same outreach copy, no second push.
     const resolved = this._recentlyResolved(key, now);
     if (resolved) {
       keepReviewWording(resolved, fields);
       Object.assign(resolved, fields, origin.askContext ? origin : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
-        lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+        lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(liveSinceMs(resolved) + QUESTION_TTL_MS)
       });
       this._save();
       return { ...resolved, reopened: true };
@@ -323,6 +352,7 @@ export class FleetStore {
       dedupeKey: key,
       ...fields,
       ...(origin.askContext ? origin : {}),
+      ...(head ? { askedHead: head } : {}),
       status: "open",
       answer: null,
       createdAt: iso(now),
@@ -399,9 +429,10 @@ export class FleetStore {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
     if (question.status === "answered" && (answer === null || question.answer === answer)) {
-      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()) });
-      // Put back as a fresh ask, so it does not expire on the next read.
-      if (asked) Object.assign(question, { lastAskedAt: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
+      // Put back with a fresh day, so an answer that failed near the end of
+      // the old one does not expire on the next read.
+      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()), liveSince: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
+      if (asked) question.lastAskedAt = iso(this.now());
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
     this._save();
@@ -465,7 +496,7 @@ export class FleetStore {
     if (this.state.questions.some((q) => q.status === "open" && q.dedupeKey === question.dedupeKey)) return null;
     Object.assign(question, {
       status: "open", answeredAt: null, resolvedBy: null, resolveReason: null, duplicateOf: null, pinned: true,
-      reopenedAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+      reopenedAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
     });
     this._save();
     return { ...question };
@@ -744,6 +775,99 @@ export class FleetStore {
     return latest;
   }
 
+  // The latest expiry of this ask, while it still holds the ask back.
+  _expiredHold(key, now, fields = {}) {
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.dedupeKey !== key || question.status !== "expired" || widens(question, fields)) continue;
+      const expiredAt = toMs(question.expiredAt ?? question.updatedAt, null);
+      if (expiredAt === null || now - expiredAt >= QUESTION_TTL_MS) continue;
+      if (!latest || expiredAt > toMs(latest.expiredAt ?? latest.updatedAt, 0)) latest = question;
+    }
+    return latest;
+  }
+
+  // An open agent ask on the same thread from an older agent message takes
+  // this newer ask in place. Its review and wording start over. The same
+  // question restated (both ask to merge, or the same words, about the same
+  // PR) keeps its push and its expiry; a different one is put to the owner
+  // anew, with its own day and push (milan: a new decision 23 h into an old
+  // ask would expire an hour later, never pushed, then stay quiet a day).
+  _supersedeAgentAsk(key, fields, origin, head, now) {
+    if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
+    const askedAt = toMs(origin.agentAskedAt, null);
+    if (askedAt === null) return null;
+    const older = this.state.questions.find((q) => q.status === "open" && q.kind === "agent-ask" && q.threadKey === fields.threadKey
+      && toMs(q.agentAskedAt, null) !== null && toMs(q.agentAskedAt, 0) < askedAt);
+    if (!older) return null;
+    const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+    // A merge ask about another PR is a new question, whatever its words.
+    const samePr = !older.prRef || !fields.prRef || older.prRef === fields.prRef;
+    // Titles are generic per topic ("wants a prod step. OK?" for every prod
+    // approval), so only the ask itself counts: the same body, or both merge
+    // asks about the same PR. The title decides only when neither has a body.
+    const body = norm(fields.body);
+    const restated = samePr && ((older.mergeAsk && fields.mergeAsk)
+      || (body ? norm(older.body) === body : !norm(older.body) && norm(older.title) === norm(fields.title)));
+    Object.assign(older, fields, origin, {
+      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
+      supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
+      ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
+    });
+    this._save();
+    return { ...older, superseded: true };
+  }
+
+  // Judge asks a build before 2026-10-12 saved under the judge's own key
+  // (judge:<thread>:<hash>, no askedBy) take the key a scan now gives the
+  // same ask (keyFor: policy's agentAskKey, on the agent message it came
+  // from) and say the judge asked them. Else an answer kept for typing is
+  // dropped as superseded on the first scan: the judge does not read a
+  // thread whose answer waits, so nothing asks that key again.
+  migrateJudgeAskKeys(keyFor) {
+    const openKeys = new Set(this.state.questions.filter((q) => q.status === "open").map((q) => q.dedupeKey));
+    let changed = false;
+    for (const question of this.state.questions) {
+      const key = String(question.dedupeKey ?? "");
+      if (question.kind !== "agent-ask" || !question.threadKey || !key.startsWith(`judge:${question.threadKey}:`)) continue;
+      if (!question.askedBy) {
+        question.askedBy = "judge";
+        changed = true;
+      }
+      if (!Number.isFinite(Date.parse(question.agentAskedAt ?? ""))) continue;
+      const next = keyFor(question.threadKey, { at: question.agentAskedAt });
+      // Never a second open question under one key.
+      if (!next || (question.status === "open" && openKeys.has(next))) continue;
+      if (question.status === "open") openKeys.add(next);
+      question.dedupeKey = next;
+      changed = true;
+    }
+    if (changed) this._save();
+    return changed;
+  }
+
+  // An agent ask a build before 2026-10-12 saved under its wording's key
+  // (ask:<thread>:<text hash>) is the same ask as one asked now about the
+  // same agent message: it takes the new key, whatever its status, so an
+  // open one is not asked twice, an answered or dismissed one holds, and an
+  // answer kept for typing is not dropped as superseded. Records saved since
+  // carry mergeAsk; a structured ask's key (its own id) never changed.
+  _adoptLegacyAsk(key, fields, origin) {
+    if (fields.kind !== "agent-ask" || !fields.threadKey) return;
+    const askedAt = toMs(origin.agentAskedAt, null);
+    if (askedAt === null) return;
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.kind !== "agent-ask" || question.threadKey !== fields.threadKey || Object.hasOwn(question, "mergeAsk")) continue;
+      if (question.dedupeKey === key || !String(question.dedupeKey ?? "").startsWith(`ask:${fields.threadKey}:`)) continue;
+      if (toMs(question.agentAskedAt, null) !== askedAt) continue;
+      if (!latest || toMs(question.updatedAt, 0) > toMs(latest.updatedAt, 0)) latest = question;
+    }
+    if (!latest) return;
+    latest.dedupeKey = key;
+    this._save();
+  }
+
   _recentlyResolved(key, now) {
     let latest = null;
     for (const question of this.state.questions) {
@@ -770,14 +894,15 @@ export class FleetStore {
     return { ...question };
   }
 
-  // Only a TTL with no ask expires a question; one still asked every tick
-  // keeps its id.
+  // A question expires a TTL after it was put to the owner, still asked or
+  // not: an ask nobody answered in a day leaves the list (see _expiredHold).
   _expireQuestions(now) {
     let changed = false;
     for (const question of this.state.questions) {
       if (question.status !== "open") continue;
-      if (now - lastAskMs(question) < QUESTION_TTL_MS) continue;
+      if (now - liveSinceMs(question) < QUESTION_TTL_MS) continue;
       question.status = "expired";
+      question.expiredAt = iso(now);
       question.updatedAt = iso(now);
       if (question.outreachId) this.expired.push({ ...question });
       changed = true;

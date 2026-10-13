@@ -9,12 +9,12 @@
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
 import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
-import { WATCH_GROUPS, classifyThread, mergeThreads, threadHealth, watchOf } from "./classify.js";
+import { WATCH_GROUPS, classifyThread, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
+import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
@@ -30,6 +30,8 @@ const MIN = 60_000;
 const SOURCE_TIMEOUT_MS = 90_000;
 const GIT_CONCURRENCY = 8;
 const MAX_BRANCH_LOOKUPS = 8;
+const MAX_NEW_BRANCH_LOOKUPS = 48;
+const BRANCH_LOOKUP_CONCURRENCY = 6;
 const BRANCH_LOOKUP_TTL_MS = 30 * MIN;
 const START_DELAY_MS = 5_000;
 // The idle watcher: a scan starts once the owner has been away long enough
@@ -48,6 +50,21 @@ const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"])
 const INFRA_KINDS = ["bb3", "lb"];
 const BLOCKED_STATES = new Set(["infra-blocked", "waiting-ci"]);
 const SETTLED_PR_STATES = new Set(["MERGED", "CLOSED"]);
+// A thread naming several PRs is read for this many of its newest, and the
+// newest open one is its PR (a merged one never reopens, so it is kept).
+const MAX_PR_CANDIDATES = 4;
+const MAX_MERGED_KEPT = 2_000;
+// The PR state read right before a send, at most.
+const PRE_SEND_PR_MS = 10_000;
+// Nudges about the thread's PR itself: one whose PR merged or closed is moot.
+const PR_PLAYBOOKS = new Set(["merge-ready", "ci-finished"]);
+// A stopped or blocked turn's resume goes out whatever its PR says (classify:
+// post-merge work may remain), so a settled PR never cancels one, even when
+// the judge's words name it ("PR: repo#7489 MERGED" is in its prompt).
+const POST_MERGE_PLAYBOOKS = new Set(["resume", "infra-recovered"]);
+// Nudges that are about the machine, not the PR: a PR number in their words
+// (the judge's "Stop local verification for #123") never makes them stale.
+const NOT_ABOUT_PR_PLAYBOOKS = new Set(["no-local-verify"]);
 // How long a remembered outage thread hidden by a failed source waits for it.
 const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
@@ -100,6 +117,52 @@ async function mapLimit(items, limit, fn) {
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+// A Conductor chat's own PRs: the ones it created (meta.prCreated, newest
+// first), then any a Claude transcript linked (pr-link rows, also created
+// there). Only these and the workspace branch's PR are ever its PR: a PR it
+// only named, viewed or checked (a stack base, one it reviewed, another
+// agent's) never is, nor stands alone as one.
+function resolveCreatedPrs(threads) {
+  for (const thread of threads) {
+    if (thread.kind !== "conductor") continue;
+    const created = Array.isArray(thread.meta?.prCreated) ? thread.meta.prCreated.filter((ref) => parsePrRef(ref)) : [];
+    thread.createdPrRefs = [...new Set([...created, ...(thread.prRefs ?? [])])];
+    thread.prRefs = [...thread.createdPrRefs];
+  }
+}
+
+// The workspace branch's PR leads a chat's created PRs as a candidate.
+function withBranchRef(thread, ref) {
+  thread.branchPrRef = ref;
+  thread.prRefs = [ref, ...(thread.prRefs ?? []).filter((other) => other !== ref)];
+}
+
+// A Conductor chat's PR among its candidates (state: ref -> "OPEN",
+// "MERGED", ..., null for no PR, undefined unread): the workspace branch's
+// PR while it is open; else the newest open PR the chat created; else the
+// newest it created, then the branch PR. An older open PR never beats the
+// branch's open one, and a PR the chat did not create is never a candidate.
+function pickConductorPr(thread, state) {
+  const branch = thread.branchPrRef ?? null;
+  const created = thread.createdPrRefs.slice(0, MAX_PR_CANDIDATES);
+  const real = (ref) => state(ref) !== null;
+  const pick = branch && state(branch) === "OPEN" ? branch
+    : created.find((ref) => state(ref) === "OPEN") ?? created.find(real) ?? (branch && real(branch) ? branch : null);
+  const rest = [...new Set([...(branch ? [branch] : []), ...thread.createdPrRefs])].filter((ref) => ref !== pick && real(ref));
+  thread.prRefs = pick ? [pick, ...rest] : rest;
+  // None of them is a PR, and the branch has none: the chat has no PR.
+  if (!thread.prRefs.length && thread.branchNoPr) thread.prLookedUp = true;
+}
+
+// GitHub unread this scan: the chat keeps the PR the last scan picked, else
+// the newest it created, never its branch PR just because it leads (that one
+// may have merged long before the chat created a newer one).
+function keepConductorPr(thread, previous) {
+  const own = [...new Set([...(thread.branchPrRef ? [thread.branchPrRef] : []), ...thread.createdPrRefs])];
+  const pick = own.includes(previous) ? previous : (thread.createdPrRefs[0] ?? null);
+  if (pick) thread.prRefs = [pick, ...(thread.prRefs ?? []).filter((ref) => ref !== pick)];
 }
 
 function emptyBb3() {
@@ -186,14 +249,62 @@ function replyMark(thread) {
   return shortHash(`${reply.at ?? ""}\n${reply.text}`);
 }
 
-// The judge's question: its title and choices, for the agent message it
-// was read from. Not the free-text body, which a re-read words differently:
-// the same ask for the same reply stays one question (and an answer to it
-// keeps it quiet), while a new reply may ask anew.
-export function judgeAskKey(thread, question) {
-  const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
-  const options = (question.options ?? []).map(norm).sort();
-  return `judge:${thread.key}:${shortHash([norm(question.title), options.join("|"), replyMark(thread)].join("\n"))}`;
+// The judge's question is the agent's ask, keyed like the policy's own
+// (agentAskKey): on the agent message it was read from, never its wording.
+// A reread that words it differently updates the same question in place
+// (and an answer to it keeps it quiet), while a new reply may ask anew.
+export function judgeAskKey(thread, _question = null) {
+  const reply = agentReply(thread);
+  return agentAskKey(thread.key, { at: reply.at, text: reply.text });
+}
+
+// A judge question that asks to merge holds like the policy's merge asks.
+function asksToMerge(question) {
+  return asksToMergePr([question?.title, question?.body, ...(question?.options ?? [])].join(" "));
+}
+
+// Asks that stand until settled, not while the thread's state reads a
+// certain way: a waiting-ci <-> needs-human flicker leaves them open. A
+// policy hold ("main CI red blocks it", "waits on your go": held:) is not
+// one: it closes once a scan decides its thread without asking it.
+const STANDING_KINDS = new Set(["agent-ask", "ready"]);
+const standing = (question) => STANDING_KINDS.has(question.kind) && !String(question.dedupeKey ?? "").startsWith("held:");
+
+// What makes an open PR asked as ready no longer ready, read from the PR
+// alone, or null. Only what the PR itself says for certain: CI running again,
+// an unread gate or unknown mergeability is no news. A required gate whose
+// latest run was cancelled or timed out is red, like a failed one.
+const NOT_READY = /^(?:CI red: |\d+ open threads$|changes requested$|merge conflicts$|branch behind base$|draft$)|\S (?:failed|cancelled|timed_out)$/;
+function notReadyBlocker(pr) {
+  if (pr?.state !== "OPEN") return null;
+  return prReadiness(pr, null).blockers.find((blocker) => NOT_READY.test(blocker)) ?? null;
+}
+
+// Why an open standing ask no longer needs the owner, or null. The owner's
+// answer closes it elsewhere. A ready PR settles when it merges, closes,
+// moves past the asked head or stops being ready on it (notReady). An
+// agent's ask also settles when its thread is gone or muted, or (unless it
+// asks to merge) when the agent spoke since and no longer asks: it withdrew
+// or answered it itself.
+// prMissing: GitHub answered and has no such PR. notReady: a blocker this
+// scan read on the PR (notReadyBlocker).
+export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false, notReady = null } = {}) {
+  const askedAt = Date.parse(question.agentAskedAt ?? question.createdAt ?? "");
+  if (question.kind === "ready" && prMissing) return "PR not found";
+  if (pr && SETTLED_PR_STATES.has(pr.state)) {
+    // An ask made after the merge (a release, QA on it) is not about it.
+    const settledAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+    const after = question.kind === "ready" || !Number.isFinite(settledAt) || !Number.isFinite(askedAt) || settledAt >= askedAt;
+    if (after) return `${parsePrRef(pr.ref)?.number ? `#${parsePrRef(pr.ref).number}` : "PR"} ${pr.state === "MERGED" ? "merged" : "closed"}`;
+  }
+  if (pr?.state === "OPEN" && question.askedHead && pr.headOid && pr.headOid !== question.askedHead) return `PR head moved past ${String(question.askedHead).slice(0, 10)}`;
+  if (question.kind === "ready" && notReady) return `PR no longer ready: ${notReady}`;
+  if (question.kind !== "agent-ask") return null;
+  if (muted) return "muted by owner";
+  if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
+  const spokeAt = Date.parse(agentReply(thread).at ?? "");
+  if (!question.mergeAsk && thread && Number.isFinite(spokeAt) && Number.isFinite(askedAt) && spokeAt > askedAt) return "agent moved on: no longer asks";
+  return null;
 }
 
 // pending: the judge has not read the chat (a failure, the per-scan cap), so
@@ -364,11 +475,16 @@ export class FleetSupervisor {
     this.lastTickAt = null;
     this.lastError = null;
     this.lastThreads = new Map();
+    this.lastPrs = new Map();
     // key -> { group, since }: when each thread entered its watch group.
     this.watchSince = new Map();
     this.branchLookups = new Map();
     // ref -> last MERGED or CLOSED read, for ticks GitHub cannot answer.
     this.settledPrs = new Map();
+    // Refs GitHub reported MERGED: final, so never read again as candidates.
+    this.mergedPrs = new Set();
+    // Conductor thread key -> the PR the last scan that read GitHub picked.
+    this.conductorPicks = new Map();
     this.answering = new Set();
     this._uiDriver = undefined;
     this._uiBlockedSince = null;
@@ -416,6 +532,8 @@ export class FleetSupervisor {
       this._store = new FleetStore({
         dir: path.join(this.dataDir, "fleet"), defaultMode: this.config.mode, limits: this.config.limits, now: () => this.now()
       });
+      // Judge asks an older build keyed its own way take today's keys.
+      this._store.migrateJudgeAskKeys(agentAskKey);
     }
     return this._store;
   }
@@ -841,7 +959,7 @@ export class FleetSupervisor {
       const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
       // The judge does not read a thread whose answer waits (judgeNudges),
       // so its ask is not asked again: it stands until the agent speaks.
-      const judgeAsk = String(question.dedupeKey ?? "").startsWith("judge:");
+      const judgeAsk = question.askedBy === "judge";
       const stale = (question.kind === "agent-ask" || question.kind === "agent-card") && !judgeAsk ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
@@ -1316,6 +1434,11 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
+    const settled = action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null;
+    if (settled) {
+      const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
+      return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
+    }
     const sentAt = new Date(this.now()).toISOString();
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
     if ((delivery.route ?? action.route) === "computer-use") this.noteUiResult(thread, delivery);
@@ -1401,9 +1524,14 @@ export class FleetSupervisor {
     const carded = threads.filter((thread) => CARD_EXCLUSIONS.has(thread.excluded) && hasCard(thread));
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
+    resolveCreatedPrs(inScope);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
+    await this.preferOpenPrs(inScope, config, run);
     const unreadPrs = new Set();
-    const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs), unreadPrs);
+    // An open question's PR is read too, even once its thread moved to
+    // another PR or left the scan: its merge settles the question.
+    const askedPrs = this.store.openQuestions().map((question) => question.prRef);
+    const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs, askedPrs), unreadPrs);
 
     const infra = {
       bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
@@ -1463,12 +1591,25 @@ export class FleetSupervisor {
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
-    // Automatic nudges are read by the judge before they go out (Auto only).
-    await this.judgeNudges(items, { started });
-
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
+    // Automatic nudges are read by the judge before they go out (Auto only),
+    // an infra recovery's resume too. It replaces its thread's own nudge
+    // (dedupeDecisions keeps it first anyway); beside an ask or a wait it is
+    // read as a decision of its own.
+    const itemOf = new Map(items.map((item) => [item.thread.key, item]));
+    const recoveries = [];
+    const replaced = new Set();
+    for (const [index, decision] of infraDecisions.entries()) {
+      const item = decision.action === "nudge" ? itemOf.get(decision.threadKey) : null;
+      if (!item) continue;
+      const own = item.decision.action === "nudge" && !replaced.has(item);
+      if (own) { item.decision = decision; replaced.add(item); }
+      recoveries.push({ index, item: own ? item : { ...item, decision }, extra: !own });
+    }
+    await this.judgeNudges([...items, ...recoveries.filter(({ extra }) => extra).map(({ item }) => item)], { started });
+    for (const { index, item } of recoveries) infraDecisions[index] = item.decision;
     // How long a nudge has waited on computer use, for telling the owner.
     // The live mode: the owner may have left Auto while this tick scanned.
     const queuedWaits = this.store.queuedAnswers().map((question) => ({ threadKey: question.threadKey, uiBlocked: true }));
@@ -1489,6 +1630,8 @@ export class FleetSupervisor {
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
     this.lastThreads = byKey;
+    // Each thread's PR as this scan read it, for a proposal sent later.
+    this.lastPrs = new Map(items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr]));
 
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
@@ -1498,7 +1641,7 @@ export class FleetSupervisor {
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1634,6 +1777,8 @@ export class FleetSupervisor {
         options: verdict.question.options,
         dedupeKey: judgeAskKey(thread, verdict.question),
         kind: "agent-ask",
+        mergeAsk: asksToMerge(verdict.question),
+        askedBy: "judge",
         askContext: clampTail(redactSecrets(reply.text), limits.excerptMax),
         agentAskedAt: reply.at ?? null
       }
@@ -1678,9 +1823,10 @@ export class FleetSupervisor {
           .map(({ thread }) => thread.key);
         this.store.setInfraBlocked(kind, [...previous[kind], ...current]);
       } else if (health[kind].up) {
+        // A resume the judge has not read yet (its cap, a failure) is still due.
         const pending = new Set(recovering
           .filter((decision) => !decision.threadKey.startsWith("infra:") && !attempted.has(decision.threadKey)
-            && decision.action === "nudge" && mode === "auto" && decision.route)
+            && ((decision.action === "nudge" && decision.route) || (decision.judgePending && decision.playbook === "infra-recovered")) && mode === "auto")
           .map((decision) => decision.threadKey));
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
         const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;
@@ -1712,16 +1858,32 @@ export class FleetSupervisor {
     if (this.skip.github) return;
     const find = this.deps.findPrForBranch ?? github.findPrForBranch;
     const now = this.now();
-    let lookups = 0;
-    // Unseen branches precede expired negative results, then oldest first.
-    const candidates = [...inScope].sort((a, b) => (this.branchLookups.get(`${a.repo}:${a.branch}`)?.at ?? -Infinity) - (this.branchLookups.get(`${b.repo}:${b.branch}`)?.at ?? -Infinity));
+    // prLookedUp: this thread's PR is known to be none (nothing to look up,
+    // or GitHub answered no PR). Policy judges no-PR threads only then.
+    // A Conductor chat's created PRs may all be done: its workspace
+    // branch's PR joins them as a candidate (pickConductorPr). Whether
+    // that branch has none is noted (branchNoPr) for when none of the
+    // created ones is a PR either.
+    const noPr = (thread) => {
+      if (thread.prRefs?.length) thread.branchNoPr = true;
+      else thread.prLookedUp = true;
+    };
+    // A branch never looked up since start (all of them on the first scan
+    // after a restart) has its own budget, so a restart is not two scans of
+    // threads with no PR (a93b6870's #7621, 01a0f89f's #7163 on the 10-12
+    // replay). Refreshes of a known branch share the smaller one.
+    const spent = { first: 0, refresh: 0 };
+    const lastAt = (thread) => this.branchLookups.get(`${thread.repo}:${thread.branch}`)?.at ?? -Infinity;
+    const hasRefs = (thread) => (thread.prRefs?.length ? 1 : 0);
+    // Unseen branches precede expired negative results, then oldest first;
+    // a thread with no PR at all before a chat whose created PRs stand in.
+    const candidates = [...inScope].sort((a, b) => lastAt(a) - lastAt(b) || hasRefs(a) - hasRefs(b));
+    const jobs = new Map();
     for (const thread of candidates) {
-      // prLookedUp: this thread's PR is known to be none (nothing to look up,
-      // or GitHub answered no PR). Policy judges no-PR threads only then.
-      if (thread.prRefs?.length) continue;
+      if (thread.prRefs?.length && thread.kind !== "conductor") continue;
       // No branch, or a trunk one: no PR to find. A missing repo (git could
       // not be read) leaves it unknown.
-      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { thread.prLookedUp = true; continue; }
+      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { noPr(thread); continue; }
       if (!thread.repo) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
@@ -1730,33 +1892,119 @@ export class FleetSupervisor {
       const head = git?.branch === thread.branch ? (git.head ?? null) : null;
       const cached = this.branchLookups.get(cacheKey);
       const fresh = cached && now - cached.at < BRANCH_LOOKUP_TTL_MS;
+      const kind = cached ? "refresh" : "first";
+      const spentOut = spent[kind] >= (cached ? MAX_BRANCH_LOOKUPS : MAX_NEW_BRANCH_LOOKUPS);
       // An unknown head (git failed) keeps the cached answer, and so does a
       // thread past this tick's lookup budget: the last answer beats none.
-      if (fresh && (head === null || cached.head === head || lookups >= MAX_BRANCH_LOOKUPS)) {
-        if (cached.ref) thread.prRefs = [cached.ref];
+      if (fresh && (head === null || cached.head === head || spentOut)) {
+        if (cached.ref) withBranchRef(thread, cached.ref);
         // No PR for this same head only (both unknown counts as the same):
         // a git failure after a known head, or a spent budget with a newer
         // head, leaves the answer unknown.
-        else if (cached.head === head) thread.prLookedUp = true;
+        else if (cached.head === head) noPr(thread);
         continue;
       }
-      if (lookups >= MAX_BRANCH_LOOKUPS) continue;
-      lookups += 1;
+      // Another thread on the same branch and head already asks.
+      const lookupKey = `${cacheKey}\n${head ?? ""}`;
+      if (jobs.has(lookupKey)) { jobs.get(lookupKey).threads.push(thread); continue; }
+      if (spentOut) {
+        // An expired PR still beats none; an expired "no PR" is unknown.
+        if (cached?.ref) withBranchRef(thread, cached.ref);
+        continue;
+      }
+      spent[kind] += 1;
+      jobs.set(lookupKey, { repo: thread.repo, branch: thread.branch, head, cwd: head ? thread.cwd : null, cacheKey, cached, threads: [thread] });
+    }
+    const list = [...jobs.values()];
+    await mapLimit(list, BRANCH_LOOKUP_CONCURRENCY, async (job) => {
       try {
-        const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head, cwd: head ? thread.cwd : null })), 20_000, "pr lookup");
-        this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now, head });
-        if (ref) thread.prRefs = [ref];
-        else thread.prLookedUp = true;
+        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd })), 20_000, "pr lookup")) ?? null;
+        job.ok = true;
       } catch (error) {
-        sourceErrors.prLookup = clampText(error?.message, 200);
-        if (cached?.ref) thread.prRefs = [cached.ref];
+        job.error = error;
+      }
+    });
+    for (const job of list) {
+      if (job.ok) this.branchLookups.set(job.cacheKey, { ref: job.ref, at: now, head: job.head });
+      else sourceErrors.prLookup = clampText(job.error?.message, 200);
+      const ref = job.ok ? job.ref : job.cached?.ref;
+      for (const thread of job.threads) {
+        if (ref) withBranchRef(thread, ref);
+        else if (job.ok) noPr(thread);
       }
     }
   }
 
-  async fetchPrs(inScope, config, run, sourceErrors, unread = new Set()) {
+  // A thread linking several PRs is about the newest open one: a merged PR
+  // it linked before is done. Each thread's newest MAX_PR_CANDIDATES are
+  // read for state only; a number GitHub says is no PR is dropped. With
+  // nothing open, or GitHub unreadable, the newest stays first. A Conductor
+  // chat that created a PR is read even for one (pickConductorPr): its
+  // branch PR may lead, or the one it created may be no PR. GitHub
+  // unreadable, it keeps the last pick (keepConductorPr).
+  async preferOpenPrs(inScope, config, run) {
+    if (this.skip.github) return;
+    const conductorOwn = (thread) => thread.kind === "conductor" && (thread.createdPrRefs?.length ?? 0) > 0;
+    const several = inScope.filter((thread) => conductorOwn(thread) || (thread.prRefs?.length ?? 0) > 1);
+    const candidatesOf = (thread) => (conductorOwn(thread) ? [thread.branchPrRef, ...thread.createdPrRefs.slice(0, MAX_PR_CANDIDATES)] : [...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef]);
+    const wanted = [...new Set(several.flatMap(candidatesOf))]
+      .filter((ref) => parsePrRef(ref) && !this.mergedPrs.has(ref));
+    let states = new Map();
+    if (wanted.length) {
+      try {
+        const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
+        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+      } catch {
+        for (const thread of several) if (conductorOwn(thread)) keepConductorPr(thread, this.conductorPicks.get(thread.key));
+        return;
+      }
+    }
+    const picks = new Map();
+    for (const [ref, pr] of states) if (pr?.state === "MERGED") this.mergedPrs.add(ref);
+    if (this.mergedPrs.size > MAX_MERGED_KEPT) this.mergedPrs = new Set([...this.mergedPrs].slice(-MAX_MERGED_KEPT / 2));
+    for (const thread of several) {
+      const candidates = [...new Set([...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef].filter(Boolean))];
+      const state = (ref) => (this.mergedPrs.has(ref) ? "MERGED" : states.has(ref) ? (states.get(ref)?.state ?? null) : undefined);
+      if (conductorOwn(thread)) {
+        pickConductorPr(thread, state);
+        if (thread.prRefs[0]) picks.set(thread.key, thread.prRefs[0]);
+        continue;
+      }
+      const open = candidates.find((ref) => state(ref) === "OPEN");
+      // null: GitHub answered that the number is no PR.
+      const kept = thread.prRefs.filter((ref) => state(ref) !== null);
+      thread.prRefs = open ? [open, ...kept.filter((ref) => ref !== open)] : kept;
+    }
+    this.conductorPicks = picks;
+  }
+
+  // The thread's PR read again right before a nudge: one merged or closed
+  // since the scan cancels it (monrovia was told #7589 was not ready 2 s
+  // after it merged), and so does a nudge about a PR already settled
+  // (madrid heard about #7586's BuildBot3 run 76 min after it merged).
+  // Null to send; an unreadable PR sends as the scan decided.
+  async prSettledBeforeSend(thread, pr, decision) {
+    const ref = pr?.ref ?? thread?.prRefs?.[0] ?? null;
+    const parsed = parsePrRef(ref);
+    if (!parsed || this.skip.github || POST_MERGE_PLAYBOOKS.has(decision.playbook)) return null;
+    let fresh;
+    try {
+      const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
+      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand })), PRE_SEND_PR_MS, "github"))?.get(ref);
+    } catch {
+      return null;
+    }
+    if (!SETTLED_PR_STATES.has(fresh?.state)) return null;
+    const since = !SETTLED_PR_STATES.has(pr?.state);
+    const about = PR_PLAYBOOKS.has(decision.playbook)
+      || (!NOT_ABOUT_PR_PLAYBOOKS.has(decision.playbook) && new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? "")));
+    if (!since && !about) return null;
+    return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
+  }
+
+  async fetchPrs(inScope, config, run, sourceErrors, unread = new Set(), extraRefs = []) {
     if (this.skip.github) return new Map();
-    const refs = [...new Set(inScope.map((thread) => thread.prRefs?.[0]).filter((ref) => parsePrRef(ref)))];
+    const refs = [...new Set([...inScope.map((thread) => thread.prRefs?.[0]), ...extraRefs].filter((ref) => parsePrRef(ref)))];
     if (!refs.length) return new Map();
     try {
       const fetch = this.deps.fetchPrStates ?? github.fetchPrStates;
@@ -1785,7 +2033,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1825,7 +2073,8 @@ export class FleetSupervisor {
       const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
-      const question = store.upsertQuestion(fields);
+      // The head it is asked at: a move past it settles the ask (settledAsk).
+      const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
@@ -1925,15 +2174,25 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; held: not judged this scan`;
         continue;
       }
+      const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
+      if (uiKey && typedInto.has(uiKey)) continue;
+      if (decision.action === "nudge") {
+        const item = items.find((entry) => entry.thread.key === decision.threadKey);
+        const settled = await this.prSettledBeforeSend(item?.thread ?? target, item?.pr ?? null, decision);
+        if (settled) {
+          const detail = `not sent: ${settled}`;
+          if (existing) store.updateAction(existing.id, { ...record, status: "stale", detail, at });
+          else store.recordAction({ ...record, status: "stale", detail, at });
+          continue;
+        }
+      }
       // An owner answer that started after the judge read (during the
-      // review, the notifications, the kept answers or an earlier send)
-      // goes first: checked again right before each send.
+      // review, the notifications, the kept answers, an earlier send or the
+      // PR read just above) goes first: checked again right before each send.
       if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;
       }
-      const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
-      if (uiKey && typedInto.has(uiKey)) continue;
       if (uiKey) typedInto.add(uiKey);
       tries += 1;
       attempted.add(decision.threadKey);
@@ -1953,15 +2212,17 @@ export class FleetSupervisor {
       if (action.kind !== "storage" && !seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
-    // decided again this tick without asking.
+    // decided again this tick without asking. An agent's own ask and a
+    // ready PR stand until settled (settledAsk), whatever the state reads.
     for (const question of store.openQuestions()) {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
       // A failed disk read is unknown: its questions wait for a good one.
       if (storageUnknown && String(question.dedupeKey ?? "").startsWith("infra:storage:")) continue;
       const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
-      // The judge has not read this chat again yet: its question stands.
-      if (decided?.judgePending && String(question.dedupeKey ?? "").startsWith("judge:")) continue;
+      // The judge has not read this chat again yet: whether the agent still
+      // asks is unknown, so its question stands.
+      if (decided?.judgePending && question.askedBy === "judge") continue;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
@@ -1973,6 +2234,18 @@ export class FleetSupervisor {
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       // A group member a capped scan left out may still be failing.
       if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;
+      if (standing(question)) {
+        const ref = question.prRef ?? known?.prRefs?.[0] ?? null;
+        const prMissing = Boolean(parsePrRef(ref)) && !this.skip.github && !prs.has(ref) && !unreadPrs.has(ref);
+        // A PR this scan could not read keeps its last settled read only.
+        const notReady = unreadPrs.has(ref) ? null : notReadyBlocker(prs.get(ref));
+        const reason = settledAsk(question, { thread: known, pr: prs.get(ref), prMissing, threadGone, muted: decided?.reason === "muted by owner", notReady });
+        if (reason) {
+          store.resolveQuestion(question.id, reason);
+          this.resolveOutreach(question, "resolved", "dismissed");
+        }
+        continue;
+      }
       if (decided || supervisorOwned || threadGone) {
         const reason = decided ? `${decided.state}: ${decided.reason}` : threadGone ? `thread ${known?.excluded ?? "left the scan"}` : "no longer asked";
         store.resolveQuestion(question.id, reason);
@@ -2172,7 +2445,8 @@ export class FleetSupervisor {
         sources,
         byState,
         byWatch,
-        needsYou: this.store.openQuestions().length,
+        // Only questions the owner can see (getState hides ones held for review).
+        needsYou: this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id)).length,
         actions: decisions.filter((decision) => SENDING.has(decision.action)).length
       },
       manager: manager ? { key: manager.key, title: clampText(manager.title, 80), live: Boolean(manager.live), agentStatus: manager.agentStatus, error: manager.error?.kind ?? null } : null,

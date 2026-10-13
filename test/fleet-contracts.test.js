@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ROUTES, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  ROUTES, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
   repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
@@ -25,6 +25,14 @@ test("resolveFleetConfig reads env and lets overrides win", () => {
   assert.equal(config.push, "buzzkit");
   assert.deepEqual(config.selfSessionIds, ["self-1"]);
   assert.equal(resolveFleetConfig({ OPENAGI_FLEET_MODE: "yolo" }, { home: "/h" }).mode, "observe");
+});
+
+test("the supervisor's own sessions: configured ids and the display prompt", () => {
+  const env = { CLAUDE_CODE_SESSION_ID: "self-1", OPENAGI_FLEET_SELF_SESSION_IDS: "01a0df66-b269-7540-81f5-592808f2e1f1, 01a1316f-4fc1-7072-8c53-d96ce5fb8085" };
+  assert.deepEqual(resolveFleetConfig(env, { home: "/h" }).selfSessionIds, ["self-1", "01a0df66-b269-7540-81f5-592808f2e1f1", "01a1316f-4fc1-7072-8c53-d96ce5fb8085"]);
+  assert.equal(isSupervisorOwnPrompt("You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring C…"), true);
+  assert.equal(isSupervisorOwnPrompt("Explain how the Agent Supervisor display works"), false);
+  assert.equal(isSupervisorOwnPrompt(null), false);
 });
 
 test("text helpers clamp, redact, and parse refs", () => {
