@@ -48,6 +48,18 @@ export function agentTurnTask(input = {}) {
   return 'chat';
 }
 
+// Models the owner never wants used, whatever a tier, task pin or caller asks
+// for: OPENAGI_MODEL_DENY, comma-separated, exact names or a prefix ending in
+// "*" ("gpt-6-astra*"). A denied model becomes OPENAGI_MODEL_DENY_FALLBACK, or
+// the base model when that is allowed; with neither allowed the call fails
+// rather than quietly using the denied model.
+export function deniedModel(model, env = process.env) {
+  const name = String(model ?? "").trim();
+  if (!name) return false;
+  return String(env.OPENAGI_MODEL_DENY ?? "").split(",").map((rule) => rule.trim()).filter(Boolean)
+    .some((rule) => (rule.endsWith("*") ? name.startsWith(rule.slice(0, -1)) : name === rule));
+}
+
 export class ModelRouter {
   // envPrefix: "OPENAI" | "ANTHROPIC". baseModel: the already-resolved base model.
   // overrides (optional, for tests/programmatic config):
@@ -58,6 +70,21 @@ export class ModelRouter {
     this.env = env;
     this.overrides = overrides;
     this.warnedEfforts = new Set();
+    this.warnedDenied = new Set();
+  }
+
+  // The model a call may really use: `model` unless OPENAGI_MODEL_DENY names it.
+  allowed(model) {
+    if (!deniedModel(model, this.env)) return model;
+    const fallback = String(this.env.OPENAGI_MODEL_DENY_FALLBACK ?? "").trim();
+    const to = fallback && !deniedModel(fallback, this.env) ? fallback
+      : (this.baseModel && !deniedModel(this.baseModel, this.env) ? this.baseModel : null);
+    if (!to) throw new Error(`Model ${model} is denied by OPENAGI_MODEL_DENY and no allowed fallback is set (OPENAGI_MODEL_DENY_FALLBACK).`);
+    if (!this.warnedDenied.has(model)) {
+      this.warnedDenied.add(model);
+      console.warn(`[model-router] ${model} is denied by OPENAGI_MODEL_DENY; using ${to}.`);
+    }
+    return to;
   }
 
   // Model for a tier name. Unset tiers fall back to base, so an undefined
@@ -119,7 +146,7 @@ export class ModelRouter {
   // on the base model because their tier isn't configured).
   describe() {
     return Object.entries(TASK_PROFILES).map(([task, p]) => {
-      const model = this.resolve(task);
+      const model = this.allowed(this.resolve(task));
       const effort = this.reasoningEffortSetting(task);
       return {
         task,

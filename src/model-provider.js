@@ -98,10 +98,8 @@ export class OpenAIResponsesProvider {
   // Resolve which model a call should use: explicit `model` wins, then a named
   // `task` (routed via the configured tiers), then a raw `tier`, else the base.
   resolveModel({ model, tier, task } = {}) {
-    if (model) return model;
-    if (task) return this.router.resolve(task);
-    if (tier) return this.router.tierModel(tier);
-    return this.model;
+    const chosen = model || (task ? this.router.resolve(task) : tier ? this.router.tierModel(tier) : this.model);
+    return this.router.allowed?.(chosen) ?? chosen;
   }
 
   async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
@@ -423,10 +421,8 @@ export class AnthropicProvider {
   }
 
   resolveModel({ model, tier, task } = {}) {
-    if (model) return model;
-    if (task) return this.router.resolve(task);
-    if (tier) return this.router.tierModel(tier);
-    return this.model;
+    const chosen = model || (task ? this.router.resolve(task) : tier ? this.router.tierModel(tier) : this.model);
+    return this.router.allowed?.(chosen) ?? chosen;
   }
 
   async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
