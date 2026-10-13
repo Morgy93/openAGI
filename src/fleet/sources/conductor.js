@@ -273,6 +273,26 @@ function readRecentMessages(db, sessionId, turnColumn) {
   return db.prepare(tailSql(turnColumn)).all(sessionId, TAIL_ROWS);
 }
 
+// A session's opening prompt, which names a supervisor display chat. The
+// tail's earliest prompt is it only while the tail holds the whole session;
+// past that it is read once per session (it never changes), so a long
+// display chat stays excluded.
+const FIRST_PROMPT_SQL = `
+  SELECT content FROM session_messages
+  WHERE session_id = ? AND role = 'user' AND cancelled_at IS NULL AND sender_session_id IS NULL AND sender_api_key_name IS NULL
+  ORDER BY sent_at, rowid LIMIT 1`;
+const FIRST_PROMPTS_KEPT = 2000;
+const firstPrompts = new Map();
+
+function firstPromptOf(db, sessionId, rows, summary, cache, cacheKey) {
+  if (rows.length < TAIL_ROWS) return summary.firstUserText;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const text = String(db.prepare(FIRST_PROMPT_SQL).get(sessionId)?.content ?? "").trim() || null;
+  if (cache.size >= FIRST_PROMPTS_KEPT) cache.delete(cache.keys().next().value);
+  cache.set(cacheKey, text);
+  return text;
+}
+
 // The open AskUserQuestion calls (the agent's or a subagent's) of the
 // current turn when the tail holds no start or end of that turn (the calls
 // fell out of it), oldest first. A later tool_result, init, result or error
@@ -387,10 +407,11 @@ function askOutlivedBy(ask, peer) {
   return !(Number.isFinite(since) && Date.parse(ask.at ?? "") < since);
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id" }) {
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id", prompts = firstPrompts, dbFile = "" }) {
   const { limits } = config;
   const rows = readRecentMessages(db, row.id, turnColumn);
   const summary = summarizeTail(rows);
+  summary.firstUserText = firstPromptOf(db, row.id, rows, summary, prompts, `${dbFile}\n${row.id}`);
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // An errored session lost its card, so it reads as stopped instead. Only a
@@ -543,7 +564,7 @@ export async function listConductorThreads(config, options = {}) {
       for (const { row } of list) {
         // A query failure means the source is unknown this tick. Returning a
         // partial catalog would close questions from sessions we failed to read.
-        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn }));
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file }));
       }
     }
     return threads;

@@ -78,7 +78,7 @@ export const JUDGE_INSTRUCTIONS = [
   "- Never repeat what the agent already reported or already did.",
   "- The agent answered the last nudge and nothing it can act on changed: wait.",
   "- It waits on something passive (a queued or pending run, a reviewer, CI running, a rate or session limit): wait.",
-  "- A cancelled, skipped or neutral check is not a failure, and neither is a run a newer one replaced. A red main-health check is main's own health, shared by every PR: not this agent's failure to fix.",
+  "- A skipped or neutral check is not a failure, and neither is a run a newer one replaced (a cancelled duplicate of a run that went on). A cancelled or timed-out check nothing replaced never reached a verdict: it is red and needs a rerun. A red main-health check is main's own health, shared by every PR: not this agent's failure to fix.",
   "- It needs a human decision, approval or credential from the owner: ask-owner, with a concrete question. Use the agent's own options when it listed them: at most 4, each under 40 characters, never \"later\".",
   "- Otherwise: send ONE short message (under 600 characters) that names exactly what is still missing or what changed. No generic checklist, no greeting.",
   "",
@@ -133,8 +133,11 @@ function prLines(pr, classified) {
     // Main's own health check is named as such: red there is shared, not this PR's failure.
     const failing = (pr.ci?.failing ?? []).slice(0, 8).map((name) => (isMainHealthCheck(name) ? `${name} (main's own health, shared by every PR)` : name));
     out.push(`CI: ${pr.ci?.state ?? "unknown"}${failing.length ? `; failing: ${failing.join(", ")}` : ""}${pr.ci?.pending?.length ? `; pending: ${pr.ci.pending.slice(0, 8).join(", ")}` : ""}`);
-    // A gate that ended without running to a verdict is not a failure.
-    const gateState = (state) => (["CANCELLED", "SKIPPED", "NEUTRAL", "STALE"].includes(state) ? `${state.toLowerCase()} (not a failure; not run to a verdict)` : state);
+    // A skipped gate is not a failure. A cancelled or timed-out one is the
+    // gate's latest run (a replaced one never shows here), so it is red, as
+    // in github.js.
+    const gateState = (state) => (["CANCELLED", "TIMED_OUT"].includes(state) ? `${state.toLowerCase()} (a failure: never run to a verdict, needs a rerun)`
+      : ["SKIPPED", "NEUTRAL", "STALE"].includes(state) ? `${state.toLowerCase()} (not a failure; not run to a verdict)` : state);
     const gates = (pr.gates ?? []).map((gate) => `${gate.label || gate.name}: ${gate.state ? gateState(gate.state) : "not reported"}`);
     if (gates.length) out.push(`Required gates: ${gates.join("; ")}`);
     if (Number.isFinite(pr.unresolvedThreads)) out.push(`Unresolved review threads: ${pr.unresolvedThreads}`);

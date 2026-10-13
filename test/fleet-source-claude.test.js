@@ -374,6 +374,26 @@ test("a transcript opened with the supervisor display prompt is the supervisor's
   assert.equal(threads["work-1"].excluded, null);
 });
 
+// A long-running display chat: its opening prompt falls out of the bounded
+// tail, and the tail's earliest prompt is an ordinary later one. It is still
+// the supervisor's own, read from the transcript's head once per session.
+test("a display transcript stays excluded once its opening prompt is out of the tail", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const display = rowsFor("display-2", cwd, { branch: "main" });
+  const filler = [];
+  for (let i = 0; i < 40; i += 1) {
+    filler.push(display.prompt(`status ${i} ${"x".repeat(200)}`, iso(60 * MIN - i * 1000)), display.text(`ok ${i} ${"y".repeat(200)}`, iso(60 * MIN - i * 1000 - 500)));
+  }
+  writeTranscript(home, cwd, "display-2", [display.prompt("You are the Agent Supervisor display. Reply with exactly: Claude supervisor connected.", iso(61 * MIN)),
+    display.text("Claude supervisor connected.", iso(61 * MIN - 500)), ...filler, ...display.history(29 * MIN)], NOW - 20 * MIN);
+  const cache = new Map();
+  const read = async () => byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false, tailBytes: 8 * 1024, firstPrompts: cache }))["display-2"];
+  assert.equal((await read()).excluded, "self");
+  assert.match(cache.get("display-2"), /Agent Supervisor display/);
+  assert.equal((await read()).excluded, "self", "the cached opening prompt still excludes it");
+});
+
 test("Conductor-hosted transcripts are flagged", async (t) => {
   const home = makeHome(t);
   for (const [id, cwd, entrypoint] of [

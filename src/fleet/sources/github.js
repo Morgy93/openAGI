@@ -127,18 +127,49 @@ function parseJson(text) {
   try { return JSON.parse(String(text ?? "")); } catch { return null; }
 }
 
+// The aliases a GraphQL field error left null ("r0.p123"; "*" for an
+// error with no path). NOT_FOUND ("Could not resolve to a PullRequest") is
+// GitHub's answer that the number is no PR; any other error on the alias is
+// a resolver that failed, which says nothing about the number.
+function failedAliases(body) {
+  const failed = new Set();
+  for (const error of Array.isArray(body?.errors) ? body.errors : []) {
+    if (error?.type === "NOT_FOUND") continue;
+    const at = Array.isArray(error?.path) ? error.path : [];
+    failed.add(at.length ? at.slice(0, 2).join(".") : "*");
+  }
+  return failed;
+}
+
 function checkStamp(node) {
   return Date.parse(node?.startedAt ?? node?.completedAt ?? node?.createdAt ?? "") || 0;
 }
 
+// Whether a cancelled run was superseded by another run of its name: it
+// started before that run finished (an older run, or a duplicate cancelled
+// beside it), or that run is still going. One started after the other run
+// finished is a later rerun cancelled or timed out: the latest result. A
+// cancelled run with no start time, or beside one with none, is never
+// assumed superseded.
+function cancelledBefore(cancelled, other) {
+  const start = Date.parse(cancelled?.startedAt ?? cancelled?.createdAt ?? "");
+  if (!Number.isFinite(start)) return false;
+  if (other?.status && other.status !== "COMPLETED") return true;
+  const end = Date.parse(other?.completedAt ?? "") || checkStamp(other);
+  return Boolean(end) && start <= end;
+}
+
 // The newer of two results for one check name. Without both times, the
 // result that does not pass wins, so a stale green never masks a red. A
-// cancelled run of the same name was superseded (a duplicate cancelled for
-// the other run): it never replaces a run that was not cancelled.
+// cancelled run another run of its name superseded (cancelledBefore) never
+// replaces that run; a cancellation after it is the newer result.
 function newerCheck(best, next) {
   if (!best) return next;
   const cancelled = (node) => node?.conclusion === "CANCELLED";
-  if (cancelled(best) !== cancelled(next)) return cancelled(next) ? best : next;
+  if (cancelled(best) !== cancelled(next)) {
+    const [gone, other] = cancelled(next) ? [next, best] : [best, next];
+    return cancelledBefore(gone, other) ? other : gone;
+  }
   const [a, b] = [checkStamp(best), checkStamp(next)];
   if (a && b) return b >= a ? next : best;
   const passes = (node) => checkState(node) === "SUCCESS";
@@ -318,11 +349,13 @@ async function fetchBatch(batch, config, run, out, unread) {
   }
   // gh exits non-zero on partial GraphQL errors (an unknown PR) but still
   // prints the body, so parse stdout regardless of the exit code.
-  const data = parseJson(result?.stdout)?.data;
+  const body = parseJson(result?.stdout);
+  const data = body?.data;
   if (!data || typeof data !== "object") {
     miss(batch);
     return;
   }
+  const failed = failedAliases(body);
   const aliases = new Map();
   for (const ref of batch) if (!aliases.has(ref.repo)) aliases.set(ref.repo, `r${aliases.size}`);
   for (const ref of batch) {
@@ -330,7 +363,11 @@ async function fetchBatch(batch, config, run, out, unread) {
     // A null repository alias is a partial GraphQL failure, not an answer.
     if (!repoNode || typeof repoNode !== "object") { miss([ref]); continue; }
     const node = repoNode[`p${ref.number}`];
-    if (!node || typeof node !== "object") continue;
+    // Null with a resolver error on it is unread; else GitHub has no such PR.
+    if (!node || typeof node !== "object") {
+      if (failed.has("*") || failed.has(`${aliases.get(ref.repo)}.p${ref.number}`)) miss([ref]);
+      continue;
+    }
     // A failed suite page leaves the gate as read from the batch.
     try { await gateSuitePages(ref.repo, node, config, run); } catch { /* keep the batch read */ }
     try {
@@ -388,11 +425,13 @@ export async function fetchPrStateLite(refs, config, { run = runCommand, unread 
     }
     // A number that is no PR fails only its own alias: gh exits non-zero
     // but still prints the rest.
-    const data = parseJson(result?.stdout)?.data;
+    const body = parseJson(result?.stdout);
+    const data = body?.data;
     if (!data || typeof data !== "object") {
       miss(batch);
       continue;
     }
+    const failed = failedAliases(body);
     const aliases = new Map();
     for (const ref of batch) if (!aliases.has(ref.repo)) aliases.set(ref.repo, `r${aliases.size}`);
     for (const ref of batch) {
@@ -400,7 +439,13 @@ export async function fetchPrStateLite(refs, config, { run = runCommand, unread 
       if (!repoNode || typeof repoNode !== "object") { miss([ref]); continue; }
       const node = repoNode[`p${ref.number}`];
       const key = prRefKey(ref.repo, ref.number);
-      if (!node || typeof node !== "object") { out.set(key, null); continue; }
+      // Null is no PR only when GitHub said so (NOT_FOUND) or gave no error
+      // on it; a resolver that failed leaves it unread.
+      if (!node || typeof node !== "object") {
+        if (failed.has("*") || failed.has(`${aliases.get(ref.repo)}.p${ref.number}`)) miss([ref]);
+        else out.set(key, null);
+        continue;
+      }
       out.set(key, { state: node.state ?? null, mergedAt: node.mergedAt ?? null, closedAt: node.closedAt ?? null, updatedAt: node.updatedAt ?? null });
     }
   }

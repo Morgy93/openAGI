@@ -4059,6 +4059,21 @@ test("a chat that created several PRs is mapped to its newest open one, not its 
   assert.equal((await prMapFixture(t, cape, states, `${BB}#6817`).row()).pr.ref, `${BB}#6817`);
 });
 
+// A lite read that times out must not hand the chat back to its branch's
+// merged PR over the newer one it created and the last scan picked.
+test("a chat keeps its picked PR, not its branch's merged one, when GitHub cannot be read", async (t) => {
+  const cape = conductorChat({ prCreated: [`${BB}#7089`, `${BB}#7063`] });
+  const states = new Map([[`${BB}#7089`, "OPEN"], [`${BB}#7063`, "OPEN"], [`${BB}#6817`, "MERGED"]]);
+  const { supervisor, row } = prMapFixture(t, cape, states, `${BB}#6817`);
+  assert.equal((await row()).pr.ref, `${BB}#7089`);
+  supervisor.deps.fetchPrStateLite = async () => { throw new Error("github timed out"); };
+  assert.equal((await row()).pr.ref, `${BB}#7089`, "the last scan's pick stands");
+  // No scan picked yet: the newest PR it created, not the branch PR.
+  const fresh = prMapFixture(t, cape, states, `${BB}#6817`);
+  fresh.supervisor.deps.fetchPrStateLite = async () => { throw new Error("github timed out"); };
+  assert.equal((await fresh.row()).pr.ref, `${BB}#7089`);
+});
+
 // meta.prMentions is what the 2026-10-12 build's source read from the same
 // transcript (every PR the chat named, viewed or checked); meta.prCreated is
 // what it reads now. Neither a stack base nor another agent's PR is the chat's.
@@ -4188,7 +4203,10 @@ test("a ready question closes once the PR stops being ready on the same head", a
     [{ mergeState: "DIRTY", mergeable: "CONFLICTING" }, "PR no longer ready: merge conflicts"],
     [{ ci: { state: "FAILURE", failing: ["test"], pending: [] } }, "PR no longer ready: CI red: test"],
     [{ unresolvedThreads: 2 }, "PR no longer ready: 2 open threads"],
-    [{ isDraft: true }, "PR no longer ready: draft"]
+    [{ isDraft: true }, "PR no longer ready: draft"],
+    // A required gate whose only run was cancelled or timed out is red too.
+    [{ gates: [{ name: "verify", label: "verify", state: "CANCELLED" }] }, "PR no longer ready: verify cancelled"],
+    [{ gates: [{ name: "verify", label: "verify", state: "TIMED_OUT" }] }, "PR no longer ready: verify timed_out"]
   ]) {
     let pr = green;
     const { supervisor } = fixture(t, { deps: { fetchPrStates: async () => new Map([["acme/app#7", pr]]) } });

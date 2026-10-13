@@ -227,6 +227,28 @@ test("fetchPrStates marks a null repository alias unread, not missing", async ()
   assert.deepEqual([...unread], [`${BBAPP}#6878`]);
 });
 
+// A null PR alias with a resolver error on it (not NOT_FOUND) is a partial
+// GitHub failure: the PR is unread, never read as no PR and dropped.
+test("a null PR alias with a resolver error is unread, not proof the number is no PR", async () => {
+  const body = {
+    data: { r0: { p7089: null, p9: null } },
+    errors: [
+      { type: "INTERNAL", path: ["r0", "p7089"], message: "Something went wrong while executing your query." },
+      { type: "NOT_FOUND", path: ["r0", "p9"], message: "Could not resolve to a PullRequest with the number of 9." }
+    ]
+  };
+  const run = async () => ({ code: 1, stdout: JSON.stringify(body), stderr: "" });
+  const unread = new Set();
+  const states = await fetchPrStateLite([`${BBAPP}#7089`, `${BBAPP}#9`], { bins: { gh: "gh" } }, { run, unread });
+  assert.equal(states.has(`${BBAPP}#7089`), false);
+  assert.equal(states.get(`${BBAPP}#9`), null, "NOT_FOUND is GitHub's answer");
+  assert.deepEqual([...unread], [`${BBAPP}#7089`]);
+  const fullUnread = new Set();
+  const prs = await fetchPrStates([`${BBAPP}#7089`, `${BBAPP}#9`], config(), { run, unread: fullUnread });
+  assert.equal(prs.size, 0);
+  assert.deepEqual([...fullUnread], [`${BBAPP}#7089`]);
+});
+
 test("fetchPrStates degrades to an empty map on failures", async () => {
   const refs = [`${BBAPP}#6878`];
   for (const result of [
@@ -296,6 +318,26 @@ test("a check whose only run was cancelled stays red", async () => {
   const twice = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
   assert.equal(twice.ci.state, "FAILURE");
   assert.deepEqual(twice.ci.failing, ["test"]);
+});
+
+// A check that passed, then a rerun on the same head that was cancelled or
+// timed out: the rerun is the latest result, so the check and the rollup
+// stay red rather than reading the earlier pass as the answer.
+test("a rerun cancelled or timed out after a pass keeps the check red", async () => {
+  for (const conclusion of ["CANCELLED", "TIMED_OUT"]) {
+    const response = capturedResponse();
+    const commit = response.data.r0.p6878.commits.nodes[0].commit;
+    commit.statusCheckRollup = { state: "FAILURE", contexts: { nodes: [
+      { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:40:00Z", completedAt: "2026-09-26T07:50:00Z" },
+      { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion, startedAt: "2026-09-26T08:10:00Z", completedAt: "2026-09-26T08:40:00Z" }
+    ] } };
+    const pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+    assert.deepEqual(pr.ci, { state: "FAILURE", failing: ["test"], pending: [], failedAt: "2026-09-26T08:40:00.000Z" }, conclusion);
+    // Listed the other way round, the same answer.
+    commit.statusCheckRollup.contexts.nodes.reverse();
+    const reversed = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`);
+    assert.deepEqual(reversed.ci.failing, ["test"], conclusion);
+  }
 });
 
 test("CI is unknown when the last commit is not the PR head or has no checks", async () => {

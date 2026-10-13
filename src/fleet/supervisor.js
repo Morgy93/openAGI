@@ -153,6 +153,15 @@ function pickConductorPr(thread, state) {
   if (!thread.prRefs.length && thread.branchNoPr) thread.prLookedUp = true;
 }
 
+// GitHub unread this scan: the chat keeps the PR the last scan picked, else
+// the newest it created, never its branch PR just because it leads (that one
+// may have merged long before the chat created a newer one).
+function keepConductorPr(thread, previous) {
+  const own = [...new Set([...(thread.branchPrRef ? [thread.branchPrRef] : []), ...thread.createdPrRefs])];
+  const pick = own.includes(previous) ? previous : (thread.createdPrRefs[0] ?? null);
+  if (pick) thread.prRefs = [pick, ...(thread.prRefs ?? []).filter((ref) => ref !== pick)];
+}
+
 function emptyBb3() {
   return { reachable: null, checkedAt: null, gate: { state: null, reason: null, since: null }, fullQueue: null, quickQueue: null, load: null, runs: [], timersDead: [], error: null };
 }
@@ -260,8 +269,9 @@ const standing = (question) => STANDING_KINDS.has(question.kind) && !String(ques
 
 // What makes an open PR asked as ready no longer ready, read from the PR
 // alone, or null. Only what the PR itself says for certain: CI running again,
-// an unread gate or unknown mergeability is no news.
-const NOT_READY = /^(?:CI red: |\d+ open threads$|changes requested$|merge conflicts$|branch behind base$|draft$)|\S failed$/;
+// an unread gate or unknown mergeability is no news. A required gate whose
+// latest run was cancelled or timed out is red, like a failed one.
+const NOT_READY = /^(?:CI red: |\d+ open threads$|changes requested$|merge conflicts$|branch behind base$|draft$)|\S (?:failed|cancelled|timed_out)$/;
 function notReadyBlocker(pr) {
   if (pr?.state !== "OPEN") return null;
   return prReadiness(pr, null).blockers.find((blocker) => NOT_READY.test(blocker)) ?? null;
@@ -470,6 +480,8 @@ export class FleetSupervisor {
     this.settledPrs = new Map();
     // Refs GitHub reported MERGED: final, so never read again as candidates.
     this.mergedPrs = new Set();
+    // Conductor thread key -> the PR the last scan that read GitHub picked.
+    this.conductorPicks = new Map();
     this.answering = new Set();
     this._uiDriver = undefined;
     this._uiBlockedSince = null;
@@ -1925,7 +1937,8 @@ export class FleetSupervisor {
   // read for state only; a number GitHub says is no PR is dropped. With
   // nothing open, or GitHub unreadable, the newest stays first. A Conductor
   // chat that created a PR is read even for one (pickConductorPr): its
-  // branch PR may lead, or the one it created may be no PR.
+  // branch PR may lead, or the one it created may be no PR. GitHub
+  // unreadable, it keeps the last pick (keepConductorPr).
   async preferOpenPrs(inScope, config, run) {
     if (this.skip.github) return;
     const conductorOwn = (thread) => thread.kind === "conductor" && (thread.createdPrRefs?.length ?? 0) > 0;
@@ -1939,20 +1952,27 @@ export class FleetSupervisor {
         const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
         states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
       } catch {
+        for (const thread of several) if (conductorOwn(thread)) keepConductorPr(thread, this.conductorPicks.get(thread.key));
         return;
       }
     }
+    const picks = new Map();
     for (const [ref, pr] of states) if (pr?.state === "MERGED") this.mergedPrs.add(ref);
     if (this.mergedPrs.size > MAX_MERGED_KEPT) this.mergedPrs = new Set([...this.mergedPrs].slice(-MAX_MERGED_KEPT / 2));
     for (const thread of several) {
       const candidates = [...new Set([...thread.prRefs.slice(0, MAX_PR_CANDIDATES), thread.branchPrRef].filter(Boolean))];
       const state = (ref) => (this.mergedPrs.has(ref) ? "MERGED" : states.has(ref) ? (states.get(ref)?.state ?? null) : undefined);
-      if (conductorOwn(thread)) { pickConductorPr(thread, state); continue; }
+      if (conductorOwn(thread)) {
+        pickConductorPr(thread, state);
+        if (thread.prRefs[0]) picks.set(thread.key, thread.prRefs[0]);
+        continue;
+      }
       const open = candidates.find((ref) => state(ref) === "OPEN");
       // null: GitHub answered that the number is no PR.
       const kept = thread.prRefs.filter((ref) => state(ref) !== null);
       thread.prRefs = open ? [open, ...kept.filter((ref) => ref !== open)] : kept;
     }
+    this.conductorPicks = picks;
   }
 
   // The thread's PR read again right before a nudge: one merged or closed

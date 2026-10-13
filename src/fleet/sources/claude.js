@@ -19,6 +19,11 @@ const NON_OWNER_ORIGINS = new Set(["task-notification", "peer"]);
 const NON_OWNER_TURNS = new Set(["task_notification", "peer", "system", "scheduled"]);
 const STOP_TOOLS = new Set(["TaskStop", "KillShell", "KillBash"]);
 const PR_URL = /github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/;
+// A transcript's opening prompt is read from its first bytes once the tail
+// no longer holds it, and kept per session: it never changes.
+const FIRST_PROMPT_BYTES = 256 * 1024;
+const FIRST_PROMPTS_KEPT = 2000;
+const firstPrompts = new Map();
 // ps lstart can trail the registry's startedAt by a few seconds, never by more.
 const PROC_START_SKEW_MS = 10 * 60_000;
 
@@ -197,7 +202,8 @@ function onUser(summary, row) {
   if (/^<(command-name|local-command-)/.test(text)) return;
   summary.phase = "in-progress";
   summary.turnStartedAt = toIso(row.timestamp);
-  // The first prompt read names a supervisor display chat.
+  // The first prompt read names a supervisor display chat (firstPromptOf
+  // reads the real one when the tail starts mid-session).
   summary.firstUserText ??= text;
   if (isOwnerText(row, text)) {
     summary.lastUserText = text;
@@ -279,6 +285,35 @@ function summarizeTranscript(rows) {
 
 function newestFirstUnique(refs) {
   return [...new Set([...refs].reverse())];
+}
+
+function readHead(file, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(maxBytes);
+    const read = fs.readSync(fd, buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, read).toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+// The session's own first prompt, which names a supervisor display chat.
+// The tail's earliest prompt is it only while the whole file fits the tail;
+// past that it is read from the head once per session, so a long display
+// transcript stays excluded.
+function firstPromptOf({ id, file }, summary, tailBytes, cache) {
+  if (cache.has(id)) return cache.get(id);
+  let size;
+  try { size = fs.statSync(file).size; } catch { return summary.firstUserText; }
+  if (size <= tailBytes) return summary.firstUserText;
+  const text = summarizeTranscript(parseJsonLines(readHead(file, FIRST_PROMPT_BYTES))).firstUserText ?? null;
+  if (cache.size >= FIRST_PROMPTS_KEPT) cache.delete(cache.keys().next().value);
+  cache.set(id, text);
+  return text;
 }
 
 function exclusionReason(id, summary, prRefs, config) {
@@ -385,6 +420,7 @@ export async function listClaudeThreads(config, options = {}) {
     if (inScope >= config.limits.maxThreads) break;
     try {
       const summary = summarizeTranscript(parseJsonLines(readTail(entry.file, tailBytes)));
+      summary.firstUserText = firstPromptOf(entry, summary, tailBytes, options.firstPrompts ?? firstPrompts);
       const thread = buildThread(entry, summary, { config, now, peers });
       // The mtime pre-filter lets metadata-only writes through; the last turn decides.
       if (!(Date.parse(thread.lastActivityAt ?? "") < cutoff)) {

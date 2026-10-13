@@ -827,3 +827,21 @@ test("a Conductor session opened with the supervisor display prompt is the super
   const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() });
   assert.equal(thread.excluded, "self");
 });
+
+// A long display chat: its opening prompt falls out of the 400-row tail and
+// the tail's earliest prompt is an ordinary later one. Still its own.
+test("a Conductor display session stays excluded once its opening prompt is out of the tail", async (t) => {
+  const home = makeHome(t);
+  seedCapeTown(home);
+  const db = new DatabaseSync(path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db"));
+  db.prepare("UPDATE session_messages SET content = ? WHERE session_id = 's-cape' AND role = 'user' AND sent_at = ?")
+    .run("You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring Codex and Claude Code.", iso(300 * MIN));
+  for (let i = 0; i < 420; i += 1) addMessage(db, "s-cape", i % 2 ? "assistant" : "user", i % 2 ? sdk.text("s-cape", `ok ${i}`) : `status ${i}`, new Date(NOW - 4 * MIN + i * 100).toISOString());
+  db.close();
+  const cache = new Map();
+  const [thread] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map(), firstPrompts: cache });
+  assert.equal(thread.excluded, "self");
+  assert.equal(cache.size, 1);
+  const [again] = await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map(), firstPrompts: cache });
+  assert.equal(again.excluded, "self");
+});

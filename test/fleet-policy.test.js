@@ -1822,8 +1822,19 @@ test("the LB is not paged while its watcher says healthy with no problems", () =
   assert.deepEqual(vouched.problems, []);
   assert.equal(vouched.down, false);
   assert.equal(vouched.up, false, "a probe that timed out proves nothing either way");
-  const connection = { kind: "connection", count: 3, lastAt: ago(2 * MIN), threadIds: ["x1"] };
-  assert.deepEqual(health({ ...lbOk, watchLine: watch(24), recentErrors: [connection] }).problems, []);
+  // Errors from before the line are what it vouches for.
+  const connection = { kind: "connection", count: 3, lastAt: ago(10 * MIN), threadIds: ["x1"] };
+  assert.deepEqual(health({ ...lbOk, watchLine: watch(5), recentErrors: [connection] }).problems, []);
+  assert.deepEqual(health({ ...timedOut(watch(5)), recentErrors: [connection] }).problems, []);
+  // Corroborated errors since the line are news it cannot answer, and a
+  // probe timing out beside them counts too.
+  const since = { ...connection, lastAt: ago(2 * MIN) };
+  assert.deepEqual(health({ ...lbOk, watchLine: watch(24), recentErrors: [since] }).problems, ["3x connection"]);
+  const outage = health({ ...timedOut(watch(24)), recentErrors: [since] });
+  assert.deepEqual(outage.problems, ["LB unhealthy (timed out after 5000 ms)", "3x connection"]);
+  assert.equal(outage.down, true);
+  // One error since the line, not corroborated, leaves it vouching.
+  assert.deepEqual(health({ ...timedOut(watch(24)), recentErrors: [{ ...since, count: 1 }] }).problems, []);
   const decisions = decideInfra({ bb3: bb3Base, lb: timedOut(watch(21)) }, { playbooks, config, now: NOW, manager, mode: "auto" });
   assert.equal(decisions.some((decision) => decision.playbook === "manager-lb"), false);
   // A stale watch line, or one with problems, vouches for nothing.

@@ -1027,12 +1027,13 @@ function transientCorroborated(entries, probe, vouched, limits) {
 }
 
 // The LB watcher's last line ("<iso> healthy=yes 280 req ..., problems:
-// none"), written in the last LB_WATCH_FRESH_MS, says the LB is fine.
-function watchVouches(lb, now, limits) {
+// none"), written in the last LB_WATCH_FRESH_MS, says the LB was fine when
+// it was written: that time, or null.
+function watchHealthyAt(lb, now, limits) {
   const match = /^(\S+)\s+healthy=(yes|no)\b.*?\bproblems:\s*(.*)$/.exec(String(lb?.watchLine ?? "").trim());
   const at = Date.parse(match?.[1] ?? "");
-  if (!match || !Number.isFinite(at) || Math.abs(now - at) > (limits.lbWatchFreshMs ?? LB_WATCH_FRESH_MS)) return false;
-  return match[2] === "yes" && /^none\b/i.test(match[3].trim());
+  if (!match || !Number.isFinite(at) || Math.abs(now - at) > (limits.lbWatchFreshMs ?? LB_WATCH_FRESH_MS)) return null;
+  return match[2] === "yes" && /^none\b/i.test(match[3].trim()) ? at : null;
 }
 
 export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
@@ -1055,13 +1056,18 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   // for the LB is the probe's problem, not the LB's (five "LB unhealthy
   // (timed out after 5000 ms)" alarms beside "healthy=yes ... problems:
   // none"): unknown, never an outage.
-  const vouched = watchVouches(lb, now, limits);
-  const probe = lb?.healthy === false && vouched && /^timed out\b/.test(String(lb?.detail ?? "")) ? null : (lb?.healthy ?? null);
   // The log window is an hour; only recent rows say the LB is down now.
   const freshMs = limits.lbErrorFreshMs ?? LB_ERROR_FRESH_MS;
   const freshErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0
     && isFresh(entry.lastAt, freshMs, now));
   const transient = freshErrors.filter((entry) => LB_TRANSIENT_KINDS.has(entry.kind));
+  // The line vouches only for what came before it: corroborated errors
+  // since it was written (or with no time) are news it cannot answer, and
+  // then a probe timing out counts too.
+  const watchAt = watchHealthyAt(lb, now, limits);
+  const sinceWatch = transient.filter((entry) => !(Date.parse(entry.lastAt ?? "") <= watchAt));
+  const vouched = watchAt !== null && !transientCorroborated(sinceWatch, null, false, limits);
+  const probe = lb?.healthy === false && vouched && /^timed out\b/.test(String(lb?.detail ?? "")) ? null : (lb?.healthy ?? null);
   const keepTransient = transientCorroborated(transient, probe, vouched, limits);
   const lbErrors = freshErrors.filter((entry) => keepTransient || !LB_TRANSIENT_KINDS.has(entry.kind));
   const lbProblems = [];

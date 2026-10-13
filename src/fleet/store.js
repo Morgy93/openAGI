@@ -429,9 +429,10 @@ export class FleetStore {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
     if (question.status === "answered" && (answer === null || question.answer === answer)) {
-      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()) });
-      // Put back as a fresh ask, so it does not expire on the next read.
-      if (asked) Object.assign(question, { lastAskedAt: iso(this.now()), liveSince: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
+      // Put back with a fresh day, so an answer that failed near the end of
+      // the old one does not expire on the next read.
+      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()), liveSince: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
+      if (asked) question.lastAskedAt = iso(this.now());
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
     this._save();
@@ -788,10 +789,10 @@ export class FleetStore {
 
   // An open agent ask on the same thread from an older agent message takes
   // this newer ask in place. Its review and wording start over. The same
-  // question restated (both ask to merge, or the same words) keeps its push
-  // and its expiry; a different one is put to the owner anew, with its own
-  // day and push (milan: a new decision 23 h into an old ask would expire
-  // an hour later, never pushed, then stay quiet a day).
+  // question restated (both ask to merge, or the same words, about the same
+  // PR) keeps its push and its expiry; a different one is put to the owner
+  // anew, with its own day and push (milan: a new decision 23 h into an old
+  // ask would expire an hour later, never pushed, then stay quiet a day).
   _supersedeAgentAsk(key, fields, origin, head, now) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
     const askedAt = toMs(origin.agentAskedAt, null);
@@ -800,7 +801,9 @@ export class FleetStore {
       && toMs(q.agentAskedAt, null) !== null && toMs(q.agentAskedAt, 0) < askedAt);
     if (!older) return null;
     const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
-    const restated = (older.mergeAsk && fields.mergeAsk) || norm(older.title) === norm(fields.title) || (Boolean(norm(fields.body)) && norm(older.body) === norm(fields.body));
+    // A merge ask about another PR is a new question, whatever its words.
+    const samePr = !older.prRef || !fields.prRef || older.prRef === fields.prRef;
+    const restated = samePr && ((older.mergeAsk && fields.mergeAsk) || norm(older.title) === norm(fields.title) || (Boolean(norm(fields.body)) && norm(older.body) === norm(fields.body)));
     Object.assign(older, fields, origin, {
       dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),

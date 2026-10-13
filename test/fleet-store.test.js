@@ -738,6 +738,43 @@ test("a newer ask from the same agent takes its open question in place", (t) => 
   assert.notEqual(store.upsertQuestion({ ...base, threadKey: "conductor:other", dedupeKey: "ask:conductor:other:dddd", title: "other", agentAskedAt: "2026-10-12T18:00:00.000Z" }).id, first.id);
 });
 
+// A long Conductor chat that opens several PRs: its merge ask about a new PR
+// is not a restatement of the old PR's, so it is pushed and gets its own day.
+test("a merge ask about another PR in the same thread gets its own day and push", (t) => {
+  const now = clock(Date.parse("2026-10-12T04:00:00.000Z"));
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const base = { kind: "agent-ask", threadKey: "conductor:cape", options: ["yes", "no"], mergeAsk: true, askContext: "Merging needs your go." };
+  const first = store.upsertQuestion({ ...base, prRef: "buildbetter-app/buildbetter#7063", dedupeKey: "ask:conductor:cape:aaaa", title: "buildbetter #7063: merge it?", agentAskedAt: "2026-10-12T03:59:00.000Z" });
+  store.markQuestionNotified(first.id, { outreachId: "out_1", pushedAt: new Date(now()).toISOString() });
+  now.advance(23 * HOUR);
+  const next = store.upsertQuestion({ ...base, prRef: "buildbetter-app/buildbetter#7089", dedupeKey: "ask:conductor:cape:bbbb", title: "buildbetter #7089: merge it?", agentAskedAt: "2026-10-13T02:59:00.000Z" });
+  assert.equal(next.id, first.id);
+  assert.equal(next.pushedAt, null, "the new PR's ask is pushed");
+  now.advance(2 * HOUR);
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [first.id], "not expired on the old PR's day");
+  // The same PR asked again keeps its push and its day.
+  store.markQuestionNotified(first.id, { outreachId: "out_2", pushedAt: new Date(now()).toISOString() });
+  now.advance(HOUR);
+  const same = store.upsertQuestion({ ...base, prRef: "buildbetter-app/buildbetter#7089", dedupeKey: "ask:conductor:cape:cccc", title: "buildbetter #7089: ready, merge?", agentAskedAt: "2026-10-13T06:00:00.000Z" });
+  assert.ok(same.pushedAt);
+});
+
+// An owner answer whose background send failed near the end of the
+// question's day is put back with a day of its own, not expired at once.
+test("a question reopened after a failed answer delivery gets a fresh day", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const q = store.upsertQuestion({ dedupeKey: "ask:conductor:x:aaaa", kind: "agent-ask", threadKey: "conductor:x", title: "Ship it?", options: ["yes", "no"], agentAskedAt: new Date(T0 - 1000).toISOString() });
+  now.advance(23 * HOUR + 50 * 60 * 1000);
+  store.queueAnswer(q.id, "yes", "Yes, ship it.");
+  now.advance(20 * 60 * 1000);
+  const back = store.reopenQuestion(q.id, ["conductor:x"], { answer: "yes" });
+  assert.equal(back.status, "open");
+  assert.deepEqual(store.openQuestions().map((one) => one.id), [q.id], "still open after the old day ended");
+  now.advance(23 * HOUR);
+  assert.deepEqual(store.openQuestions().map((one) => one.id), [q.id]);
+});
+
 // milan 1941cea4 asked "who gets the free Coda token?" at 04:38Z. A new
 // decision from the same agent 23 h later took that open question over with
 // its push spent and its day nearly gone: it expired an hour later, never
