@@ -168,6 +168,15 @@ final class FleetWatchingTests: XCTestCase {
     XCTAssertEqual(FleetWatching.rowText(FleetWatch(group: "working", since: "2026-10-12T12:05:00Z"), now: now), "for 0s")
   }
 
+  func testShortRowTextKeepsTheNameItsRoom() {
+    XCTAssertEqual(FleetWatching.shortRowText(FleetWatch(group: "waiting", since: "2026-10-12T06:00:00Z", waitingOn: "a background task"), now: now), "task 6h")
+    XCTAssertEqual(FleetWatching.shortRowText(FleetWatch(group: "waiting", since: "2026-10-12T11:37:00Z", waitingOn: "BuildBot3 full run"), now: now), "BB3 full 23m")
+    XCTAssertEqual(FleetWatching.shortRowText(FleetWatch(group: "waiting", since: "2026-10-12T11:48:00Z", waitingOn: "CI"), now: now), "CI 12m")
+    XCTAssertEqual(FleetWatching.shortRowText(FleetWatch(group: "waiting", since: nil, waitingOn: "bb-quick"), now: now), "bb-quick")
+    XCTAssertEqual(FleetWatching.shortRowText(FleetWatch(group: "you", since: "2026-10-12T10:00:00Z", waitingOn: "your answer"), now: now), "2h")
+    XCTAssertNil(FleetWatching.shortRowText(FleetWatch(group: "push", since: "soon"), now: now))
+  }
+
   func testDurationMatchesThePage() {
     XCTAssertEqual(FleetWatching.duration(-5), "0s")
     XCTAssertEqual(FleetWatching.duration(42), "42s")
