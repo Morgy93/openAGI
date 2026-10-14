@@ -4279,3 +4279,140 @@ test("answers kept under keys an older build saved are still typed after the upg
   // The answered ask holds: not put to the owner again under its new key.
   assert.deepEqual(supervisor.getState().questions.filter((q) => q.kind === "agent-ask"), []);
 });
+
+test("a dismissed question takes its row out of Waiting on you at once, not at the next scan (codex:01a13388)", async (t) => {
+  let now = NOW;
+  const asking = makeThread({ lastAgentText: "The request is ready. Should I call U.S. Bank or the Amazon transition line? Your call.", prRefs: [] });
+  const { supervisor } = fixture(t, { threads: [asking], prs: new Map(), now: () => now });
+  await supervisor.tick({ reason: "test" });
+  const before = supervisor.getState();
+  const question = before.questions.find((q) => q.threadKey === "codex:t1");
+  assert.ok(question, "the agent's ask is open");
+  assert.equal(before.snapshot.threads[0].watch.group, "you");
+  assert.equal(before.snapshot.counts.byWatch.you, 1);
+  now += 8 * 60 * MIN;
+  supervisor.dismissQuestion(question.id);
+  // No scan since: the stored snapshot still says "you", the state does not.
+  assert.equal(supervisor.store.snapshot.threads[0].watch.group, "you");
+  const after = supervisor.getState();
+  assert.equal(after.questions.some((q) => q.threadKey === "codex:t1"), false);
+  assert.equal(after.snapshot.threads[0].watch.group, "push");
+  assert.equal(after.snapshot.threads[0].watch.since, new Date(now).toISOString());
+  assert.equal(after.snapshot.counts.byWatch.you, 0);
+  assert.equal(after.snapshot.counts.byWatch.push, 1);
+  assert.equal(after.snapshot.counts.needsYou, after.questions.length);
+});
+
+test("every question card says when the agent asked, in which chat, and where it is answered", async (t) => {
+  const asking = makeThread({ title: "Fix billing", lastAgentText: "Ready. Want me to merge with --admin or wait for Nikhil's approval?", prRefs: [] });
+  const { supervisor } = fixture(t, { threads: [asking], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const question = supervisor.getState().questions.find((q) => q.threadKey === "codex:t1");
+  assert.equal(question.askedAt, asking.lastAgentAt, "the agent's own ask time");
+  assert.equal(question.chatLabel, "Fix billing (Codex)");
+  assert.deepEqual(question.openChat, { app: "codex", url: "codex://threads/t1", label: "Fix billing (Codex)", note: null });
+  assert.equal(question.answerIn, "here");
+  assert.equal(question.risky, true, "a merge ask is read in full first");
+  // A question card is answered in the agent's app; it has no agent time, so the supervisor's.
+  const card = supervisor.questionView({ id: "fq_c", kind: "agent-card", threadKey: "codex:t1", options: ["open thread"], title: "Which browser?", createdAt: ago(3 * MIN) }, new Map());
+  assert.equal(card.answerIn, "agent app");
+  assert.equal(card.askedAt, ago(3 * MIN));
+  assert.equal(card.openChat.url, "codex://threads/t1");
+  assert.equal(card.risky, false);
+  // A group names each chat; a thread this process never read uses the row's link.
+  const rows = new Map([["conductor:s1", { openChat: { app: "conductor", url: "conductor://workspace?id=w&session=s1", label: "cairo (Conductor)", note: null } }]]);
+  const group = supervisor.questionView({ id: "fq_g", kind: "limit", threadKey: null, threadKeys: ["codex:t1", "conductor:s1"], options: ["wait", "added"], title: "2 capped", createdAt: ago(1 * MIN) }, rows);
+  assert.equal(group.chatLabel, "Fix billing (Codex) +1 more");
+  assert.deepEqual(group.chats.map((chat) => chat.url), ["codex://threads/t1", "conductor://workspace?id=w&session=s1"]);
+  assert.equal(group.openChat, null);
+  assert.equal(group.answerIn, "here");
+});
+
+test("a thread's detail: last agent message, owner's last word, PR, watch, next step, questions and its chat", async (t) => {
+  const thread = makeThread({ lastUserText: "please fix the tests", lastUserAt: ago(90 * MIN) });
+  const { supervisor } = fixture(t, { threads: [thread] });
+  await supervisor.tick({ reason: "test" });
+  const detail = supervisor.threadDetail("codex:t1");
+  assert.equal(detail.key, "codex:t1");
+  assert.deepEqual(detail.lastAgentMessage, { text: "Pushed.", at: thread.lastAgentAt });
+  assert.equal(detail.lastOwnerAt, ago(90 * MIN));
+  assert.equal(detail.pr.ref, "acme/app#7");
+  assert.equal(detail.pr.url, "https://github.com/acme/app/pull/7");
+  assert.equal(detail.pr.ci.state, "FAILURE");
+  assert.equal(detail.pr.head, HEAD.slice(0, 10));
+  assert.equal(detail.watch.group, "push");
+  assert.equal(detail.decision.action, "nudge");
+  assert.equal(detail.decision.playbook, "merge-ready");
+  assert.match(detail.decision.message, /Ready to merge\?/);
+  assert.deepEqual(detail.questions, []);
+  assert.equal(detail.openChat.url, "codex://threads/t1");
+  assert.equal(detail.muted, null);
+  assert.equal(detail.scannedAt, supervisor.getState().snapshot.at);
+  assert.equal(supervisor.threadDetail("codex:nope"), null);
+  // The supervisor's own message is no owner word.
+  const own = fixture(t, { threads: [makeThread({ lastUserText: "[OpenAGI supervisor] CI is green", lastUserAt: ago(5 * MIN) })] }).supervisor;
+  await own.tick({ reason: "test" });
+  assert.equal(own.threadDetail("codex:t1").lastOwnerAt, null);
+});
+
+test("Push now sends the planned nudge at once, inside the cooldown, recorded as the owner's", async (t) => {
+  let now = NOW;
+  const { supervisor, delivered } = fixture(t, { mode: "auto", now: () => now });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1, "the scan's own nudge");
+  now += 60_000;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1, "cooling down");
+  assert.equal(supervisor.getState().snapshot.threads[0].decision.action, "wait");
+  const result = await supervisor.pushNow("codex:t1");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 2);
+  assert.equal(delivered[1].playbook, "merge-ready");
+  assert.match(delivered[1].message, /Ready to merge\?/);
+  assert.equal(result.action.by, "owner");
+  assert.match(result.action.reason, /^owner: push now/);
+  assert.equal(supervisor.store.ledgerFor("codex:t1").nudges.at(-1).status, "sent");
+  // In Observe too: the owner's own push is no automatic send.
+  supervisor.setMode("observe");
+  assert.equal((await supervisor.pushNow("codex:t1")).delivery.status, "sent");
+  assert.equal(delivered.length, 3);
+  assert.equal(delivered[2].route, "codex-exec");
+});
+
+test("Push now never goes ahead of an open question or a muted thread, and needs a scan", async (t) => {
+  const asking = makeThread({ lastAgentText: "Ready. Want me to merge with --admin or wait for Nikhil's approval?", prRefs: [] });
+  const { supervisor, delivered } = fixture(t, { threads: [asking], prs: new Map() });
+  assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /scan first/);
+  await supervisor.tick({ reason: "test" });
+  const asked = await supervisor.pushNow("codex:t1");
+  assert.equal(asked.delivery.status, "blocked");
+  assert.match(asked.delivery.detail, /^waits on your answer first: /);
+  assert.equal(delivered.length, 0);
+  // Answered: an ask is still all policy has for it, so nothing to push.
+  const question = supervisor.getState().questions.find((q) => q.threadKey === "codex:t1");
+  supervisor.dismissQuestion(question.id);
+  assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /^nothing to push: /);
+  // Muted and unmuted.
+  const muted = supervisor.muteThread("codex:t1", { hours: 2 });
+  assert.equal(muted.until, new Date(NOW + 2 * 60 * MIN).toISOString());
+  assert.equal(supervisor.getState().snapshot.threads[0].muted, muted.until);
+  assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /^muted/);
+  supervisor.unmuteThread("codex:t1");
+  assert.equal(supervisor.getState().snapshot.threads[0].muted, null);
+  assert.equal(supervisor.store.mutedKeys().has("codex:t1"), false);
+  assert.ok(supervisor.getState().actions.some((action) => action.kind === "mute" && action.by === "owner"));
+  assert.equal(delivered.length, 0);
+});
+
+test("Push now waits for an owner answer still on its way to the thread", async (t) => {
+  const { supervisor, delivered } = fixture(t, { mode: "auto" });
+  await supervisor.tick({ reason: "test" });
+  const sent = delivered.length;
+  supervisor.store.upsertQuestion({ dedupeKey: "ask:codex:t1:x", kind: "agent-ask", threadKey: "codex:t1", title: "Merge?", options: ["yes", "no"] });
+  const id = supervisor.store.openQuestions().find((q) => q.dedupeKey === "ask:codex:t1:x").id;
+  supervisor.store.queueAnswer(id, "yes", "Owner answer: yes. Continue with that.");
+  const result = await supervisor.pushNow("codex:t1");
+  assert.equal(result.delivery.status, "blocked");
+  assert.match(result.delivery.detail, /still on its way/);
+  assert.equal(delivered.length, sent);
+});

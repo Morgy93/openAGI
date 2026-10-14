@@ -294,3 +294,40 @@ test("screen, click and app routes validate their input and reach the supervisor
     ["appAction", "conductor", "restart", ["conductor:s1"]]
   ]);
 });
+
+test("thread routes: detail, Push now, Mute and Unmute, by a key from the state", async () => {
+  const supervisor = fakeSupervisor();
+  supervisor.threadDetail = async (key) => { supervisor.calls.push(["threadDetail", key]); return key === "conductor:s-1" ? { key, openChat: { app: "conductor", url: "conductor://workspace?id=w&session=s-1", label: "cairo (Conductor)", note: null } } : null; };
+  supervisor.pushNow = async (key, options) => { supervisor.calls.push(["pushNow", key, options.deadlineAt]); return { delivery: { status: "sent", route: "computer-use", detail: "typed" }, action: { id: "fa_1", by: "owner" } }; };
+  supervisor.muteThread = async (key, options) => { supervisor.calls.push(["muteThread", key, options.hours]); return { until: "2026-09-27T00:00:00.000Z" }; };
+  supervisor.unmuteThread = async (key) => { supervisor.calls.push(["unmuteThread", key]); return { until: null }; };
+  const route = createFleetRoute({ supervisor });
+  const call = (method, path, value = {}) => route(method, path, url(path), body(value));
+  const detail = await call("GET", "/fleet/api/threads/conductor:s-1");
+  assert.equal(detail.status, 200);
+  assert.equal(detail.body.thread.openChat.url, "conductor://workspace?id=w&session=s-1");
+  // The colon may come percent-encoded.
+  assert.equal((await call("GET", "/fleet/api/threads/conductor%3As-1")).status, 200);
+  assert.equal((await call("GET", "/fleet/api/threads/codex:gone")).status, 404);
+  for (const bad of ["nope", "conductor:a%2Fb", "shell:x", "codex:" + "x".repeat(121), "%E0%A4%A"]) {
+    assert.equal((await call("GET", "/fleet/api/threads/" + bad)).status, 400, bad);
+  }
+  assert.equal((await call("POST", "/fleet/api/threads/conductor:s-1")).status, 405);
+  const pushed = await call("POST", "/fleet/api/threads/conductor:s-1/push");
+  assert.equal(pushed.status, 200);
+  assert.equal(pushed.body.delivery.status, "sent");
+  assert.equal(pushed.body.action.by, "owner");
+  assert.ok(pushed.body.state);
+  assert.equal((await call("GET", "/fleet/api/threads/conductor:s-1/push")).status, 405);
+  const muted = await call("POST", "/fleet/api/threads/conductor:s-1/mute", { hours: 4 });
+  assert.equal(muted.body.muted, "2026-09-27T00:00:00.000Z");
+  assert.equal((await call("POST", "/fleet/api/threads/conductor:s-1/mute")).status, 200);
+  for (const hours of [0, 1.5, 169, "x"]) assert.equal((await call("POST", "/fleet/api/threads/conductor:s-1/mute", { hours })).status, 400, String(hours));
+  const unmuted = await call("POST", "/fleet/api/threads/conductor:s-1/unmute");
+  assert.equal(unmuted.body.muted, null);
+  assert.equal((await call("POST", "/fleet/api/threads/conductor:s-1/delete")).status, 404);
+  assert.deepEqual(supervisor.calls.filter((c) => c[0] !== "getState"), [
+    ["threadDetail", "conductor:s-1"], ["threadDetail", "conductor:s-1"], ["threadDetail", "codex:gone"],
+    ["pushNow", "conductor:s-1", null], ["muteThread", "conductor:s-1", 4], ["muteThread", "conductor:s-1", undefined], ["unmuteThread", "conductor:s-1"]
+  ]);
+});

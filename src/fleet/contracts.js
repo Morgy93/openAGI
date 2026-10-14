@@ -425,6 +425,43 @@ export function linkUiHosts(threads) {
   });
 }
 
+const CHAT_NAME_MAX = 80;
+const sameName = (a, b) => String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+
+// How the owner opens one thread's own chat: { app, url, label, note }. url
+// is the app's id link, the one computer-use sends navigate by, and they
+// check on screen that it lands on exactly that chat (Conductor's page URL
+// carries the workspace and session ids, Codex labels the page with the
+// thread). A chat no link opens (a Claude Code terminal session, a
+// Conductor Codex thread with no Conductor tab, an archived thread) has url
+// null; its label names the workspace or folder and the app instead, and
+// note says why. Labels tell apart chats that share a workspace name.
+export function openChatFor(thread) {
+  if (!thread?.kind) return null;
+  const name = (value) => clampText(value, CHAT_NAME_MAX);
+  const title = name(thread.title);
+  const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
+  const target = uiTargetFor(thread);
+  if (target?.app === "conductor") {
+    const workspace = name(target.workspace);
+    const tab = name(target.title);
+    const shown = [workspace, tab && !sameName(tab, workspace) ? tab : ""].filter(Boolean).join(" · ") || title || "untitled chat";
+    return { app: "conductor", url: target.deepLink, label: `${shown} (Conductor)`, note: null };
+  }
+  if (target?.app === "codex") return { app: "codex", url: target.deepLink, label: `${title || "untitled thread"} (Codex)`, note: null };
+  const where = name(thread.workspace) || folder;
+  if (thread.kind === "conductor") return { app: "conductor", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled chat"} (Conductor)`, note: "Conductor gave no workspace or session id for this chat; open it from the sidebar." };
+  if (thread.kind === "codex") {
+    const inConductor = thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR;
+    return {
+      app: inConductor ? "conductor" : "codex", url: null,
+      label: `${title || "untitled thread"} (${inConductor ? "Conductor" : "Codex"})`,
+      note: thread.archived ? "Archived in Codex: unarchive it to open." : inConductor ? "No Conductor tab shows this Codex thread now; open its workspace in Conductor." : "No link opens this thread."
+    };
+  }
+  return { app: "claude", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled session"} (Claude Code)`, note: `A Claude Code terminal session${folder ? ` in ${folder}` : ""}: no app link opens it; open it in its terminal.` };
+}
+
 // Runs a child process and never throws. Timeouts kill only the child this
 // call spawned (SIGTERM, then SIGKILL after a grace) and always settle.
 // Output is capped so a chatty command cannot exhaust memory.

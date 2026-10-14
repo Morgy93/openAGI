@@ -13,7 +13,7 @@ export function createFleetCapability(supervisor) {
     // inside it.
     async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(codex|claude|conductor)(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
       const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
@@ -34,7 +34,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000 }) {
@@ -115,6 +115,26 @@ export class RemoteFleetSupervisor {
   async clickThread(threadKey, label, { stateId = null } = {}) {
     const body = await this.request('POST', '/fleet/api/click', { threadKey, label, ...(stateId ? { stateId } : {}) });
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
+  }
+  // A thread the computer's last scan does not have is null, not an outage.
+  async threadDetail(threadKey) {
+    try {
+      return (await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}`)).thread ?? null;
+    } catch (error) {
+      if (error.reached) return null;
+      throw error;
+    }
+  }
+  async pushNow(threadKey) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/push`);
+    return { delivery: body.delivery ?? null, action: body.action ?? null };
+  }
+  async muteThread(threadKey, { hours } = {}) {
+    return { until: (await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/mute`, hours === undefined ? {} : { hours })).muted ?? null };
+  }
+  async unmuteThread(threadKey) {
+    await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/unmute`);
+    return { until: null };
   }
   async runningInApp(app) {
     return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;

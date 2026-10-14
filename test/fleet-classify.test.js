@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, WATCH_GROUPS, blockedOnSection, classifyThread, mergeThreads, prReadiness, threadHealth, watchOf
+  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, WATCH_GROUPS, blockedOnSection, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf
 } from "../src/fleet/classify.js";
 import { DEFAULTS, STATES, clampTail, clampTailLines } from "../src/fleet/contracts.js";
 
@@ -678,4 +678,35 @@ test("watchOf: the owner's view of what each thread is watched for, and since wh
     const watch = watchOf(makeThread(), { state }, { now: NOW });
     if (watch) assert.ok(WATCH_GROUPS.includes(watch.group), state);
   }
+});
+
+test("liveWatch: Waiting on you only while a question the owner can see is open", () => {
+  // Asked while CI ran: back to waiting on CI, on its own clock, once answered.
+  const asked = watchOf(makeThread({ agentStatus: "idle" }), { state: "waiting-ci", wait: { source: "ci", ageMs: 20 * MIN } }, { now: NOW, askedAt: ago(5 * MIN) });
+  assert.equal(asked.group, "you");
+  assert.deepEqual(asked.otherwise, { group: "waiting", waitingOn: "CI" });
+  const answered = liveWatch(asked, { state: "waiting-ci", askedAt: null, closedAt: ago(1 * MIN) });
+  assert.equal(answered.group, "waiting");
+  assert.equal(answered.waitingOn, "CI");
+  assert.equal(answered.since, ago(20 * MIN));
+  assert.equal(answered.otherwise, undefined);
+  // A needs-human row whose question was dismissed: the supervisor's to push, from the dismissal.
+  const ask = watchOf(makeThread(), { state: "needs-human" }, { now: NOW, askedAt: ago(8 * 60 * MIN) });
+  const dismissed = liveWatch(ask, { state: "needs-human", askedAt: null, closedAt: ago(2 * MIN) });
+  assert.equal(dismissed.group, "push");
+  assert.equal(dismissed.since, ago(2 * MIN));
+  assert.equal(dismissed.waitingOn, null);
+  // A snapshot from before otherwise falls back by state.
+  const { otherwise: _drop, ...legacy } = ask;
+  assert.equal(liveWatch(legacy, { state: "needs-human" }).group, "push");
+  // A question opened since the scan puts the row in, timed by it.
+  const quiet = watchOf(makeThread(), { state: "idle-no-pr" }, { now: NOW });
+  const now = liveWatch(quiet, { state: "idle-no-pr", askedAt: ago(1 * MIN) });
+  assert.equal(now.group, "you");
+  assert.equal(now.since, ago(1 * MIN));
+  assert.equal(now.otherwise.group, "quiet");
+  assert.equal(liveWatch(now, { state: "idle-no-pr" }).group, "quiet");
+  // Nothing open and not "you": unchanged; out of scope stays null.
+  assert.equal(liveWatch(quiet, { state: "idle-no-pr" }), quiet);
+  assert.equal(liveWatch(null, { askedAt: ago(1 * MIN) }), null);
 });

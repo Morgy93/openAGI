@@ -438,3 +438,34 @@ test('main reads screens, clicks and controls apps on the Mac through the broker
   // The chats a restart would stop, read live on the Mac.
   assert.deepEqual(await remote.runningInApp('conductor'), [{ key: 'conductor:s1', name: 'madrid' }]);
 });
+
+test('main reads a thread\'s detail and pushes, mutes and unmutes it on the Mac through the broker', async t => {
+  const { remote, calls } = fixture(t);
+  const seen = [];
+  const mac = {
+    getState: () => ({ mode: 'auto', enabled: true, snapshot: { threads: [] }, questions: [], actions: [] }),
+    threadDetail: async (key) => { seen.push(['detail', key]); return key === 'conductor:s1' ? { key, openChat: { app: 'conductor', url: 'conductor://workspace?id=w&session=s1', label: 'madrid (Conductor)', note: null } } : null; },
+    pushNow: async (key) => { seen.push(['push', key]); return { delivery: { status: 'sent', route: 'computer-use', detail: 'typed' }, action: { id: 'fa_1', by: 'owner' } }; },
+    muteThread: async (key, options) => { seen.push(['mute', key, options.hours]); return { until: '2026-09-27T00:00:00.000Z' }; },
+    unmuteThread: async (key) => { seen.push(['unmute', key]); return { until: null }; }
+  };
+  const capability = createFleetCapability(mac);
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => { calls.push(args); return capability.invoke(args[2], args[3]); };
+  assert.equal((await remote.threadDetail('conductor:s1')).openChat.url, 'conductor://workspace?id=w&session=s1');
+  // Not in the Mac's last scan: null, not an outage.
+  assert.equal(await remote.threadDetail('codex:gone'), null);
+  assert.equal((await remote.pushNow('conductor:s1')).delivery.status, 'sent');
+  assert.equal((await remote.muteThread('conductor:s1', { hours: 3 })).until, '2026-09-27T00:00:00.000Z');
+  assert.equal((await remote.unmuteThread('conductor:s1')).until, null);
+  assert.deepEqual(seen, [['detail', 'conductor:s1'], ['detail', 'codex:gone'], ['push', 'conductor:s1'], ['mute', 'conductor:s1', 3], ['unmute', 'conductor:s1']]);
+  assert.deepEqual(calls.slice(-5).map((call) => [call[3].path, call[4].timeoutMs]), [
+    ['/fleet/api/threads/conductor%3As1', 120000], ['/fleet/api/threads/codex%3Agone', 120000],
+    ['/fleet/api/threads/conductor%3As1/push', 300000], ['/fleet/api/threads/conductor%3As1/mute', 120000], ['/fleet/api/threads/conductor%3As1/unmute', 120000]
+  ], 'a push waits like a send');
+  await assert.rejects(() => capability.invoke('request', { method: 'POST', path: '/fleet/api/threads/codex:t1/delete' }), /Unsupported fleet request/);
+  await assert.rejects(() => capability.invoke('request', { method: 'GET', path: '/fleet/api/threads/../state' }), /Unsupported fleet request/);
+  // Through the main's own route, as the phone and the page call it.
+  const route = createFleetRoute({ supervisor: remote });
+  assert.equal((await route('GET', '/fleet/api/threads/codex:gone', null, async () => ({}))).status, 404);
+  assert.equal((await route('POST', '/fleet/api/threads/conductor:s1/push', null, async () => ({}))).body.delivery.status, 'sent');
+});

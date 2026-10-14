@@ -13,6 +13,15 @@ const LABEL_MAX = 80;
 const THREAD_KEY = /^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
+const THREAD_ACTIONS = new Set(["push", "mute", "unmute"]);
+const MUTE_HOURS_MAX = 7 * 24;
+
+// A thread key from the path: "conductor:<id>", its colon raw or %3A.
+function pathThreadKey(segment) {
+  let key;
+  try { key = decodeURIComponent(segment); } catch { return null; }
+  return THREAD_KEY.test(key) ? key : null;
+}
 
 const ok = (body) => ({ status: 200, body });
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
@@ -171,6 +180,32 @@ export function createFleetRoute({ supervisor } = {}) {
         if (typeof supervisor.appAction !== "function") return fail(503, "App control is not available.");
         const result = await supervisor.appAction(parts[1], parts[2], { ...sendOptions, expectRunning });
         return ok({ result, state: state() });
+      }
+      // One thread, expanded: its detail (GET), or the owner's Push now,
+      // Mute or Unmute of it (POST).
+      if (parts[0] === "threads" && (parts.length === 2 || parts.length === 3)) {
+        const threadKey = pathThreadKey(parts[1]);
+        if (!threadKey) return fail(400, "Pass a thread key from the fleet state.");
+        if (parts.length === 2) {
+          if (method !== "GET") return fail(405, "Use GET.");
+          if (typeof supervisor.threadDetail !== "function") return fail(503, "Thread details are not available.");
+          const thread = await supervisor.threadDetail(threadKey);
+          return thread ? ok({ thread }) : fail(404, "No thread with that key in the last scan.");
+        }
+        if (!THREAD_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (parts[2] === "push") {
+          if (typeof supervisor.pushNow !== "function") return fail(503, "Push now is not available.");
+          const result = await supervisor.pushNow(threadKey, sendOptions);
+          return ok({ delivery: result?.delivery ?? null, action: result?.action ?? null, state: state() });
+        }
+        if (typeof supervisor.muteThread !== "function") return fail(503, "Muting is not available.");
+        if (parts[2] === "unmute") return ok({ muted: (await supervisor.unmuteThread(threadKey))?.until ?? null, state: state() });
+        const body = (await readObject(readBody)) ?? {};
+        const hours = body.hours === undefined ? undefined : Number(body.hours);
+        if (hours !== undefined && !(Number.isInteger(hours) && hours >= 1 && hours <= MUTE_HOURS_MAX)) return fail(400, `hours must be a whole number from 1 to ${MUTE_HOURS_MAX}.`);
+        const muted = await supervisor.muteThread(threadKey, hours === undefined ? {} : { hours });
+        return ok({ muted: muted?.until ?? null, state: state() });
       }
       if (parts.length === 3 && parts[0] === "actions" && parts[2] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");

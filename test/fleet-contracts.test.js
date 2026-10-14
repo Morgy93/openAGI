@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   ROUTES, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
-  repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
+  linkUiHosts, openChatFor, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
@@ -191,4 +191,40 @@ test("a card item that says it needs nothing, or only acknowledges, asks nothing
   assert.equal(isAckItem(item("Please sign back into ZeroShot Staging.")), false);
   assert.equal(isAckItem(item("No input needed? Pick a region.", ["us-east-1", "eu-west-1"])), false);
   assert.deepEqual(liveCardItems({ app: "codex", items: [item("no action needed"), { ...item("Sign in?"), at: null }] }).map((entry) => entry.question), ["Sign in?"]);
+});
+
+test("openChatFor: the link that opens exactly that chat, or a label that says where it is", () => {
+  // Two chats in one workspace named remote-dev: the tab title tells them apart.
+  const conductor = (session, tab) => ({
+    key: `conductor:${session}`, kind: "conductor", id: session, title: tab, workspace: "remote-dev", cwd: "/ws/remote-dev",
+    meta: { conductorWorkspaceId: "w1", conductorSessionId: session, conductorSessionTitle: tab, conductorWorkspaceSessions: 2 }
+  });
+  const a = openChatFor(conductor("d1dbe71a", "Codex LB Transcript open"));
+  const b = openChatFor(conductor("0056f770", "Remote dev setup"));
+  assert.deepEqual(a, { app: "conductor", url: "conductor://workspace?id=w1&session=d1dbe71a", label: "remote-dev · Codex LB Transcript open (Conductor)", note: null });
+  assert.equal(b.label, "remote-dev · Remote dev setup (Conductor)");
+  assert.notEqual(a.url, b.url);
+  // A tab titled like its workspace is not named twice.
+  assert.equal(openChatFor(conductor("s9", "Remote-Dev")).label, "remote-dev (Conductor)");
+  // Codex: the thread's id link, the one computer-use sends use.
+  const codex = { key: "codex:019f", kind: "codex", id: "019f", title: "Download Amex Statements", cwd: "/w/bb", meta: {} };
+  assert.deepEqual(openChatFor(codex), { app: "codex", url: "codex://threads/019f", label: "Download Amex Statements (Codex)", note: null });
+  assert.equal(openChatFor({ ...codex, archived: true }).url, null);
+  assert.match(openChatFor({ ...codex, archived: true }).note, /unarchive/);
+  // A Codex thread Conductor runs opens through its Conductor tab.
+  const hosted = { ...codex, key: "codex:c1", id: "c1", meta: { originator: "codex_sdk_ts" } };
+  const host = { ...conductor("s2", "Ship it"), claudeSessionId: "c1" };
+  const [linked] = linkUiHosts([hosted, host]);
+  assert.equal(openChatFor(linked).url, "conductor://workspace?id=w1&session=s2");
+  assert.equal(openChatFor(linked).app, "conductor");
+  // With no Conductor tab showing it: no guessed link, its app named.
+  assert.equal(openChatFor(hosted).url, null);
+  assert.equal(openChatFor(hosted).app, "conductor");
+  // A Claude Code terminal session: no app link opens it.
+  const claude = openChatFor({ key: "claude:x", kind: "claude", id: "x", title: "fix auth", workspace: null, cwd: "/Users/me/Dev/api", meta: {} });
+  assert.equal(claude.url, null);
+  assert.equal(claude.app, "claude");
+  assert.equal(claude.label, "api · fix auth (Claude Code)");
+  assert.match(claude.note, /terminal/);
+  assert.equal(openChatFor(null), null);
 });
