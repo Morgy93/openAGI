@@ -160,8 +160,8 @@ export function watchOf(thread, classified, { now = Date.now(), askedAt = null }
   if (!state || state === "excluded") return null;
   // Waiting on you only with a question the owner can see; one still held
   // for review leaves the thread with the supervisor for now.
-  const byState = WATCH_BY_STATE[state] ?? "quiet";
-  const group = askedAt ? "you" : byState === "you" ? "push" : byState;
+  const own = ownWatchGroup(state);
+  const group = askedAt ? "you" : own;
   const wait = classified.wait ?? null;
   const waitSince = Number.isFinite(wait?.ageMs) ? new Date(now - wait.ageMs).toISOString() : null;
   const busy = thread.agentStatus === "running" || thread.agentStatus === "waiting";
@@ -171,7 +171,36 @@ export function watchOf(thread, classified, { now = Date.now(), askedAt = null }
     : group === "waiting" ? waitSince
       : group === "working" ? runningSince
         : null;
-  return { group, since: since ?? thread.lastActivityAt ?? null, runningSince, waitSince, waitingOn };
+  // otherwise: its group once the question closes (liveWatch reads it).
+  const otherwise = group === "you" ? { group: own, waitingOn: own === "waiting" ? waitLabel(wait) : null } : undefined;
+  return { group, since: since ?? thread.lastActivityAt ?? null, runningSince, waitSince, waitingOn, ...(otherwise ? { otherwise } : {}) };
+}
+
+// A state's group with no question open: one that asks the owner, unasked
+// (held for review, or answered), is the supervisor's to push.
+function ownWatchGroup(state) {
+  const byState = WATCH_BY_STATE[state] ?? "quiet";
+  return byState === "you" ? "push" : byState;
+}
+
+// A scan's watch brought up to now: "Waiting on you" only while a question
+// the owner can see names the thread. askedAt: when the earliest such
+// question was put to the owner (null: none open now). closedAt: when its
+// last one closed; the group it falls back to starts there unless that
+// group keeps its own clock (a wait, a turn).
+export function liveWatch(watch, { state = null, askedAt = null, closedAt = null, muted = null } = {}) {
+  if (!watch?.group) return watch ?? null;
+  if (muted) return { ...watch, group: "quiet", waitingOn: null };
+  if (askedAt) {
+    const otherwise = watch.group === "you" ? watch.otherwise : { group: watch.group, waitingOn: watch.waitingOn ?? null };
+    return { ...watch, group: "you", since: askedAt, waitingOn: "your answer", ...(otherwise ? { otherwise } : {}) };
+  }
+  if (watch.group !== "you") return watch;
+  const { otherwise, ...rest } = watch;
+  // A snapshot from before otherwise: the group its state maps to.
+  const group = otherwise?.group ?? ownWatchGroup(state);
+  const since = group === "waiting" ? watch.waitSince : group === "working" ? watch.runningSince : null;
+  return { ...rest, group, since: since ?? closedAt ?? watch.since ?? null, waitingOn: otherwise?.waitingOn ?? null };
 }
 
 export function threadHealth(state, error = null) {
@@ -182,7 +211,8 @@ export function threadHealth(state, error = null) {
 
 // A Claude transcript and a Conductor session are the same agent when the
 // Conductor row points at the transcript's session id. Conductor owns status.
-export function mergeThreads({ codex = [], claude = [], conductor = [] } = {}) {
+// Antigravity conversations stand alone.
+export function mergeThreads({ codex = [], claude = [], conductor = [], antigravity = [] } = {}) {
   const merged = conductor.filter(Boolean).map((thread) => ({ ...thread }));
   const byClaudeId = new Map();
   for (const thread of merged) if (thread.claudeSessionId) byClaudeId.set(thread.claudeSessionId, thread);
@@ -192,7 +222,7 @@ export function mergeThreads({ codex = [], claude = [], conductor = [] } = {}) {
     if (target) foldClaudeInto(target, thread);
     else loose.push({ ...thread });
   }
-  return [...codex.filter(Boolean).map((thread) => ({ ...thread })), ...merged, ...loose];
+  return [...codex.filter(Boolean).map((thread) => ({ ...thread })), ...merged, ...loose, ...antigravity.filter(Boolean).map((thread) => ({ ...thread }))];
 }
 
 function foldClaudeInto(target, claude) {

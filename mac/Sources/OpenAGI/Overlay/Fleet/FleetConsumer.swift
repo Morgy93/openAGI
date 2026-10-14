@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// The coding-agent supervisor's open questions, from the LOCAL daemon's
@@ -34,6 +35,17 @@ final class FleetConsumer: ObservableObject {
   /// Scan, refresh, and closed-question results.
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
+  /// The Watching row the owner opened (one at a time), and the question
+  /// cards they opened. Both change the panel's height.
+  @Published private(set) var expandedThread: String? = nil
+  @Published private(set) var expandedQuestions: Set<String> = []
+  /// GET /fleet/api/threads/:key, by thread key, for opened rows and cards.
+  @Published private(set) var details: [String: FleetThreadDetail] = [:]
+  @Published private(set) var detailLoading: Set<String> = []
+  /// Thread keys with a Push now, Mute or Unmute in flight.
+  @Published private(set) var threadInFlight: Set<String> = []
+  /// Each thread's last Push now, Mute or Unmute result, in its row.
+  @Published private(set) var threadNotes: [String: FleetNote] = [:]
 
   /// Bumped by every refresh start and every apply. A refresh publishes only
   /// if nothing newer started or landed meanwhile, so a slow GET can never
@@ -53,6 +65,14 @@ final class FleetConsumer: ObservableObject {
   /// its "fleet" event, and `running` must not stick.
   private var runningRecheck: Task<Void, Never>?
   private static let stillSendingWait: TimeInterval = 300
+  /// The scan the opened row's detail was last read for.
+  private var lastDetailTick: String?
+  private var pendingDetails: Set<String> = []
+  private let fetchDetail: (URLRequest) async throws -> (Data, URLResponse)
+
+  init(fetchDetail: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }) {
+    self.fetchDetail = fetchDetail
+  }
 
   func refresh() async {
     generation &+= 1
@@ -172,6 +192,136 @@ final class FleetConsumer: ObservableObject {
     }
   }
 
+  // MARK: - One thread
+
+  /// Opens a Watching row (closing any other) and loads its detail.
+  func toggleThread(_ key: String) {
+    if expandedThread == key {
+      expandedThread = nil
+      return
+    }
+    expandedThread = key
+    Task { await loadDetail(key) }
+  }
+
+  /// Opens a question card: the agent's words it came from, and its
+  /// thread's PR, wait and next step.
+  func toggleQuestion(_ question: FleetQuestion) {
+    if expandedQuestions.contains(question.id) {
+      expandedQuestions.remove(question.id)
+      return
+    }
+    expandedQuestions.insert(question.id)
+    if let key = question.threadKey { Task { await loadDetail(key) } }
+  }
+
+  /// The open questions about one thread, grouped ones included.
+  func questions(about key: String) -> [FleetQuestion] {
+    questions.filter { $0.threadKey == key || $0.chats.contains { $0.threadKey == key } }
+  }
+
+  func thread(_ key: String) -> FleetThread? { threads.first { $0.key == key } }
+
+  /// A failed read keeps what the row already shows from the scan.
+  func loadDetail(_ key: String) async {
+    guard !detailLoading.contains(key) else {
+      pendingDetails.insert(key)
+      return
+    }
+    detailLoading.insert(key)
+    defer { detailLoading.remove(key) }
+    repeat {
+      pendingDetails.remove(key)
+      await readDetail(key)
+    } while pendingDetails.contains(key)
+  }
+
+  private func readDetail(_ key: String) async {
+    let req = request(path: Self.threadPath(key), method: "GET", timeout: 8)
+    guard let (data, response) = try? await fetchDetail(req) else { return }
+    switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
+    case 200..<300:
+      if let detail = FleetThreadDetail.decodeResponse(data) { details[key] = detail }
+    case 404:
+      // Not in the last scan any more.
+      details[key] = nil
+    default:
+      return
+    }
+  }
+
+  /// Push now: the thread's planned nudge goes out at once, as the owner's
+  /// own message. The daemon still refuses one that waits on an answer.
+  func pushNow(_ key: String) async {
+    await threadAction(key, "push", body: [:])
+  }
+
+  func mute(_ key: String, hours: Int = 24) async {
+    await threadAction(key, "mute", body: ["hours": hours])
+  }
+
+  func unmute(_ key: String) async {
+    await threadAction(key, "unmute", body: [:])
+  }
+
+  private func threadAction(_ key: String, _ action: String, body: [String: Any]) async {
+    guard !threadInFlight.contains(key) else { return }
+    threadInFlight.insert(key)
+    defer { threadInFlight.remove(key) }
+    threadNotes[key] = nil
+    // A push types into the agent's app, which can take minutes.
+    var req = request(path: Self.threadPath(key) + "/" + action, method: "POST", timeout: action == "push" ? 150 : 15)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
+      case 200..<300:
+        let decoded = try? JSONDecoder().decode(FleetThreadActionResponse.self, from: data)
+        if let state = decoded?.state { apply(state) } else { await refresh() }
+        threadNotes[key] = action == "push" ? FleetThreadOutcome.push(decoded?.delivery) : FleetThreadOutcome.muted(decoded?.muted)
+        if expandedThread == key { await loadDetail(key) }
+      case 503:
+        threadNotes[key] = FleetNote(text: Self.serverError(data) ?? "Supervisor isn't available.", isError: true)
+      case 401:
+        threadNotes[key] = FleetNote(text: "Daemon sign-in failed.", isError: true)
+      default:
+        // 400 (bad key or hours), 404 (a daemon without these routes).
+        threadNotes[key] = FleetNote(text: Self.serverError(data) ?? "The supervisor couldn't do that.", isError: true)
+      }
+    } catch let error as URLError where error.code == .timedOut {
+      threadNotes[key] = FleetNote(text: "No reply yet. It may still be sending.", isError: false)
+      await refresh()
+    } catch {
+      threadNotes[key] = FleetNote(text: "Couldn't reach the supervisor. Try again.", isError: true)
+    }
+  }
+
+  func clearThreadNote(_ key: String) {
+    threadNotes[key] = nil
+  }
+
+  /// Lands in that exact chat when it has a link; else brings its app to
+  /// the front, where its workspace is named on the row.
+  func openChat(_ chat: FleetOpenChat) {
+    switch FleetChatOpener.target(chat) {
+    case let .link(url):
+      if !NSWorkspace.shared.open(url) { setActionError("Couldn't open \(chat.label).") }
+    case let .app(bundleIdentifier, name):
+      guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+        setActionError("\(name) isn't installed on this Mac.")
+        return
+      }
+      NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration())
+    case .nowhere:
+      break
+    }
+  }
+
+  /// "conductor:abc" -> "/fleet/api/threads/conductor%3Aabc".
+  static func threadPath(_ key: String) -> String {
+    "/fleet/api/threads/" + key.replacingOccurrences(of: ":", with: "%3A")
+  }
+
   /// Opens or closes a Watching group that starts collapsed.
   func toggleWatchGroup(_ group: String) {
     if openWatchGroups.contains(group) { openWatchGroups.remove(group) } else { openWatchGroups.insert(group) }
@@ -242,6 +392,15 @@ final class FleetConsumer: ObservableObject {
     questions = state.questions
     threads = state.threads
     status = state.status
+    // Opened rows and cards stay open while their thread or question does.
+    let keys = Set(state.threads.map(\.key))
+    if let key = expandedThread, !keys.contains(key) { expandedThread = nil }
+    expandedQuestions.formIntersection(open)
+    details = details.filter { keys.contains($0.key) }
+    threadNotes = threadNotes.filter { keys.contains($0.key) }
+    // A new scan: the opened row's agent message may have moved on.
+    if state.lastTickAt != lastDetailTick, let key = expandedThread { Task { await loadDetail(key) } }
+    lastDetailTick = state.lastTickAt
     hasSupervisor = state.enabled || !state.questions.isEmpty
     // Answering the last question with auto-scan off must not pull the
     // panel to Tasks mid-action and hide the result. The tab goes once the
@@ -260,6 +419,10 @@ final class FleetConsumer: ObservableObject {
     notes = [:]
     stillSending = []
     sendingDeadline = [:]
+    expandedThread = nil
+    expandedQuestions = []
+    details = [:]
+    threadNotes = [:]
     hasSupervisor = false
     available = false
     OverlayState.shared.selectTab(.tasks)

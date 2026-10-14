@@ -7,8 +7,24 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor"]);
+export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity"]);
+// The one list every thread-key matcher is built from (server routes, the
+// broker's and the phone's allowlists): "kind:id", the id as sources mint it.
+export const THREAD_KIND_PATTERN = THREAD_KINDS.join("|");
+export const THREAD_KEY_PATTERN = new RegExp(`^(?:${THREAD_KIND_PATTERN}):[A-Za-z0-9_.-]{1,120}$`);
+
+export function isThreadKey(key) {
+  return typeof key === "string" && THREAD_KEY_PATTERN.test(key);
+}
+
+// What the owner calls each kind's app in questions and labels.
+export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity" });
+
+export function kindName(kind) {
+  return KIND_NAMES[kind] ?? "Agent";
+}
 
 // Provider-level status of the thread's last turn, before PR/infra context.
 export const AGENT_STATUS = Object.freeze(["running", "idle", "waiting", "stalled", "aborted", "error", "unknown"]);
@@ -26,7 +42,8 @@ export const STATES = Object.freeze([
 
 export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager", "ask-user"]);
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
-export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use"]);
+// antigravity-send: agentapi send-message, the Antigravity app's own API.
+export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use", "antigravity-send"]);
 // How supervisor text reaches a thread. "cli" is the original set of routes;
 // "computer-use" types into the app that shows the thread and never runs a
 // CLI; "computer-use-first" types when computer use is ready, else falls back.
@@ -138,8 +155,16 @@ export const DEFAULT_LB_URL = null;
 export const DEFAULT_MANAGER_REF = null;
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
 // Model for the review of the needs-you list, chosen by the owner on
-// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
+// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides. Since
+// 2026-10-13 it is the Claude fallback: the review runs on Codex through
+// codex-lb (DEFAULT_REVIEW_CODEX_MODEL) when a provider is configured, and
+// on Claude when that call fails. OPENAGI_FLEET_REVIEW_PROVIDER=codex|claude
+// pins one.
 export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
+export const DEFAULT_REVIEW_CODEX_MODEL = "gpt-6-luna";
+export const REVIEW_PROVIDERS = Object.freeze(["codex", "claude"]);
+// The Codex try leaves the Claude fallback its own full timeout.
+export const DEFAULT_REVIEW_CODEX_TIMEOUT_MS = 180_000;
 export const DEFAULT_REVIEW_MS = 30 * MIN;
 // Sonnet took about 3 minutes on 13 questions, mostly thinking.
 export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
@@ -164,9 +189,15 @@ export function defaultPaths(home = os.homedir()) {
     bb3WatchState: path.join(home, ".bb3-watch-state"),
     bb3WatchGateState: path.join(home, ".bb3-watch-gate-state"),
     lbWatchLog: path.join(home, "Library", "Logs", "lb-watch.log"),
-    relayCwd: path.join(home, ".agent-supervisor", "relay")
+    relayCwd: path.join(home, ".agent-supervisor", "relay"),
+    // Antigravity's data: conversation_summaries.db and conversations/<id>.db.
+    antigravityHome: path.join(home, ".gemini", "antigravity")
   };
 }
+
+// The Antigravity app's language server: its agent API, and the process the
+// running instance's loopback port and csrf token are read from.
+export const ANTIGRAVITY_LS = "/Applications/Antigravity.app/Contents/Resources/bin/language_server";
 
 // The OpenAGI.app daemon runs with PATH=/usr/bin:/bin:/usr/sbin:/sbin, so
 // every child binary is resolved to an absolute path up front.
@@ -187,7 +218,11 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     df: pick(["/bin/df"], "df"),
     ditto: pick(["/usr/bin/ditto"], "ditto"),
     diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
-    rm: pick(["/bin/rm"], "rm")
+    rm: pick(["/bin/rm"], "rm"),
+    // A shim that runs the app's language server with "agentapi". The server
+    // binary itself is how the running instance is found in ps.
+    agentapi: pick([path.join(home, ".gemini", "antigravity", "bin", "agentapi")], null),
+    antigravityLs: pick([ANTIGRAVITY_LS, path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server")], ANTIGRAVITY_LS)
   };
 }
 
@@ -230,7 +265,7 @@ export function resolveOcuPath(env = process.env, { exists = fs.existsSync, real
 // Non-UI routes a computer-use send may fall back to while the owner is at
 // the Mac (so nothing takes the screen). claude-resume is never one: it
 // forks a session behind Conductor.
-export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay"]);
+export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay", "antigravity-send"]);
 
 export function parseBackgroundRoutes(value) {
   const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
@@ -240,6 +275,12 @@ export function parseBackgroundRoutes(value) {
 export function parseDeliveryMode(value) {
   const text = String(value ?? "").trim().toLowerCase();
   return DELIVERY_MODES.includes(text) ? text : "cli";
+}
+
+// OPENAGI_FLEET_REVIEW_PROVIDER: "codex" or "claude"; anything else is auto (null).
+export function parseReviewProvider(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return REVIEW_PROVIDERS.includes(text) ? text : null;
 }
 
 function envFlag(value) {
@@ -300,9 +341,13 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // supervisor unless OPENAGI_FLEET_REVIEW=0.
     review: {
       enabled: overrides.review?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_REVIEW)),
-      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
+      // null: codex when the Codex config names a provider (codex-lb),
+      // else claude (resolved in review.js). model null: that provider's default.
+      provider: overrides.review?.provider ?? parseReviewProvider(env.OPENAGI_FLEET_REVIEW_PROVIDER),
+      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || null),
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
-      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
+      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+      codexTimeoutMs: overrides.review?.codexTimeoutMs ?? DEFAULT_REVIEW_CODEX_TIMEOUT_MS
     },
     // The nudge judge (judge.js): a model reads the chat before an automatic
     // nudge. Off unless OPENAGI_FLEET_JUDGE=1 and a model is named.
@@ -325,6 +370,11 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       ...(overrides.storage ?? {}),
       enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
     },
+    // Antigravity conversations: read, and sent to with agentapi, unless
+    // OPENAGI_FLEET_ANTIGRAVITY=0. No data dir means no threads.
+    antigravity: {
+      enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
@@ -339,6 +389,15 @@ export const UI_APPS = Object.freeze({
   conductor: Object.freeze({ app: "conductor", name: "Conductor", bundleId: "com.conductor.app" }),
   codex: Object.freeze({ app: "codex", name: "Codex", bundleId: "com.openai.codex" })
 });
+
+// How the owner opens an Antigravity conversation: { app, url, label, note },
+// the shape of the other apps' open-chat links. The app registers
+// antigravity:// but handles only antigravity://teleport/ai_studio, and the
+// /c/<id> page its window shows is a loopback URL on a random port that opens
+// a browser tab, not the app. No link opens one conversation, so url is null.
+export function antigravityOpenChat(thread) {
+  return openChatFor(thread);
+}
 
 // Codex threads started by Conductor's Codex agent carry this originator;
 // they show in Conductor, not in the Codex app.
@@ -423,6 +482,44 @@ export function linkUiHosts(threads) {
     const conductorHost = host ? { ...conductorFields(host), key: host.key } : null;
     return { ...thread, meta: { ...(thread.meta ?? {}), conductorHost } };
   });
+}
+
+const CHAT_NAME_MAX = 80;
+const sameName = (a, b) => String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+
+// How the owner opens one thread's own chat: { app, url, label, note }. url
+// is the app's id link, the one computer-use sends navigate by, and they
+// check on screen that it lands on exactly that chat (Conductor's page URL
+// carries the workspace and session ids, Codex labels the page with the
+// thread). A chat no link opens (a Claude Code terminal session, a
+// Conductor Codex thread with no Conductor tab, an archived thread) has url
+// null; its label names the workspace or folder and the app instead, and
+// note says why. Labels tell apart chats that share a workspace name.
+export function openChatFor(thread) {
+  if (!thread?.kind) return null;
+  const name = (value) => clampText(value, CHAT_NAME_MAX);
+  const title = name(thread.title);
+  const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
+  const target = uiTargetFor(thread);
+  if (target?.app === "conductor") {
+    const workspace = name(target.workspace);
+    const tab = name(target.title);
+    const shown = [workspace, tab && !sameName(tab, workspace) ? tab : ""].filter(Boolean).join(" · ") || title || "untitled chat";
+    return { app: "conductor", url: target.deepLink, label: `${shown} (Conductor)`, note: null };
+  }
+  if (target?.app === "codex") return { app: "codex", url: target.deepLink, label: `${title || "untitled thread"} (Codex)`, note: null };
+  const where = name(thread.workspace) || folder;
+  if (thread.kind === "antigravity") return { app: "antigravity", url: null, label: `${[where, title && !sameName(title, where) ? title : ""].filter(Boolean).join(" · ") || "untitled conversation"} (Antigravity)`, note: "Antigravity has no link to one conversation: open it in Antigravity and pick it in the sidebar." };
+  if (thread.kind === "conductor") return { app: "conductor", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled chat"} (Conductor)`, note: "Conductor gave no workspace or session id for this chat; open it from the sidebar." };
+  if (thread.kind === "codex") {
+    const inConductor = thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR;
+    return {
+      app: inConductor ? "conductor" : "codex", url: null,
+      label: `${[where, title].filter(Boolean).join(" · ") || "untitled thread"} (${inConductor ? "Conductor" : "Codex"})`,
+      note: thread.archived ? "Archived in Codex: unarchive it to open." : inConductor ? `No Conductor tab shows this Codex thread now; open ${where || "its workspace"} in Conductor.` : "No link opens this thread."
+    };
+  }
+  return { app: "claude", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled session"} (Claude Code)`, note: `A Claude Code terminal session${folder ? ` in ${folder}` : ""}: no app link opens it; open it in its terminal.` };
 }
 
 // Runs a child process and never throws. Timeouts kill only the child this
@@ -539,7 +636,13 @@ const SECRET_PATTERNS = [
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[redacted]"],
   [/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, "[redacted]"],
   [/(https:\/\/ping\.buzzkit\.dev\/)[^\s"')]+/g, "$1[redacted]"],
-  [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"]
+  [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"],
+  // An Authorization header an agent printed in a curl example.
+  [/(\bBearer\s+)[A-Za-z0-9._~+/=-]{12,}/g, "$1[redacted]"],
+  // The Antigravity language server's flags and header (ps args, curl lines).
+  [/(--(?:csrf_token|host_bridge_token)[= ])\S+/g, "$1[redacted]"],
+  [/(x-codeium-csrf-token["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, "$1[redacted]"],
+  [/("csrfToken"\s*:\s*")[^"]+/g, "$1[redacted]"]
 ];
 
 // Keeps the END of a message: agents put their question or wait notice last.
@@ -677,10 +780,27 @@ export async function openReadOnlyDb(filePath) {
   }
 }
 
+// A WAL database another app is writing (Antigravity's) opened as an
+// immutable snapshot: no lock, no -shm, nothing written. It misses rows still
+// in the WAL, so callers try openReadOnlyDb first.
+export async function openImmutableDb(filePath) {
+  if (sqliteModule === undefined) {
+    try { sqliteModule = await import("node:sqlite"); } catch { sqliteModule = null; }
+  }
+  if (!sqliteModule || !fs.existsSync(filePath)) return null;
+  try {
+    const url = pathToFileURL(filePath);
+    url.searchParams.set("immutable", "1");
+    return new sqliteModule.DatabaseSync(url, { readOnly: true });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * @typedef {Object} FleetThread
- * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>"
- * @property {"codex"|"claude"|"conductor"} kind
+ * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>" | "antigravity:<conversationId>"
+ * @property {"codex"|"claude"|"conductor"|"antigravity"} kind
  * @property {string} id
  * @property {string} title
  * @property {string|null} cwd
@@ -782,3 +902,20 @@ export async function openReadOnlyDb(filePath) {
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */
+
+/**
+ * @typedef {Object} FleetPushPreview
+ * @property {"nudge"} action
+ * @property {string} playbook
+ * @property {string} reason
+ * @property {string} message             full text Push now sends verbatim
+ */
+
+/**
+ * @typedef {Object} FleetQuestionView
+ * @property {string|null} askContext     redacted agent context, for display only
+ * @property {boolean} risky             classify the ask and options, not context
+ */
+
+// Supervisor state and thread detail carry pushPreview (FleetPushPreview or
+// null) and pushing (a send is in flight). No repeat until the agent replies.

@@ -76,6 +76,16 @@ test("every route the phone app needs is allowed", () => {
     ["POST", "/fleet/api/mode"],
     ["POST", "/fleet/api/questions/fq_abc-1"],
     ["POST", "/fleet/api/actions/fa_abc-1/send"],
+    ["GET", "/fleet/api/threads/antigravity:a1"],
+    ["GET", "/fleet/api/threads/antigravity%3Aa1"],
+    ["POST", "/fleet/api/threads/antigravity:a1/push"],
+    ["POST", "/fleet/api/threads/antigravity%3Aa1/mute"],
+    ["POST", "/fleet/api/threads/antigravity:a1/unmute"],
+    ["GET", "/fleet/api/threads/conductor:d1dbe71a-1fdf"],
+    ["GET", "/fleet/api/threads/codex%3A01a13388"],
+    ["POST", "/fleet/api/threads/codex:01a13388/push"],
+    ["POST", "/fleet/api/threads/claude:abc/mute"],
+    ["POST", "/fleet/api/threads/claude:abc/unmute"],
     ["GET", "/conversations/agent/messages"],
     ["GET", "/conversations/supervisor/messages"],
     ["GET", "/lifelog/moments"]
@@ -113,7 +123,12 @@ test("one representative route from every excluded family is refused", () => {
     ["GET", "/conversations/owner/messages"],
     ["POST", "/conversations/agent/messages"],
     ["POST", "/lifelog/moments"],
-    ["GET", "/g2/lifelog"]
+    ["GET", "/g2/lifelog"],
+    ["POST", "/fleet/api/threads/codex:t1/delete"],
+    ["GET", "/fleet/api/threads/antigravity:"],
+    ["GET", "/fleet/api/threads/antigravity:a/b"],
+    ["GET", "/fleet/api/threads/shell:x"],
+    ["GET", "/fleet/api/threads/codex:../x"]
   ];
   for (const [method, pathname] of refused) {
     assert.equal(isMobileRouteAllowed(method, pathname), false, `${method} ${pathname} must be refused`);

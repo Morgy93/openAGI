@@ -76,12 +76,87 @@ data class FleetThread(
     val live: Boolean = false,
     val route: String? = null,
     val decision: FleetDecision? = null,
+    val pushPreview: FleetDecision? = null,
+    val pushing: Boolean = false,
     // When the agent last said something, as opposed to any activity.
     @Serializable(with = OptionalInstantSerializer::class) val lastAgentAt: Instant? = null,
     // What the supervisor is watching this thread for, and since when. Null
     // for an out-of-scope thread, and on every thread from an older daemon.
     val watch: FleetWatch? = null,
+    // What opens this exact chat, and until when the owner muted it.
+    val openChat: FleetOpenChat? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val muted: Instant? = null,
+    // The owner's own last message in the chat; the supervisor's are not his.
+    @Serializable(with = OptionalInstantSerializer::class) val lastOwnerAt: Instant? = null,
 )
+
+// GET /fleet/api/threads/:key — one row expanded: the agent's last message
+// (a longer excerpt than the row's), the owner's last word, the questions
+// open about it, and when the scan it comes from ran.
+@Serializable
+data class FleetThreadDetailResult(val thread: FleetThreadDetail? = null)
+
+@Serializable
+data class FleetThreadDetail(
+    val key: String = "",
+    val kind: String? = null,
+    val title: String? = null,
+    val workspace: String? = null,
+    val repo: String? = null,
+    val branch: String? = null,
+    val app: String? = null,
+    val agentStatus: String? = null,
+    val live: Boolean = false,
+    val state: String? = null,
+    val health: String? = null,
+    val reason: String? = null,
+    val blockers: List<String> = emptyList(),
+    val error: FleetThreadError? = null,
+    val lastAgentMessage: FleetAgentMessage? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val lastOwnerAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val lastActivityAt: Instant? = null,
+    val pr: FleetPr? = null,
+    val watch: FleetWatch? = null,
+    val decision: FleetDecision? = null,
+    val pushPreview: FleetDecision? = null,
+    val pushing: Boolean = false,
+    @Serializable(with = OptionalInstantSerializer::class) val muted: Instant? = null,
+    val questions: List<FleetQuestion> = emptyList(),
+    val openChat: FleetOpenChat? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val scannedAt: Instant? = null,
+)
+
+// The last 1200 characters, secrets already redacted by the daemon.
+@Serializable
+data class FleetAgentMessage(
+    val text: String? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val at: Instant? = null,
+)
+
+// src/fleet/contracts.js openChatFor. url is the Mac app's own link
+// (conductor://workspace?..., codex://threads/<id>), null when no link opens
+// the chat; label names the workspace or folder, the chat and the app
+// ("remote-dev · Codex LB Transcript open (Conductor)"); note says why
+// there is no link.
+@Serializable
+data class FleetOpenChat(
+    val app: String? = null,
+    val url: String? = null,
+    val label: String? = null,
+    val note: String? = null,
+)
+
+// One chat of a grouped question.
+@Serializable
+data class FleetQuestionChat(
+    val threadKey: String? = null,
+    val app: String? = null,
+    val url: String? = null,
+    val label: String? = null,
+    val note: String? = null,
+) {
+    val openChat: FleetOpenChat get() = FleetOpenChat(app, url, label, note)
+}
 
 // src/fleet/classify.js watchOf, kept across scans by the supervisor:
 // group is one of FleetWatchGroup; since is when the thread entered it;
@@ -95,7 +170,12 @@ data class FleetWatch(
     val waitingOn: String? = null,
     @Serializable(with = OptionalInstantSerializer::class) val waitSince: Instant? = null,
     @Serializable(with = OptionalInstantSerializer::class) val runningSince: Instant? = null,
+    // On a "you" row: the group it returns to once its question closes.
+    val otherwise: FleetWatchOtherwise? = null,
 )
+
+@Serializable
+data class FleetWatchOtherwise(val group: String? = null, val waitingOn: String? = null)
 
 // A thread whose PR the supervisor could not read still carries its ref, with
 // url/state null — the same partial shape buildSnapshot emits.
@@ -130,6 +210,8 @@ data class FleetDecision(
     val playbook: String? = null,
     val reason: String? = null,
     @Serializable(with = OptionalInstantSerializer::class) val notBefore: Instant? = null,
+    // The words Push now would send; null when nothing is planned to be sent.
+    val message: String? = null,
 )
 
 @Serializable
@@ -143,7 +225,23 @@ data class FleetQuestion(
     val threadKeys: List<String>? = null,
     val prRef: String? = null,
     @Serializable(with = OptionalInstantSerializer::class) val createdAt: Instant? = null,
-)
+    // When the agent asked (else when the supervisor first asked), in which
+    // chat, and whether the answer can be given here or only in the agent's
+    // app ("here" or "agent app").
+    @Serializable(with = OptionalInstantSerializer::class) val askedAt: Instant? = null,
+    val chatLabel: String? = null,
+    val answerIn: String? = null,
+    val openChat: FleetOpenChat? = null,
+    // Grouped questions only: each of its chats.
+    val chats: List<FleetQuestionChat> = emptyList(),
+    // A merge, release, deploy, delete or force-push: the full text is read
+    // before any button.
+    val risky: Boolean = false,
+    // The agent message the ask came from.
+    val askContext: String? = null,
+) {
+    val answeredInAgentApp: Boolean get() = answerIn == "agent app" || (answerIn == null && "open thread" in options)
+}
 
 @Serializable
 data class FleetAction(
@@ -162,6 +260,25 @@ data class FleetAction(
 // status is "sent", "blocked" or "failed" (src/fleet/executor.js).
 @Serializable
 data class FleetDelivery(val status: String? = null, val route: String? = null, val detail: String? = null)
+
+// POST /fleet/api/threads/:key/push. A refusal is a "blocked" delivery whose
+// detail says why; action is the recorded send, by "owner".
+@Serializable
+data class FleetPushResult(
+    val delivery: FleetDelivery? = null,
+    val action: FleetAction? = null,
+    val state: FleetState? = null,
+)
+
+// POST /fleet/api/threads/:key/mute and /unmute: until when, or null.
+@Serializable
+data class FleetMuteResult(
+    @Serializable(with = OptionalInstantSerializer::class) val muted: Instant? = null,
+    val state: FleetState? = null,
+)
+
+@Serializable
+data class FleetMuteRequest(val hours: Int)
 
 // POST /fleet/api/questions/:id. A dismissal carries no delivery.
 @Serializable
