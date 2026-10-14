@@ -12,7 +12,7 @@ import path from "node:path";
 import { ensureDir } from "../file-utils.js";
 import { DEFAULTS, DEFAULT_REVIEW_CODEX_MODEL, DEFAULT_REVIEW_CODEX_TIMEOUT_MS, DEFAULT_REVIEW_MODEL, DEFAULT_REVIEW_TIMEOUT_MS, SUPERVISOR_PREFIX, clampTail, clampText, parsePrRef, redactSecrets, runCommand, shortHash } from "./contracts.js";
 import { fleetChildEnv, summariseRelayFailure } from "./executor.js";
-import { createLockedCodexExec, judgeCodexConfig } from "./judge.js";
+import { codexModelProvider, createLockedCodexExec, judgeCodexConfig } from "./judge.js";
 import { ownerLabel } from "./policy.js";
 
 export const REVIEW_CATEGORIES = Object.freeze(["live", "stale", "junk", "duplicate", "done-elsewhere"]);
@@ -500,16 +500,6 @@ function createClaudeReview({ config, run, env, model }) {
   };
 }
 
-// The top-level model_provider of the owner's Codex config, or null.
-function codexProviderName(toml) {
-  for (const raw of String(toml ?? "").split(/\r?\n/)) {
-    if (/^\s*\[/.test(raw)) break;
-    const match = /^\s*model_provider\s*=\s*["']([^"']+)["']/.exec(raw);
-    if (match) return match[1];
-  }
-  return null;
-}
-
 // Which model runs the review. config.review.provider "codex" or "claude"
 // pins it; unset, a Claude model name means claude, else codex when the
 // owner's Codex config uses codex-lb (another provider would get a model
@@ -520,7 +510,7 @@ export function reviewProvider(config, read = fs.readFileSync) {
   if (/^claude/i.test(String(review.model ?? ""))) return "claude";
   let toml = "";
   try { toml = read(path.join(config?.paths?.codexHome ?? path.join(os.homedir(), ".codex"), "config.toml"), "utf8"); } catch { /* no Codex here */ }
-  return codexProviderName(toml) === "codex-lb" && judgeCodexConfig(toml) ? "codex" : "claude";
+  return codexModelProvider(toml) === "codex-lb" && judgeCodexConfig(toml) ? "codex" : "claude";
 }
 
 // codex output back to the review's own contract: a null optional field is

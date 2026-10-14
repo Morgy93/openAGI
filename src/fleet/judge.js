@@ -338,6 +338,16 @@ function tomlKeyPart(part) {
 // owner's own config, and with web search and JUDGE_FEATURES_OFF switched
 // off it reads untrusted chat text with no tools at hand.
 // Built from <codexHome>/config.toml; null when it names no provider.
+// The top-level model_provider of a Codex config.toml (quoted keys too), or null.
+export function codexModelProvider(text) {
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    if (tomlHeader(raw)) break;
+    const entry = tomlStringEntry(raw);
+    if (entry?.name === "model_provider") return entry.value;
+  }
+  return null;
+}
+
 export function judgeCodexConfig(text) {
   const lines = String(text ?? "").split(/\r?\n/);
   const top = [];

@@ -545,6 +545,8 @@ test("the provider: codex when codex-lb is configured, else Claude; OPENAGI_FLEE
   assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { provider: false })), "claude");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true, provider: "claude" })), "claude");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { providerName: "ollama" })), "claude", "only codex-lb is picked on its own");
+  const quoted = codexConfig(t);
+  assert.equal(reviewProvider(quoted, (file, enc) => fs.readFileSync(file, enc).replace("model_provider =", "\"model_provider\" =")), "codex", "a quoted key is the same key");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true, provider: "codex" }, { providerName: "ollama" })), "codex", "an explicit pin still wins");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true, model: "claude-opus-5" })), "claude", "a Claude model means Claude");
   // Pinned to Claude: claude -p with the named model, no codex call.
