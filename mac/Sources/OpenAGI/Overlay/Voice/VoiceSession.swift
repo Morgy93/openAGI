@@ -120,6 +120,17 @@ struct VoicePTT {
 }
 
 @MainActor
+protocol VoiceSocket: AnyObject {
+  var response: URLResponse? { get }
+  func resume()
+  func send(_ message: URLSessionWebSocketTask.Message) async throws
+  func receive() async throws -> URLSessionWebSocketTask.Message
+  func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+}
+
+extension URLSessionWebSocketTask: VoiceSocket {}
+
+@MainActor
 final class VoiceSession: ObservableObject {
   static let shared = VoiceSession()
   @Published private(set) var phase: VoicePTT.Phase = .idle
@@ -130,8 +141,12 @@ final class VoiceSession: ObservableObject {
   @Published private(set) var micHeld = false
 
   private var ptt = VoicePTT()
-  private let audio = VoiceAudio()
-  private var socket: URLSessionWebSocketTask?
+  private let audio: any VoiceAudioDevice
+  private let connection: @MainActor () throws -> VoiceConnection
+  private let microphoneAccess: () async -> Bool
+  private let makeSocket: ((VoiceConnection) -> any VoiceSocket)?
+  private let connectionTimeout: Duration
+  private var socket: (any VoiceSocket)?
   private var transport: URLSession?
   private var connectionTask: Task<Void, Never>?
   private var receiver: Task<Void, Never>?
@@ -145,8 +160,24 @@ final class VoiceSession: ObservableObject {
   private var awaitingBarge = false
   private var replyStarted = false
   private var replyFinished = false
+  private var waitingForReplyAudio = false
 
-  init() {
+  init(audio: any VoiceAudioDevice = VoiceAudio(),
+       connection: @escaping @MainActor () throws -> VoiceConnection = { try AppState.shared.voiceConnection() },
+       microphoneAccess: @escaping () async -> Bool = {
+         switch AVCaptureDevice.authorizationStatus(for: .audio) {
+         case .authorized: return true
+         case .notDetermined: return await AVCaptureDevice.requestAccess(for: .audio)
+         default: return false
+         }
+       },
+       makeSocket: ((VoiceConnection) -> any VoiceSocket)? = nil,
+       connectionTimeout: Duration = .seconds(20)) {
+    self.audio = audio
+    self.connection = connection
+    self.microphoneAccess = microphoneAccess
+    self.makeSocket = makeSocket
+    self.connectionTimeout = connectionTimeout
     audio.onDrained = { [weak self] in
       Task { @MainActor in self?.finishReplyIfDrained() }
     }
@@ -166,6 +197,10 @@ final class VoiceSession: ObservableObject {
   }
 
   func release(_ source: VoicePTT.Source) {
+    if recording, ptt.held == [source] {
+      // Drain the audio queue while this turn still accepts PCM.
+      capturePendingPCM(stopping: true)
+    }
     perform(ptt.release(source))
     phase = ptt.phase
     micHeld = ptt.held.contains(.mic)
@@ -187,11 +222,6 @@ final class VoiceSession: ObservableObject {
         generation &+= 1
         let mine = generation
         connectionTask = Task { await connect(gesture: gesture, generation: mine) }
-        deadline = Task {
-          try? await Task.sleep(for: .seconds(20))
-          guard !Task.isCancelled, mine == generation, phase == .connecting else { return }
-          fail("The hub didn't start voice in time. Check hub voice configuration and try again.")
-        }
       case .capture:
         transcript = ""; reply = ""; notice = nil
         replyStarted = false; replyFinished = false
@@ -199,6 +229,7 @@ final class VoiceSession: ObservableObject {
       case .barge:
         ignoreReply = true
         awaitingBarge = true
+        waitingForReplyAudio = true
         // Audio's serial queue stops playback before new mic frames reach us.
         let played = audio.interrupt()
         enqueue(VoiceControl(type: "barge", playedMs: Double(played)))
@@ -211,21 +242,26 @@ final class VoiceSession: ObservableObject {
 
   private func connect(gesture: String, generation mine: UInt) async {
     do {
-      let config = try AppState.shared.voiceConnection()
-      let allowed: Bool
-      switch AVCaptureDevice.authorizationStatus(for: .audio) {
-      case .authorized: allowed = true
-      case .notDetermined: allowed = await AVCaptureDevice.requestAccess(for: .audio)
-      default: allowed = false
-      }
+      let config = try connection()
+      let allowed = await microphoneAccess()
       guard mine == generation, !Task.isCancelled else { return }
       guard allowed else { throw VoiceFailure("Allow microphone access for OpenAGI in System Settings → Privacy & Security → Microphone.") }
-      let session = URLSession(configuration: .ephemeral)
-      let ws = session.webSocketTask(with: config.url, protocols: ["openagi-voice", config.token])
-      transport = session; socket = ws
+      deadline = Task {
+        try? await Task.sleep(for: connectionTimeout)
+        guard !Task.isCancelled, mine == generation, phase == .connecting else { return }
+        fail("The hub didn't start voice in time. Check hub voice configuration and try again.")
+      }
+      let ws: any VoiceSocket
+      if let makeSocket { ws = makeSocket(config) }
+      else {
+        let session = URLSession(configuration: .ephemeral)
+        transport = session
+        ws = session.webSocketTask(with: config.url, protocols: ["openagi-voice", config.token])
+      }
+      socket = ws
       ws.resume()
-      try await ws.send(try VoiceControl(type: "start", gesture: gesture, mode: "ptt", focus: focus).message())
-      guard mine == generation else { return }
+      // Start shares the sender with context, PCM, and commit frames.
+      enqueue(VoiceControl(type: "start", gesture: gesture, mode: "ptt", focus: focus))
       receiver = Task { await receive(ws, generation: mine) }
     } catch {
       guard mine == generation else { return }
@@ -233,7 +269,7 @@ final class VoiceSession: ObservableObject {
     }
   }
 
-  private func receive(_ ws: URLSessionWebSocketTask, generation mine: UInt) async {
+  private func receive(_ ws: any VoiceSocket, generation mine: UInt) async {
     do {
       while !Task.isCancelled {
         let message = try await ws.receive()
@@ -241,6 +277,7 @@ final class VoiceSession: ObservableObject {
         switch message {
         case .data(let pcm):
           guard !ignoreReply, !recording else { continue }
+          waitingForReplyAudio = false
           if !replyStarted { audio.beginReply(); replyStarted = true; replyFinished = false }
           ptt.reply(); phase = ptt.phase
           try audio.play(pcm)
@@ -249,11 +286,10 @@ final class VoiceSession: ObservableObject {
           switch event["type"] as? String {
           case "ready":
             deadline?.cancel(); deadline = nil
-            try await audio.start { [weak self] pcm in
+            try await audio.start { [weak self] in
               Task { @MainActor in
                 guard let self, mine == self.generation, self.recording else { return }
-                self.ptt.append(pcm.count)
-                self.enqueue(.data(pcm))
+                self.capturePendingPCM()
               }
             }
             guard mine == generation else { return }
@@ -262,7 +298,8 @@ final class VoiceSession: ObservableObject {
           case "reply.delta":
             if !ignoreReply { reply = String((reply + (event["text"] as? String ?? "")).prefix(4000)) }
           case "reply.done":
-            if !ignoreReply {
+            // The hub truncates old audio on barge, but its done can arrive later.
+            if !ignoreReply, !waitingForReplyAudio {
               reply = String((event["text"] as? String ?? "").prefix(4000))
               audio.finishReply(itemId: event["itemId"] as? String, audioMs: event["audioMs"] as? Double)
               replyStarted = false
@@ -286,6 +323,13 @@ final class VoiceSession: ObservableObject {
     } catch {
       guard mine == generation else { return }
       fail((error as? VoiceFailure)?.message ?? VoiceConnection.failureMessage(status: (ws.response as? HTTPURLResponse)?.statusCode))
+    }
+  }
+
+  private func capturePendingPCM(stopping: Bool = false) {
+    for pcm in audio.drainCapturedPCM(stopping: stopping) {
+      ptt.append(pcm.count)
+      enqueue(.data(pcm))
     }
   }
 
@@ -352,7 +396,7 @@ final class VoiceSession: ObservableObject {
     outbox = []; queuedBytes = 0
     audio.stop()
     ptt.reset(); phase = .idle; ignoreReply = false; awaitingBarge = false; micHeld = false
-    replyStarted = false; replyFinished = false
+    replyStarted = false; replyFinished = false; waitingForReplyAudio = false
   }
 
   private func fail(_ message: String) {

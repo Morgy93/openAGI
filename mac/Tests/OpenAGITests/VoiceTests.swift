@@ -12,6 +12,126 @@ final class VoiceTests: XCTestCase {
     return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
   }
 
+  @MainActor
+  private func waitUntil(_ condition: () -> Bool) async throws {
+    for _ in 0..<2000 {
+      if condition() { return }
+      try await Task.sleep(for: .milliseconds(1))
+    }
+    XCTFail("Voice fixture did not reach the expected state")
+  }
+
+  @MainActor
+  private func session(audio: VoiceTestAudio, socket: VoiceTestSocket,
+                       microphoneAccess: @escaping () async -> Bool = { true },
+                       timeout: Duration = .seconds(20)) -> VoiceSession {
+    VoiceSession(audio: audio,
+      connection: { try VoiceConnection(base: "https://fixture.invalid", token: "test-daemon-token-1234") },
+      microphoneAccess: microphoneAccess, makeSocket: { _ in socket }, connectionTimeout: timeout)
+  }
+
+  @MainActor
+  func testReleaseFlushesPendingPCMBeforeCommit() async throws {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    let voice = session(audio: audio, socket: socket)
+    defer { voice.stop(sendControl: false) }
+    voice.press(.mic, focus: VoiceFocus())
+    try await waitUntil { socket.types == ["start"] }
+    socket.push(.string("{\"type\":\"ready\"}"))
+    try await waitUntil { voice.recording }
+    // Simulate converted tap buffers whose main-actor notification is delayed.
+    audio.pendingPCM = [Data(repeating: 1, count: 2400), Data(repeating: 2, count: 2400)]
+    voice.release(.mic)
+    XCTAssertFalse(audio.capturing)
+    XCTAssertTrue(audio.pendingPCM.isEmpty)
+    XCTAssertEqual(voice.phase, .waiting)
+    try await waitUntil { socket.types.count == 4 }
+    XCTAssertEqual(socket.types, ["start", "pcm", "pcm", "commit"])
+    audio.onPCM?()
+    await Task.yield()
+    XCTAssertEqual(socket.types, ["start", "pcm", "pcm", "commit"])
+  }
+
+  @MainActor
+  func testMicrophonePromptDoesNotConsumeHubDeadline() async throws {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    var permission: CheckedContinuation<Bool, Never>?
+    let voice = session(audio: audio, socket: socket, microphoneAccess: {
+      await withCheckedContinuation { permission = $0 }
+    }, timeout: .milliseconds(20))
+    defer { voice.stop(sendControl: false) }
+    voice.press(.mic, focus: VoiceFocus())
+    try await waitUntil { permission != nil }
+    try await Task.sleep(for: .milliseconds(60))
+    XCTAssertEqual(voice.phase, .connecting)
+    XCTAssertNil(voice.error)
+    XCTAssertTrue(socket.types.isEmpty)
+    permission?.resume(returning: true)
+    try await waitUntil { socket.types == ["start"] }
+    // The hub still gets a bounded deadline after permission is granted.
+    try await waitUntil { voice.phase == .idle }
+    XCTAssertTrue(voice.error?.contains("didn't start voice in time") == true)
+  }
+
+  @MainActor
+  func testFocusDuringStartUsesTheSameSerialSender() async throws {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    socket.holdStart = true
+    let voice = session(audio: audio, socket: socket)
+    defer { voice.stop(sendControl: false) }
+    voice.press(.mic, focus: VoiceFocus())
+    try await waitUntil { socket.startPending != nil }
+    voice.updateFocus(VoiceFocus(threadKey: "codex:new-focus"))
+    for _ in 0..<10 { await Task.yield() }
+    XCTAssertEqual(socket.types, ["start"])
+    XCTAssertEqual(socket.maxConcurrentSends, 1)
+    socket.finishStart()
+    try await waitUntil { socket.types.count == 2 }
+    XCTAssertEqual(socket.types, ["start", "context"])
+    XCTAssertEqual(socket.maxConcurrentSends, 1)
+    let frame = try XCTUnwrap(socket.messages.last)
+    guard case .string(let text) = frame else { return XCTFail("Expected context") }
+    XCTAssertTrue(text.contains("codex:new-focus"))
+  }
+
+  @MainActor
+  func testBargedThenStaleDoneDoesNotFinishTheNewTurn() async throws {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    let voice = session(audio: audio, socket: socket)
+    defer { voice.stop(sendControl: false) }
+    voice.press(.mic, focus: VoiceFocus())
+    try await waitUntil { socket.types == ["start"] }
+    socket.push(.string("{\"type\":\"ready\"}"))
+    try await waitUntil { voice.recording }
+    audio.pendingPCM = [Data(repeating: 1, count: 9600)]
+    voice.release(.mic)
+    socket.push(.data(Data(repeating: 1, count: 4800)))
+    try await waitUntil { voice.phase == .replying }
+    voice.press(.mic, focus: VoiceFocus())
+    audio.pendingPCM = [Data(repeating: 2, count: 9600)]
+    voice.release(.mic)
+    XCTAssertEqual(voice.phase, .waiting)
+    socket.push(.string("{\"type\":\"barged\"}"))
+    socket.push(.string("{\"type\":\"reply.done\",\"text\":\"Old reply\",\"itemId\":\"old\",\"audioMs\":100}"))
+    socket.push(.string("{\"type\":\"notice\",\"message\":\"barrier\"}"))
+    try await waitUntil { voice.notice == "barrier" }
+    XCTAssertEqual(voice.phase, .waiting)
+    XCTAssertEqual(voice.reply, "")
+    XCTAssertEqual(audio.finishedItems, [])
+    socket.push(.data(Data(repeating: 2, count: 4800)))
+    socket.push(.string("{\"type\":\"reply.done\",\"text\":\"New reply\",\"itemId\":\"new\",\"audioMs\":100}"))
+    try await waitUntil { voice.reply == "New reply" }
+    XCTAssertEqual(voice.phase, .replying)
+    XCTAssertEqual(audio.finishedItems, ["new"])
+    audio.drained = true
+    audio.onDrained()
+    try await waitUntil { voice.phase == .ready }
+  }
+
   func testStartFrameMatchesRelayProtocol() throws {
     let frame = try json(VoiceControl(type: "start", gesture: "hotkey", mode: "ptt", focus: VoiceFocus()))
     XCTAssertEqual(frame["type"] as? String, "start")
@@ -269,5 +389,82 @@ final class VoiceTests: XCTestCase {
     } catch {
       XCTAssertEqual((socket.response as? HTTPURLResponse)?.statusCode, 404)
     }
+  }
+}
+
+private final class VoiceTestAudio: VoiceAudioDevice {
+  var onDrained: () -> Void = {}
+  var onFailure: () -> Void = {}
+  var onPCM: (() -> Void)?
+  var drained = true
+  var capturing = false
+  var pendingPCM: [Data] = []
+  var finishedItems: [String] = []
+
+  func start(onPCM: @escaping () -> Void) async throws { self.onPCM = onPCM }
+  func setCapturing(_ on: Bool) { capturing = on }
+  func drainCapturedPCM(stopping: Bool) -> [Data] {
+    if stopping { capturing = false }
+    let pending = pendingPCM
+    pendingPCM = []
+    return pending
+  }
+  func beginReply() {}
+  func play(_ pcm: Data) throws { drained = false }
+  func finishReply(itemId: String?, audioMs: Double?) {
+    if let itemId { finishedItems.append(itemId) }
+  }
+  func playbackAcknowledgements() -> [VoiceControl] { [] }
+  func interrupt() -> Int { drained = true; return 0 }
+  func stop() { capturing = false; pendingPCM = [] }
+}
+
+@MainActor
+private final class VoiceTestSocket: VoiceSocket {
+  var response: URLResponse? { nil }
+  var messages: [URLSessionWebSocketTask.Message] = []
+  var holdStart = false
+  var startPending: CheckedContinuation<Void, Never>?
+  private var pendingReceive: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+  private var incoming: [URLSessionWebSocketTask.Message] = []
+  private var closed = false
+  private var concurrentSends = 0
+  private(set) var maxConcurrentSends = 0
+
+  var types: [String] {
+    messages.map { message in
+      guard case .string(let text) = message,
+            let frame = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return "pcm" }
+      return frame["type"] as? String ?? "unknown"
+    }
+  }
+
+  func resume() {}
+  func send(_ message: URLSessionWebSocketTask.Message) async throws {
+    concurrentSends += 1
+    maxConcurrentSends = max(maxConcurrentSends, concurrentSends)
+    defer { concurrentSends -= 1 }
+    messages.append(message)
+    if holdStart, types.last == "start" {
+      await withCheckedContinuation { startPending = $0 }
+    }
+  }
+  func finishStart() { startPending?.resume(); startPending = nil }
+  func receive() async throws -> URLSessionWebSocketTask.Message {
+    if closed { throw CancellationError() }
+    if !incoming.isEmpty { return incoming.removeFirst() }
+    return try await withCheckedThrowingContinuation { pendingReceive = $0 }
+  }
+  func push(_ message: URLSessionWebSocketTask.Message) {
+    if let pendingReceive {
+      self.pendingReceive = nil
+      pendingReceive.resume(returning: message)
+    } else { incoming.append(message) }
+  }
+  func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+    closed = true
+    finishStart()
+    pendingReceive?.resume(throwing: CancellationError())
+    pendingReceive = nil
   }
 }

@@ -38,7 +38,22 @@ struct VoicePlayback {
   mutating func reset() { self = VoicePlayback() }
 }
 
-final class VoiceAudio {
+protocol VoiceAudioDevice: AnyObject {
+  var onDrained: () -> Void { get set }
+  var onFailure: () -> Void { get set }
+  var drained: Bool { get }
+  func start(onPCM: @escaping () -> Void) async throws
+  func setCapturing(_ on: Bool)
+  func drainCapturedPCM(stopping: Bool) -> [Data]
+  func beginReply()
+  func play(_ pcm: Data) throws
+  func finishReply(itemId: String?, audioMs: Double?)
+  func playbackAcknowledgements() -> [VoiceControl]
+  func interrupt() -> Int
+  func stop()
+}
+
+final class VoiceAudio: VoiceAudioDevice {
   private let queue = DispatchQueue(label: "app.openagi.voice.audio")
   private var engine: AVAudioEngine?
   private let player = AVAudioPlayerNode()
@@ -46,6 +61,7 @@ final class VoiceAudio {
   private var tapInstalled = false
   private var playerAttached = false
   private var capturing = false
+  private var capturedPCM: [Data] = []
   private var playback = VoicePlayback()
   private var renderedFrameOffset: Int64 = 0
   private var playbackGeneration: UInt = 0
@@ -55,7 +71,7 @@ final class VoiceAudio {
   private let wireFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
   private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
 
-  func start(onPCM: @escaping (Data) -> Void) async throws {
+  func start(onPCM: @escaping () -> Void) async throws {
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       queue.async {
         do {
@@ -84,7 +100,10 @@ final class VoiceAudio {
             }
             self.queue.async {
               guard self.capturing, self.engine === engine else { return }
-              self.convert(copy, onPCM: onPCM)
+              self.convert(copy) { pcm in
+                self.capturedPCM.append(pcm)
+                onPCM()
+              }
             }
           }
           self.tapInstalled = true
@@ -121,6 +140,15 @@ final class VoiceAudio {
     queue.async {
       self.capturing = on
       if on { self.converter?.reset() }
+    }
+  }
+
+  func drainCapturedPCM(stopping: Bool = false) -> [Data] {
+    queue.sync {
+      if stopping { capturing = false }
+      let pending = capturedPCM
+      capturedPCM = []
+      return pending
     }
   }
 
@@ -195,6 +223,7 @@ final class VoiceAudio {
 
   private func stopEngine() {
     capturing = false
+    capturedPCM = []
     playbackGeneration &+= 1
     player.stop()
     if let engine {
