@@ -30,6 +30,31 @@ final class OverlayState: ObservableObject {
   @Published private(set) var fleetContext: BriefChatContext? = nil
   /// Counter rather than Bool so selecting the same row twice still focuses.
   @Published private(set) var composerFocusRequest: UInt = 0
+  @Published private(set) var voiceFocus = VoiceFocus()
+
+  func beginVoice(_ source: VoicePTT.Source) {
+    guard !isLoading, !isDetached else {
+      error = "Wait for the current question to finish before starting voice."
+      return
+    }
+    selectTab(.supervisor)
+    expanded = true
+    OverlayController.shared.show()
+    VoiceSession.shared.press(source, focus: voiceFocus)
+  }
+
+  func selectVoiceContext(_ focus: VoiceFocus) {
+    voiceFocus = focus
+    VoiceSession.shared.updateFocus(focus)
+  }
+
+  func pruneVoiceContext(openIDs: Set<String>, threadKeys: Set<String>) {
+    if let id = voiceFocus.questionId, !openIDs.contains(id) {
+      selectVoiceContext(VoiceFocus())
+    } else if let key = voiceFocus.threadKey, !threadKeys.contains(key), voiceFocus.questionId == nil {
+      selectVoiceContext(VoiceFocus())
+    }
+  }
 
   enum DetachedPhase: Equatable {
     case none
@@ -75,7 +100,10 @@ final class OverlayState: ObservableObject {
     // mid-request would show it under the other tab.
     guard tab != newTab, !isLoading, !isDetached else { return }
     tab = newTab
-    if newTab == .tasks { FleetConsumer.shared.supervisorTabLeft() }
+    if newTab == .tasks {
+      VoiceSession.shared.stop()
+      FleetConsumer.shared.supervisorTabLeft()
+    }
     answer = ""
     error = nil
     contextNote = nil
@@ -85,6 +113,7 @@ final class OverlayState: ObservableObject {
   func chatAbout(_ question: FleetQuestion) {
     tab = .supervisor
     fleetContext = BriefChatContext(question: question)
+    selectVoiceContext(.question(question))
     answer = ""
     error = nil
     endDetached()
@@ -93,7 +122,10 @@ final class OverlayState: ObservableObject {
   }
 
   func clearActiveContext() {
-    if tab == .supervisor { fleetContext = nil } else { briefContext = nil }
+    if tab == .supervisor {
+      fleetContext = nil
+      selectVoiceContext(VoiceFocus())
+    } else { briefContext = nil }
     composerFocusRequest &+= 1
   }
 
