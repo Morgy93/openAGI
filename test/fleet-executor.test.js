@@ -939,3 +939,95 @@ test("spawnWithTail with detach leaves a turn running past the ceiling and repor
   assert.equal(late.code, 0, "the turn ran to its end");
   assert.match(late.tail, /pushed the fix/);
 });
+
+function antigravitySetup(t, { results = [], fresh = undefined, server = undefined, delivery = undefined } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-ag-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const config = resolveFleetConfig({}, { home, bins: { agentapi: "/abs/agentapi" }, ...(delivery ? { delivery } : {}) });
+  const store = new FleetStore({ dir: path.join(home, "fleet") });
+  const calls = [];
+  const run = (cmd, args, options = {}) => {
+    calls.push({ cmd, args, env: options.env, timeoutMs: options.timeoutMs });
+    return Promise.resolve({ code: 0, stdout: "", stderr: "", timedOut: false, error: null, ...(results.shift() ?? {}) });
+  };
+  const ls = server === undefined ? { pid: 9, address: "127.0.0.1:50489" } : server;
+  if (ls) Object.defineProperty(ls, "csrfToken", { value: "csrf-secret-77", enumerable: false });
+  const refreshed = [];
+  const executor = createExecutor({
+    config, run, store,
+    refreshThread: async (thread) => { refreshed.push(thread.key); return fresh === undefined ? thread : fresh; },
+    findLanguageServer: async () => ls
+  });
+  return { home, config, store, calls, executor, refreshed };
+}
+
+function antigravityThread(extra = {}) {
+  return {
+    key: "antigravity:e8b9db19", kind: "antigravity", id: "e8b9db19", cwd: null, archived: false, writerLocked: false, live: null,
+    agentStatus: "error", lastUserAt: "2026-10-14T06:11:16.121Z", meta: { projectId: "proj-1" }, ...extra
+  };
+}
+
+test("antigravity-send runs agentapi send-message with the server address and token in the child env only", async (t) => {
+  const { calls, store, executor, refreshed } = antigravitySetup(t, { results: [{ stdout: '{"response":{"sendMessage":{"recipientId":"e8b9db19"}}}\n' }] });
+  const result = await executor.deliver({ thread: antigravityThread(), message: "The quota reset; continue.", route: "antigravity-send", playbook: "resume" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "antigravity-send");
+  assert.deepEqual(refreshed, ["antigravity:e8b9db19"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, "/abs/agentapi");
+  assert.deepEqual(calls[0].args, ["send-message", "--title", "OpenAGI supervisor", "e8b9db19", `${MESSAGE_PREFIX}The quota reset; continue.`]);
+  assert.equal(calls[0].env.ANTIGRAVITY_LS_ADDRESS, "127.0.0.1:50489");
+  assert.equal(calls[0].env.ANTIGRAVITY_CSRF_TOKEN, "csrf-secret-77");
+  assert.equal(calls[0].env.ANTIGRAVITY_PROJECT_ID, "proj-1");
+  assert.equal(process.env.ANTIGRAVITY_CSRF_TOKEN, undefined);
+  const action = store.action(result.actionId);
+  assert.equal(action.status, "sent");
+  assert.equal(action.route, "antigravity-send");
+  const everything = JSON.stringify(result) + JSON.stringify(store.actions()) + fs.readFileSync(path.join(store.dir, "state.json"), "utf8");
+  assert.doesNotMatch(everything, /csrf-secret-77/);
+  assert.deepEqual(executor.inFlight(), []);
+});
+
+test("antigravity-send re-reads the conversation and leaves a busy one alone", async (t) => {
+  const cases = [
+    [{ agentStatus: "running" }, /turn running/],
+    [{ agentStatus: "waiting", meta: { blockedOnOwner: true } }, /approval in Antigravity/],
+    [{ agentStatus: "idle", lastUserAt: "2026-10-14T07:00:00.000Z" }, /owner wrote/],
+    [null, /read the conversation again/]
+  ];
+  for (const [change, reason] of cases) {
+    const fresh = change ? antigravityThread(change) : null;
+    const { calls, executor } = antigravitySetup(t, { fresh });
+    const result = await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+    assert.equal(result.status, "blocked", String(reason));
+    assert.match(result.detail, reason);
+    assert.equal(calls.length, 0);
+  }
+  // The scan's own reading is checked before anything is read again.
+  const { calls, executor, refreshed } = antigravitySetup(t);
+  assert.match((await executor.deliver({ thread: antigravityThread({ agentStatus: "running" }), message: "x", route: "antigravity-send" })).detail, /turn running/);
+  assert.match((await executor.deliver({ thread: { ...antigravityThread(), kind: "claude" }, message: "x", route: "antigravity-send" })).detail, /needs an Antigravity conversation/);
+  assert.deepEqual([calls.length, refreshed.length], [0, 0]);
+});
+
+test("antigravity-send without a running app, or with agentapi failing, says why", async (t) => {
+  const off = antigravitySetup(t, { server: null });
+  const blocked = await off.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+  assert.equal(blocked.status, "blocked");
+  assert.match(blocked.detail, /Antigravity is not running/);
+  assert.equal(off.calls.length, 0);
+  const failing = antigravitySetup(t, { results: [{ code: 0, stdout: '{"error":"ANTIGRAVITY_LS_ADDRESS is not set"}' }] });
+  const failed = await failing.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.detail, /agentapi failed: ANTIGRAVITY_LS_ADDRESS is not set/);
+});
+
+test("antigravity-send works on a computer-use-only Mac and dry-runs without running", async (t) => {
+  const { calls, executor } = antigravitySetup(t, { delivery: "computer-use", results: [{ stdout: '{"response":{"sendMessage":{}}}' }] });
+  const dry = await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send", dryRun: true });
+  assert.equal(dry.status, "dry-run");
+  assert.match(dry.detail, /agentapi send-message e8b9db19/);
+  assert.equal(calls.length, 0);
+  assert.equal((await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" })).status, "sent");
+});

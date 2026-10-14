@@ -79,6 +79,10 @@ const TOPIC_TITLES = {
 // ready. apps maps bundleId -> running; false means that app is closed.
 export function chooseRoute(thread, mode, delivery = null) {
   if (!thread || thread.archived) return null;
+  // Antigravity takes messages through its own API (agentapi send-message):
+  // nothing is typed or forked, the app shows it in the conversation, so
+  // every delivery mode may use it.
+  if (thread.kind === "antigravity") return "antigravity-send";
   const ui = deliveryOf(delivery);
   if (ui.mode !== "cli") {
     const target = uiTargetFor(thread);

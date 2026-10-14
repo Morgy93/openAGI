@@ -1920,3 +1920,33 @@ test("a Codex send the app cannot verify is the owner's after two failures", () 
   assert.notEqual(run(tab, { pr, ledger: streak("could not verify thread: another session is open") }).decision.action, "ask-user");
   assert.equal(run(tab, { pr, ledger: { ...streak("could not verify thread: another session is open", 3), undelivered: { ...streak("x", 3).undelivered, reason: "could not verify thread: another session is open", since: ago(31 * MIN) } } }).decision.action, "ask-user");
 });
+
+test("an Antigravity quota limit waits until reset + 2 min, then resumes through agentapi", () => {
+  const resetAt = new Date(NOW + 37 * MIN).toISOString();
+  const thread = makeThread({
+    key: "antigravity:a1", kind: "antigravity", id: "a1", workspace: null, claudeSessionId: null, live: null, agentStatus: "error",
+    error: { kind: "usage-limit", text: "Individual quota reached. Resets in 37m19s.", resetAt }, meta: { app: "antigravity" }
+  });
+  const before = run(thread).decision;
+  assert.equal(before.action, "wait");
+  assert.equal(before.notBefore, new Date(NOW + 39 * MIN).toISOString());
+  const after = run(thread, { now: NOW + 40 * MIN }).decision;
+  assert.equal(after.action, "nudge");
+  assert.equal(after.playbook, "resume");
+  assert.equal(after.route, "antigravity-send");
+  // A reset far off asks the owner, naming Antigravity, not Claude.
+  const far = run({ ...thread, error: { ...thread.error, resetAt: new Date(NOW + 9 * 60 * MIN).toISOString() } }).decision;
+  assert.equal(far.action, "ask-user");
+  assert.match(far.question.title, /Antigravity cap/);
+});
+
+test("chooseRoute sends Antigravity through agentapi in every delivery mode", () => {
+  const thread = makeThread({ key: "antigravity:a1", kind: "antigravity", id: "a1", live: null, meta: {} });
+  for (const delivery of ["cli", "computer-use", "computer-use-first", { mode: "computer-use", ready: false }]) {
+    assert.equal(chooseRoute(thread, "auto", delivery), "antigravity-send", JSON.stringify(delivery));
+  }
+  assert.equal(chooseRoute({ ...thread, archived: true }, "auto"), null);
+  // Conductor's own cap question still names Claude.
+  const conductor = run(makeThread({ agentStatus: "error", error: { kind: "session-limit", text: "weekly limit", resetAt: new Date(NOW + 9 * 60 * MIN).toISOString() } })).decision;
+  assert.match(conductor.question.title, /Claude cap/);
+});

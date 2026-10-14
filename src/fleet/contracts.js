@@ -41,7 +41,8 @@ export const STATES = Object.freeze([
 
 export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager", "ask-user"]);
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
-export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use"]);
+// antigravity-send: agentapi send-message, the Antigravity app's own API.
+export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use", "antigravity-send"]);
 // How supervisor text reaches a thread. "cli" is the original set of routes;
 // "computer-use" types into the app that shows the thread and never runs a
 // CLI; "computer-use-first" types when computer use is ready, else falls back.
@@ -179,9 +180,15 @@ export function defaultPaths(home = os.homedir()) {
     bb3WatchState: path.join(home, ".bb3-watch-state"),
     bb3WatchGateState: path.join(home, ".bb3-watch-gate-state"),
     lbWatchLog: path.join(home, "Library", "Logs", "lb-watch.log"),
-    relayCwd: path.join(home, ".agent-supervisor", "relay")
+    relayCwd: path.join(home, ".agent-supervisor", "relay"),
+    // Antigravity's data: conversation_summaries.db and conversations/<id>.db.
+    antigravityHome: path.join(home, ".gemini", "antigravity")
   };
 }
+
+// The Antigravity app's language server: its agent API, and the process the
+// running instance's loopback port and csrf token are read from.
+export const ANTIGRAVITY_LS = "/Applications/Antigravity.app/Contents/Resources/bin/language_server";
 
 // The OpenAGI.app daemon runs with PATH=/usr/bin:/bin:/usr/sbin:/sbin, so
 // every child binary is resolved to an absolute path up front.
@@ -202,7 +209,11 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     df: pick(["/bin/df"], "df"),
     ditto: pick(["/usr/bin/ditto"], "ditto"),
     diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
-    rm: pick(["/bin/rm"], "rm")
+    rm: pick(["/bin/rm"], "rm"),
+    // A shim that runs the app's language server with "agentapi". The server
+    // binary itself is how the running instance is found in ps.
+    agentapi: pick([path.join(home, ".gemini", "antigravity", "bin", "agentapi")], "agentapi"),
+    antigravityLs: ANTIGRAVITY_LS
   };
 }
 
@@ -340,6 +351,11 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       ...(overrides.storage ?? {}),
       enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
     },
+    // Antigravity conversations: read, and sent to with agentapi, unless
+    // OPENAGI_FLEET_ANTIGRAVITY=0. No data dir means no threads.
+    antigravity: {
+      enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
@@ -354,6 +370,19 @@ export const UI_APPS = Object.freeze({
   conductor: Object.freeze({ app: "conductor", name: "Conductor", bundleId: "com.conductor.app" }),
   codex: Object.freeze({ app: "codex", name: "Codex", bundleId: "com.openai.codex" })
 });
+
+// How the owner opens an Antigravity conversation: { app, url, label, note },
+// the shape of the other apps' open-chat links. The app registers
+// antigravity:// but handles only antigravity://teleport/ai_studio, and the
+// /c/<id> page its window shows is a loopback URL on a random port that opens
+// a browser tab, not the app. No link opens one conversation, so url is null.
+export function antigravityOpenChat(thread) {
+  const title = clampText(thread?.title ?? "", 80);
+  return {
+    app: "antigravity", url: null, label: `${title || "untitled conversation"} (Antigravity)`,
+    note: "Antigravity has no link to one conversation: open the app and pick it in the sidebar."
+  };
+}
 
 // Codex threads started by Conductor's Codex agent carry this originator;
 // they show in Conductor, not in the Codex app.
@@ -554,7 +583,13 @@ const SECRET_PATTERNS = [
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[redacted]"],
   [/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, "[redacted]"],
   [/(https:\/\/ping\.buzzkit\.dev\/)[^\s"')]+/g, "$1[redacted]"],
-  [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"]
+  [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"],
+  // An Authorization header an agent printed in a curl example.
+  [/(\bBearer\s+)[A-Za-z0-9._~+/=-]{12,}/g, "$1[redacted]"],
+  // The Antigravity language server's flags and header (ps args, curl lines).
+  [/(--(?:csrf_token|host_bridge_token)[= ])\S+/g, "$1[redacted]"],
+  [/(x-codeium-csrf-token["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, "$1[redacted]"],
+  [/("csrfToken"\s*:\s*")[^"]+/g, "$1[redacted]"]
 ];
 
 // Keeps the END of a message: agents put their question or wait notice last.
@@ -687,6 +722,22 @@ export async function openReadOnlyDb(filePath) {
   if (!sqliteModule || !fs.existsSync(filePath)) return null;
   try {
     return new sqliteModule.DatabaseSync(filePath, { readOnly: true });
+  } catch {
+    return null;
+  }
+}
+
+// A WAL database another app is writing (Antigravity's) opened as an
+// immutable snapshot: no lock, no -shm, nothing written. It misses rows still
+// in the WAL, so callers try openReadOnlyDb first.
+export async function openImmutableDb(filePath) {
+  if (sqliteModule === undefined) {
+    try { sqliteModule = await import("node:sqlite"); } catch { sqliteModule = null; }
+  }
+  if (!sqliteModule || !fs.existsSync(filePath)) return null;
+  try {
+    const url = new URL(`file://${encodeURI(filePath)}?immutable=1`);
+    return new sqliteModule.DatabaseSync(url, { readOnly: true });
   } catch {
     return null;
   }

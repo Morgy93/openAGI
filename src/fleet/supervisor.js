@@ -19,6 +19,7 @@ import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions }
 import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
+import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -1028,11 +1029,17 @@ export class FleetSupervisor {
   // can show it (Codex and Conductor). A thread the last scan saw that this
   // read does not list (a full page) keeps its last state. null when a
   // source failed: unknown is not idle.
-  // One Conductor chat read again now (a background send re-checks it).
+  // One Conductor chat or Antigravity conversation read again now (a
+  // background or agentapi send re-checks it).
   async refreshThread(thread) {
-    if (thread?.kind !== "conductor") return null;
     const config = { ...this.config, mode: this.mode };
     const d = this.deps;
+    if (thread?.kind === "antigravity") {
+      const read = Promise.resolve().then(() => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: this.now(), only: [thread.id] }));
+      const fresh = await withTimeout(read, SOURCE_TIMEOUT_MS, "antigravity");
+      return (fresh ?? []).find((entry) => entry.key === thread.key) ?? null;
+    }
+    if (thread?.kind !== "conductor") return null;
     let peers = new Map();
     try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch { /* peers only label sessions */ }
     const read = Promise.resolve().then(() => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: this.now(), peers, only: [thread.id] }));
@@ -1496,10 +1503,11 @@ export class FleetSupervisor {
     // The Codex keys whose open card this tick's scan settled (see act).
     const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
-    const [codexThreads, claudeThreads, conductorThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
+    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
       guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
       guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
       guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
+      guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
       guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
       guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
       this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
@@ -1509,7 +1517,7 @@ export class FleetSupervisor {
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
-    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [] }));
+    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [] }));
     const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
     const ranked = threads
