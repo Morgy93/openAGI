@@ -7,7 +7,9 @@ import { spawnSync } from "node:child_process";
 export function compareReplay(base, fix, metric) {
   const before = base.metrics[metric?.name];
   const after = fix.metrics[metric?.name];
-  const moved = Number.isFinite(before) && Number.isFinite(after) && (metric.direction === "up" ? after > before : after < before);
+  const failureMetric = ["failed", "blocked", "repeats", "unanswered", "judgeWait"].includes(metric?.name);
+  const validDirection = ["up", "down"].includes(metric?.direction) && (!failureMetric || metric.direction === "down");
+  const moved = validDirection && Number.isFinite(before) && Number.isFinite(after) && (metric.direction === "up" ? after > before : after < before);
   const groups = new Set([...Object.keys(base.playbooks), ...Object.keys(fix.playbooks)]);
   const regressions = [...groups].filter((name) => name !== metric?.playbook && ["questions", "sent"].some((key) => (fix.playbooks[name]?.[key] ?? 0) > (base.playbooks[name]?.[key] ?? 0) * 1.1));
   return { passed: moved && !regressions.length, metric: { name: metric?.name, before, after }, regressions, base, fix };

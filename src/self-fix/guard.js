@@ -21,6 +21,6 @@ export function guardDiff({ files, diff, secrets = [] } = {}) {
   });
   if (denied.length) throw new Error("Guard blocked protected files: " + denied.join(", "));
   if ((files ?? []).includes("package.json") && /^[+-](?![+-]).*"version"\s*:/m.test(diff ?? "")) throw new Error("Guard blocked package version change.");
-  if (/(?:sk-|ek_|ghp_|github_pat_)[A-Za-z0-9_-]{8,}/.test(diff ?? "") || keyScrubber(...secrets)(diff) !== redactSecrets(diff)) throw new Error("Guard blocked a secret in the diff.");
+  if (/(?:sk-|ek_|ghp_|github_pat_)[A-Za-z0-9_-]{8,}/.test(diff ?? "") || keyScrubber(...secrets)(diff) !== String(diff ?? "")) throw new Error("Guard blocked a secret in the diff.");
   return true;
 }

@@ -18,3 +18,14 @@ test("review repairs required findings, runs replay each round, and stops at thr
   const result = await reviewLoop({ review: async () => repairs ? [{ severity: "P3" }] : [{ severity: "P1" }], repair: async () => repairs++, replay: async () => {} });
   assert.equal(result.round, 1); assert.equal(result.findings[0].severity, "P3");
 });
+test("review repairs publish only after replay passes", async () => {
+  for (const fail of [false, true]) {
+    const order = [];
+    let reviews = 0;
+    const pending = reviewLoop({ review: async () => reviews++ ? [] : [{ severity: "P1" }],
+      repair: async () => order.push("repair"), replay: async () => { order.push("replay"); if (fail) throw new Error("replay failed"); },
+      publish: async () => order.push("publish") });
+    if (fail) await assert.rejects(pending, /replay failed/); else await pending;
+    assert.deepEqual(order, fail ? ["repair", "replay"] : ["repair", "replay", "publish"]);
+  }
+});

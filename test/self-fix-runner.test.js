@@ -5,9 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { execFileSync } from "node:child_process";
 import { SelfFixRunner, runFixProcess, createSelfFixCapability } from "../src/self-fix/runner.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { SelfFixHub } from "../src/fleet/remote.js";
+import { createFleetRoute } from "../src/fleet/routes.js";
 
 const FIX = { title: "Stop duplicate questions", problem: "Duplicate questions", area: "policy", acceptance: "Questions decline." };
 const CONFIG = 'model_provider = "codex-lb"\n[model_providers.codex-lb]\nname = "test"\nbase_url = "https://unit.invalid"\nenv_key = "CODEX_LB_API_KEY"\nwire_api = "responses"';
@@ -16,9 +18,11 @@ function fixture(t, settings = {}, extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "self-fix-runner-"));
   const root = path.join(dir, "fixes"); fs.mkdirSync(path.join(root, "_repo/node_modules"), { recursive: true });
   const calls = [];
-  let testFailures = 0, ownReviews = 0;
+  let testFailures = 0, ownReviews = 0, replays = 0;
   const run = async (bin, args, options = {}) => {
     calls.push({ bin, args, options });
+    const override = await extra.onRun?.(bin, args, options);
+    if (override) return override;
     if (args.includes("worktree") && args.includes("add")) {
       const wt = args.at(-2); fs.mkdirSync(path.join(wt, "test"), { recursive: true });
       fs.writeFileSync(path.join(wt, "test/fixture.test.js"), "");
@@ -34,7 +38,7 @@ function fixture(t, settings = {}, extra = {}) {
       }
     }
     if (args[0] === "--test" && testFailures++ < (extra.testFailures ?? 0)) throw new Error("fixture test failure");
-    if (args.some((arg) => arg.endsWith("fleet-replay.mjs"))) return { stdout: JSON.stringify({ passed: true, metric: { name: "questions", before: 2, after: 1 }, regressions: [] }) };
+    if (args.some((arg) => arg.endsWith("fleet-replay.mjs"))) return { stdout: JSON.stringify({ passed: extra.replay?.(replays++) ?? true, metric: { name: "questions", before: 2, after: 1 }, regressions: [] }) };
     return { stdout: args.includes("get-url") ? "https://github.com/Spshulem/openAGI.git\n" : args.includes("rev-parse") ? "base-head\n" : args.includes("--name-only") ? "src/fleet/policy.js\0test/fixture.test.js\0" : args[0] === "diff" ? "+ safe repair\n" : "" };
   };
   const gh = { auth: async () => {}, push: async () => { calls.push({ publish: true }); return "fixed-head"; },
@@ -90,7 +94,6 @@ test("abort kills the child's process group and rejects before another command",
   controller.abort(new Error("Owner stop"));
   await assert.rejects(pending, /Owner stop/);
   assert.deepEqual(kills[0], [-424242, "SIGTERM"]);
-  await new Promise((resolve) => setTimeout(resolve, 1050));
   assert.deepEqual(kills[1], [-424242, "SIGKILL"]);
 });
 test("hub retains queued and stop state while offline; dispatch is pinned and idempotent", async (t) => {
@@ -149,4 +152,143 @@ test("wall clock cap and stop abort coding, retain worktree and prevent publicat
     if (!stop) assert.match(result.error, /wall clock cap/);
     assert.ok(!calls.some((call) => call.publish));
   }
+});
+
+test("dedicated checkout refreshes before briefs and replay on every run", async (t) => {
+  let current = "first", repo;
+  const { runner, root, calls } = fixture(t, {}, { onRun: (bin, args, options) => {
+    if (bin === "git" && args[0] === "fetch") execFileSync("git", ["update-ref", "refs/remotes/origin/main", current], { cwd: repo });
+    if (bin === "git" && args[0] === "reset") return { stdout: execFileSync("git", args, { cwd: repo, encoding: "utf8" }) };
+    if ((bin === "fake-codex" && options.cwd === repo) || args.some((arg) => arg.endsWith("fleet-replay.mjs"))) {
+      assert.equal(fs.readFileSync(path.join(repo, "version.txt"), "utf8"), current);
+      assert.equal(fs.readFileSync(path.join(repo, "scripts/fleet-replay.mjs"), "utf8"), current);
+    }
+  } });
+  repo = path.join(root, "_repo");
+  const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.name", "Fixture"); git("config", "user.email", "fixture@example.invalid");
+  fs.mkdirSync(path.join(repo, "scripts"));
+  for (const version of ["stale", "first", "second"]) {
+    fs.writeFileSync(path.join(repo, "version.txt"), version);
+    fs.writeFileSync(path.join(repo, "scripts/fleet-replay.mjs"), version);
+    git("add", "version.txt", "scripts/fleet-replay.mjs"); git("commit", "-qm", version); git("tag", version);
+  }
+  git("reset", "--hard", "stale");
+  for (const version of ["first", "second"]) {
+    current = version;
+    const fix = runner.enqueue({ ...FIX, title: version }); await runner.idle();
+    assert.equal(runner.store.fix(fix.id).state, "owner-ask");
+  }
+  assert.equal(calls.filter((call) => call.args?.[0] === "reset").length, 2);
+});
+
+test("owner revision resolves the ready card through success and failure", async (t) => {
+  for (const fail of [false, true]) {
+    const { runner } = fixture(t, {}, { replay: () => !fail || !runner.store.fixes().some((fix) => fix.ownerRounds) });
+    const fix = runner.enqueue(FIX); await runner.idle();
+    const ready = runner.store.openQuestions().find((q) => q.dedupeKey === "self-fix:" + fix.id);
+    runner.revise(fix.id, "Fix the rejected behavior.");
+    assert.equal(runner.store.question(ready.id).status, "resolved");
+    assert.ok(!runner.store.openQuestions().some((q) => q.kind === "self-fix"));
+    await runner.idle();
+    assert.equal(runner.store.fix(fix.id).state, fail ? "failed" : "owner-ask");
+    assert.equal(runner.store.openQuestions().filter((q) => q.kind === "self-fix").length, fail ? 0 : 1);
+  }
+});
+
+test("review replay failure retains the initial published head without pushing repairs", async (t) => {
+  for (const fail of [false, true]) {
+    const { runner, calls } = fixture(t, {}, { findings: (round) => round ? [] : [{ severity: "P1", summary: "Real failure", small: true }], replay: (round) => !fail || round === 0 });
+    const fix = runner.enqueue(FIX); await runner.idle();
+    assert.equal(runner.store.fix(fix.id).state, fail ? "failed" : "owner-ask");
+    assert.equal(calls.filter((call) => call.publish).length, fail ? 1 : 2);
+    const order = calls.filter((call) => call.publish || call.args?.some((arg) => arg.endsWith("fleet-replay.mjs"))).map((call) => call.publish ? "publish" : "replay");
+    assert.deepEqual(order, fail ? ["replay", "publish", "replay"] : ["replay", "publish", "replay", "publish"]);
+  }
+});
+
+test("async capability shutdown waits for a child ignoring SIGTERM and cleans the lock", async (t) => {
+  let entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const kills = [];
+  const { runner, root } = fixture(t, {}, { codingWait: (options) => runFixProcess(process.execPath,
+    ["-e", 'process.on("SIGTERM", () => {}); console.log("ready"); setInterval(() => {}, 1000);'],
+    { ...options, env: { PATH: process.env.PATH }, onLine: () => entered(), kill: (pid, signal) => { kills.push(signal); process.kill(pid, signal); } }) });
+  const node = createSelfFixCapability({ dataDir: runner.dataDir, home: runner.home, env: {}, config: runner.config, deps: runner.deps, store: runner.store });
+  t.after(() => node.stop());
+  const fix = node.runner.enqueue(FIX); await started;
+  await node.stop();
+  assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
+  assert.equal(node.runner.active, null);
+  assert.equal(node.runner.store.fix(fix.id).state, "abandoned");
+  assert.equal(fs.existsSync(path.join(root, ".active-lock")), false);
+});
+
+function hubFixture(t) {
+  const { runner, dir } = fixture(t);
+  const store = new FleetStore({ dir: path.join(dir, "hub") });
+  const operations = [];
+  const runtime = { nodeCapabilities: { dispatch: async (_node, _capability, operation, payload) => {
+    operations.push(operation);
+    if (operation === "start") runner.enqueue(payload.fix);
+    if (operation === "revise") runner.revise(payload.id, payload.instructions, payload.requestId);
+    return runner.snapshot();
+  } } };
+  const hub = new SelfFixHub({ store, runtime, config: runner.config, nodeId: "coding-mac" });
+  return { hub, runner, store, runtime, operations };
+}
+
+test("failed and token cards stay closed on hub sync, including old deliver cards", async (t) => {
+  for (const kind of ["deliver", "self-fix-attention"]) {
+    for (const dismiss of [false, true]) {
+      const { hub, runner, store } = hubFixture(t);
+      const fix = store.queueFix(FIX); runner.store.importFix(fix); runner.store.updateFix(fix.id, { state: "owner-ask" });
+      for (const dedupeKey of ["self-fix:failed:" + fix.id, "self-fix:token"]) runner.store.upsertQuestion({ kind, dedupeKey, title: "Needs attention", options: ["OK"] });
+      await hub.sync();
+      for (const question of store.openQuestions()) {
+        if (dismiss) store.dismissQuestion(question.id); else assert.equal((await hub.answer(question.id, "OK")).delivery.detail, "Acknowledged");
+      }
+      await hub.sync(); await hub.sync();
+      assert.equal(store.openQuestions().length, 0);
+      assert.equal(store.state.questions.length, 2);
+    }
+  }
+});
+
+test("second revision is refused locally and old capped commands cannot poison sync", async (t) => {
+  const { hub, runner, store, operations } = hubFixture(t);
+  const fix = await hub.queue(FIX); await runner.idle(); await hub.sync();
+  await hub.revise(fix.id, "One revision."); await runner.idle(); await hub.sync();
+  assert.equal(store.fix(fix.id).ownerRounds, 1);
+  await assert.rejects(hub.revise(fix.id, "Second revision."), /cap/);
+  assert.deepEqual(store.fixCommands(), {});
+  store.updateFix(fix.id, { ownerRounds: 0 });
+  store.queueFixCommand("revise:" + fix.id, { operation: "revise", payload: { id: fix.id, instructions: "Old command", requestId: "old-request" } });
+  const count = operations.filter((operation) => operation === "revise").length;
+  await hub.sync();
+  assert.deepEqual(store.fixCommands(), {});
+  assert.equal(operations.filter((operation) => operation === "revise").length, count);
+  assert.equal(store.fix(fix.id).state, "owner-ask");
+  assert.equal(store.openQuestions().filter((q) => q.kind === "self-fix").length, 1);
+});
+
+test("Request changes hides the hub card immediately while offline and during replay", async (t) => {
+  const { hub, runner, store, runtime } = hubFixture(t);
+  const fix = await hub.queue(FIX); await runner.idle(); await hub.sync();
+  const ready = store.openQuestions().find((q) => q.kind === "self-fix");
+  const dispatch = runtime.nodeCapabilities.dispatch;
+  runtime.nodeCapabilities.dispatch = async () => { throw new Error("offline"); };
+  const supervisor = { getState: () => ({ questions: store.openQuestions() }), reviseFix: (...args) => hub.revise(...args) };
+  const route = createFleetRoute({ supervisor });
+  const response = await route("POST", "/fleet/api/questions/" + ready.id, null, async () => ({ answer: "Request changes", instructions: "Cover this case." }));
+  assert.equal(response.status, 200);
+  assert.equal(response.body.question, null);
+  assert.equal(response.body.state.questions.length, 0);
+  assert.equal(store.fix(fix.id).state, "queued");
+  await assert.rejects(hub.revise(fix.id, "Again while offline."), /cap/);
+  runtime.nodeCapabilities.dispatch = dispatch;
+  await hub.sync(); await runner.idle(); await hub.sync();
+  assert.equal(runner.store.fix(fix.id).ownerRounds, 1);
+  assert.equal(store.fix(fix.id).state, "owner-ask");
+  assert.equal(store.openQuestions().filter((q) => q.kind === "self-fix").length, 1);
 });

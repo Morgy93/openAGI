@@ -66,7 +66,7 @@ export function createFleetRoute({ supervisor } = {}) {
     if (answer !== "dismiss" && !options.includes(answer)) return fail(400, "Pick one of the question's options.");
     if (open.kind === "self-fix" && answer === "Request changes" && typeof body.instructions === "string") {
       const fix = await supervisor.reviseFix(open.meta?.fixId, body.instructions);
-      return fix ? ok({ question: open, fix, delivery: { status: "sent", detail: "Changes sent to fixer." }, state: state() }) : fail(404, "No fix with that id.");
+      return fix ? ok({ question: (state().questions ?? []).find((q) => q.id === id) ?? null, fix, delivery: { status: "sent", detail: "Changes sent to fixer." }, state: state() }) : fail(404, "No fix with that id.");
     }
     const result = await supervisor.answerQuestion(id, answer, sendOptions);
     if (!result) return fail(409, "Question already closed.");

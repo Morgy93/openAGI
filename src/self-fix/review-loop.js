@@ -13,7 +13,7 @@ export function requiredFindings(findings) {
   return (findings ?? []).filter((finding) => finding.severity === "P1" || (finding.severity === "P2" && finding.small === true));
 }
 
-export async function reviewLoop({ review, repair, replay, initialRound = 0, maxRounds = 3, onRound = () => {} }) {
+export async function reviewLoop({ review, repair, replay, publish = () => {}, initialRound = 0, maxRounds = 3, onRound = () => {} }) {
   let round = initialRound;
   for (;;) {
     const findings = await review();
@@ -24,5 +24,6 @@ export async function reviewLoop({ review, repair, replay, initialRound = 0, max
     await onRound(round);
     await repair(required);
     await replay();
+    await publish();
   }
 }

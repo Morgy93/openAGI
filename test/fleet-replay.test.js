@@ -25,6 +25,17 @@ test("base and fix get identical frozen fixture data, live inputs remain unchang
   assert.deepEqual(result.base, result.fix); assert.equal(result.passed, false);
   assert.equal(fs.readFileSync(path.join(dataDir, "fleet/state.json"), "utf8"), state);
 });
+test("failure metrics only improve downward and unknown directions fail closed", () => {
+  for (const name of ["failed", "blocked", "repeats", "unanswered", "judgeWait"]) {
+    const base = { ...sample(0), metrics: { [name]: 2 } };
+    const higher = { ...sample(0), metrics: { [name]: 3 } };
+    const lower = { ...sample(0), metrics: { [name]: 1 } };
+    assert.equal(compareReplay(base, higher, { name, direction: "up" }).passed, false);
+    assert.equal(compareReplay(base, lower, { name, direction: "down" }).passed, true);
+    assert.equal(compareReplay(base, lower, { name, direction: "sideways" }).passed, false);
+  }
+  assert.equal(compareReplay(sample(1), sample(2), { name: "questions", direction: "up", playbook: "classify" }).passed, true);
+});
 
 test("base versus fix compares different revisions over the same frozen inputs", (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-replay-diff-"));

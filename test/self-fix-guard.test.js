@@ -32,6 +32,12 @@ test("GitHub credentials never fall back to owner login and reject symlinks and 
   fs.renameSync(file, file + ".real"); fs.symlinkSync(file + ".real", file);
   assert.throws(() => readGitHubToken({ home, env: {} }));
 });
+test("guard blocks every shared secret scrubber form without explicit keys", () => {
+  for (const value of ["xoxb-unitfixture000000", "API_KEY=unitfixture000000", "SERVICE_TOKEN=unitfixture000000", "Bearer unitfixture000000", "--csrf_token unitfixture000000", "--host_bridge_token=unitfixture000000"]) {
+    assert.throws(() => guardDiff({ files: ["src/x.js"], diff: "+ " + value }), /secret/);
+  }
+  assert.equal(guardDiff({ files: ["src/x.js"], diff: "+ const ready = true;" }), true);
+});
 test("push compares remote head and proves ancestry; never force pushes or publishes main", async () => {
   const calls = [];
   let remote = "";

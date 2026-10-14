@@ -27,6 +27,6 @@ worker.start();
 void heartbeat();
 const timer = setInterval(heartbeat, 30000);
 let stopping = false;
-const stop = async () => { if (stopping) return; stopping = true; clearInterval(timer); node.stop(); fixer.stop(); await worker.stop(); process.exit(0); };
+const stop = async () => { if (stopping) return; stopping = true; clearInterval(timer); node.stop(); await Promise.all([fixer.stop(), worker.stop()]); process.exit(0); };
 process.once('SIGTERM', stop); process.once('SIGINT', stop);
 console.log('Coding supervisor node started; outbound authenticated connection only.');

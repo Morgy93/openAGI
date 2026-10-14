@@ -216,6 +216,12 @@ export class SelfFixHub {
     for (const fix of snapshot.fixes) {
       const existing = this.store.fix(fix.id);
       if (!existing) continue;
+      let revision = this.store.fixCommands()["revise:" + fix.id];
+      if (revision && (fix.ownerRounds ?? 0) >= 1 && !fix.revisionRequests?.includes(revision.payload.requestId)) {
+        this.store.clearFixCommand("revise:" + fix.id);
+        revision = null;
+      }
+      if (revision && fix.state === "owner-ask" && !fix.revisionRequests?.includes(revision.payload.requestId)) continue;
       // A stop the Mac has not received yet wins over stale status.
       if (existing.state === "abandoned" && fix.state !== "abandoned") continue;
       const stateChanged = existing.state !== fix.state;
@@ -231,8 +237,14 @@ export class SelfFixHub {
       this.store._save();
     }
     for (const session of snapshot.selfSessions) this.store.addSelfSession(session.id, session.fixId);
-    for (const question of snapshot.questions ?? []) this.store.upsertQuestion(question);
-    for (const fix of snapshot.fixes.filter((item) => ["done", "abandoned"].includes(item.state))) {
+    for (const question of snapshot.questions ?? []) {
+      if (question.dedupeKey?.startsWith("self-fix:failed:") || question.dedupeKey === "self-fix:token") {
+        if (this.store.state.questions.some((item) => item.dedupeKey === question.dedupeKey && ["answered", "dismissed"].includes(item.status))) continue;
+      }
+      if (question.kind === "self-fix" && this.store.fix(question.meta?.fixId)?.state !== "owner-ask") continue;
+      this.store.upsertQuestion(question);
+    }
+    for (const fix of this.store.fixes().filter((item) => item.state !== "owner-ask")) {
       const question = this.store.openQuestions().find((item) => item.dedupeKey === "self-fix:" + fix.id);
       if (question) this.store.resolveQuestion(question.id);
     }
@@ -253,8 +265,14 @@ export class SelfFixHub {
       await this.dispatch(command.operation, command.payload);
       this.store.clearFixCommand(key);
     }
-    for (const fix of this.store.fixes().filter((item) => item.state === "queued")) await this.dispatch("start", { fix, auto: fix.auto, confidence: fix.confidence });
+    if (Object.values(this.store.fixCommands()).some((command) => command.operation === "revise")) await this.dispatch("list");
+    for (const fix of this.store.fixes().filter((item) => item.state === "queued" && !this.store.fixCommands()["revise:" + item.id])) await this.dispatch("start", { fix, auto: fix.auto, confidence: fix.confidence });
     for (const [key, command] of Object.entries(this.store.fixCommands()).filter(([, command]) => command.operation !== "stop")) {
+      const fix = this.store.fix(command.payload.id);
+      if (command.operation === "revise" && fix && ((fix.ownerRounds ?? 0) >= 1 || ["done", "failed", "abandoned"].includes(fix.state)) && !fix.revisionRequests?.includes(command.payload.requestId)) {
+        this.store.clearFixCommand(key);
+        continue;
+      }
       await this.dispatch(command.operation, command.payload);
       this.store.clearFixCommand(key);
     }
@@ -264,10 +282,15 @@ export class SelfFixHub {
     const fix = this.store.fix(id);
     if (!fix) return null;
     if (["done", "failed", "abandoned"].includes(fix.state)) throw new Error("Only running or open fixes can be revised.");
+    if ((fix.ownerRounds ?? 0) >= 1 || this.store.fixCommands()["revise:" + id]) throw new Error("Owner revision round cap reached.");
     const command = { operation: "revise", payload: { id, instructions, requestId: randomUUID() } };
     // Validate locally but do not duplicate the revision on node readback.
     fixRevision(fix, instructions);
     this.store.queueFixCommand("revise:" + id, command);
+    if (fix.state === "owner-ask") {
+      this.store.resolveQuestion(this.store.openQuestions().find((question) => question.dedupeKey === "self-fix:" + id)?.id);
+      this.store.updateFix(id, { state: "queued", pendingRevision: instructions });
+    }
     await this.dispatch(command.operation, command.payload).then(() => this.store.clearFixCommand("revise:" + id)).catch(() => {});
     return this.store.fix(id);
   }
@@ -282,6 +305,7 @@ export class SelfFixHub {
   async answer(id, answer) {
     const question = this.store.question(id);
     if (!question || question.status !== "open" || !question.options.includes(answer)) return null;
+    if (question.kind !== "self-fix") return { question: this.store.answerQuestion(id, answer), delivery: { status: "sent", detail: "Acknowledged" } };
     const fixId = question.meta?.fixId;
     if (answer === "Request changes") return { question, delivery: { status: "blocked", detail: "Use self_fix_revise or POST fixes/" + fixId + "/revise with your change instructions." } };
     if (answer === "Close PR") await this.dispatch("close", { id: fixId });
