@@ -352,7 +352,7 @@ test("a send blocked by a card names its buttons and stateId so it can be answer
     /Not delivered \(blocked\): permission prompt visible: answer it first \(fleet_click\), then send again; a card is waiting \("Run npm test\?"\) with buttons "Allow once", "Deny" \(stateId 0123456789abcdef\): fleet_click can answer it/);
 });
 
-test("voice tools: walkthrough order, focus, diagnose counts, self-fix stubs", async () => {
+test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix stubs", async () => {
   const questions = [{ id: "fq_1", title: "Merge PR 42?", options: ["Yes", "No"], threadKey: "codex:t1", prRef: "acme/app#42" }];
   const threads = [
     row({ key: "codex:red", workspace: "amman", state: "needs-human", health: "red", reason: "Waiting on you" }),
@@ -363,6 +363,7 @@ test("voice tools: walkthrough order, focus, diagnose counts, self-fix stubs", a
   const supervisor = {
     ...fakeSupervisor({ questions, snapshot: { at: "2026-10-13T20:00:00.000Z", counts: {}, threads, infra: {}, sourceErrors: { claude: "locked" } },
       actions: [{ id: "fa_1", kind: "nudge", status: "sent", at: new Date().toISOString() }] }),
+    diagnose: async (options) => ({ ...options, metrics: { review: { failures: 35 } }, anomalies: [{ metric: "review-failures" }] }),
     fixes: async () => fixes,
     feedback: async () => [{ intent: "change", at: new Date().toISOString() }]
   };
@@ -379,13 +380,8 @@ test("voice tools: walkthrough order, focus, diagnose counts, self-fix stubs", a
 
   const diagnose = (await tools.invoke("fleet_diagnose", { window: "7d" })).result;
   assert.equal(diagnose.window, "7d");
-  assert.deepEqual(diagnose.threads, { red: 1, yellow: 0, green: 1, gray: 0 });
-  assert.equal(diagnose.openQuestions, 1);
-  assert.deepEqual(diagnose.recentActions, { "nudge:sent": 1 });
-  assert.deepEqual(diagnose.failedSources, ["claude"]);
-  assert.deepEqual(diagnose.feedback, { change: 1 });
-  assert.deepEqual(diagnose.fixes, { queued: 1, total: 2 });
-  assert.deepEqual(diagnose.anomalies, []);
+  assert.deepEqual(diagnose.metrics, { review: { failures: 35 } });
+  assert.deepEqual(diagnose.anomalies, [{ metric: "review-failures" }]);
 
   const list = (await tools.invoke("self_fix_list", { status: "queued" })).result;
   assert.deepEqual(list.fixes.map((fix) => fix.id), ["fix_1"]);

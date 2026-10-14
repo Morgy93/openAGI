@@ -3,6 +3,7 @@
 // { status, body }, or null for paths it does not own.
 
 import { MODES } from "./contracts.js";
+import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 
 const PREFIX = "/fleet/api/";
@@ -75,6 +76,29 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!supervisor) return fail(503, "Fleet supervisor is not available.");
     const parts = pathname.slice(PREFIX.length).split("/");
     try {
+      if (parts.length === 1 && parts[0] === "diagnose") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.diagnose !== "function") return fail(503, "Diagnose is not available.");
+        const window = url?.searchParams?.get("window") ?? "24h";
+        const area = url?.searchParams?.get("area") ?? null;
+        if (!["24h", "7d"].includes(window) || (area && !FIX_AREAS.includes(area))) return fail(400, "Bad diagnose window or area.");
+        return ok(await supervisor.diagnose({ window, area }));
+      }
+      if (parts[0] === "suggestions" && (parts.length === 1 || parts.length === 2)) {
+        if (typeof supervisor.suggestions !== "function") return fail(503, "Suggestions are not available.");
+        if (parts.length === 1) return method === "GET" ? ok({ suggestions: await supervisor.suggestions() }) : fail(405, "Use GET.");
+        if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad suggestion id.");
+        if (method === "GET") {
+          const suggestion = (await supervisor.suggestions()).find((s) => s.id === parts[1]);
+          return suggestion ? ok({ suggestion }) : fail(404, "No suggestion with that id.");
+        }
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        try {
+          const result = await supervisor.respondSuggestion(parts[1], body?.choice);
+          return result ? ok(result) : fail(404, "No suggestion with that id.");
+        } catch { return fail(409, "Suggestion could not be applied. Check its choice, self-fix mode, locks and daily cap."); }
+      }
       if (parts.length === 1 && parts[0] === "state") {
         if (method !== "GET") return fail(405, "Use GET.");
         await supervisor.refresh?.();

@@ -1,6 +1,6 @@
 // Tools the voice Supervisor adds to the fleet set: a walkthrough to narrate,
-// what the owner is looking at, a diagnose (current counts until the full
-// diagnose lands), owner feedback, and self-fix requests (stored until the
+// what the owner is looking at, diagnosis, suggestions, owner feedback,
+// and self-fix requests (stored until the
 // runner lands; nothing runs yet). Text chats can use them too. A voice
 // call carries context.__voice (built by the broker per call): the owner's
 // on-screen focus, the device source and the owner's own last words.
@@ -9,7 +9,7 @@ import { FIX_AREAS, FIX_STATES, FEEDBACK_INTENTS, TARGET_FIELDS, UTTERANCE_MAX, 
 import { threadHealth } from "./classify.js";
 
 const SOURCE = "integration:fleet-supervisor";
-export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough", "fleet_diagnose", "feedback_record", "self_fix_list", "self_fix_start", "self_fix_revise", "self_fix_stop"]);
+export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough", "fleet_diagnose", "feedback_record", "self_fix_list", "self_fix_start", "self_fix_revise", "self_fix_stop", "suggestion_respond"]);
 // Everything a voice session may call: the fleet set plus the above. No
 // merge, release, deploy or restart-hub tool exists on purpose.
 export const VOICE_SESSION_TOOLS = Object.freeze([
@@ -75,7 +75,9 @@ export async function fleetWalkthrough(supervisor, { scope = "all" } = {}) {
   if (want === "all" || want === "fixes") {
     for (const fix of await readFixes(supervisor)) if (fix.state !== "abandoned") items.push({ kind: "fix", ...compactFix(fix) });
   }
-  // Suggestions arrive with the diagnose pass; none yet.
+  if ((want === "all" || want === "suggestions") && typeof supervisor.suggestions === "function") {
+    for (const s of await supervisor.suggestions()) if (s.status === "open") items.push({ kind: "suggestion", id: s.id, title: clip(s.proposedFix, 100), area: s.area, score: s.score });
+  }
   return {
     scope: want,
     total: items.length,
@@ -85,45 +87,10 @@ export async function fleetWalkthrough(supervisor, { scope = "all" } = {}) {
   };
 }
 
-// Current counts until the full diagnose (metrics and anomalies) lands.
-export async function fleetDiagnose(supervisor, { window = "24h", area = null } = {}) {
-  const state = await readState(supervisor);
-  const sinceMs = Date.now() - (window === "7d" ? 7 : 1) * 24 * 60 * 60 * 1000;
-  const byHealth = { red: 0, yellow: 0, green: 0, gray: 0 };
-  for (const row of state.snapshot?.threads ?? []) {
-    const health = row?.health ?? threadHealth(row?.state, row?.error ?? null);
-    byHealth[health] = (byHealth[health] ?? 0) + 1;
-  }
-  const actions = {};
-  for (const action of state.actions ?? []) {
-    if (Date.parse(action?.at ?? "") < sinceMs) continue;
-    const key = `${action.kind ?? "nudge"}:${action.status ?? "unknown"}`;
-    actions[key] = (actions[key] ?? 0) + 1;
-  }
-  let feedback = [];
-  if (typeof supervisor.feedback === "function") {
-    try { feedback = (await supervisor.feedback({ limit: 100 })) ?? []; } catch { feedback = []; }
-  }
-  const recentFeedback = {};
-  for (const record of feedback) {
-    if (Date.parse(record?.at ?? "") >= sinceMs) recentFeedback[record.intent] = (recentFeedback[record.intent] ?? 0) + 1;
-  }
-  const fixes = await readFixes(supervisor);
-  return {
-    window: window === "7d" ? "7d" : "24h",
-    area: typeof area === "string" && FIX_AREAS.includes(area) ? area : null,
-    mode: state.mode ?? null,
-    lastTickAt: state.lastTickAt ?? null,
-    lastError: state.lastError ? clip(state.lastError, 200) : null,
-    threads: byHealth,
-    openQuestions: (state.questions ?? []).length,
-    recentActions: actions,
-    failedSources: Object.keys(state.snapshot?.sourceErrors ?? {}),
-    feedback: recentFeedback,
-    fixes: { queued: fixes.filter((fix) => fix.state === "queued").length, total: fixes.length },
-    anomalies: [],
-    note: "Counts only: the full diagnose (metrics, anomalies, root cause) is not built yet. Say so if asked for causes."
-  };
+// The API and voice tool share the same read-only diagnosis.
+export async function fleetDiagnose(supervisor, options = {}) {
+  if (typeof supervisor.diagnose === "function") return supervisor.diagnose(options);
+  throw new Error("Fleet diagnosis is unavailable. Update the fleet computer.");
 }
 
 export function registerVoiceTools(registry, supervisor) {
@@ -138,9 +105,28 @@ export function registerVoiceTools(registry, supervisor) {
     parameters: { type: "object", properties: { scope: { type: "string", enum: SCOPES } }, additionalProperties: false },
     handler: (args) => fleetWalkthrough(supervisor, args) });
   registry.register({ name: "fleet_diagnose", source: SOURCE, sideEffects: false,
-    description: "How the supervisor itself is doing over a window: thread health, open questions, recent actions by kind and status, failed sources, owner feedback, fixes. Read-only. The full diagnose with anomalies is not built yet; this returns counts.",
+    description: "Measure fleet health, anomalies and suggested fixes over 24h or 7d. Read-only; never queues a fix or sends a notification. The explanation model runs only if anomalies exist.",
     parameters: { type: "object", properties: { window: { type: "string", enum: ["24h", "7d"] }, area: { type: "string", enum: FIX_AREAS } }, additionalProperties: false },
     handler: (args) => fleetDiagnose(supervisor, args) });
+  if (typeof supervisor.respondSuggestion === "function") registry.register({ name: "suggestion_respond", source: SOURCE,
+    needsConfirmation: true,
+    confirmationRequired: (args) => String(args?.choice ?? "").toLowerCase() === "fix it",
+    description: "Respond to a suggestion: Fix it queues self_fix_start with the same caps (owner merges), Not now snoozes seven days, Never blocks its fingerprint. Read back title, area and caps before confirming Fix it.",
+    parameters: { type: "object", properties: { suggestionId: { type: "string", maxLength: 80 }, choice: { type: "string", enum: ["fix it", "not now", "never"] } }, required: ["suggestionId", "choice"], additionalProperties: false },
+    prepareApprovalArgs: async (args) => {
+      const s = (await supervisor.suggestions()).find((s) => s.id === args.suggestionId && s.status === "open");
+      if (!s) throw new Error("No open suggestion with that id.");
+      return { ...args, title: clip(s.proposedFix, 100), area: s.area, fingerprint: s.fingerprint };
+    },
+    summarize: (args) => `Start a self-fix "${args.title}" in ${args.area}: ${FIX_CAPS}. I'll open a PR, you merge`,
+    handler: async (args, context) => {
+      if (args.choice === "fix it" && context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+      if (args.fingerprint) {
+        const current = (await supervisor.suggestions()).find((s) => s.id === args.suggestionId);
+        if (current?.fingerprint !== args.fingerprint) throw new Error("Suggestion changed; read it back again.");
+      }
+      return supervisor.respondSuggestion(args.suggestionId, args.choice);
+    } });
   if (typeof supervisor.recordFeedback === "function") registry.register({ name: "feedback_record", source: SOURCE,
     description: "Record the owner's feedback on the supervisor ('I don't like that', 'fix that', 'explain this'). Stores it only; nothing changes or runs. intent: explain, change, fix, create-pr, spawn-fixer or dismiss. target defaults to what the owner is looking at.",
     parameters: { type: "object", properties: {

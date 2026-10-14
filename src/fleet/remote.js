@@ -13,10 +13,14 @@ export function createFleetCapability(supervisor) {
     // inside it.
     async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
-      const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
+      const url = new URL(payload.path, 'http://localhost');
+      if (payload.path === '/fleet/api/diagnose') for (const key of ['window', 'area']) {
+        if (typeof payload.body?.[key] === 'string') url.searchParams.set(key, payload.body[key]);
+      }
+      const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
     }
@@ -119,6 +123,9 @@ export class RemoteFleetSupervisor {
   // Feedback and self-fix requests live with the fleet, on the computer.
   async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
   async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
+  async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }
+  async respondSuggestion(id, choice) { return this.request('POST', `/fleet/api/suggestions/${id}`, { choice }); }
   async queueFix(input) { return (await this.request('POST', '/fleet/api/fixes', input)).fix; }
   async fixes() { return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
   async reviseFix(id, instructions) { return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }

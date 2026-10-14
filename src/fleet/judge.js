@@ -407,7 +407,8 @@ function keyScrubber(secret) {
 }
 
 // config.judge: { enabled, model, timeoutMs }. run: runCommand-like.
-export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now } = {}) {
+export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now,
+  schema = JUDGE_SCHEMA, promptFor = buildJudgePrompt, validate = validateVerdict } = {}) {
   const settings = config?.judge ?? {};
   const model = String(settings.model ?? "").trim();
   const enabled = Boolean(settings.enabled) && Boolean(model);
@@ -527,14 +528,14 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
   async function judge(input) {
     if (!enabled) throw new Error("judge off");
     const limitMs = Math.min(timeoutMs, Number.isFinite(input?.timeoutMs) ? input.timeoutMs : Infinity);
-    const prompt = buildJudgePrompt(input);
+    const prompt = promptFor(input);
     const key = lbKey();
     const scrub = keyScrubber(key);
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-judge-"));
     try {
       const schemaPath = path.join(dir, "schema.json");
       const outPath = path.join(dir, "out.json");
-      fs.writeFileSync(schemaPath, JSON.stringify(JUDGE_SCHEMA));
+      fs.writeFileSync(schemaPath, JSON.stringify(schema));
       const options = { cwd: dir, env: { ...childEnv(dir, key), CODEX_HOME: codexHome(dir) }, timeoutMs: limitMs };
       // A lockdown read comes out of this call's time.
       const execMs = Math.max(1_000, limitMs - await checkLockdown(options));
@@ -557,7 +558,7 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
           || (result?.code === 0 ? "output was not JSON" : `exit ${result?.code}`);
         throw new Error(why);
       }
-      return validateVerdict(parsed, limits);
+      return validate(parsed, limits);
     } finally {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ }
     }

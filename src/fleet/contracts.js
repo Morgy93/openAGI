@@ -280,6 +280,11 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     relayModel: overrides.relayModel ?? (String(env.OPENAGI_FLEET_RELAY_MODEL ?? "").trim() || DEFAULT_RELAY_MODEL),
     publicUrl: overrides.publicUrl ?? (String(env.OPENAGI_PUBLIC_URL ?? "").trim() || null),
     selfSessionIds,
+    selfFix: {
+      mode: ["off", "0"].includes(String(env.OPENAGI_FLEET_SELF_FIX ?? "").toLowerCase()) ? "off"
+        : (["off", "propose", "auto"].includes(overrides.selfFix?.mode) ? overrides.selfFix.mode
+          : (String(env.OPENAGI_FLEET_SELF_FIX ?? "").toLowerCase() === "auto" ? "auto" : "propose"))
+    },
     // repo -> UI path prefixes that make visual QA required; github.js has
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},

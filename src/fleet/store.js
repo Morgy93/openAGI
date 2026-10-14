@@ -4,10 +4,12 @@
 // Methods never throw on disk errors; the last one is kept in lastWriteError.
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
-import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "../file-utils.js";
+import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
+import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
 
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
@@ -69,6 +71,8 @@ function emptyState() {
     restartedAt: {},
     feedback: [],
     fixes: [],
+    suggestions: [],
+    diagnosis: {},
     selfSessions: []
   };
 }
@@ -349,6 +353,7 @@ export class FleetStore {
       keepReviewWording(resolved, fields);
       Object.assign(resolved, fields, origin.askContext ? origin : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
+        reopenHistory: [...(resolved.reopenHistory ?? []), iso(now)].filter((at) => now - Date.parse(at) <= 7 * DAY_MS),
         lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(liveSinceMs(resolved) + QUESTION_TTL_MS)
       });
       this._save();
@@ -599,6 +604,52 @@ export class FleetStore {
 
   actions(limit = 50) {
     return this.state.actions.slice(-Math.max(0, limit)).reverse().map((a) => ({ ...a }));
+  }
+
+  actionHistory() {
+    let rows = [];
+    try {
+      rows = fs.readFileSync(this.journalPath, "utf8").split(/\r?\n/).flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+    return foldActions([...this.state.actions, ...rows]);
+  }
+
+  // Keep complete folded records, newest first in priority, in a bounded log.
+  rotateActions() {
+    try {
+      if (fs.statSync(this.journalPath).size <= ACTION_LOG_MAX) return false;
+      const folded = this.actionHistory().sort((a, b) => Date.parse(a.updatedAt ?? a.at) - Date.parse(b.updatedAt ?? b.at));
+      const tail = [];
+      let bytes = 0;
+      for (const action of folded.reverse()) {
+        const line = JSON.stringify({ op: "record", ...action }) + "\n";
+        const size = Buffer.byteLength(line);
+        if (bytes + size > ACTION_LOG_MAX * 0.8) break;
+        tail.push(line); bytes += size;
+      }
+      writeTextAtomic(this.journalPath, tail.reverse().join(""));
+      return true;
+    } catch (error) {
+      if (error.code !== "ENOENT") this.lastWriteError = error?.message ?? String(error);
+      return false;
+    }
+  }
+
+  suggestions() { return structuredClone(this.state.suggestions); }
+
+  saveSuggestion(record) {
+    const at = this.state.suggestions.findIndex((s) => s.id === record.id);
+    if (at < 0) this.state.suggestions.push(structuredClone(record));
+    else this.state.suggestions[at] = structuredClone(record);
+    this._save();
+    return structuredClone(record);
+  }
+
+  saveDiagnosis(patch) {
+    Object.assign(this.state.diagnosis, patch);
+    this._save();
   }
 
   // ─── infra escalations and outages ──────────────────────────────────────
@@ -1035,6 +1086,9 @@ export class FleetStore {
       restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {},
       feedback: Array.isArray(raw.feedback) ? raw.feedback.filter(isObject) : [],
       fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
+      suggestions: Array.isArray(raw.suggestions) ? raw.suggestions.filter(isObject) : [],
+      diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
+      areaLocks: isObject(raw.areaLocks) ? raw.areaLocks : {},
       selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
     };
   }
@@ -1051,6 +1105,7 @@ export class FleetStore {
   _journal(entry) {
     try {
       appendJsonLine(this.journalPath, entry);
+      this.rotateActions();
     } catch (error) {
       this.lastWriteError = error?.message ?? String(error);
     }
