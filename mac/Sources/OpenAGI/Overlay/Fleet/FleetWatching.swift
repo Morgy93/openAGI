@@ -14,15 +14,20 @@ struct FleetWatch: Decodable, Equatable {
   let waitingOn: String?
   let waitSince: String?
   let runningSince: String?
+  /// On a "you" row: its group once the owner's question closes.
+  let otherwiseGroup: String?
 
-  enum CodingKeys: String, CodingKey { case group, since, waitingOn, waitSince, runningSince }
+  enum CodingKeys: String, CodingKey { case group, since, waitingOn, waitSince, runningSince, otherwise }
+  private enum OtherwiseKeys: String, CodingKey { case group }
 
-  init(group: String, since: String?, waitingOn: String? = nil, waitSince: String? = nil, runningSince: String? = nil) {
+  init(group: String, since: String?, waitingOn: String? = nil, waitSince: String? = nil, runningSince: String? = nil,
+       otherwiseGroup: String? = nil) {
     self.group = group
     self.since = since
     self.waitingOn = waitingOn
     self.waitSince = waitSince
     self.runningSince = runningSince
+    self.otherwiseGroup = otherwiseGroup
   }
 
   /// `group` is required: a watch without one says nothing.
@@ -37,6 +42,8 @@ struct FleetWatch: Decodable, Equatable {
     waitingOn = try? c.decodeIfPresent(String.self, forKey: .waitingOn)
     waitSince = try? c.decodeIfPresent(String.self, forKey: .waitSince)
     runningSince = try? c.decodeIfPresent(String.self, forKey: .runningSince)
+    let otherwise = try? c.nestedContainer(keyedBy: OtherwiseKeys.self, forKey: .otherwise)
+    otherwiseGroup = (try? otherwise?.decodeIfPresent(String.self, forKey: .group)) ?? nil
   }
 
   /// A daemon from before watch existed: the group its state maps to (the
@@ -70,15 +77,31 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let lastAgentAt: String?
   /// Nil: out of scope (the daemon sent watch: null), so not listed.
   let watch: FleetWatch?
+  /// The scan's PR read: state, title, CI, unresolved review threads.
+  let pr: FleetPR?
+  /// The tail of the agent's last message as the scan read it. Not
+  /// redacted: the opened row shows the detail's redacted one instead.
+  let lastAgentText: String?
+  let lastOwnerAt: String?
+  /// When the owner's Mute ends; nil: not muted.
+  let muted: String?
+  /// What opens this exact chat.
+  let openChat: FleetOpenChat?
+  /// The supervisor's next step, and the words Push now would send.
+  let decision: FleetDecision?
 
   var id: String { key }
 
-  enum CodingKeys: String, CodingKey { case key, title, workspace, repo, state, pr, lastActivityAt, lastAgentAt, watch }
+  enum CodingKeys: String, CodingKey {
+    case key, title, workspace, repo, state, pr, lastActivityAt, lastAgentAt, watch
+    case lastAgentText, lastOwnerAt, muted, openChat, decision
+  }
   private enum PRKeys: String, CodingKey { case ref, url }
 
   init(key: String, title: String? = nil, workspace: String? = nil, repo: String? = nil, state: String? = nil,
        prRef: String? = nil, prURL: String? = nil, lastActivityAt: String? = nil, lastAgentAt: String? = nil,
-       watch: FleetWatch?) {
+       watch: FleetWatch?, pr: FleetPR? = nil, lastAgentText: String? = nil, lastOwnerAt: String? = nil,
+       muted: String? = nil, openChat: FleetOpenChat? = nil, decision: FleetDecision? = nil) {
     self.key = key
     self.title = title
     self.workspace = workspace
@@ -89,6 +112,12 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     self.lastActivityAt = lastActivityAt
     self.lastAgentAt = lastAgentAt
     self.watch = watch
+    self.pr = pr
+    self.lastAgentText = lastAgentText
+    self.lastOwnerAt = lastOwnerAt
+    self.muted = muted
+    self.openChat = openChat
+    self.decision = decision
   }
 
   /// Only `key` is required. A daemon that sends no watch key at all predates
@@ -101,11 +130,17 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     workspace = try? c.decodeIfPresent(String.self, forKey: .workspace)
     repo = try? c.decodeIfPresent(String.self, forKey: .repo)
     state = try? c.decodeIfPresent(String.self, forKey: .state)
-    let pr = try? c.nestedContainer(keyedBy: PRKeys.self, forKey: .pr)
-    prRef = (try? pr?.decodeIfPresent(String.self, forKey: .ref)) ?? nil
-    prURL = (try? pr?.decodeIfPresent(String.self, forKey: .url)) ?? nil
+    let prKeys = try? c.nestedContainer(keyedBy: PRKeys.self, forKey: .pr)
+    prRef = (try? prKeys?.decodeIfPresent(String.self, forKey: .ref)) ?? nil
+    prURL = (try? prKeys?.decodeIfPresent(String.self, forKey: .url)) ?? nil
     lastActivityAt = try? c.decodeIfPresent(String.self, forKey: .lastActivityAt)
     lastAgentAt = try? c.decodeIfPresent(String.self, forKey: .lastAgentAt)
+    pr = try? c.decodeIfPresent(FleetPR.self, forKey: .pr)
+    lastAgentText = try? c.decodeIfPresent(String.self, forKey: .lastAgentText)
+    lastOwnerAt = try? c.decodeIfPresent(String.self, forKey: .lastOwnerAt)
+    muted = try? c.decodeIfPresent(String.self, forKey: .muted)
+    openChat = try? c.decodeIfPresent(FleetOpenChat.self, forKey: .openChat)
+    decision = try? c.decodeIfPresent(FleetDecision.self, forKey: .decision)
     if c.contains(.watch), (try? c.decodeNil(forKey: .watch)) == true {
       watch = nil
     } else if let decoded = try? c.decodeIfPresent(FleetWatch.self, forKey: .watch) {

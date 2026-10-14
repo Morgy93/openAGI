@@ -28,9 +28,24 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   let reviewCategory: String?
   let pinned: Bool
   let createdAt: String?
+  /// When the agent asked, else when the supervisor first asked the owner.
+  let askedAt: String?
+  /// The chat it is about: "remote-dev · Remote dev setup (Conductor)".
+  let chatLabel: String?
+  /// "here" or "agent app". Nil from a daemon before it: the options decide.
+  let answerIn: String?
+  let openChat: FleetOpenChat?
+  /// A grouped question names each of its chats.
+  let chats: [FleetOpenChat]
+  /// Merge, production, release, deploy, delete, force-push: the full text
+  /// shows before any button.
+  let risky: Bool
+  /// The agent message the ask came from (untrusted, redacted).
+  let askContext: String?
 
   enum CodingKeys: String, CodingKey {
     case id, kind, title, body, options, threadKey, prRef, reviewReason, reviewCategory, pinned, createdAt
+    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext
   }
 
   /// Why the supervisor's review kept it, or the close the owner overrode
@@ -52,7 +67,16 @@ extension FleetQuestion {
   var tappableOptions: [String] { options.filter { $0 != Self.openThread } }
 
   /// True when the answer has to be typed in the agent's own app.
-  var answersInThread: Bool { options.contains(Self.openThread) }
+  var answersInThread: Bool { answerIn.map { $0 == "agent app" } ?? options.contains(Self.openThread) }
+
+  /// "asked 3h ago": the agent's ask time, else the question's own.
+  var askedTime: String? { askedAt ?? createdAt }
+
+  /// Every chat the question is about, the one it names first.
+  var allChats: [FleetOpenChat] {
+    if !chats.isEmpty { return chats }
+    return openChat.map { [$0] } ?? []
+  }
 
   static let openThread = "open thread"
 
@@ -87,6 +111,79 @@ extension FleetQuestion {
     reviewCategory = try? c.decodeIfPresent(String.self, forKey: .reviewCategory)
     pinned = (try? c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
     createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    askedAt = try? c.decodeIfPresent(String.self, forKey: .askedAt)
+    chatLabel = try? c.decodeIfPresent(String.self, forKey: .chatLabel)
+    answerIn = try? c.decodeIfPresent(String.self, forKey: .answerIn)
+    openChat = try? c.decodeIfPresent(FleetOpenChat.self, forKey: .openChat)
+    chats = ((try? c.decodeIfPresent([Lossy<FleetOpenChat>].self, forKey: .chats)) ?? []).compactMap { $0.value }
+    risky = (try? c.decodeIfPresent(Bool.self, forKey: .risky)) ?? false
+    askContext = try? c.decodeIfPresent(String.self, forKey: .askContext)
+  }
+}
+
+/// What opens one thread's own chat (src/fleet/contracts.js openChatFor).
+/// url nil: no link opens it; label names the workspace or folder and the
+/// app, and note says why.
+struct FleetOpenChat: Decodable, Equatable {
+  let app: String?
+  let url: String?
+  let label: String
+  let note: String?
+  /// Set on a grouped question's chats.
+  let threadKey: String?
+
+  enum CodingKeys: String, CodingKey { case app, url, label, note, threadKey }
+
+  init(app: String?, url: String?, label: String, note: String? = nil, threadKey: String? = nil) {
+    self.app = app
+    self.url = url
+    self.label = label
+    self.note = note
+    self.threadKey = threadKey
+  }
+
+  /// `label` is required: a chat this build cannot name is not offered.
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    let raw = try c.decode(String.self, forKey: .label).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else {
+      throw DecodingError.dataCorruptedError(forKey: .label, in: c, debugDescription: "empty label")
+    }
+    label = raw
+    app = try? c.decodeIfPresent(String.self, forKey: .app)
+    url = try? c.decodeIfPresent(String.self, forKey: .url)
+    note = try? c.decodeIfPresent(String.self, forKey: .note)
+    threadKey = try? c.decodeIfPresent(String.self, forKey: .threadKey)
+  }
+
+  /// The link that lands in this exact chat. Only the two app schemes the
+  /// daemon sends: a daemon string is never opened as anything else.
+  var link: URL? {
+    guard let url, let parsed = URL(string: url), let scheme = parsed.scheme?.lowercased(),
+          Self.schemes.contains(scheme) else { return nil }
+    return parsed
+  }
+
+  static let schemes: Set<String> = ["conductor", "codex"]
+
+  /// "Conductor", "Codex", "Claude Code".
+  var appName: String? {
+    switch app {
+    case "conductor": return "Conductor"
+    case "codex": return "Codex"
+    case "claude": return "Claude Code"
+    default: return nil
+    }
+  }
+
+  /// With no link, the app that shows the chat's workspace, brought to the
+  /// front. A Claude Code terminal session has none.
+  var bundleIdentifier: String? {
+    switch app {
+    case "conductor": return "com.conductor.app"
+    case "codex": return "com.openai.codex"
+    default: return nil
+    }
   }
 }
 

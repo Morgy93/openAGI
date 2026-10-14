@@ -26,7 +26,7 @@ struct OverlayView: View {
   // a single chain of sixteen generic .onChange overloads. Opaque helper
   // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody))))))))
+    fleetDetailWatchers(watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))))))
   }
 
   private var panelBody: some View {
@@ -63,6 +63,9 @@ struct OverlayView: View {
     .onChange(of: state.answer) { _, _ in onContentChange() }
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
     .onChange(of: state.progressStage) { _, _ in onContentChange() }
+    // The "connection lost" banner's text and buttons change as it checks
+    // back on its own, then it goes.
+    .onChange(of: state.detachedPhase) { _, _ in onContentChange() }
   }
 
   private func composerWatchers<V: View>(_ content: V) -> some View {
@@ -168,6 +171,18 @@ struct OverlayView: View {
     content
     .onChange(of: fleet.threads) { _, _ in onContentChange() }
     .onChange(of: fleet.openWatchGroups) { _, _ in onContentChange() }
+  }
+
+  // An opened Watching row or question card: its detail lands, its Push now
+  // or Mute runs and leaves a note, each a height change.
+  private func fleetDetailWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: fleet.expandedThread) { _, _ in onContentChange() }
+    .onChange(of: fleet.expandedQuestions) { _, _ in onContentChange() }
+    .onChange(of: fleet.details) { _, _ in onContentChange() }
+    .onChange(of: fleet.detailLoading) { _, _ in onContentChange() }
+    .onChange(of: fleet.threadInFlight) { _, _ in onContentChange() }
+    .onChange(of: fleet.threadNotes) { _, _ in onContentChange() }
   }
 
   /// Outreach rows for "Needs you". Supervisor questions also arrive as
@@ -308,9 +323,16 @@ struct OverlayView: View {
           .frame(maxHeight: 220)
         }
       } else if state.isDetached {
+        // Checks back once on its own, then clears itself (OverlayState
+        // recoverDetached): it never sits at the top of the panel.
         VStack(alignment: .leading, spacing: 5) {
-          Text("Connection lost before completion was confirmed. Open the main app to see whether the request is still running.")
-            .font(.caption).foregroundStyle(.secondary).lineLimit(4)
+          HStack(spacing: 6) {
+            if state.detachedPhase == .checking { ProgressView().controlSize(.small) }
+            Text(state.detachedPhase == .stillRunning
+                 ? "Still running. The answer will be in the main app."
+                 : "Connection lost. Checking whether it finished…")
+              .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+          }
           HStack {
             Button("Open in main app") {
               app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
