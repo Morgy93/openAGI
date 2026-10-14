@@ -15,6 +15,7 @@ import org.junit.Before
 import org.junit.Test
 import sh.openagi.mobile.protocol.ProtocolJson
 import java.io.File
+import java.time.Instant
 
 class DaemonClientTest {
     private lateinit var server: MockWebServer
@@ -533,6 +534,73 @@ class DaemonClientTest {
         val request = server.takeRequest()
         assertEquals("POST", request.method)
         assertEquals("/fleet/api/actions/fa_1/send", request.path)
+    }
+
+    @Test
+    fun fleetThreadGetsTheKeyWithARawColon() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"thread":{"key":"conductor:d1dbe71a","lastAgentMessage":{"text":"Which fix?","at":"2026-10-14T00:21:00Z"},""" +
+                    """"openChat":{"app":"conductor","url":"conductor://workspace?id=w&session=s","label":"remote-dev · Codex LB Transcript open (Conductor)","note":null}}}""",
+            ),
+        )
+        val thread = client().fleetThread("conductor:d1dbe71a").thread!!
+        assertEquals("Which fix?", thread.lastAgentMessage!!.text)
+        assertEquals("remote-dev · Codex LB Transcript open (Conductor)", thread.openChat!!.label)
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/fleet/api/threads/conductor:d1dbe71a", request.path)
+    }
+
+    @Test
+    fun fleetPushPostsNoBodyAndReadsARefusal() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"delivery":{"status":"blocked","route":null,"detail":"muted until 3pm"},"action":null,"state":$fleetStateJson}""",
+            ),
+        )
+        val result = client().fleetPush("codex:abc")
+        assertEquals("blocked", result.delivery!!.status)
+        assertEquals("muted until 3pm", result.delivery!!.detail)
+        assertEquals(null, result.action)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/fleet/api/threads/codex:abc/push", request.path)
+        assertEquals("", request.body.readUtf8())
+    }
+
+    @Test
+    fun fleetMuteAndUnmutePostTheirRoutes() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"muted":"2026-10-15T00:00:00Z","state":$fleetStateJson}"""))
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"muted":null,"state":$fleetStateJson}"""))
+        assertEquals(Instant.parse("2026-10-15T00:00:00Z"), client().fleetMute("claude:x1", 24).muted)
+        assertEquals(null, client().fleetUnmute("claude:x1").muted)
+        val mute = server.takeRequest()
+        assertEquals("/fleet/api/threads/claude:x1/mute", mute.path)
+        assertEquals("""{"hours":24}""", mute.body.readUtf8())
+        val unmute = server.takeRequest()
+        assertEquals("/fleet/api/threads/claude:x1/unmute", unmute.path)
+    }
+
+    @Test
+    fun antigravityThreadAndActionsUseTheThreadRoutes() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"thread":{"key":"antigravity:a1"}}"""))
+        repeat(3) { server.enqueue(MockResponse().setResponseCode(200).setBody("""{"muted":null}""")) }
+        assertEquals("antigravity:a1", client().fleetThread("antigravity:a1").thread!!.key)
+        client().fleetPush("antigravity:a1")
+        client().fleetMute("antigravity:a1", 24)
+        client().fleetUnmute("antigravity:a1")
+        listOf("", "/push", "/mute", "/unmute").forEach { suffix ->
+            assertEquals("/fleet/api/threads/antigravity:a1$suffix", server.takeRequest().path)
+        }
+    }
+
+    // A key the daemon never sends goes nowhere: no path built from it.
+    @Test
+    fun aThreadKeyOutsideTheContractIsNotSent() = runBlocking {
+        val refused = runCatching { client().fleetPush("codex:../../tasks") }.exceptionOrNull()
+        assertTrue(refused is DaemonException.NotFound)
+        assertEquals(0, server.requestCount)
     }
 
     // An older daemon has no /fleet/api routes (404); a daemon without a

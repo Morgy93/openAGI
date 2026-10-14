@@ -87,3 +87,21 @@ test("voice metering fails closed when the ledger cannot be written", (t) => {
   assert.throws(() => guard.recordUsd(0.1, "gpt-realtime-2.1", { channel: "voice" }), /disk full/);
   assert.deepEqual(new BudgetGuard({ storePath: guard.storePath }).voiceReservationsToday(), { "in-flight": 0.5 });
 });
+
+test("outstanding voice holds reduce the shared budget for text and embedding callers", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-shared-budget-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const options = { storePath: path.join(dir, "usage.json"), dailyUsdLimit: 1 };
+  const guard = new BudgetGuard(options);
+  guard.recordUsd(0.25, "text-model");
+  guard.setVoiceReservation("audio", 0.25);
+  guard.setVoiceReservation("response", 0.5);
+  assert.throws(() => guard.check(), { code: "BUDGET_EXCEEDED" });
+  assert.throws(() => new BudgetGuard(options).check(), { code: "BUDGET_EXCEEDED" });
+  guard.setVoiceReservation("response", 0);
+  assert.doesNotThrow(() => guard.check());
+  assert.doesNotThrow(() => guard.check(0.49));
+  assert.throws(() => guard.check(0.5), { code: "BUDGET_EXCEEDED" });
+  guard.setVoiceReservation("audio", 0);
+  assert.doesNotThrow(() => guard.check(0.5));
+});

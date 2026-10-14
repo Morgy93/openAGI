@@ -41,9 +41,9 @@ export const REALTIME_PRICES = Object.freeze({
 });
 
 export function realtimePrice(model) {
-  const name = String(model ?? "");
-  const key = Object.keys(REALTIME_PRICES).filter((prefix) => name.startsWith(prefix)).sort((a, b) => b.length - a.length)[0];
-  return REALTIME_PRICES[key ?? "gpt-realtime-2.1"];
+  const price = REALTIME_PRICES[String(model ?? "")];
+  if (!Object.hasOwn(REALTIME_PRICES, String(model ?? ""))) throw new Error("Realtime model has no known pricing.");
+  return price;
 }
 
 // USD for one response.done usage (or a transcription's usage).

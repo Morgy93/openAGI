@@ -10,19 +10,37 @@ const RULES = [
   { kind: "model-limit", pattern: /You've reached your \w[\w .-]* limit|Switch to another model|Selected model is at capacity|model is at capacity/i },
   { kind: "session-limit", pattern: /You've hit your (?:session|weekly|daily) limit/i },
   { kind: "usage-limit", pattern: /You've hit your usage limit|usage_limit_exceeded|usageLimitExceeded|out of usage credits|usage_limit_reached|You're out of extra usage/i },
+  // Antigravity (Gemini) quota: "Individual quota reached. ... Resets in
+  // 37m19s." with reason QUOTA_EXHAUSTED, an HTTP 429 that would otherwise
+  // read as overloaded. The quota resets on its own, so it waits like a cap.
+  { kind: "usage-limit", pattern: /Individual quota reached|\bQUOTA_EXHAUSTED\b|exhausted your quota on this model/i },
   { kind: "logged-out", pattern: /Not logged in|Please run \/login|authentication_failed|OAuth token (?:has )?expired/i },
   { kind: "disk-full", pattern: /ENOSPC|no space left on device/i },
   { kind: "lb", pattern: /No available accounts|degraded mode|session bridge is cooling down|Previous response owner account|Invalid [`']?previous_response_id|continuity sources conflict|CODEX_LB_API_KEY|100\.99\.3\.113:2455|Incorrect API key provided/i },
-  { kind: "overloaded", pattern: /\b529\b|Overloaded|server_overloaded|serverOverloaded|\b50[0234]\b.*(?:error|Internal|Bad Gateway|Unavailable)|Internal server error|rate_limit_error|\b429\b/i },
+  { kind: "overloaded", pattern: /\b529\b|Overloaded|MODEL_CAPACITY_EXHAUSTED|PREFILL_QUEUE_OVERLOADED|servers are experiencing high traffic|server_overloaded|serverOverloaded|\b50[0234]\b.*(?:error|Internal|Bad Gateway|Unavailable)|Internal server error|rate_limit_error|\b429\b/i },
   { kind: "network", pattern: /ENOTFOUND|ECONNRESET|ETIMEDOUT|Can't reach the API server|Unable to connect to API|Connection (?:failed|closed mid-response)|stream disconnected|request timed out|error sending request/i }
 ];
+
+// Antigravity's error details carry the exact reset
+// ("quotaResetTimeStamp": "2026-10-14T06:15:03Z"); its message only a delay.
+const QUOTA_RESET_STAMP = /quotaResetTimeStamp\\?"?\s*[:=]\s*\\?"?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/;
+const RESETS_IN = /\bResets in\s+(?=\d)(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:(\d+(?:\.\d+)?)s)?/i;
 
 // Parses "resets 12am (America/Los_Angeles)", "resets Sep 28 at 9am (...)",
 // and Codex "Try again at Sep 24th, 2026 9:25 AM." into an ISO time. The
 // time is interpreted in the machine's local zone, which is the owner's
-// zone for this daemon; unparseable text returns null.
+// zone for this daemon; unparseable text returns null. Antigravity's exact
+// reset stamp wins; its "Resets in 2h6m11s" counts from now (the error's
+// own time, as callers pass it).
 export function parseResetAt(text, now = new Date()) {
   const source = String(text ?? "");
+  const stamp = QUOTA_RESET_STAMP.exec(source);
+  if (stamp && Number.isFinite(Date.parse(stamp[1]))) return new Date(stamp[1]).toISOString();
+  const delay = RESETS_IN.exec(source);
+  if (delay && (delay[1] || delay[2] || delay[3])) {
+    const ms = ((Number(delay[1] ?? 0) * 60 + Number(delay[2] ?? 0)) * 60 + Number(delay[3] ?? 0)) * 1000;
+    return new Date(now.getTime() + Math.round(ms)).toISOString();
+  }
   const claude = /resets\s+(?:(\w{3})\w*\s+(\d{1,2})\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i.exec(source);
   const codex = /[Tt]ry again at\s+(?:(\w{3})\w*\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+)?(\d{1,2}):(\d{2})\s*(AM|PM)/.exec(source);
   let month; let day; let year; let hour; let minute; let meridiem;

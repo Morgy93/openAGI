@@ -11,9 +11,10 @@ import { threadHealth } from "./classify.js";
 const SOURCE = "integration:fleet-supervisor";
 export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough", "fleet_diagnose", "feedback_record", "self_fix_list", "self_fix_start", "self_fix_revise", "self_fix_stop"]);
 // Everything a voice session may call: the fleet set plus the above. No
-// merge, release, deploy or restart-hub tool exists on purpose.
+// merge, release, deploy or restart-hub tool exists on purpose. Scans can
+// send nudges in Auto mode, so voice uses the read-only fleet_status.
 export const VOICE_SESSION_TOOLS = Object.freeze([
-  "fleet_status", "fleet_thread", "fleet_screen", "fleet_scan", "fleet_send_message", "fleet_answer_question", "fleet_click", "fleet_app",
+  "fleet_status", "fleet_thread", "fleet_screen", "fleet_send_message", "fleet_answer_question", "fleet_click", "fleet_app",
   ...VOICE_TOOL_NAMES
 ]);
 const SCOPES = ["questions", "blocked", "fixes", "suggestions", "all"];
@@ -213,8 +214,14 @@ export function registerVoiceTools(registry, supervisor) {
   if (typeof supervisor.stopFix === "function") registry.register({ name: "self_fix_stop", source: SOURCE,
     description: "Stop a self-fix now (fixId) or every one (\"all\"): kills its run and marks it abandoned; the worktree is kept. No confirmation needed.",
     parameters: { type: "object", properties: { fixId: { type: "string", maxLength: 80 } }, required: ["fixId"], additionalProperties: false },
-    handler: async (args) => {
+    handler: async (args, context) => {
+      const voice = voiceOf(context);
       const id = typeof args?.fixId === "string" ? args.fixId.trim() : "";
+      const words = String(voice?.ownerText ?? "").trim();
+      const stop = /^(?:(?:please|hey|okay|ok)[,!.]?\s+|(?:can|could|would) you\s+|i want (?:you )?to\s+)*(?:stop|cancel|abort|halt)(?:\s+(?:(?:all(?: of)?|the|that|this|my)\s+)*(?:self[- ]?fix(?:es)?|fix(?:es)?|everything|all|it))?[.!,]?$/i;
+      if ((voice || context?.channel === "voice") && (!stop.test(words) || (id === "all" && !/\b(?:all|everything)\b/i.test(words)))) {
+        throw new Error("Ask to stop the fix in your own words first.");
+      }
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new Error("Pass a fix id from self_fix_list, or \"all\".");
       const stopped = (await supervisor.stopFix(id)) ?? [];
       return { stopped: stopped.map((fix) => fix.id), note: stopped.length ? "Stopped." : "Nothing was running under that id." };
