@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { DEFAULTS, SUPERVISOR_PREFIX, resolveFleetConfig } from "../src/fleet/contracts.js";
-import { decodeStep, findLanguageServer, listAntigravityThreads, quotaResetFor } from "../src/fleet/sources/antigravity.js";
+import { decodeStep, findLanguageServer, listAntigravityThreads, quotaResetFor, readAntigravityDb } from "../src/fleet/sources/antigravity.js";
 import { classifyThread } from "../src/fleet/classify.js";
 
 const NOW = Date.parse("2026-10-14T06:00:00.000Z");
@@ -208,7 +208,7 @@ test("run status, background work, approvals and the owner's stop", async (t) =>
   writeSteps(home, "cut", [step.reply("Earlier.", iso(5 * MIN)), step.cut(iso(2 * MIN))]);
   const byId = new Map((await list(home)).map((thread) => [thread.id, thread]));
   assert.equal(byId.get("run").agentStatus, "running");
-  assert.equal(byId.get("bg").agentStatus, "running");
+  assert.equal(byId.get("bg").agentStatus, "waiting");
   assert.equal(byId.get("bg").meta.notFullyIdle, true);
   // Busy with no step for longer than the silent window: the server died mid-run.
   assert.equal(byId.get("hung").agentStatus, "stalled");
@@ -313,6 +313,7 @@ test("findLanguageServer reads the pid and token from ps, the RPC port from lsof
 test("a send-time re-read takes one conversation whatever its age", async (t) => {
   const home = makeHome(t);
   writeSummaries(home, [{ id: "old-1", modified: goTime(72 * 60 * MIN) }, { id: "new-1" }]);
+  writeSteps(home, "old-1", [step.reply("Done.", iso(72 * 60 * MIN))]);
   const threads = await list(home, { only: ["old-1"] });
   assert.deepEqual(threads.map((thread) => thread.id), ["old-1"]);
 });
@@ -337,4 +338,52 @@ test("reads rows still in the WAL of a database the app holds open, and never cr
     VALUES ('c2', 'fresh', ?, '["file:///work/app"]', ?)`).run(goTime(1 * MIN), GO_ZERO);
   assert.deepEqual(sidecars(), ["-wal", "-shm"]);
   assert.deepEqual((await list(home)).map((thread) => thread.id).sort(), ["c1", "c2"]);
+});
+
+
+test("long tools and background work stay busy while the language server is alive", async (t) => {
+  const home = makeHome(t);
+  writeSummaries(home, [{ id: "run", status: "CASCADE_RUN_STATUS_RUNNING", modified: goTime(90 * MIN) }, { id: "bg", notFullyIdle: true, modified: goTime(90 * MIN) }]);
+  writeSteps(home, "run", [step.tool(2, iso(90 * MIN))]);
+  writeSteps(home, "bg", [step.reply("Server up.", iso(90 * MIN))]);
+  const threads = new Map((await list(home, { languageServer: { address: "127.0.0.1:1" } })).map((thread) => [thread.id, thread]));
+  assert.equal(threads.get("run").agentStatus, "running");
+  assert.equal(threads.get("bg").agentStatus, "waiting");
+  assert.equal(threads.get("bg").meta.blockedOnOwner, false);
+});
+
+test("refilled quota never moves an exact error reset earlier", () => {
+  const exact = "2026-10-14T06:15:03.000Z";
+  const thread = { error: { kind: "usage-limit", resetAt: exact }, meta: { model: "gemini-4-argon-high" }, lastActivityAt: iso(10 * MIN) };
+  assert.equal(quotaResetFor(thread, [{ family: "gemini", remaining: 0.3, resetAt: "2026-10-14T07:04:08.000Z" }]), null);
+  assert.equal(quotaResetFor(thread, [{ family: "gemini", remaining: 0, resetAt: "2026-10-14T07:04:08.000Z" }]), "2026-10-14T07:04:08.000Z");
+});
+
+test("failed WAL reads never fall back to stale immutable rows", async (t) => {
+  const home = makeHome(t);
+  const file = path.join(home, "broken.db");
+  for (const suffix of ["", "-wal", "-shm"]) fs.writeFileSync(file + suffix, "fixture");
+  let fallback = 0;
+  await assert.rejects(readAntigravityDb(file, () => { throw new Error("busy"); }, { open: async () => ({ close() {} }), immutable: async () => { fallback += 1; } }), /busy/);
+  assert.equal(fallback, 0);
+});
+
+test("the app closing its WAL during a snapshot never opens or writes its database", async (t) => {
+  const home = makeHome(t);
+  const file = path.join(home, "closing.db");
+  for (const suffix of ["", "-wal", "-shm"]) fs.writeFileSync(file + suffix, "fixture");
+  let opened = false;
+  await assert.rejects(readAntigravityDb(file, () => [], { copy: (source, target) => { fs.copyFileSync(source, target); if (source === file) { fs.unlinkSync(file + "-wal"); fs.unlinkSync(file + "-shm"); } }, open: async () => { opened = true; } }), /ENOENT/);
+  assert.equal(opened, false);
+  assert.equal(fs.existsSync(file + "-wal"), false);
+  assert.equal(fs.existsSync(file + "-shm"), false);
+});
+
+test("failed step opens are retried with an unchanged summary and refresh bypasses the cache", async (t) => {
+  const home = makeHome(t);
+  writeSummaries(home, [{ id: "q1" }]);
+  writeSteps(home, "q1", [step.error(QUOTA_TEXT, quotaDetails("2026-10-14T06:15:03Z"), iso(10 * MIN))]);
+  assert.equal((await list(home, { readDatabase: async () => null }))[0].error, null);
+  assert.equal((await list(home))[0].error.kind, "usage-limit");
+  await assert.rejects(list(home, { only: ["q1"], readDatabase: async () => null }), /steps unavailable/);
 });

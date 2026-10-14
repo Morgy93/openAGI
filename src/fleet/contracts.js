@@ -256,7 +256,7 @@ export function resolveOcuPath(env = process.env, { exists = fs.existsSync, real
 // Non-UI routes a computer-use send may fall back to while the owner is at
 // the Mac (so nothing takes the screen). claude-resume is never one: it
 // forks a session behind Conductor.
-export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay"]);
+export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay", "antigravity-send"]);
 
 export function parseBackgroundRoutes(value) {
   const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);

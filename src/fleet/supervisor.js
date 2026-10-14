@@ -2430,6 +2430,7 @@ export class FleetSupervisor {
         // The app that shows it (fleet_app pins the chats an app action stops)
         // and the permission card it waits on (fleet_click's labels).
         app: uiTargetFor(thread)?.app ?? null,
+        ...(thread.kind === "antigravity" && thread.meta?.openChat ? { openChat: thread.meta.openChat } : {}),
         ...(thread.meta?.prompt ? { prompt: { text: clampText(thread.meta.prompt.text, 300), buttons: thread.meta.prompt.buttons, stateId: thread.meta.prompt.stateId } } : {}),
         route: chooseRoute(thread, mode, delivery),
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null } : null,

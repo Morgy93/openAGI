@@ -568,6 +568,7 @@ details.thread>summary{padding:0}
 
     var more = el('div', 'more', null, d);
     line(more, 'Agent', [t.kind, t.agentStatus].filter(Boolean).join(', '));
+    if (t.kind === 'antigravity' && t.openChat) line(more, 'Open chat', t.openChat.note);
     var w = t.watch || null;
     if (w && w.runningSince) line(more, 'Turn running', 'for ' + dur(w.runningSince) + ' (since ' + when(w.runningSince) + ')');
     if (w && w.waitSince && w.group !== 'waiting') line(more, 'Waiting', 'for ' + dur(w.waitSince));

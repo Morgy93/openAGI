@@ -234,7 +234,7 @@ function onUser(summary, row) {
     summary.lastUserText = text;
     summary.lastUserAt = toIso(row.timestamp);
     summary.workflowLimit = null;
-  } else if (text.startsWith(SUPERVISOR_PREFIX)) {
+  } else if (text.startsWith(SUPERVISOR_PREFIX) || ((NON_OWNER_TURNS.has(row.turnOrigin) || row.promptSource === "system" || NON_OWNER_ORIGINS.has(row.origin?.kind)) && text.includes(SUPERVISOR_PREFIX))) {
     summary.lastSupervisorAt = toIso(row.timestamp);
     summary.workflowLimit = null;
   }
@@ -258,6 +258,7 @@ function onAssistant(summary, row) {
   for (const block of blocks) {
     if (block?.type !== "tool_use") continue;
     usesTool = true;
+    summary.workflowLimit = null;
     if (block.id) summary.toolDescriptions.set(block.id, clampText(block.input?.description ?? block.name ?? "", 120));
     if (STOP_TOOLS.has(block.name)) {
       const taskId = block.input?.task_id ?? block.input?.shell_id ?? block.input?.bash_id;
@@ -271,6 +272,8 @@ function onAssistant(summary, row) {
   const relayed = blocks.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
     && typeof block.input?.message === "string")?.input.message.trim();
   const said = relayed || text;
+  // A finished reply that no longer reports the cap supersedes the report.
+  if (summary.workflowLimit && said && TURN_END_STOPS.has(message.stop_reason) && !ACCOUNT_LIMITS.has(classifyErrorText(said)?.kind) && !/session limit|usage limit|quota|account cap/i.test(said)) summary.workflowLimit = null;
   if (said) {
     summary.lastAgentText = said;
     summary.lastAgentAt = toIso(row.timestamp);

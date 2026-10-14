@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
 import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
-import { findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
+import { runStatusOf, findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
 import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
 import { DEADLINE_MARGIN_MS, UI_LOCK, flattenMessage, uiIdentity } from "./ui-delivery.js";
@@ -264,6 +264,10 @@ export function backgroundRouteFor(thread, config) {
   return null;
 }
 
+function antigravityBusy(thread) {
+  return thread.agentStatus === "running" || ["RUNNING", "BUSY", "CANCELING"].includes(runStatusOf(thread.meta?.runStatus)) || thread.meta?.notFullyIdle === true;
+}
+
 function checkPreconditions(thread, route, message, config, fallback = false) {
   if (!thread?.key) return "no thread";
   if (!ROUTES.includes(route)) return "no delivery route";
@@ -290,8 +294,9 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
   if (route === "peer-relay" && !thread.live?.peerName) return "no live peer";
   if (route === "antigravity-send") {
     if (thread.kind !== "antigravity") return "antigravity-send needs an Antigravity conversation";
-    // A message to a running conversation waits for its next turn, unseen until then.
-    if (thread.agentStatus === "running") return "turn running";
+    if (["computer-use", "computer-use-first"].includes(config?.delivery) && !config.backgroundRoutes?.includes(route)) return "Antigravity background delivery is not allowed: enable antigravity-send in backgroundRoutes";
+    // A message to a busy conversation queues unseen behind its current work.
+    if (antigravityBusy(thread)) return "turn running or background work active";
     if (thread.meta?.blockedOnOwner === true) return "waiting on an approval in Antigravity: answer it in the app";
   }
   if (route === "claude-resume") {
@@ -324,6 +329,13 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // confirmed. Rebuilt from the action journal so a restart between an
   // uncertain send and its retry does not type the message twice.
   const unconfirmed = new Map();
+  const apiUnconfirmed = new Map();
+  const apiSeen = new Set();
+  for (const action of store?.actions?.(limits.maxActionsKept ?? 500) ?? []) {
+    if (action.route !== "antigravity-send" || apiSeen.has(action.threadKey)) continue;
+    apiSeen.add(action.threadKey);
+    if (action.unconfirmed) apiUnconfirmed.set(action.threadKey, { hash: action.messageHash, at: Date.parse(action.apiStartedAt ?? action.at) });
+  }
   try {
     const seen = new Set();
     for (const action of store?.actions?.(limits.maxActionsKept ?? 500) ?? []) {
@@ -450,7 +462,9 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // got an owner message since the scan is left alone. The server address
   // and csrf token go to this child only, read fresh from the running app.
   const apiSend = async (thread, step, base, actionId, blocked, timeoutMs) => {
+    const startedAt = Date.now();
     let fresh = thread;
+    if (!refreshThread) return blocked("could not read the conversation again: scan again");
     if (refreshThread) {
       try {
         fresh = await within(Promise.resolve().then(() => refreshThread(thread)), REFRESH_MAX_MS);
@@ -458,9 +472,19 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         fresh = null;
       }
       if (!fresh) return blocked("could not read the conversation again: scan again");
-      if (fresh.agentStatus === "running") return blocked("turn running");
+      if (antigravityBusy(fresh)) return blocked("turn running or background work active");
       if (fresh.meta?.blockedOnOwner === true) return blocked("waiting on an approval in Antigravity: answer it in the app");
       if ((Date.parse(fresh.lastUserAt ?? "") || 0) > (Date.parse(thread.lastUserAt ?? "") || 0)) return blocked("the owner wrote in the conversation since the scan");
+    }
+    const uncertain = apiUnconfirmed.get(thread.key);
+    if (uncertain) {
+      if ((Date.parse(fresh.meta?.lastSupervisorAt ?? "") || 0) < uncertain.at) return { ...blocked("earlier agentapi delivery is unconfirmed: inspect the conversation before retrying"), unconfirmed: true };
+      apiUnconfirmed.delete(thread.key);
+      if (uncertain.hash === base.messageHash) {
+        const detail = "earlier delivery confirmed in the conversation";
+        const id = journal(actionId, { ...base, status: "sent", unconfirmed: false, detail, finishedAt: new Date().toISOString() });
+        return { status: "sent", route: base.route, detail, actionId: id };
+      }
     }
     let server = null;
     try { server = await findLanguageServer(config, { run: runner }); } catch { server = null; }
@@ -472,25 +496,24 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       ANTIGRAVITY_CSRF_TOKEN: server.csrfToken,
       ...(projectId ? { ANTIGRAVITY_PROJECT_ID: projectId } : {})
     };
-    active.add(thread.key);
     let result;
     try {
       result = await runner(step.cmd, step.args, { env, timeoutMs });
     } catch (error) {
       result = { code: null, stdout: "", stderr: "", timedOut: false, error: error?.message ?? String(error) };
-    } finally {
-      active.delete(thread.key);
     }
     let reply = null;
     try { reply = JSON.parse(String(result?.stdout ?? "").trim()); } catch { /* not JSON */ }
     let detail = null;
     if (result?.timedOut) detail = `agentapi timed out after ${Math.round(timeoutMs / 1000)}s; it may have delivered`;
-    else if (reply?.response?.sendMessage) detail = null;
+    else if (result?.code === 0 && !result?.error && !reply?.error) detail = null;
     else detail = `agentapi failed: ${firstLine(typeof reply?.error === "string" ? reply.error : "") || firstLine(result?.error) || firstLine(result?.stderr) || firstLine(result?.stdout) || `exit ${result?.code}`}`;
-    const status = detail ? "failed" : "sent";
+    const status = result?.timedOut ? "blocked" : detail ? "failed" : "sent";
+    const extra = result?.timedOut ? { unconfirmed: true, apiStartedAt: new Date(startedAt).toISOString() } : {};
     const finalDetail = detail ? detailText(detail) : "delivered to the Antigravity conversation";
-    const id = journal(actionId, { ...base, status, detail: finalDetail, finishedAt: new Date().toISOString() });
-    return { status, route: base.route, detail: finalDetail, actionId: id };
+    const id = journal(actionId, { ...base, status, detail: finalDetail, ...extra, finishedAt: new Date().toISOString() });
+    if (result?.timedOut) apiUnconfirmed.set(thread.key, { hash: base.messageHash, at: startedAt });
+    return { status, route: base.route, detail: finalDetail, actionId: id, ...extra };
   };
 
   // Synchronous: the result is final when this returns, so there is no done
@@ -740,7 +763,12 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     if (step.api) {
       const apiMs = left - DEFAULTS.uiKillGraceMs;
       if (apiMs < AGENTAPI_MIN_MS) return blocked("no time left in this request to deliver; not sent, retry");
-      return apiSend(thread, step, base, actionId, blocked, Math.min(AGENTAPI_TIMEOUT_MS, apiMs));
+      active.add(thread.key);
+      try {
+        return await apiSend(thread, step, base, actionId, blocked, Math.min(AGENTAPI_TIMEOUT_MS, apiMs));
+      } finally {
+        active.delete(thread.key);
+      }
     }
     const relayMs = left - DEFAULTS.uiKillGraceMs;
     if (step.background ? left <= 0 : relayMs < RELAY_MIN_MS) return blocked("no time left in this request to deliver; not sent, retry");

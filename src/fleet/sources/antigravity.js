@@ -1,17 +1,14 @@
 // Antigravity conversations (Google's agent app), read-only. Its language
 // server keeps one summary row per conversation in conversation_summaries.db
 // and each conversation's steps, as protobuf blobs, in conversations/<id>.db.
-// Both are SQLite in WAL mode and the owner's live work: each is opened
-// read-only, read once and closed, never written. A read-only open of a WAL
-// database creates its -wal and -shm files when they are missing, so one
-// opens read-only only while both exist (the app has it open and the newest
-// rows are still in the WAL); otherwise it is read as an immutable snapshot,
-// which creates and locks nothing. The running server's loopback API adds
-// the quota reset time; it is found from the server's ps args, and its csrf
-// token is never logged, journaled or stored.
+// Both are SQLite in WAL mode and the owner's live work. Closed databases
+// are immutable reads; open ones are copied into a private temporary folder
+// and opened read-only there, then removed. No app files are written. The
+// loopback API adds quota reset times; its csrf token is never stored.
 
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { classifyErrorText } from "../errors.js";
 import {
@@ -186,26 +183,33 @@ export function summarizeSteps(rows) {
 
 // ---------- SQLite ----------
 
-// Reads with a read-only handle while the app holds the WAL open (both its
-// files exist), else from an immutable snapshot; a read that fails on the
-// first handle is tried once on the snapshot. null when neither opens.
-async function readDb(file, read) {
-  const walOpen = fs.existsSync(`${file}-wal`) && fs.existsSync(`${file}-shm`);
-  const openers = walOpen ? [openReadOnlyDb, openImmutableDb] : [openImmutableDb];
-  let failure = null;
-  for (const open of openers) {
-    const db = await open(file);
-    if (!db) continue;
-    try {
-      return { value: read(db) };
-    } catch (error) {
-      failure = error;
-    } finally {
-      try { db.close(); } catch { /* ignore */ }
-    }
+// Copy an open WAL database before reading: SQLite never touches the app's
+// side files, even if the app closes them during the read. A changing copy
+// fails closed; an immutable fallback would miss the newest WAL rows.
+export async function readAntigravityDb(file, read, { open = openReadOnlyDb, immutable = openImmutableDb, copy = fs.copyFileSync } = {}) {
+  const wal = `${file}-wal`;
+  let dir = null;
+  let db = null;
+  try {
+    if (fs.existsSync(wal)) {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-ag-read-"));
+      const snapshot = path.join(dir, "snapshot.db");
+      const files = [file, wal, `${file}-shm`];
+      const before = files.map((name) => fs.statSync(name));
+      files.forEach((name, index) => copy(name, `${snapshot}${["", "-wal", "-shm"][index]}`));
+      // The shared-memory reader marks can change without changing the data.
+      for (const index of [0, 1]) {
+        const after = fs.statSync(files[index]);
+        if (after.ino !== before[index].ino || after.size !== before[index].size || after.mtimeMs !== before[index].mtimeMs) throw new Error("Antigravity database changed during snapshot");
+      }
+      db = await open(snapshot);
+    } else db = await immutable(file);
+    if (!db) throw new Error("Antigravity database unavailable");
+    return { value: read(db) };
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
-  if (failure) throw failure;
-  return null;
 }
 
 // "2026-10-14 14:50:09.778434+00:00"; Go's zero time ("0001-01-01 ...") is none.
@@ -226,30 +230,46 @@ function workspaceDir(value) {
   try { return fileURLToPath(uri); } catch { return null; }
 }
 
-async function readSteps(file, stamp) {
+async function readSteps(file, stamp, { fresh = false, readDatabase = readAntigravityDb } = {}) {
   const cached = stepCache.get(file);
-  if (cached && cached.stamp === stamp) return cached.summary;
-  if (!fs.existsSync(file)) return summarizeSteps([]);
-  const read = await readDb(file, (db) => db.prepare(STEPS_SQL).all(TAIL_STEPS));
+  if (!fresh && cached && cached.stamp === stamp) return cached.summary;
+  if (!fs.existsSync(file)) {
+    if (fresh) throw new Error("Antigravity steps unavailable");
+    return summarizeSteps([]);
+  }
+  const read = await readDatabase(file, (db) => db.prepare(STEPS_SQL).all(TAIL_STEPS));
+  if (!read) throw new Error("Antigravity steps unavailable");
   const summary = summarizeSteps(read?.value ?? []);
   if (stepCache.size >= STEP_CACHE_MAX) stepCache.delete(stepCache.keys().next().value);
   stepCache.set(file, { stamp, summary });
   return summary;
 }
 
-function statusOf(row, steps, lastActivityAt, now, limits) {
+// The run's status without its enum prefix: "RUNNING", "IDLE", ...
+export function runStatusOf(value) {
+  return String(value ?? "").replace(/^CASCADE_RUN_STATUS_/, "");
+}
+
+// A busy run (or an active newest step) with no step for the silent window.
+// It is stalled only when no language server runs: a live server may be on
+// one long tool step, or on a subagent whose steps go to its own database.
+function silentBusy(row, steps, lastActivityAt, now, limits) {
+  if (!RUN_BUSY.has(runStatusOf(row.status)) && !steps.active) return false;
+  return now - (Date.parse(lastActivityAt ?? "") || 0) >= limits.silentTurnMs;
+}
+
+function statusOf(row, steps, lastActivityAt, now, limits, serverAlive) {
   if (truthy(row.killed)) return "aborted";
   if (steps.waiting) return "waiting";
-  const run = String(row.status ?? "").replace(/^CASCADE_RUN_STATUS_/, "");
-  // not_fully_idle: subagents or background commands still run (the app
-  // shows a spinner and "Stop execution").
-  if (RUN_BUSY.has(run) || truthy(row.not_fully_idle) || steps.active) {
-    // A server that died mid-run leaves its row busy; past the silent window it is stalled.
-    const age = now - (Date.parse(lastActivityAt ?? "") || 0);
-    return age >= limits.silentTurnMs ? "stalled" : "running";
+  if (RUN_BUSY.has(runStatusOf(row.status)) || steps.active) {
+    // A server that died mid-run leaves its row busy.
+    return !serverAlive && silentBusy(row, steps, lastActivityAt, now, limits) ? "stalled" : "running";
   }
+  // not_fully_idle on an idle run: background commands or subagents still
+  // run after the reply (the app shows a spinner and "Stop execution").
+  if (truthy(row.not_fully_idle)) return "waiting";
   if (steps.error) return "error";
-  return run === "IDLE" ? "idle" : "unknown";
+  return runStatusOf(row.status) === "IDLE" ? "idle" : "unknown";
 }
 
 function threadErrorOf(stepError, fallbackAt, now, excerptMax) {
@@ -261,12 +281,14 @@ function threadErrorOf(stepError, fallbackAt, now, excerptMax) {
   return { kind: classified.kind, text: clampText(redactSecrets(stepError.text), excerptMax), resetAt: classified.resetAt };
 }
 
-function buildThread(row, steps, { config, now }) {
+const lastActivityOf = (row, steps) => [dbTime(row.last_modified_time), steps.lastStepAt].filter(Boolean).sort().at(-1) ?? null;
+
+function buildThread(row, steps, { config, now, serverAlive }) {
   const { limits } = config;
   const id = String(row.conversation_id);
   const cwd = workspaceDir(row.workspace_uris);
-  const lastActivityAt = [dbTime(row.last_modified_time), steps.lastStepAt].filter(Boolean).sort().at(-1) ?? null;
-  const agentStatus = statusOf(row, steps, lastActivityAt, now, limits);
+  const lastActivityAt = lastActivityOf(row, steps);
+  const agentStatus = statusOf(row, steps, lastActivityAt, now, limits, serverAlive);
   const error = agentStatus === "error" ? threadErrorOf(steps.error, lastActivityAt, now, limits.excerptMax) : null;
   const lastUserAt = dbTime(row.last_user_input_time) ?? steps.lastUserAt;
   const title = String(row.title ?? "").trim() || path.basename(cwd ?? "") || "Antigravity conversation";
@@ -307,8 +329,9 @@ function buildThread(row, steps, { config, now }) {
       abortReason: agentStatus === "aborted" ? "aborted by user" : null,
       abortedAt: agentStatus === "aborted" ? lastActivityAt : null,
       lastSupervisorAt: steps.lastSupervisorAt,
-      // A tool step waits for the owner's approval in the app.
-      blockedOnOwner: agentStatus === "waiting",
+      // A tool step waits for the owner's approval in the app (background
+      // work is "waiting" too, but on nothing the owner holds).
+      blockedOnOwner: agentStatus === "waiting" && steps.waiting,
       runStatus: String(row.status ?? "") || null,
       notFullyIdle: truthy(row.not_fully_idle),
       projectId: String(row.project_id ?? "") || null,
@@ -414,7 +437,10 @@ export async function readQuota(server, { fetchImpl = globalThis.fetch } = {}) {
 // The limit's reset as the quota shows it now: the error's own time when the
 // model's family has quota again (the reset has passed), else the family's
 // window reset. The reset time means something only while quota is used up.
-// null when the quota cannot tell.
+// An exact reset in the error (quotaResetTimeStamp) is never moved earlier:
+// the error and the quota can count different windows, so a family that
+// shows quota left may still be over the limit that stopped this run.
+// null when the quota cannot tell, or tells nothing past the error's own.
 export function quotaResetFor(thread, quota) {
   const error = thread?.error;
   if (!error || !LIMIT_KINDS.has(error.kind) || !Array.isArray(quota) || !quota.length) return null;
@@ -422,20 +448,33 @@ export function quotaResetFor(thread, quota) {
   const pool = family ? quota.filter((entry) => entry.family === family) : quota;
   if (!pool.length) return null;
   const spent = pool.filter((entry) => !(entry.remaining > 0));
-  if (!spent.length) return thread.lastActivityAt ?? null;
-  if (!family) return null;
-  const resets = spent.map((entry) => entry.resetAt).filter((at) => Number.isFinite(Date.parse(at ?? ""))).sort();
-  return resets.at(-1) ?? null;
+  let resetAt = null;
+  if (!spent.length) resetAt = thread.lastActivityAt ?? null;
+  else if (family) resetAt = spent.map((entry) => entry.resetAt).filter((at) => Number.isFinite(Date.parse(at ?? ""))).sort().at(-1) ?? null;
+  const exact = Date.parse(error.resetAt ?? "");
+  if (!resetAt || (Number.isFinite(exact) && !(Date.parse(resetAt) > exact))) return null;
+  return resetAt;
 }
 
-async function applyQuota(threads, options, config) {
+// The running language server, looked up at most once per listing and only
+// when something needs it. null when none runs or the lookup fails.
+function serverLookup(options, config) {
+  let found;
+  return async () => {
+    if (options.languageServer !== undefined) return options.languageServer;
+    found ??= findLanguageServer(config, { run: options.run ?? runCommand, fetchImpl: options.fetchImpl ?? globalThis.fetch }).catch(() => null);
+    return found;
+  };
+}
+
+async function applyQuota(threads, options, server) {
   const limited = threads.filter((thread) => LIMIT_KINDS.has(thread.error?.kind));
   if (!limited.length) return;
-  const { run = runCommand, fetchImpl = globalThis.fetch } = options;
+  const { fetchImpl = globalThis.fetch } = options;
   let quota = null;
   try {
-    const server = options.languageServer !== undefined ? options.languageServer : await findLanguageServer(config, { run, fetchImpl });
-    if (server) quota = await readQuota(server, { fetchImpl });
+    const found = await server();
+    if (found) quota = await readQuota(found, { fetchImpl });
   } catch {
     // No quota read: the error's own reset time stands.
   }
@@ -457,7 +496,7 @@ export async function listAntigravityThreads(config, options = {}) {
   // No Antigravity install is an empty list. An unreadable database throws,
   // so the supervisor records a source error instead of seeing zero threads.
   if (!fs.existsSync(file)) return [];
-  const read = await readDb(file, (db) => db.prepare("SELECT * FROM conversation_summaries").all());
+  const read = await readAntigravityDb(file, (db) => db.prepare("SELECT * FROM conversation_summaries").all());
   if (!read) throw new Error("Antigravity database unavailable");
   const { now = Date.now() } = options;
   const cutoff = now - config.lookbackHours * 3_600_000;
@@ -472,18 +511,24 @@ export async function listAntigravityThreads(config, options = {}) {
     .filter((entry) => (only ? only.has(String(entry.row.conversation_id)) : entry.at >= cutoff))
     .sort((a, b) => b.at - a.at || String(a.row.conversation_id).localeCompare(String(b.row.conversation_id)))
     .slice(0, config.limits.maxThreads);
-  const threads = [];
+  const entries = [];
   for (const { row } of rows) {
     const id = String(row.conversation_id);
     // A conversation whose steps cannot be read still shows, from its summary row.
     let steps;
     try {
-      steps = await readSteps(path.join(home, "conversations", `${id}.db`), `${row.last_modified_time}|${row.step_count}|${row.status}|${row.not_fully_idle}`);
-    } catch {
+      steps = await readSteps(path.join(home, "conversations", `${id}.db`), `${row.last_modified_time}|${row.step_count}|${row.status}|${row.not_fully_idle}`, { fresh: Boolean(only), readDatabase: options.readDatabase });
+    } catch (error) {
+      if (only) throw error;
       steps = summarizeSteps([]);
     }
-    threads.push(buildThread(row, steps, { config, now }));
+    entries.push({ row, steps });
   }
-  if (!only) await applyQuota(threads, options, config);
+  const server = serverLookup(options, config);
+  // A busy row silent past the window is stalled only with no server running.
+  const silent = entries.some(({ row, steps }) => silentBusy(row, steps, lastActivityOf(row, steps), now, config.limits));
+  const serverAlive = silent ? Boolean(await server()) : true;
+  const threads = entries.map(({ row, steps }) => buildThread(row, steps, { config, now, serverAlive }));
+  if (!only) await applyQuota(threads, options, server);
   return threads;
 }

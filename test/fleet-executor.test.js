@@ -940,10 +940,10 @@ test("spawnWithTail with detach leaves a turn running past the ceiling and repor
   assert.match(late.tail, /pushed the fix/);
 });
 
-function antigravitySetup(t, { results = [], fresh = undefined, server = undefined, delivery = undefined } = {}) {
+function antigravitySetup(t, { results = [], fresh = undefined, server = undefined, delivery = undefined, backgroundRoutes = undefined, refresh = null } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-ag-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const config = resolveFleetConfig({}, { home, bins: { agentapi: "/abs/agentapi" }, ...(delivery ? { delivery } : {}) });
+  const config = resolveFleetConfig({}, { home, bins: { agentapi: "/abs/agentapi" }, ...(delivery ? { delivery } : {}), ...(backgroundRoutes ? { backgroundRoutes } : {}) });
   const store = new FleetStore({ dir: path.join(home, "fleet") });
   const calls = [];
   const run = (cmd, args, options = {}) => {
@@ -955,7 +955,7 @@ function antigravitySetup(t, { results = [], fresh = undefined, server = undefin
   const refreshed = [];
   const executor = createExecutor({
     config, run, store,
-    refreshThread: async (thread) => { refreshed.push(thread.key); return fresh === undefined ? thread : fresh; },
+    refreshThread: async (thread) => { refreshed.push(thread.key); return refresh ? refresh(thread) : fresh === undefined ? thread : fresh; },
     findLanguageServer: async () => ls
   });
   return { home, config, store, calls, executor, refreshed };
@@ -1024,10 +1024,70 @@ test("antigravity-send without a running app, or with agentapi failing, says why
 });
 
 test("antigravity-send works on a computer-use-only Mac and dry-runs without running", async (t) => {
-  const { calls, executor } = antigravitySetup(t, { delivery: "computer-use", results: [{ stdout: '{"response":{"sendMessage":{}}}' }] });
+  const { calls, executor } = antigravitySetup(t, { delivery: "computer-use", backgroundRoutes: ["antigravity-send"], results: [{ stdout: '{"response":{"sendMessage":{}}}' }] });
   const dry = await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send", dryRun: true });
   assert.equal(dry.status, "dry-run");
   assert.match(dry.detail, /agentapi send-message e8b9db19/);
   assert.equal(calls.length, 0);
   assert.equal((await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" })).status, "sent");
+});
+
+
+test("Antigravity reserves the thread before refreshing and releases every blocked send", async (t) => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const setup = antigravitySetup(t, { refresh: async (thread) => { await gate; return thread; } });
+  const request = { thread: antigravityThread(), message: "resume", route: "antigravity-send" };
+  const first = setup.executor.deliver(request);
+  assert.deepEqual(setup.executor.inFlight(), [request.thread.key]);
+  const second = await setup.executor.deliver(request);
+  assert.match(second.detail, /in flight/);
+  release();
+  assert.equal((await first).status, "sent");
+  assert.equal(setup.calls.length, 1);
+  assert.deepEqual(setup.executor.inFlight(), []);
+  const blocked = antigravitySetup(t, { fresh: null });
+  await blocked.executor.deliver(request);
+  assert.deepEqual(blocked.executor.inFlight(), []);
+});
+
+test("Antigravity busy metadata blocks both scan and fresh delivery regardless of displayed status", async (t) => {
+  for (const meta of [{ runStatus: "CASCADE_RUN_STATUS_RUNNING" }, { runStatus: "BUSY" }, { notFullyIdle: true }]) {
+    const thread = antigravityThread({ agentStatus: "stalled", meta });
+    const scan = antigravitySetup(t);
+    assert.match((await scan.executor.deliver({ thread, message: "resume", route: "antigravity-send" })).detail, /turn running/);
+    const fresh = antigravitySetup(t, { fresh: thread });
+    assert.match((await fresh.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).detail, /turn running/);
+    assert.equal(scan.calls.length + fresh.calls.length, 0);
+  }
+});
+
+test("Antigravity requires an explicit background allowance in computer-use modes", async (t) => {
+  for (const delivery of ["computer-use", "computer-use-first"]) {
+    const setup = antigravitySetup(t, { delivery });
+    assert.match((await setup.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).detail, /background delivery is not allowed/);
+    assert.equal(setup.calls.length, 0);
+  }
+});
+
+test("agentapi timeout stays unconfirmed across retries and executor restart", async (t) => {
+  const setup = antigravitySetup(t, { results: [{ timedOut: true }] });
+  const request = { thread: antigravityThread(), message: "resume", route: "antigravity-send" };
+  const first = await setup.executor.deliver(request);
+  assert.equal(first.status, "blocked");
+  assert.equal(first.unconfirmed, true);
+  assert.equal(setup.store.action(first.actionId).unconfirmed, true);
+  assert.match((await setup.executor.deliver(request)).detail, /unconfirmed/);
+  const restarted = createExecutor({ config: setup.config, store: setup.store, run: () => { throw new Error("must not send again"); }, refreshThread: async () => request.thread });
+  assert.match((await restarted.deliver(request)).detail, /unconfirmed/);
+  assert.equal(setup.calls.length, 1);
+  const confirmed = createExecutor({ config: setup.config, store: setup.store, run: () => { throw new Error("must not send again"); }, refreshThread: async () => ({ ...request.thread, meta: { lastSupervisorAt: new Date(Date.now() + 1000).toISOString() } }) });
+  assert.equal((await confirmed.deliver(request)).status, "sent");
+});
+
+test("agentapi accepts exit zero without depending on one JSON success shape", async (t) => {
+  for (const stdout of ["", "Message delivered", '{"ok":true}']) {
+    const setup = antigravitySetup(t, { results: [{ stdout }] });
+    assert.equal((await setup.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).status, "sent");
+  }
 });

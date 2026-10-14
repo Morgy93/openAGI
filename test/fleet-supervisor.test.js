@@ -4304,3 +4304,12 @@ test("an Antigravity conversation stopped on its quota resumes through agentapi 
   const snapshot = await broken.supervisor.tick({ reason: "test" });
   assert.match(snapshot.sourceErrors.antigravity, /unavailable/);
 });
+
+
+test("Antigravity open-chat guidance reaches the public fleet snapshot", async (t) => {
+  const openChat = { app: "antigravity", url: null, label: "Data room", note: "Open Antigravity and pick it in the sidebar." };
+  const thread = makeThread({ key: "antigravity:a1", kind: "antigravity", id: "a1", prRefs: [], meta: { openChat } });
+  const { supervisor } = fixture(t, { threads: [thread] });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(snapshot.threads[0].openChat, openChat);
+});

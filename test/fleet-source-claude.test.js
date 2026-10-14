@@ -700,3 +700,24 @@ test("a workflow whose agents all hit the session limit makes the stopped sessio
   assert.equal(threads.last.agentStatus, "stalled");
   for (const id of ["partial", "mixed", "cleared", "resumed"]) assert.equal(threads[id].error, null, id);
 });
+
+
+test("peer and system resumes and real work clear stale workflow limits", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/work/app";
+  const failure = "[build] failed: You've hit your session limit · resets 2:50am (America/Los_Angeles)";
+  const tails = {
+    peer: (r) => [r.peer("[OpenAGI supervisor] Continue after reset.", iso(20 * MIN)), r.text("Finished.", iso(19 * MIN))],
+    system: (r) => [r.prompt("System wrapper\n[OpenAGI supervisor] Continue.", iso(20 * MIN), { promptSource: "system", turnOrigin: "system" }), r.text("Finished.", iso(19 * MIN))],
+    worked: (r) => [r.tool("Bash", "b1", { command: "echo done" }, iso(20 * MIN)), r.result("b1", "done", iso(19 * MIN)), r.text("Pushed the PR.", iso(18 * MIN))],
+    finished: (r) => [r.text("Completed inline and pushed the PR.", iso(20 * MIN))]
+  };
+  for (const [id, tail] of Object.entries(tails)) {
+    const r = rowsFor(id, cwd);
+    writeTranscript(home, cwd, id, [...r.history(120 * MIN), r.workflowReport("w1", [failure], iso(30 * MIN)), ...tail(r)], NOW - 18 * MIN);
+  }
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  for (const id of Object.keys(tails)) assert.equal(threads[id].error, null, id);
+  assert.equal(threads.peer.meta.lastSupervisorAt, iso(20 * MIN));
+  assert.equal(threads.system.meta.lastSupervisorAt, iso(20 * MIN));
+});
