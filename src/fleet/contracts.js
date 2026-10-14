@@ -138,8 +138,16 @@ export const DEFAULT_LB_URL = null;
 export const DEFAULT_MANAGER_REF = null;
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
 // Model for the review of the needs-you list, chosen by the owner on
-// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
+// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides. Since
+// 2026-10-13 it is the Claude fallback: the review runs on Codex through
+// codex-lb (DEFAULT_REVIEW_CODEX_MODEL) when a provider is configured, and
+// on Claude when that call fails. OPENAGI_FLEET_REVIEW_PROVIDER=codex|claude
+// pins one.
 export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
+export const DEFAULT_REVIEW_CODEX_MODEL = "gpt-6-luna";
+export const REVIEW_PROVIDERS = Object.freeze(["codex", "claude"]);
+// The Codex try leaves the Claude fallback its own full timeout.
+export const DEFAULT_REVIEW_CODEX_TIMEOUT_MS = 180_000;
 export const DEFAULT_REVIEW_MS = 30 * MIN;
 // Sonnet took about 3 minutes on 13 questions, mostly thinking.
 export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
@@ -242,6 +250,12 @@ export function parseDeliveryMode(value) {
   return DELIVERY_MODES.includes(text) ? text : "cli";
 }
 
+// OPENAGI_FLEET_REVIEW_PROVIDER: "codex" or "claude"; anything else is auto (null).
+export function parseReviewProvider(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return REVIEW_PROVIDERS.includes(text) ? text : null;
+}
+
 function envFlag(value) {
   return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
 }
@@ -300,9 +314,13 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // supervisor unless OPENAGI_FLEET_REVIEW=0.
     review: {
       enabled: overrides.review?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_REVIEW)),
-      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
+      // null: codex when the Codex config names a provider (codex-lb),
+      // else claude (resolved in review.js). model null: that provider's default.
+      provider: overrides.review?.provider ?? parseReviewProvider(env.OPENAGI_FLEET_REVIEW_PROVIDER),
+      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || null),
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
-      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
+      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+      codexTimeoutMs: overrides.review?.codexTimeoutMs ?? DEFAULT_REVIEW_CODEX_TIMEOUT_MS
     },
     // The nudge judge (judge.js): a model reads the chat before an automatic
     // nudge. Off unless OPENAGI_FLEET_JUDGE=1 and a model is named.
