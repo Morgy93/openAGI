@@ -18,6 +18,9 @@ const TMP_ROOTS = ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders
 const NON_OWNER_ORIGINS = new Set(["task-notification", "peer"]);
 const NON_OWNER_TURNS = new Set(["task_notification", "peer", "system", "scheduled"]);
 const STOP_TOOLS = new Set(["TaskStop", "KillShell", "KillBash"]);
+// Starting new agent work moves on from an agent limit report; reading a
+// log or checking state does not.
+const AGENT_LAUNCH_TOOLS = new Set(["Workflow", "Agent", "Task"]);
 const PR_URL = /github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/;
 // A transcript's opening prompt is read from its first bytes once the tail
 // no longer holds it, and kept per session: it never changes.
@@ -258,7 +261,7 @@ function onAssistant(summary, row) {
   for (const block of blocks) {
     if (block?.type !== "tool_use") continue;
     usesTool = true;
-    summary.workflowLimit = null;
+    if (AGENT_LAUNCH_TOOLS.has(block.name)) summary.workflowLimit = null;
     if (block.id) summary.toolDescriptions.set(block.id, clampText(block.input?.description ?? block.name ?? "", 120));
     if (STOP_TOOLS.has(block.name)) {
       const taskId = block.input?.task_id ?? block.input?.shell_id ?? block.input?.bash_id;

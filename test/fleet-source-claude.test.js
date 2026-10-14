@@ -681,6 +681,13 @@ test("a workflow whose agents all hit the session limit makes the stopped sessio
   // (b) The report is the last row: the turn never ran, so it stalls.
   write("last", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
     r.workflowReport("w1", [limit("verify")], iso(30 * MIN))]);
+  // (c) The main agent reads the journal, then reports the cap: still limited.
+  write("checked", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
+    r.workflowReport("w1", [limit("build")], iso(32 * MIN)), r.tool("Bash", "b1", { command: "cat journal.jsonl" }, iso(31 * MIN)),
+    r.result("b1", "failed", iso(30 * MIN)), r.text("Every agent hit the session limit; I will resume after it resets.", iso(29 * MIN))]);
+  // (d) A new workflow after the report moves on.
+  write("relaunched", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("build")], iso(40 * MIN)),
+    r.tool("Workflow", "toolu_w2", {}, iso(39 * MIN)), r.result("toolu_w2", "launched", iso(38 * MIN)), r.text("Relaunched; the session limit had reset.", iso(37 * MIN))]);
   // One agent finished, or a failure that is not a limit: nothing to wait for.
   write("partial", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(30 * MIN), { done: 1 }), r.text("Partly done.", iso(29 * MIN))]);
   write("mixed", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a"), "[b] failed: tests are red"], iso(30 * MIN)), r.text("One broke.", iso(29 * MIN))]);
@@ -690,7 +697,7 @@ test("a workflow whose agents all hit the session limit makes the stopped sessio
   write("resumed", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(40 * MIN)),
     r.prompt("[OpenAGI supervisor] The limit reset; resume.", iso(32 * MIN), { promptSource: "system" }), r.text("Resumed and finished.", iso(29 * MIN))]);
   const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, peers: new Map() }));
-  for (const id of ["replied", "last"]) {
+  for (const id of ["replied", "last", "checked"]) {
     const error = threads[id].error;
     assert.equal(error?.kind, "session-limit", id);
     assert.ok(Date.parse(error.resetAt) > Date.parse(iso(30 * MIN)), `${id}: reset after the report`);
@@ -698,7 +705,7 @@ test("a workflow whose agents all hit the session limit makes the stopped sessio
   }
   assert.equal(threads.replied.agentStatus, "idle");
   assert.equal(threads.last.agentStatus, "stalled");
-  for (const id of ["partial", "mixed", "cleared", "resumed"]) assert.equal(threads[id].error, null, id);
+  for (const id of ["partial", "mixed", "cleared", "resumed", "relaunched"]) assert.equal(threads[id].error, null, id);
 });
 
 
