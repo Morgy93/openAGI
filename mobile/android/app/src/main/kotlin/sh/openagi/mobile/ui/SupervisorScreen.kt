@@ -164,38 +164,42 @@ fun SupervisorScreen(
     // Push now, Mute and Unmute: one at a time, and their result, by thread.
     var busyThread by remember { mutableStateOf<String?>(null) }
     var threadNote by remember { mutableStateOf<Pair<String, SupervisorFormat.Note>?>(null) }
-    val voice = remember(credentials) { VoiceSession(credentials.server, credentials.token, VoiceAudio()) }
+    val voice = remember(credentials) { VoiceSession(credentials.server, credentials.token, VoiceAudio(context)) }
     val voiceStatus by voice.status.collectAsState()
     var voiceQuestion by remember { mutableStateOf<FleetQuestion?>(null) }
     var voiceAction by remember { mutableStateOf<FleetAction?>(null) }
     var permissionNote by remember { mutableStateOf<String?>(null) }
-    var pendingHandsFree by remember { mutableStateOf(false) }
+    val voicePermission = remember(voice) { VoicePermissionRequest() }
     val voiceLifecycle = LocalLifecycleOwner.current
+    fun resumeHandsFree() {
+        if (voicePermission.resume()) { permissionNote = null; voice.handsFree(true) }
+    }
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         permissionNote = if (granted) "Microphone allowed. Hold the mic to talk." else "Microphone permission is needed for voice. Allow it in Android Settings."
-        if (granted && pendingHandsFree && voiceLifecycle.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) voice.handsFree(true)
-        pendingHandsFree = false
+        voicePermission.result(granted)
+        if (voiceLifecycle.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) resumeHandsFree()
     }
     fun microphoneAllowed(): Boolean = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     fun pressMic() {
         if (microphoneAllowed()) { permissionNote = null; voice.press() }
-        else { pendingHandsFree = false; micPermission.launch(Manifest.permission.RECORD_AUDIO) }
+        else { voicePermission.cancel(); micPermission.launch(Manifest.permission.RECORD_AUDIO) }
     }
     fun toggleHandsFree() {
         if (voiceStatus.handsFree || microphoneAllowed()) {
             permissionNote = null
             voice.handsFree(!voiceStatus.handsFree)
-        } else { pendingHandsFree = true; micPermission.launch(Manifest.permission.RECORD_AUDIO) }
+        } else { voicePermission.handsFree(); micPermission.launch(Manifest.permission.RECORD_AUDIO) }
     }
     val voiceControls: @Composable () -> Unit = {
         SupervisorVoiceControls(voiceStatus, permissionNote, ::pressMic, { voice.release(it) }, ::toggleHandsFree, { voice.stop() })
     }
     DisposableEffect(voice, voiceLifecycle) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_PAUSE) { pendingHandsFree = false; voice.stop() }
+            if (event == Lifecycle.Event.ON_PAUSE) voice.stop()
+            if (voicePermission.lifecycle(event)) { permissionNote = null; voice.handsFree(true) }
         }
         voiceLifecycle.lifecycle.addObserver(observer)
-        onDispose { voiceLifecycle.lifecycle.removeObserver(observer); voice.close() }
+        onDispose { voiceLifecycle.lifecycle.removeObserver(observer); voicePermission.cancel(); voice.close() }
     }
     LaunchedEffect(openThread, voiceQuestion, voiceAction) {
         voice.setFocus(VoiceFocus.supervisor(voiceQuestion, voiceAction, openThread))
@@ -418,7 +422,7 @@ fun SupervisorScreen(
         }
     }
 
-    LaunchedEffect(chatOpen) { if (chatOpen) { pendingHandsFree = false; voice.stop() } }
+    LaunchedEffect(chatOpen) { if (chatOpen) { voicePermission.cancel(); voice.stop() } }
 
     if (chatOpen) {
         BackHandler { chatOpen = false }

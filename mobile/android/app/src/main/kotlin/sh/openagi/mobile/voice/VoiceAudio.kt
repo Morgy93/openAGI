@@ -1,6 +1,7 @@
 package sh.openagi.mobile.voice
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -8,7 +9,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -19,13 +20,21 @@ internal interface VoiceOutput {
     fun close()
 }
 
-class VoiceAudio internal constructor(private val outputFactory: () -> VoiceOutput? = { createOutput() }) : VoiceAudioIO {
+class VoiceAudio internal constructor(
+    private val audioFocus: VoiceFocusControl,
+    private val outputFactory: () -> VoiceOutput? = { createOutput() },
+) : VoiceAudioIO {
+    constructor(context: Context) : this(VoiceAudioFocus(context))
+
     private class Capture(val record: AudioRecord) { @Volatile var active = true }
     private var capture: Capture? = null
     private var track: VoiceOutput? = null
     private var player: Thread? = null
-    private var queue = ArrayBlockingQueue<ByteArray>(250)
+    private var queue = LinkedBlockingQueue<ByteArray>()
+    private var queuedBytes = 0
     private var playback = VoicePlayback(RATE)
+
+    override fun open(onFocusLost: () -> Unit): Boolean = audioFocus.acquire(onFocusLost)
 
     @SuppressLint("MissingPermission")
     @Synchronized
@@ -97,6 +106,10 @@ class VoiceAudio internal constructor(private val outputFactory: () -> VoiceOutp
                             offset += count
                             if (count == 0) Thread.sleep(5)
                         }
+                        synchronized(this) {
+                            if (track !== created || pending !== queue) return@thread
+                            queuedBytes -= chunk.size
+                        }
                     }
                 } catch (_: InterruptedException) { /* stopped */ }
                 catch (_: Exception) {
@@ -109,13 +122,10 @@ class VoiceAudio internal constructor(private val outputFactory: () -> VoiceOutp
                 }
             }
         }
-        // Five seconds of reply audio is plenty; fail instead of growing memory.
-        var offset = 0
-        while (offset < pcm.size) {
-            val end = minOf(offset + FRAME_BYTES, pcm.size)
-            if (!queue.offer(pcm.copyOfRange(offset, end))) return false
-            offset = end
-        }
+        // Replies arrive faster than playback; bound bytes rather than delta count.
+        if (pcm.size > MAX_QUEUED_BYTES - queuedBytes) return false
+        queuedBytes += pcm.size
+        queue.offer(pcm)
         playback.append(pcm.size)
         return true
     }
@@ -136,17 +146,19 @@ class VoiceAudio internal constructor(private val outputFactory: () -> VoiceOutp
         player?.interrupt()
         player = null
         queue.clear()
-        queue = ArrayBlockingQueue(250)
+        queue = LinkedBlockingQueue()
+        queuedBytes = 0
         track?.let { runCatching { it.close() } }
         track = null
         playback = VoicePlayback(RATE)
     }
 
     @Synchronized
-    override fun close() { stopCapture(); stopPlayback() }
+    override fun close() { stopCapture(); stopPlayback(); audioFocus.release() }
 
     companion object {
         const val RATE = 24000
+        internal const val MAX_QUEUED_BYTES = RATE * 2 * 120 // Two minutes of PCM16 mono.
         private const val FRAME_BYTES = 960 // 20 ms of PCM16 mono.
         private fun format(channels: Int) = AudioFormat.Builder().setSampleRate(RATE)
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(channels).build()

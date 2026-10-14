@@ -151,6 +151,7 @@ data class VoiceStatus(
 )
 
 interface VoiceAudioIO {
+    fun open(onFocusLost: () -> Unit): Boolean
     fun startCapture(onAudio: (ByteArray) -> Unit, onError: () -> Unit)
     fun stopCapture()
     fun play(pcm: ByteArray, onError: () -> Unit): Boolean
@@ -222,6 +223,10 @@ class VoiceSession(
             val url = origin.newBuilder().encodedPath("/nodes/voice").query(null)
                 .addQueryParameter("rate", "24000").addQueryParameter("mode", if (handsFree) "handsfree" else "ptt").build()
             val request = Request.Builder().url(url).header("Sec-WebSocket-Protocol", "openagi-voice, $token").build()
+            if (!audio.open { synchronized(this) { finish("Voice paused because another app needs audio. Start voice again.") } }) {
+                finish("Voice needs audio focus. Pause other audio and try again.")
+                return
+            }
             socket = client.newWebSocket(request, listener)
         } catch (_: Exception) {
             finish("Voice could not connect. Check the paired hub and try again.")

@@ -137,6 +137,14 @@ class VoiceSessionTest {
     private var session: VoiceSession? = null
 
     private class FakeAudio : VoiceAudioIO {
+        var focusAllowed = true
+        @Volatile var focused = false
+        var onFocusLost: (() -> Unit)? = null
+        override fun open(onFocusLost: () -> Unit): Boolean {
+            this.onFocusLost = onFocusLost
+            focused = focusAllowed
+            return focused
+        }
         @Volatile var recording = false
         @Volatile var onAudio: ((ByteArray) -> Unit)? = null
         @Volatile var onError: (() -> Unit)? = null
@@ -149,7 +157,7 @@ class VoiceSessionTest {
         override fun play(pcm: ByteArray, onError: () -> Unit): Boolean { playbackError = onError; return true }
         override fun completeReply(audioMs: Double, onPlayed: () -> Unit) { durations.offer(audioMs); completions.offer(onPlayed) }
         override fun barge(): Long { barges++; return 125 }
-        override fun close() { recording = false }
+        override fun close() { recording = false; focused = false }
     }
     private fun connect(): VoiceSession {
         server.start()
@@ -183,6 +191,7 @@ class VoiceSessionTest {
         voice.setFocus(VoiceFocus(threadKey = "thread1"))
         voice.press()
         val ws = peer()
+        assertTrue(audio.focused)
         val start = VoiceFrames.decode(event())!!
         assertEquals("start", VoiceFrames.field(start, "type"))
         assertEquals("thread1", start["focus"]!!.jsonObject["threadKey"]!!.jsonPrimitive.content)
@@ -199,6 +208,42 @@ class VoiceSessionTest {
         voice.release()
         assertEquals(VoiceFrames.control("commit"), event())
         assertFalse(audio.recording)
+    }
+    @Test fun deniedFocusNeverConnectsOrRecords() {
+        val voice = connect()
+        audio.focusAllowed = false
+        voice.handsFree(true)
+        assertEquals(VoicePhase.IDLE, voice.status.value.phase)
+        assertTrue(voice.status.value.message!!.contains("audio focus"))
+        assertFalse(audio.recording)
+        assertFalse(audio.focused)
+        assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun focusLossEndsSessionAndReleasesMicrophone() {
+        val voice = connect()
+        voice.handsFree(true)
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        audio.onFocusLost!!()
+        assertEquals(VoicePhase.IDLE, voice.status.value.phase)
+        assertFalse(audio.recording)
+        assertFalse(audio.focused)
+        assertTrue(voice.status.value.message!!.contains("another app"))
+    }
+
+    @Test fun stopAndCloseReleaseFocus() {
+        val voice = connect()
+        voice.press()
+        peer()
+        event()
+        assertTrue(audio.focused)
+        voice.stop()
+        assertFalse(audio.focused)
+        voice.close()
+        assertFalse(audio.focused)
     }
     @Test fun releaseBeforeReadyNeverCommitsEmptyTurn() {
         val voice = connect()
@@ -314,6 +359,7 @@ class VoiceSessionTest {
         await { voice.status.value.phase == VoicePhase.IDLE && voice.status.value.message == "Voice cap reached." }
         assertFalse(audio.recording)
         assertEquals("Voice cap reached.", voice.status.value.message)
+        assertFalse(audio.focused)
     }
     @Test fun disabledHubShowsActionableCopy() {
         server.start()
@@ -323,6 +369,7 @@ class VoiceSessionTest {
         await { voice.status.value.message?.contains("Voice is off") == true }
         assertFalse(audio.recording)
         assertEquals(VoicePhase.IDLE, voice.status.value.phase)
+        assertFalse(audio.focused)
     }
     @Test fun revokedPhoneNeverRecords() {
         server.start()
