@@ -18,6 +18,9 @@ final class OverlayState: ObservableObject {
   @Published var isLoading = false
   @Published var progressStage: String? = nil
   @Published var isDetached = false
+  /// What the "connection lost" banner says while the overlay finds out on
+  /// its own how a dropped ask ended. Changes the banner's height.
+  @Published private(set) var detachedPhase: DetachedPhase = .none
   @Published var error: String? = nil
   @Published var contextNote: String? = nil
   @Published private(set) var briefContext: BriefChatContext? = nil
@@ -28,11 +31,24 @@ final class OverlayState: ObservableObject {
   /// Counter rather than Bool so selecting the same row twice still focuses.
   @Published private(set) var composerFocusRequest: UInt = 0
 
+  enum DetachedPhase: Equatable {
+    case none
+    /// Reading the session back once to see whether the reply landed.
+    case checking
+    /// Not finished yet: the answer will be in the main app. Clears itself.
+    case stillRunning
+  }
+
+  /// The one read-back after a dropped stream, then the banner's own clear.
+  private var detachedRecovery: Task<Void, Never>?
+  static let detachedCheckDelay: TimeInterval = 4
+  static let detachedClearDelay: TimeInterval = 12
+
   func chatAbout(_ item: BriefItem) {
     briefContext = BriefChatContext(item: item)
     answer = ""
     error = nil
-    isDetached = false
+    endDetached()
     contextNote = nil
     composerFocusRequest &+= 1
   }
@@ -71,7 +87,7 @@ final class OverlayState: ObservableObject {
     fleetContext = BriefChatContext(question: question)
     answer = ""
     error = nil
-    isDetached = false
+    endDetached()
     contextNote = nil
     composerFocusRequest &+= 1
   }
@@ -95,13 +111,52 @@ final class OverlayState: ObservableObject {
     contextNote = nil
     question = ""
     progressStage = nil
+    endDetached()
+  }
+
+  private func endDetached() {
+    detachedRecovery?.cancel()
+    detachedRecovery = nil
     isDetached = false
+    detachedPhase = .none
+  }
+
+  /// The stream dropped, but the daemon may still finish the turn. Read the
+  /// session back once, after a short wait: a saved reply replaces the
+  /// banner; otherwise it says the answer will be in the main app and goes
+  /// away on its own. Never re-sends the ask.
+  private func recoverDetached(sessionId: String, requestId: String) {
+    detachedRecovery?.cancel()
+    detachedPhase = .checking
+    detachedRecovery = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(OverlayState.detachedCheckDelay * 1_000_000_000))
+      guard let self, !Task.isCancelled, self.isDetached else { return }
+      let found = await AppState.shared.overlayReply(sessionId: sessionId, requestId: requestId)
+      guard !Task.isCancelled, self.isDetached else { return }
+      switch found {
+      case let .answered(text):
+        self.answer = text
+        self.progressStage = nil
+        self.endDetached()
+      case let .failed(text):
+        self.error = text
+        self.progressStage = nil
+        self.endDetached()
+      case nil:
+        self.detachedPhase = .stillRunning
+        try? await Task.sleep(nanoseconds: UInt64(OverlayState.detachedClearDelay * 1_000_000_000))
+        guard !Task.isCancelled, self.isDetached else { return }
+        self.progressStage = nil
+        self.endDetached()
+      }
+    }
   }
 
   func ask() async {
     let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !q.isEmpty, !isLoading, !isDetached else { return }
-    isLoading = true; error = nil; isDetached = false; answer = ""; progressStage = "queued"
+    endDetached()
+    isLoading = true; error = nil; answer = ""; progressStage = "queued"
     let supervisor = tab == .supervisor
     let sessionId = supervisor ? AppState.overlaySupervisorSessionId : AppState.overlayTasksSessionId
     let requestId = AppState.shared.beginOverlayAsk(sessionId: sessionId)
@@ -140,6 +195,7 @@ final class OverlayState: ObservableObject {
       if AppState.requestMayStillBeRunning(after: error) {
         isDetached = true
         progressStage = "disconnected"
+        recoverDetached(sessionId: AppState.shared.lastAskSessionId ?? sessionId, requestId: requestId)
       } else {
         self.error = error.localizedDescription
       }

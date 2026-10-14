@@ -160,12 +160,13 @@ function isManager(ctx) {
 
 // options.escalationLedger: lastEscalation(key) for shared incident keys
 // ("infra:bb3", "infra:lb"). options.mutedKeys: thread keys the owner muted.
+// options.ownerPush: the owner's Push now, which no pacing wait holds.
 export function decideThread(classified, thread, options = {}) {
   const ctx = makeContext(classified, thread, options);
   if (ctx.mutedKeys.has(thread?.key)) return { ...baseDecision(ctx), reason: "muted by owner" };
   // No nudge, resume or stuck question about a thread whose owner just
   // stopped the supervisor's own turn there. An open card is still asked.
-  const decision = ownerStoppedNudge(thread)
+  const decision = ownerStoppedNudge(thread) && !ctx.ownerPush
     ? { ...baseDecision(ctx), reason: "owner stopped the supervisor's turn" }
     : resolveIntent(ctx, intentFor(ctx));
   // A Codex card beside the thread's own decision (a resume, a nudge, a
@@ -181,6 +182,8 @@ function makeContext(classified, thread, options) {
   const delivery = options.delivery ?? config?.delivery ?? null;
   return {
     classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery, config,
+    // The owner's own Push now (supervisor pushNow): see resolveNudge.
+    ownerPush: options.ownerPush === true,
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
     progressMark: progressMarkFor(classified, thread, ledger),
@@ -593,7 +596,7 @@ function resolveIntent(ctx, intent) {
   // Typing in the composer does not answer a card: it is asked whatever the owner does.
   if (intent.type === "ask" && intent.card) return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: null };
   // The owner typing into this thread outranks anything that touches it.
-  const ownerUntil = ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
+  const ownerUntil = ctx.ownerPush ? null : ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
   if (ownerUntil) return { ...base, action: "wait", reason: "owner active in thread", notBefore: ownerUntil };
   if (intent.type === "ask") {
     return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: intent.notBefore ?? null };
@@ -606,6 +609,7 @@ function resolveNudge(ctx, intent, base) {
   const decision = { ...base, playbook: intent.playbook, reason: intent.reason };
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
+  if (ctx.ownerPush) return pushedNudge(ctx, intent, decision, playbook);
   if (deliberateStop(thread)) return { ...decision, reason: "owner stopped this turn" };
   const drivenUntil = ownerDrivenUntil(ctx);
   if (drivenUntil) return { ...decision, action: "wait", reason: "owner is driving this thread", notBefore: drivenUntil };
@@ -672,6 +676,20 @@ function resolveNudge(ctx, intent, base) {
     return { ...decision, action: "wait", reason: why };
   }
   return { ...decision, action: "nudge", route, message, messageHash, factsKey: reply.factsKey, facts: reply.facts };
+}
+
+// The owner's Push now: the playbook's words go out now. The waits that only
+// pace automatic nudges (the owner's own recent words or stop, a reply hold,
+// idle, cooldown, a failing route's backoff, the attempt budget, a repeat)
+// are the owner's to skip; an ask, a wait on CI or an outage still decides
+// before this (resolveIntent), and a thread with no route stays unsent.
+function pushedNudge(ctx, intent, decision, playbook) {
+  const route = chooseRoute(ctx.thread, ctx.mode, ctx.delivery);
+  if (!route) return { ...decision, reason: uiWaitReason(ctx.thread, ctx.delivery) ?? uiBlockedReason(ctx.thread, ctx.delivery) ?? "no delivery route" };
+  const vars = { ...ctx.facts, attempts: String(attemptsWithoutProgress(ctx.ledger, ctx.progressMark)), ...(intent.vars ?? {}) };
+  const reply = replyCheck(ctx, intent.playbook);
+  const message = `${reply.prefix}${renderTemplate(playbook.body, vars)}`;
+  return { ...decision, action: "nudge", route, message, messageHash: shortHash(message), factsKey: reply.factsKey, facts: reply.facts };
 }
 
 // Nudges that report on the PR. Resume, status checks and limit retries
