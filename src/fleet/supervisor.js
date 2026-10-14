@@ -498,7 +498,7 @@ export class FleetSupervisor {
     this.tickCount = 0;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
-    this.lastReview = { at: null, failedAt: null, error: null };
+    this.lastReview = { at: null, failedAt: null, error: null, ran: null };
     // New questions waiting on the review: hidden from the state the main
     // mirrors until the review has seen them.
     this.awaitingReview = new Set();
@@ -791,8 +791,13 @@ export class FleetSupervisor {
         deliveryDetail: this.lastDelivery.detail,
         review: {
           enabled: Boolean(this.config.review?.enabled),
-          model: this.config.review?.model ?? null,
+          // What the review tries first, and the Claude model behind codex.
+          provider: this.reviewRunner?.provider ?? this.config.review?.provider ?? null,
+          model: this.reviewRunner?.model ?? this.config.review?.model ?? null,
+          fallbackModel: this.reviewRunner?.fallbackModel ?? null,
           lastAt: this.lastReview.at ? new Date(this.lastReview.at).toISOString() : null,
+          // Which ran last: { provider, model, fallbackReason }.
+          lastRun: this.lastReview.ran ?? null,
           lastError: this.lastReview.error
         }
       }
@@ -2305,11 +2310,11 @@ export class FleetSupervisor {
         verdicts = await reviewQuestions({ questions: remaining, others: rest, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now, ownerNotes: loadOwnerNotes(this.dataDir) });
       } catch (error) {
         const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
-        this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
+        this.lastReview = { ...this.lastReview, failedAt: now, error: detail, ran: this.reviewRunner?.lastRun ?? null };
         store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
         break;
       }
-      this.lastReview = { at: now, failedAt: null, error: null };
+      this.lastReview = { at: now, failedAt: null, error: null, ran: this.reviewRunner?.lastRun ?? null };
       this.applyReview(verdicts, fingerprints);
       const answered = new Set(verdicts.map((verdict) => verdict.id));
       for (const verdict of verdicts) if (!verdict.deferred) settled.add(verdict.id);
