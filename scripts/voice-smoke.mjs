@@ -28,6 +28,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
+import { pathToFileURL } from "node:url";
 import { loadEnvFile } from "../src/file-utils.js";
 import { resamplePcm16, realtimeCostUsd } from "../src/voice/audio.js";
 
@@ -49,9 +50,7 @@ const brokerResponds = flag("broker-responds");
 const text = option("text", "Hey, what is the fleet status right now?");
 const wavPath = option("wav", null);
 
-loadEnvFile(path.join(process.env.OPENAGI_DATA_DIR || path.join(os.homedir(), ".openagi"), ".env"));
-const key = process.env.OPENAI_API_KEY;
-if (!key) { console.error("OPENAI_API_KEY is not set (env or ~/.openagi/.env)."); process.exit(2); }
+let key;
 
 const log = (...parts) => { if (!asJson) console.log(...parts); };
 
@@ -223,19 +222,41 @@ async function run({ label, rate, sendRate }) {
   });
 }
 
-const runs = flag("rate") || resample || wavPath
-  ? [{ label: resample ? "16k audio resampled to 24k" : `declared ${declaredRate}`, rate: declaredRate, sendRate: resample ? 16000 : declaredRate }]
-  : [
-      { label: "24k audio, rate 24000", rate: 24000, sendRate: 24000 },
-      { label: "16k audio, rate 16000", rate: 16000, sendRate: 16000 },
-      { label: "16k audio resampled to 24k", rate: 24000, sendRate: 16000 }
-    ];
-const results = [];
-for (const spec of runs) {
-  log(`\n== ${spec.label} (${model}${vad ? ", semantic_vad" : ", push-to-talk"})`);
-  const result = await run(spec);
-  results.push(result);
-  log(`  end: ${result.end}; ${result.ms} ms; function call ${result.functionCall ? `${result.functionCall.name} at ${result.functionCall.ms} ms` : "none"}; round trip ${result.functionRoundTrip ? "ok" : "no"}; cost $${result.usd}`);
-  if (result.errors.length) log(`  errors: ${result.errors.join(" | ")}`);
+export function smokeExitCode(results, { barge = false, textOut = false } = {}) {
+  if (!results.length) return 1;
+  return results.every((result) => {
+    const expectedRejection = result.declaredRate === 16000 && result.sendRate === 16000
+      && result.end === "session.update rejected" && result.errors.length === 1
+      && /(?:>=\s*24000|at least 24000|minimum.*24000)/i.test(result.errors[0]);
+    if (expectedRejection) return true;
+    if (result.errors.length || !result.transcript?.trim()) return false;
+    if (barge && !textOut) return result.end === "barged" && result.barge?.cancelled === true && result.barge?.truncated === true;
+    return result.end === "done" && result.functionRoundTrip === true && Boolean(result.replies?.some((reply) => reply?.trim()));
+  }) ? 0 : 1;
 }
-if (asJson) console.log(JSON.stringify(results, null, 2));
+
+async function main() {
+  loadEnvFile(path.join(process.env.OPENAGI_DATA_DIR || path.join(os.homedir(), ".openagi"), ".env"));
+  key = process.env.OPENAI_API_KEY;
+  if (!key) { console.error("OPENAI_API_KEY is not set (env or ~/.openagi/.env)."); process.exitCode = 2; return; }
+  const runs = flag("rate") || resample || wavPath
+    ? [{ label: resample ? "16k audio resampled to 24k" : `declared ${declaredRate}`, rate: declaredRate, sendRate: resample ? 16000 : declaredRate }]
+    : [
+        { label: "24k audio, rate 24000", rate: 24000, sendRate: 24000 },
+        { label: "16k audio, rate 16000", rate: 16000, sendRate: 16000 },
+        { label: "16k audio resampled to 24k", rate: 24000, sendRate: 16000 }
+      ];
+  const results = [];
+  for (const spec of runs) {
+    log(`\n== ${spec.label} (${model}${vad ? ", semantic_vad" : ", push-to-talk"})`);
+    const result = await run(spec);
+    results.push(result);
+    log(`  end: ${result.end}; ${result.ms} ms; function call ${result.functionCall ? `${result.functionCall.name} at ${result.functionCall.ms} ms` : "none"}; round trip ${result.functionRoundTrip ? "ok" : "no"}; cost $${result.usd}`);
+    if (result.errors.length) log(`  errors: ${result.errors.join(" | ")}`);
+  }
+  if (asJson) console.log(JSON.stringify(results, null, 2));
+
+  process.exitCode = smokeExitCode(results, { barge, textOut });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) await main();
