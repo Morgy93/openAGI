@@ -940,10 +940,14 @@ test("spawnWithTail with detach leaves a turn running past the ceiling and repor
   assert.match(late.tail, /pushed the fix/);
 });
 
-function antigravitySetup(t, { results = [], fresh = undefined, server = undefined, delivery = undefined, backgroundRoutes = undefined, refresh = null } = {}) {
+function antigravitySetup(t, { results = [], fresh = undefined, server = undefined, delivery = undefined, backgroundRoutes = undefined, refresh = null, binary = "shim" } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-ag-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  const config = resolveFleetConfig({}, { home, bins: { agentapi: "/abs/agentapi" }, ...(delivery ? { delivery } : {}), ...(backgroundRoutes ? { backgroundRoutes } : {}) });
+  const agentapi = path.join(home, "agentapi");
+  const antigravityLs = path.join(home, "language_server");
+  if (binary === "shim") fs.writeFileSync(agentapi, "#!/bin/sh\nexec /Applications/Antigravity.app/Contents/Resources/bin/language_server agentapi \"$@\"\n");
+  if (["shim", "bundled"].includes(binary)) fs.writeFileSync(antigravityLs, "fixture");
+  const config = resolveFleetConfig({}, { home, bins: { agentapi, antigravityLs }, ...(delivery ? { delivery } : {}), ...(backgroundRoutes ? { backgroundRoutes } : {}) });
   const store = new FleetStore({ dir: path.join(home, "fleet") });
   const calls = [];
   const run = (cmd, args, options = {}) => {
@@ -968,14 +972,57 @@ function antigravityThread(extra = {}) {
   };
 }
 
+test("Antigravity delivery falls back to bundled agentapi and blocks missing or relative binaries", async (t) => {
+  const bundled = antigravitySetup(t, { binary: "bundled" });
+  assert.equal((await bundled.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" })).status, "sent");
+  assert.equal(bundled.calls[0].cmd, bundled.config.bins.antigravityLs);
+  assert.deepEqual(bundled.calls[0].args.slice(0, 2), ["agentapi", "send-message"]);
+  for (const relative of [false, true]) {
+    const missing = antigravitySetup(t, { binary: "missing" });
+    if (relative) Object.assign(missing.config.bins, { agentapi: "agentapi", antigravityLs: "language_server" });
+    const result = await missing.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+    assert.equal(result.status, "blocked");
+    assert.match(result.detail, /delivery unavailable.*\/Applications.*~\/Applications/);
+    assert.equal(missing.calls.length, 0);
+  }
+});
+
+test("Antigravity cancels stale resumes and proposed nudges after agent activity", async (t) => {
+  const scanned = antigravityThread({ lastAgentAt: "2026-10-14T06:00:00.000Z", lastActivityAt: "2026-10-14T06:10:00.000Z", meta: { stepCount: 10 } });
+  for (const playbook of ["resume", "nudge"]) {
+    for (const change of [
+      { lastAgentAt: "2026-10-14T06:20:00.000Z" },
+      { lastActivityAt: "2026-10-14T06:20:00.000Z" },
+      { meta: { stepCount: 11 } }
+    ]) {
+      const setup = antigravitySetup(t, { fresh: { ...scanned, agentStatus: "idle", ...change } });
+      const result = await setup.executor.deliver({ thread: scanned, message: "continue", route: "antigravity-send", playbook });
+      assert.equal(result.status, "blocked");
+      assert.match(result.detail, /agent replied or did new work/);
+      assert.equal(setup.calls.length, 0);
+    }
+  }
+});
+
+test("Antigravity resumes only while the original error still stands", async (t) => {
+  const thread = antigravityThread({ error: { kind: "usage-limit", text: "quota spent" } });
+  for (const error of [null, { kind: "network", text: "offline" }, { kind: "usage-limit", text: "different limit" }, thread.error]) {
+    const setup = antigravitySetup(t, { fresh: { ...thread, error } });
+    const result = await setup.executor.deliver({ thread, message: "continue", route: "antigravity-send", playbook: "resume" });
+    assert.equal(result.status, error === thread.error ? "sent" : "blocked");
+    if (error !== thread.error) assert.match(result.detail, /original error no longer stands/);
+    assert.equal(setup.calls.length, error === thread.error ? 1 : 0);
+  }
+});
+
 test("antigravity-send runs agentapi send-message with the server address and token in the child env only", async (t) => {
-  const { calls, store, executor, refreshed } = antigravitySetup(t, { results: [{ stdout: '{"response":{"sendMessage":{"recipientId":"e8b9db19"}}}\n' }] });
+  const { calls, config, store, executor, refreshed } = antigravitySetup(t, { results: [{ stdout: '{"response":{"sendMessage":{"recipientId":"e8b9db19"}}}\n' }] });
   const result = await executor.deliver({ thread: antigravityThread(), message: "The quota reset; continue.", route: "antigravity-send", playbook: "resume" });
   assert.equal(result.status, "sent");
   assert.equal(result.route, "antigravity-send");
   assert.deepEqual(refreshed, ["antigravity:e8b9db19"]);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].cmd, "/abs/agentapi");
+  assert.equal(calls[0].cmd, config.bins.agentapi);
   assert.deepEqual(calls[0].args, ["send-message", "--title", "OpenAGI supervisor", "e8b9db19", `${MESSAGE_PREFIX}The quota reset; continue.`]);
   assert.equal(calls[0].env.ANTIGRAVITY_LS_ADDRESS, "127.0.0.1:50489");
   assert.equal(calls[0].env.ANTIGRAVITY_CSRF_TOKEN, "csrf-secret-77");

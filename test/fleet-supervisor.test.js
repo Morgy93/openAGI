@@ -1503,6 +1503,20 @@ test("a question stays open when its thread was only pushed out by the scan cap"
   assert.equal(supervisor.store.question(question.id).status, "open");
 });
 
+test("excluded Antigravity rows do not make a missing conversation look capped", async (t) => {
+  let threads = [makeThread({ key: "antigravity:asking", kind: "antigravity", id: "asking", prRefs: [], meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } })];
+  const { supervisor } = fixture(t, { limits: { maxThreads: 2 }, deps: { listAntigravityThreads: async () => threads } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.ok(question);
+  threads = [1, 2].map((n) => makeThread({ key: `antigravity:loose-${n}`, kind: "antigravity", id: `loose-${n}`, prRefs: [], excluded: "no-repo" }));
+  supervisor.uiBlockedSince.set("antigravity:asking", NOW - MIN);
+  supervisor.trackUiBlocked([], { mode: "auto", delivery: { ready: false }, threads, sourceErrors: {}, started: NOW, config: supervisor.config });
+  assert.equal(supervisor.uiBlockedSince.has("antigravity:asking"), false);
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
+});
+
 test("an open agent question closes itself once its PR merges after the ask, and stays for an ask made after the merge", async (t) => {
   const resolved = [];
   const pending = { text: "Start a solo huddle and send a screenshot?", options: ["open thread"], at: ago(60 * MIN) };

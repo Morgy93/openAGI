@@ -381,9 +381,14 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       };
     }
     if (route === "antigravity-send") {
+      const shim = bins.agentapi;
+      const server = bins.antigravityLs;
+      const available = (file) => file && path.isAbsolute(file) && fs.existsSync(file);
+      const cmd = available(shim) ? shim : available(server) ? server : null;
       return {
-        cmd: bins.agentapi ?? "agentapi",
-        args: ["send-message", "--title", AGENTAPI_TITLE, thread.id, text],
+        cmd,
+        args: [...(cmd === server ? ["agentapi"] : []), "send-message", "--title", AGENTAPI_TITLE, thread.id, text],
+        blocked: cmd ? null : "Antigravity delivery unavailable: install Antigravity.app in /Applications or ~/Applications, or restore its agentapi shim",
         api: true,
         background: false,
         describe: `agentapi send-message ${thread.id}`
@@ -459,7 +464,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
 
   // agentapi send-message into an Antigravity conversation. The conversation
   // is read again first: one that started a turn, waits on an approval, or
-  // got an owner message since the scan is left alone. The server address
+  // moved since the scan is left alone. The server address
   // and csrf token go to this child only, read fresh from the running app.
   const apiSend = async (thread, step, base, actionId, blocked, timeoutMs) => {
     const startedAt = Date.now();
@@ -486,6 +491,9 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         return { status: "sent", route: base.route, detail, actionId: id };
       }
     }
+    if (["lastAgentAt", "lastActivityAt"].some((field) => (Date.parse(fresh[field] ?? "") || 0) > (Date.parse(thread[field] ?? "") || 0))
+      || Number(fresh.meta?.stepCount ?? 0) !== Number(thread.meta?.stepCount ?? 0)) return blocked("the agent replied or did new work since the scan: scan again");
+    if (base.playbook === "resume" && thread.error && (!fresh.error || fresh.error.kind !== thread.error.kind || fresh.error.text !== thread.error.text)) return blocked("the original error no longer stands: scan again");
     let server = null;
     try { server = await findLanguageServer(config, { run: runner }); } catch { server = null; }
     if (!server?.address || !server.csrfToken) return blocked("Antigravity is not running: no language server to deliver through");
@@ -722,6 +730,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     // The composer takes one line; the journaled hash is of what is typed.
     const text = route === "computer-use" ? flattenMessage(withPrefix(message)) : withPrefix(message);
     const step = plan(thread, route, text);
+    if (step.blocked) return blocked(step.blocked);
     if (dryRun) return { status: "dry-run", route, detail: step.ui ? `would ${step.describe}` : `would run ${step.describe}`, actionId };
 
     const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(fallbackFrom ? { fallbackFrom } : {}) };

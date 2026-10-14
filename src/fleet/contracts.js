@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity"]);
 // The one list every thread-key matcher is built from (server routes, the
@@ -212,8 +213,8 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     rm: pick(["/bin/rm"], "rm"),
     // A shim that runs the app's language server with "agentapi". The server
     // binary itself is how the running instance is found in ps.
-    agentapi: pick([path.join(home, ".gemini", "antigravity", "bin", "agentapi")], "agentapi"),
-    antigravityLs: ANTIGRAVITY_LS
+    agentapi: pick([path.join(home, ".gemini", "antigravity", "bin", "agentapi")], null),
+    antigravityLs: pick([ANTIGRAVITY_LS, path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server")], ANTIGRAVITY_LS)
   };
 }
 
@@ -736,7 +737,8 @@ export async function openImmutableDb(filePath) {
   }
   if (!sqliteModule || !fs.existsSync(filePath)) return null;
   try {
-    const url = new URL(`file://${encodeURI(filePath)}?immutable=1`);
+    const url = pathToFileURL(filePath);
+    url.searchParams.set("immutable", "1");
     return new sqliteModule.DatabaseSync(url, { readOnly: true });
   } catch {
     return null;

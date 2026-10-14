@@ -3,10 +3,39 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
-  isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
+  ANTIGRAVITY_LS, defaultBinaries, openImmutableDb, isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
+
+test("Antigravity binaries resolve the app shim and both app install locations without PATH", () => {
+  const home = "/home/fixture";
+  const shim = path.join(home, ".gemini", "antigravity", "bin", "agentapi");
+  const userApp = path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server");
+  const both = defaultBinaries(home, (file) => [shim, ANTIGRAVITY_LS, userApp].includes(file));
+  assert.equal(both.agentapi, shim);
+  assert.equal(both.antigravityLs, ANTIGRAVITY_LS);
+  const bundled = defaultBinaries(home, (file) => file === userApp);
+  assert.equal(bundled.agentapi, null);
+  assert.equal(bundled.antigravityLs, userApp);
+  assert.equal(defaultBinaries(home, () => false).agentapi, null);
+});
+
+test("immutable SQLite reads preserve special path characters and create no sidecars", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-contracts-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "space #question?percent%.db");
+  const setup = new DatabaseSync(file);
+  setup.exec("PRAGMA journal_mode=WAL; CREATE TABLE fixture (value); INSERT INTO fixture VALUES (42)");
+  setup.close();
+  const db = await openImmutableDb(file);
+  assert.ok(db);
+  try { assert.equal(db.prepare("SELECT value FROM fixture").get().value, 42); }
+  finally { db.close(); }
+  assert.equal(fs.existsSync(file + "-wal"), false);
+  assert.equal(fs.existsSync(file + "-shm"), false);
+});
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
   const config = resolveFleetConfig({}, { home: "/home/fixture" });

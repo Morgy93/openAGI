@@ -118,6 +118,60 @@ test("no Antigravity data dir, or the toggle off, is an empty list", async (t) =
   assert.equal(resolveFleetConfig({}, { home }).paths.antigravityHome, dataDir(home));
 });
 
+test("excluded conversations do not hide older workspace threads and stay bounded", async (t) => {
+  const home = makeHome(t);
+  writeSummaries(home, [
+    ...Array.from({ length: 8 }, (_, index) => ({ id: `loose-${index}`, workspaces: "", modified: goTime(MIN) })),
+    { id: "self", modified: goTime(2 * MIN) },
+    { id: "coding-1", modified: goTime(3 * MIN), steps: 7 },
+    { id: "coding-2", modified: goTime(4 * MIN) },
+    { id: "coding-3", modified: goTime(5 * MIN) }
+  ]);
+  for (let index = 0; index < 8; index += 1) writeSteps(home, `loose-${index}`, []);
+  const overrides = { limits: { maxThreads: 2 }, selfSessionIds: ["self"] };
+  const threads = await list(home, {}, overrides);
+  assert.deepEqual(threads.map((thread) => thread.id), ["coding-1", "coding-2"]);
+  assert.equal(threads[0].meta.stepCount, 7);
+  const excluded = await list(home, { only: Array.from({ length: 8 }, (_, index) => `loose-${index}`) }, overrides);
+  assert.equal(excluded.length, 2);
+  assert.ok(excluded.every((thread) => thread.excluded === "no-repo"));
+});
+
+test("only supervisor deliveries clear a quota error across system steps", async (t) => {
+  const home = makeHome(t);
+  writeSummaries(home, [{ id: "completion" }, { id: "other" }, { id: "supervisor" }]);
+  for (const [id, text, sender] of [
+    ["completion", "Task id finished", "s1/task-3"],
+    ["other", "Task id finished", "system"],
+    ["supervisor", `${SUPERVISOR_PREFIX} The quota reset; continue.`, "system"]
+  ]) writeSteps(home, id, [step.error(QUOTA_TEXT, quotaDetails("2026-10-14T06:15:03Z"), iso(10 * MIN)), step.system(text, iso(MIN), sender)]);
+  const threads = new Map((await list(home)).map((thread) => [thread.id, thread]));
+  for (const id of ["completion", "other"]) {
+    assert.equal(threads.get(id).error.kind, "usage-limit");
+    assert.equal(threads.get(id).agentStatus, "error");
+    assert.equal(threads.get(id).meta.lastSupervisorAt, null);
+  }
+  assert.equal(threads.get("supervisor").error, null);
+  assert.equal(threads.get("supervisor").meta.lastSupervisorAt, iso(MIN));
+});
+
+test("a leftover WAL without SHM reads its rows through a private snapshot", async (t) => {
+  const home = makeHome(t);
+  const liveFile = path.join(home, "writer.db");
+  const file = path.join(home, "closed.db");
+  const app = new DatabaseSync(liveFile);
+  try {
+    app.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE fixture (value); INSERT INTO fixture VALUES (42)");
+    fs.copyFileSync(liveFile, file);
+    fs.copyFileSync(liveFile + "-wal", file + "-wal");
+  } finally { app.close(); }
+  const before = [file, file + "-wal"].map((name) => fs.readFileSync(name));
+  const read = await readAntigravityDb(file, (db) => db.prepare("SELECT value FROM fixture").get().value);
+  assert.equal(read.value, 42);
+  assert.equal(fs.existsSync(file + "-shm"), false);
+  assert.deepEqual([file, file + "-wal"].map((name) => fs.readFileSync(name)), before);
+});
+
 test("maps a conversation to the fleet thread shape", async (t) => {
   const home = makeHome(t);
   const id = "7a962056-4c27-48e0-82f4-c22ee00ff45b";

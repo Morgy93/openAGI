@@ -172,8 +172,10 @@ export function summarizeSteps(rows) {
       }
       moved = true;
     } else if (step.type === STEP.SYSTEM_MESSAGE) {
-      if (!summary.lastSupervisorAt && isSupervisorMessage(step.text)) summary.lastSupervisorAt = step.at;
-      moved = true;
+      if (isSupervisorMessage(step.text)) {
+        if (!summary.lastSupervisorAt) summary.lastSupervisorAt = step.at;
+        moved = true;
+      }
     } else if (step.type === STEP.ERROR_MESSAGE && !moved && !summary.error && step.error) {
       summary.error = { ...step.error, at: step.at };
     }
@@ -194,7 +196,8 @@ export async function readAntigravityDb(file, read, { open = openReadOnlyDb, imm
     if (fs.existsSync(wal)) {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-ag-read-"));
       const snapshot = path.join(dir, "snapshot.db");
-      const files = [file, wal, `${file}-shm`];
+      const files = [file, wal];
+      if (fs.existsSync(`${file}-shm`)) files.push(`${file}-shm`);
       const before = files.map((name) => fs.statSync(name));
       files.forEach((name, index) => copy(name, `${snapshot}${["", "-wal", "-shm"][index]}`));
       // The shared-memory reader marks can change without changing the data.
@@ -335,6 +338,7 @@ function buildThread(row, steps, { config, now, serverAlive }) {
       runStatus: String(row.status ?? "") || null,
       notFullyIdle: truthy(row.not_fully_idle),
       projectId: String(row.project_id ?? "") || null,
+      stepCount: Number(row.step_count) || 0,
       openChat: null,
       resetFrom: error?.resetAt ? "error" : null
     }
@@ -509,11 +513,14 @@ export async function listAntigravityThreads(config, options = {}) {
     .filter((row) => !(Number(row.nesting_depth) > 0) && !String(row.parent_conversation_id ?? ""))
     .map((row) => ({ row, at: Date.parse(dbTime(row.last_modified_time) ?? "") || 0 }))
     .filter((entry) => (only ? only.has(String(entry.row.conversation_id)) : entry.at >= cutoff))
-    .sort((a, b) => b.at - a.at || String(a.row.conversation_id).localeCompare(String(b.row.conversation_id)))
-    .slice(0, config.limits.maxThreads);
+    .sort((a, b) => b.at - a.at || String(a.row.conversation_id).localeCompare(String(b.row.conversation_id)));
   const entries = [];
+  let inScope = 0;
+  let excluded = 0;
   for (const { row } of rows) {
+    if (inScope >= config.limits.maxThreads) break;
     const id = String(row.conversation_id);
+    if (!workspaceDir(row.workspace_uris) && excluded >= config.limits.maxThreads) continue;
     // A conversation whose steps cannot be read still shows, from its summary row.
     let steps;
     try {
@@ -522,13 +529,20 @@ export async function listAntigravityThreads(config, options = {}) {
       if (only) throw error;
       steps = summarizeSteps([]);
     }
+    const thread = buildThread(row, steps, { config, now, serverAlive: true });
+    if (thread.excluded) {
+      if (excluded >= config.limits.maxThreads) continue;
+      excluded += 1;
+    } else inScope += 1;
     entries.push({ row, steps });
   }
   const server = serverLookup(options, config);
   // A busy row silent past the window is stalled only with no server running.
   const silent = entries.some(({ row, steps }) => silentBusy(row, steps, lastActivityOf(row, steps), now, config.limits));
   const serverAlive = silent ? Boolean(await server()) : true;
-  const threads = entries.map(({ row, steps }) => buildThread(row, steps, { config, now, serverAlive }));
+  let room = config.limits.maxThreads - inScope;
+  const threads = entries.map(({ row, steps }) => buildThread(row, steps, { config, now, serverAlive }))
+    .filter((thread) => !thread.excluded || room-- > 0);
   if (!only) await applyQuota(threads, options, server);
   return threads;
 }
