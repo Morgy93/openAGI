@@ -530,6 +530,16 @@ test("a codex that cannot show its tools off never runs the review: Claude does"
   }
 });
 
+test("the LB key never leaves in a lockdown error either", async (t) => {
+  const features = { ...OK, code: 2, stderr: "error: lb rejected lb-key-review-1" };
+  const { run, codex } = reviewRun({ codexOut: { reviews: [] }, features });
+  const runModel = createReviewRunner({ config: codexConfig(t), run, env: { PATH: "/usr/bin" } });
+  await runModel({ system: "S", prompt: "P", schema: REVIEW_SCHEMA });
+  assert.equal(codex.length, 0);
+  assert.doesNotMatch(runModel.lastRun.fallbackReason, /lb-key-review-1/);
+  assert.match(runModel.lastRun.fallbackReason, /codex: tool lockdown unconfirmed: .*\[redacted\]/);
+});
+
 test("the provider: codex when codex-lb is configured, else Claude; OPENAGI_FLEET_REVIEW_PROVIDER pins it", async (t) => {
   assert.equal(reviewProvider(codexConfig(t)), "codex");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { provider: false })), "claude");

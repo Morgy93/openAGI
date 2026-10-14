@@ -534,8 +534,11 @@ export function createLockedCodexExec({ config, run = runCommand, env = process.
       const outPath = path.join(dir, "out.json");
       fs.writeFileSync(schemaPath, JSON.stringify(schema));
       const options = { cwd: dir, env: { ...childEnv(dir, key), CODEX_HOME: codexHome(dir) }, timeoutMs };
-      // A lockdown read comes out of this call's time.
-      const execMs = Math.max(1_000, timeoutMs - await checkLockdown(options));
+      // A lockdown read comes out of this call's time; its error is scrubbed
+      // too, as codex stderr there runs with the key in its env.
+      let lockdownMs;
+      try { lockdownMs = await checkLockdown(options); } catch (error) { throw new Error(scrub(error?.message ?? String(error))); }
+      const execMs = Math.max(1_000, timeoutMs - lockdownMs);
       const args = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", model, "--output-schema", schemaPath, "-o", outPath, stdin ? "-" : prompt];
       let result;
       try {
