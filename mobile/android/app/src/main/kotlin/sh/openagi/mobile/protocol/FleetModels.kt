@@ -240,7 +240,7 @@ data class FleetQuestion(
     // The agent message the ask came from.
     val askContext: String? = null,
 ) {
-    val answeredInAgentApp: Boolean get() = answerIn == "agent app"
+    val answeredInAgentApp: Boolean get() = answerIn == "agent app" || (answerIn == null && "open thread" in options)
 }
 
 @Serializable

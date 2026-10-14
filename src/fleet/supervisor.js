@@ -1561,6 +1561,9 @@ export class FleetSupervisor {
       if (repeatsLastSend(thread, this.store.ledgerFor(threadKey), decision.messageHash)) return blocked("this nudge was already sent; waiting for the agent's reply");
       const settled = await this.prSettledBeforeSend(thread, item.pr, decision);
       if (settled) return blocked(`not sent: ${settled}`);
+      const currentAsk = this.store.openQuestions().find((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
+      if (currentAsk) return blocked(`waits on your answer first: ${currentAsk.title}`);
+      if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
       // The owner is speaking to this thread now: an automatic nudge a scan
       // decided meanwhile is held, as for an owner answer.
       this.ownerAnsweredAt.set(threadKey, this.now());

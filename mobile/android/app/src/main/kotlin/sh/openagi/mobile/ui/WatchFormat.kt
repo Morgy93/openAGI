@@ -3,6 +3,7 @@ package sh.openagi.mobile.ui
 import sh.openagi.mobile.protocol.FleetOpenChat
 import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetThread
+import sh.openagi.mobile.protocol.FleetThreadDetail
 import sh.openagi.mobile.protocol.FleetWatch
 import java.time.Duration
 import java.time.Instant
@@ -208,7 +209,7 @@ object WatchFormat {
     }
 
     fun answerOptions(question: FleetQuestion): List<String> =
-        question.options.filter { it.isNotBlank() && it != "dismiss" && it != "open thread" }
+        question.options.filter { it.isNotBlank() && it != "dismiss" && (it != "open thread" || question.answerIn == null) }
 
     // What happened to a Push now. A refusal sends nothing, so nothing is
     // "saved" the way an answer is: it says why, in the daemon's words.
@@ -218,9 +219,19 @@ object WatchFormat {
             "sent" -> SupervisorFormat.Note("Pushed. The agent has your nudge.", isAlert = false)
             "blocked" -> SupervisorFormat.Note("Not sent" + (why?.let { ": $it" } ?: "."), isAlert = true)
             "failed" -> SupervisorFormat.Note("Push failed" + (why?.let { ": $it" } ?: "."), isAlert = true)
-            else -> SupervisorFormat.Note("Pushed.", isAlert = false)
+            "queued" -> SupervisorFormat.Note("Queued. Waiting to reach the agent" + (why?.let { ": $it" } ?: "."), isAlert = false)
+            "dry-run" -> SupervisorFormat.Note("Dry run. Nothing sent" + (why?.let { ": $it" } ?: "."), isAlert = false)
+            else -> SupervisorFormat.Note("Delivery not confirmed" + (why?.let { ": $it" } ?: "."), isAlert = true)
         }
     }
+
+    // The row is from the latest scan; detail adds the longer message.
+    fun detailContext(thread: FleetThread, detail: FleetThreadDetail?): FleetThreadDetail =
+        (detail ?: FleetThreadDetail(key = thread.key)).copy(
+            pr = thread.pr ?: detail?.pr,
+            decision = thread.decision ?: detail?.decision,
+            watch = thread.watch ?: detail?.watch,
+        )
 
     // The supervisor's next step in words: "Nudge (pr-ci-failing), not
     // before 3:40 PM" without the clock, which the screen formats.

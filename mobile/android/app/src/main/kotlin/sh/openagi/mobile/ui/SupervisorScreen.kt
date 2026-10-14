@@ -1070,10 +1070,9 @@ private fun ThreadDetailSheet(
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val uriHandler = LocalUriHandler.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    // The state's row is live (its group, its mute); the detail reads the
-    // chat itself, so its message, PR and plan are the newer ones.
-    val pr = detail?.pr ?: thread.pr
-    val decision = detail?.decision ?: thread.decision
+    val context = WatchFormat.detailContext(thread, detail)
+    val pr = context.pr
+    val decision = context.decision
     val agentText = detail?.lastAgentMessage?.text?.takeIf { it.isNotBlank() } ?: thread.lastAgentText
     val agentAt = detail?.lastAgentMessage?.at ?: thread.lastAgentAt
     val ownerAt = thread.lastOwnerAt ?: detail?.lastOwnerAt

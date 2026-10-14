@@ -210,4 +210,33 @@ final class FleetThreadDetailTests: XCTestCase {
     XCTAssertTrue(AppState.requestMayStillBeRunning(after: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)))
   }
 
+  func testDetailLoadInFlightKeepsOneFollowUpForTheNewScan() async throws {
+    let started = expectation(description: "first detail request started")
+    var release: CheckedContinuation<Void, Never>?
+    var reads = 0
+    let consumer = FleetConsumer(fetchDetail: { request in
+      reads += 1
+      let read = reads
+      if read == 1 {
+        await withCheckedContinuation { continuation in
+          release = continuation
+          started.fulfill()
+        }
+      }
+      let text = read == 1 ? "Before scan" : "After scan"
+      let data = Data("{\"thread\":{\"key\":\"codex:t\",\"lastAgentMessage\":{\"text\":\"\(text)\"}}}".utf8)
+      return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    })
+    let first = Task { await consumer.loadDetail("codex:t") }
+    await fulfillment(of: [started], timeout: 2)
+    await consumer.loadDetail("codex:t")
+    await consumer.loadDetail("codex:t")
+    XCTAssertEqual(reads, 1, "overlapping reads coalesce")
+    release?.resume()
+    await first.value
+    XCTAssertEqual(reads, 2)
+    XCTAssertEqual(consumer.details["codex:t"]?.lastAgentText, "After scan")
+    XCTAssertFalse(consumer.detailLoading.contains("codex:t"))
+  }
+
 }

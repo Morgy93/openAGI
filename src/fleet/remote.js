@@ -70,9 +70,10 @@ export class RemoteFleetSupervisor {
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
-      this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
+      const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
+      if (!missingThread) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(this.state.lastError), { reached, status });
+      throw Object.assign(new Error(missingThread ? error.message : this.state.lastError), { reached, status });
     }
   }
   refresh() {

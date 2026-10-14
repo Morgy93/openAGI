@@ -309,4 +309,12 @@ class FleetDecodingTest {
         assertEquals("codex://threads/01a13388", detail.openChat!!.url)
         assertEquals(Instant.parse("2026-10-14T04:03:50Z"), detail.scannedAt)
     }
+
+    @Test
+    fun anOlderDaemonAppOnlyQuestionKeepsItsHint() {
+        val question = decode("""{"questions":[{"id":"q","options":["open thread"]}]}""").questions.single()
+        assertNull(question.answerIn)
+        assertTrue(question.answeredInAgentApp)
+    }
+
 }

@@ -477,3 +477,15 @@ test('thread detail preserves computer errors other than not found', async t => 
     await assert.rejects(() => remote.threadDetail('codex:t1'), error => error.status === status);
   }
 });
+
+test('a missing thread keeps the lastError returned by the computer', async t => {
+  const { remote, runtime, state } = fixture(t);
+  for (const lastError of [null, 'A scan source failed']) {
+    runtime.nodeCapabilities.dispatch = async () => ({ state: { ...state, lastError }, response: { status: 404, body: { error: 'thread not found' } } });
+    assert.equal(await remote.threadDetail('codex:gone'), null);
+    assert.equal(remote.getState().lastError, lastError);
+  }
+  runtime.nodeCapabilities.dispatch = async () => { throw new Error('offline'); };
+  await assert.rejects(() => remote.threadDetail('codex:gone'), /unavailable/);
+  assert.match(remote.getState().lastError, /unavailable/);
+});

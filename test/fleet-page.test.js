@@ -537,7 +537,10 @@ test("Watching rows link to their chat; a chat no link opens names itself and wh
 });
 
 test("expanding a row loads its detail: last message, PR with CI, owner's last word, next step", async () => {
-  const page = boot({ state: watchState() });
+  const state = watchState();
+  const thread = state.snapshot.threads.find((row) => row.key === "conductor:p1");
+  for (const field of ["pr", "decision", "lastOwnerAt"]) delete thread[field];
+  const page = boot({ state });
   await settle();
   const row = rowOf(page, "Stalled PR");
   page.responses.push({ status: 200, body: { thread: {
@@ -662,4 +665,40 @@ test("Push now stays disabled through polling during a send", async () => {
   assert.equal(page.requests.filter((r) => r.method === "POST").length, 1);
   release({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
   await send;
+});
+
+test("a refreshed row wins over cached detail after dismissing its question", async () => {
+  const state = watchState();
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: { thread: {
+    key: "conductor:d1", watch: { group: "you", waitingOn: "your answer" },
+    pr: { ref: "o/r#99", title: "Stale PR" }, decision: { action: "ask-owner", reason: "Stale decision" },
+    muted: new Date(Date.now() + 3600_000).toISOString(),
+    lastAgentMessage: { text: "Longer agent message" }
+  } } });
+  await expand(rowOf(page, "Capacity fix"));
+  const fresh = structuredClone(state);
+  fresh.questions = [];
+  const thread = fresh.snapshot.threads[0];
+  thread.watch = { group: "push", waitingOn: "ready to continue" };
+  thread.pr = { ref: "o/r#8", title: "Current PR" };
+  thread.decision = { action: "wait", reason: "Current decision" };
+  page.responses.push({ status: 200, body: { state: fresh } });
+  await findAll(rowOf(page, "Capacity fix"), (e) => e.tagName === "BUTTON" && e.textContent === "Dismiss")[0].click();
+  await settle();
+  let text = rowOf(page, "Capacity fix").textContent;
+  assert.ok(text.includes("ready to continue"));
+  assert.ok(text.includes("Current PR"));
+  assert.ok(text.includes("Current decision"));
+  assert.ok(text.includes("Longer agent message"));
+  assert.doesNotMatch(text, /your answer|Stale PR|Stale decision|Muted until/);
+  assert.equal(page.requests.filter((r) => r.path.startsWith("/fleet/api/threads/")).length, 1, "detail remains cached");
+  thread.pr = null;
+  thread.decision = null;
+  page.setState(fresh);
+  await page.el("scan").click();
+  await settle();
+  text = rowOf(page, "Capacity fix").textContent;
+  assert.doesNotMatch(text, /Stale PR|Stale decision|Current PR|Current decision/);
 });

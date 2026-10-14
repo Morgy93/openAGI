@@ -4479,3 +4479,37 @@ test("Push now waits for an owner answer still on its way to the thread", async 
   assert.match(result.delivery.detail, /still on its way/);
   assert.equal(delivered.length, sent);
 });
+
+for (const probe of ["probeDelivery", "prSettledBeforeSend"]) {
+  for (const ownerState of ["question", "grouped question", "answer"]) {
+    test(`Push now rechecks ${ownerState} after ${probe}`, async (t) => {
+      const { supervisor, delivered } = fixture(t);
+      await supervisor.tick();
+      const original = supervisor[probe].bind(supervisor);
+      let release;
+      let entered;
+      const started = new Promise((resolve) => { entered = resolve; });
+      supervisor[probe] = async (...args) => {
+        const result = await original(...args);
+        entered();
+        await new Promise((resolve) => { release = resolve; });
+        return result;
+      };
+      const push = supervisor.pushNow("codex:t1");
+      await started;
+      const question = supervisor.store.upsertQuestion({ dedupeKey: "during-push", kind: "agent-ask", title: "Which fix?", options: ["A"],
+        ...(ownerState === "grouped question" ? { threadKeys: ["codex:t1"] } : { threadKey: "codex:t1" }) });
+      if (ownerState === "answer") {
+        supervisor.answering.add(question.id);
+        supervisor.store.answerQuestion(question.id, "A");
+      }
+      release();
+      const result = await push;
+      assert.equal(result.delivery.status, "blocked");
+      assert.match(result.delivery.detail, ownerState === "answer" ? /answer to it is still on its way/ : /waits on your answer/);
+      assert.equal(result.action, null);
+      assert.equal(delivered.length, 0);
+      assert.equal(supervisor.pushing.has("codex:t1"), false);
+    });
+  }
+}

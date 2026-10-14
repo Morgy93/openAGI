@@ -664,34 +664,37 @@ a.btn.primary{color:var(--ink)}
   }
 
   // A row's expanded context: the last scan's row, and once it arrives the
-  // thread's detail (last agent message, owner's last word, full PR).
+  // thread's detail for the longer message and fields the row lacks.
   function paintMore(more, t, entry) {
     var x = entry && entry.thread ? entry.thread : null;
-    var w = (x && x.watch) || t.watch || null;
+    function field(name) {
+      return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : (x && x[name]);
+    }
+    var w = field('watch');
     if (w && w.group) {
       var since = w.waitSince || w.since;
       var what = (WATCH_LABEL[w.group] || w.group) + (w.waitingOn ? ': ' + w.waitingOn : '');
       line(more, 'Waits on', what + (since ? ', for ' + dur(since) + ' (since ' + when(since) + ')' : ''));
     }
-    line(more, 'Agent', [t.kind, (x && x.agentStatus) || t.agentStatus].filter(Boolean).join(', '));
+    line(more, 'Agent', [t.kind, field('agentStatus')].filter(Boolean).join(', '));
     if (w && w.runningSince) line(more, 'Turn running', 'for ' + dur(w.runningSince) + ' (since ' + when(w.runningSince) + ')');
     var spoke = (x && x.lastAgentMessage && x.lastAgentMessage.at) || t.lastAgentAt;
     if (spoke) line(more, 'Agent last spoke', ago(spoke));
-    var owner = (x && x.lastOwnerAt) || t.lastOwnerAt;
+    var owner = field('lastOwnerAt');
     if (owner) line(more, 'You last wrote', ago(owner));
     if (t.lastActivityAt) line(more, 'Last activity', ago(t.lastActivityAt));
     line(more, 'Branch', t.branch);
-    prLine(more, (x && x.pr) || t.pr);
+    prLine(more, field('pr'));
     var blockers = Array.isArray(t.blockers) ? t.blockers : [];
     if (blockers.length > 1) line(more, 'Blockers', blockers.join('; '));
-    var dec = (x && x.decision) || t.decision || null;
+    var dec = field('decision');
     if (dec && dec.action && dec.action !== 'none') {
       line(more, 'Next', dec.action + (dec.playbook ? ' (' + dec.playbook + ')' : '') + (dec.notBefore ? ', not before ' + when(dec.notBefore) : ''));
     }
     if (dec && dec.reason) line(more, 'Why', dec.reason);
-    var muted = (x && x.muted) || t.muted;
+    var muted = field('muted');
     if (muted) line(more, 'Muted until', when(muted));
-    chatNote((x && x.openChat) || t.openChat, more);
+    chatNote(field('openChat'), more);
     var said = x && x.lastAgentMessage && typeof x.lastAgentMessage.text === 'string' ? x.lastAgentMessage.text : t.lastAgentText;
     if (said) {
       el('p', 'k', 'Last agent message (unverified):', more);

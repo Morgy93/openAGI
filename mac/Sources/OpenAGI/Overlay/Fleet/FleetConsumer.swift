@@ -67,6 +67,12 @@ final class FleetConsumer: ObservableObject {
   private static let stillSendingWait: TimeInterval = 300
   /// The scan the opened row's detail was last read for.
   private var lastDetailTick: String?
+  private var pendingDetails: Set<String> = []
+  private let fetchDetail: (URLRequest) async throws -> (Data, URLResponse)
+
+  init(fetchDetail: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }) {
+    self.fetchDetail = fetchDetail
+  }
 
   func refresh() async {
     generation &+= 1
@@ -218,11 +224,21 @@ final class FleetConsumer: ObservableObject {
 
   /// A failed read keeps what the row already shows from the scan.
   func loadDetail(_ key: String) async {
-    guard !detailLoading.contains(key) else { return }
+    guard !detailLoading.contains(key) else {
+      pendingDetails.insert(key)
+      return
+    }
     detailLoading.insert(key)
     defer { detailLoading.remove(key) }
+    repeat {
+      pendingDetails.remove(key)
+      await readDetail(key)
+    } while pendingDetails.contains(key)
+  }
+
+  private func readDetail(_ key: String) async {
     let req = request(path: Self.threadPath(key), method: "GET", timeout: 8)
-    guard let (data, response) = try? await URLSession.shared.data(for: req) else { return }
+    guard let (data, response) = try? await fetchDetail(req) else { return }
     switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
     case 200..<300:
       if let detail = FleetThreadDetail.decodeResponse(data) { details[key] = detail }

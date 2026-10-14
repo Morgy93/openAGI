@@ -5,10 +5,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.openagi.mobile.protocol.FleetAgentMessage
 import sh.openagi.mobile.protocol.FleetDecision
 import sh.openagi.mobile.protocol.FleetOpenChat
+import sh.openagi.mobile.protocol.FleetPr
 import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetThread
+import sh.openagi.mobile.protocol.FleetThreadDetail
 import sh.openagi.mobile.protocol.FleetWatch
 import java.time.Instant
 
@@ -261,8 +264,44 @@ class WatchFormatTest {
 
     @Test
     fun openThreadIsNotAnAnswerAndMacNavigationIsAnInstruction() {
-        assertEquals(listOf("Apply fix A"), WatchFormat.answerOptions(FleetQuestion(options = listOf("open thread", "dismiss", "Apply fix A"))))
+        assertEquals(listOf("Apply fix A"), WatchFormat.answerOptions(FleetQuestion(answerIn = "here", options = listOf("open thread", "dismiss", "Apply fix A"))))
         val link = WatchFormat.chatLink(conductorChat) { false }!!
         assertEquals("Open this chat on your Mac in Conductor.", WatchFormat.chatInstruction(link))
     }
+
+    @Test
+    fun pushNoteOnlyClaimsDeliveryForSent() {
+        assertEquals(SupervisorFormat.Note("Queued. Waiting to reach the agent: app busy", isAlert = false), WatchFormat.pushNote("queued", "app busy"))
+        assertEquals(SupervisorFormat.Note("Dry run. Nothing sent: would type", isAlert = false), WatchFormat.pushNote("dry-run", "would type"))
+        for (status in listOf(null, "", "unknown")) {
+            assertEquals(SupervisorFormat.Note("Delivery not confirmed.", isAlert = true), WatchFormat.pushNote(status, null))
+        }
+    }
+
+    @Test
+    fun anOlderDaemonKeepsTheOpenThreadOptionAndAppHint() {
+        val old = FleetQuestion(options = listOf("open thread", "dismiss"))
+        assertTrue(old.answeredInAgentApp)
+        assertEquals(listOf("open thread"), WatchFormat.answerOptions(old))
+        assertFalse(old.copy(answerIn = "here").answeredInAgentApp)
+        assertTrue(WatchFormat.answerOptions(old.copy(answerIn = "here")).isEmpty())
+        assertTrue(WatchFormat.answerOptions(old.copy(answerIn = "agent app")).isEmpty())
+    }
+
+    @Test
+    fun theRefreshedRowWinsOverCachedDetailAndKeepsTheLongerMessage() {
+        val cached = FleetThreadDetail(key = "codex:t", pr = FleetPr(ref = "o/r#1"),
+            decision = FleetDecision(action = "ask-owner"), watch = FleetWatch(group = "you"),
+            lastAgentMessage = FleetAgentMessage(text = "The longer agent message"))
+        val row = FleetThread(key = cached.key, pr = FleetPr(ref = "o/r#2"),
+            decision = FleetDecision(action = "wait"), watch = FleetWatch(group = "push"))
+        val context = WatchFormat.detailContext(row, cached)
+        assertEquals(row.pr, context.pr)
+        assertEquals(row.decision, context.decision)
+        assertEquals(row.watch, context.watch)
+        assertEquals(cached.lastAgentMessage, context.lastAgentMessage)
+        assertEquals(cached, WatchFormat.detailContext(FleetThread(key = cached.key), cached))
+        assertEquals(row.pr, WatchFormat.detailContext(row, null).pr)
+    }
+
 }
