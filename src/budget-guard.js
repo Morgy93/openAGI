@@ -76,10 +76,10 @@ export class BudgetGuard {
     };
   }
 
-  check() {
+  check(additionalUsd = 0) {
     const today = this.todayKey();
     const day = this.state.days[today] ?? { usd: 0 };
-    if (day.usd >= this.dailyUsdLimit) {
+    if (day.usd + additionalUsd >= this.dailyUsdLimit) {
       const error = new Error(
         `Daily budget reached: $${day.usd.toFixed(4)} of $${this.dailyUsdLimit.toFixed(2)}. ` +
         `Raise OPENAGI_DAILY_USD_LIMIT or wait until tomorrow.`

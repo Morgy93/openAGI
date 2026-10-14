@@ -10,7 +10,8 @@ import { AgentHost } from "../src/agent-host.js";
 import { matchConfirmation, ownerPrincipal } from "../src/owner-authority.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { VoiceSession, createVoiceSpend, digitsFromWords, voiceDailyCapUsd, voiceEnabled, voiceModel } from "../src/voice/broker.js";
+import { VoiceSession, createVoiceSessionFactory, createVoiceSpend, digitsFromWords, voiceDailyCapUsd, voiceEnabled, voiceModel } from "../src/voice/broker.js";
+import { BudgetGuard } from "../src/budget-guard.js";
 import { createResampler, realtimeCostUsd, resamplePcm16 } from "../src/voice/audio.js";
 
 const KEY = "sk-test-server-only-key";
@@ -90,7 +91,7 @@ function harness(t, { handsFree = false, capUsd = 5, spentToday = 0, focus = nul
   t.after(() => session.close());
   session.start();
   const ready = () => { upstream.event({ type: "session.created", session: {} }); upstream.event({ type: "session.updated", session: {} }); };
-  return { session, get upstream() { return upstream; }, ready, events, audio, ends, thread, ledger, sent, pendingActions, fleet, registry };
+  return { session, get upstream() { return upstream; }, ready, events, audio, ends, thread, ledger, sent, pendingActions, fleet, registry, supervisor, budget };
 }
 
 // One function call in a finished response.
@@ -195,6 +196,9 @@ test("a gated action runs only on the owner's transcript, never on model text or
   await flush();
   assert.equal(h.sent.length, 0, "model text and tool text never confirm");
   assert.equal(h.pendingActions.list({ status: "pending" }).length, 1, "the repeat reused the one card");
+
+  h.upstream.event(sayDone(h.events.find((event) => event.type === "confirmation.readback").text));
+  await flush();
 
   // The owner's next turn: the transcript is heard before the model answers.
   h.upstream.event({ type: "response.done", response: { status: "completed", output: [] } });
@@ -310,6 +314,8 @@ test("self_fix_start waits for the owner's yes; self_fix_stop is instant", async
   const card = h.events.find((event) => event.status === "awaiting_confirmation");
   assert.match(card.summary, /I'll open a PR, you merge/);
   assert.equal(h.fleet.fixes().length, 0);
+  h.upstream.event(sayDone(h.events.find((event) => event.type === "confirmation.readback").text));
+  await flush();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "in_2" });
   h.upstream.event({ type: "conversation.item.input_audio_transcription.completed", item_id: "in_2", transcript: `yes ${card.code}` });
   await flush(10);
@@ -346,6 +352,8 @@ test("voice approvals require a code that existed before the committed owner tur
   await h.session.onTranscript("request", "Tell amman to rebase.");
   await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
   const card = h.events.find((event) => event.status === "awaiting_confirmation");
+  h.upstream.event(sayDone(h.events.find((event) => event.type === "confirmation.readback").text));
+  await flush();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "bare" });
   await h.session.onTranscript("bare", "yes");
   assert.equal(h.sent.length, 0);
@@ -477,4 +485,194 @@ test("streaming resampling matches a whole waveform across irregular frame bound
   const resample = createResampler(16000, 24000);
   const streamed = Buffer.concat([resample(pcm.subarray(0, 202)), resample(pcm.subarray(202, 804)), resample(pcm.subarray(804))]);
   assert.deepEqual(streamed, resamplePcm16(pcm, 16000, 24000));
+});
+
+test("audio reservations persist once per second, not once per PCM frame", (t) => {
+  const h = harness(t);
+  let writes = 0;
+  h.budget.setVoiceReservation = () => { writes++; };
+  h.ready();
+  for (let i = 0; i < 150; i++) assert.equal(h.session.appendAudio(Buffer.alloc(960)), true);
+  assert.equal(writes, 3);
+  assert.ok(Math.abs(h.session.spend.today() - 0.006) < 1e-9);
+});
+
+test("quiet hands-free audio has a bounded reservation and releases it on close", (t) => {
+  const h = harness(t, { handsFree: true });
+  const held = {};
+  let writes = 0;
+  h.budget.setVoiceReservation = (id, usd) => { writes++; if (usd) held[id] = usd; else delete held[id]; };
+  h.budget.voiceReservationsToday = () => ({ ...held });
+  h.ready();
+  const second = Buffer.alloc(48_000);
+  for (let i = 0; i < 2600; i++) assert.equal(h.session.appendAudio(second), true);
+  assert.equal(writes, 1);
+  assert.equal(h.session.spend.today(), 0.002);
+  h.session.close();
+  assert.deepEqual(held, {});
+  assert.equal(h.session.spend.today(), 0);
+  assert.equal(h.ledger.length, 0);
+});
+
+test("short audio is released; committed audio without transcript usage is conservatively settled", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.session.appendAudio(Buffer.alloc(960));
+  h.session.commit();
+  assert.equal(h.session.spend.today(), 0);
+  h.session.appendAudio(Buffer.alloc(9600));
+  h.session.commit();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "unmetered" });
+  const id = h.session.turns.get("unmetered").reservationId;
+  await h.session.onTranscript("unmetered", "Hello");
+  assert.equal(h.session.spend.amount(id), 0);
+  assert.equal(h.ledger[0].estimated, true);
+  assert.equal(h.ledger[0].usd, 0.002);
+  // A commit in flight at close is not mistaken for unbillable tail audio.
+  h.session.appendAudio(Buffer.alloc(9600));
+  h.session.commit();
+  const pending = h.session.pendingCommits[0];
+  h.session.close();
+  assert.equal(h.session.spend.amount(pending), 0);
+  assert.equal(h.ledger.length, 2);
+});
+
+test("transcription failure and close without a transcript settle committed audio", (t) => {
+  const h = harness(t, { handsFree: true });
+  h.ready();
+  for (const id of ["failed", "missing"]) {
+    h.session.appendAudio(Buffer.alloc(9600));
+    h.upstream.event({ type: "input_audio_buffer.committed", item_id: id });
+    if (id === "failed") h.upstream.event({ type: "conversation.item.input_audio_transcription.failed", item_id: id });
+  }
+  h.session.close();
+  for (const turn of h.session.turns.values()) assert.equal(h.session.spend.amount(turn.reservationId), 0);
+  assert.equal(h.ledger.length, 2);
+});
+
+test("voice persistence failures recover after a successful retry or UTC rollover", () => {
+  let fail = true;
+  let now = Date.parse("2026-10-14T12:00:00Z");
+  const spend = createVoiceSpend({ now: () => now, budget: {
+    setVoiceReservation() { if (fail) throw new Error("disk full"); }
+  } });
+  assert.equal(spend.reserve("first", 0.01), false);
+  assert.equal(spend.capped(), true);
+  fail = false;
+  assert.equal(spend.capped(), false);
+  assert.equal(spend.reserve("second", 0.01), true);
+  fail = true;
+  assert.equal(spend.reserve("third", 0.01), false);
+  now += 86_400_000;
+  assert.equal(spend.capped(), false);
+  assert.equal(spend.reserve("fourth", 0.01), false, "a fresh write must still succeed");
+});
+
+test("voice obeys the global budget at creation and across concurrent reservations", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-budget-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const budget = new BudgetGuard({ storePath: path.join(dir, "usage.json"), dailyUsdLimit: 10 });
+  budget.recordUsd(9.9, "text-model");
+  const spend = createVoiceSpend({ budget });
+  assert.equal(spend.reserve("mac", 0.06), true);
+  assert.equal(spend.reserve("phone", 0.05), false);
+  budget.recordUsd(0.05, "text-model");
+  assert.equal(spend.capped(), true);
+  assert.equal(spend.reserve("mac", 0.002), false);
+  spend.release("mac");
+  budget.recordUsd(0.05, "text-model");
+  const factory = createVoiceSessionFactory({ runtime: { budget }, env: { OPENAI_API_KEY: KEY } });
+  await assert.rejects(factory.create({}, {}), { code: "budget" });
+  const h = harness(t);
+  h.ready();
+  h.session.spend = createVoiceSpend({ budget });
+  assert.equal(h.session.appendAudio(Buffer.alloc(960)), false);
+  assert.equal(h.ends.at(-1).code, "voice_cap");
+});
+
+test("a finished reply cannot arm a barge timer that cancels a short next turn", async (t) => {
+  const h = harness(t, { handsFree: true });
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "first" });
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event({ type: "response.output_audio.delta", item_id: "old", delta: Buffer.alloc(4800).toString("base64") });
+  h.upstream.event(sayDone("Ready."));
+  h.upstream.event({ type: "input_audio_buffer.speech_started" });
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "next" });
+  h.upstream.event({ type: "response.created" });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(h.session.responding, true);
+  assert.equal(h.upstream.types().includes("response.cancel"), false);
+  assert.equal(h.upstream.types().includes("conversation.item.truncate"), false);
+});
+
+test("the fallback truncates only the old item even when the next reply starts", async (t) => {
+  const h = harness(t, { handsFree: true });
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "first" });
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event({ type: "response.output_audio.delta", item_id: "old", delta: Buffer.alloc(4800).toString("base64") });
+  h.upstream.event({ type: "input_audio_buffer.speech_started" });
+  h.upstream.event({ type: "response.done", response: { status: "cancelled", output: [] } });
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "next" });
+  h.upstream.event({ type: "response.created" });
+  const generation = h.session.generation;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(h.session.responding, true);
+  assert.equal(h.session.generation, generation);
+  assert.equal(h.upstream.types().includes("response.cancel"), false);
+  assert.equal(h.upstream.last("conversation.item.truncate").item_id, "old");
+});
+
+for (const crossChat of [false, true]) test(`slow approved actions speak their receipt after execution (cross-chat: ${crossChat})`, async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.session.transcriptWaitMs = 10;
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
+  await h.session.onTranscript("request", "Tell amman to rebase.");
+  await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
+  const readback = h.events.find((event) => event.type === "confirmation.readback");
+  h.upstream.event(sayDone(readback.text));
+  await flush();
+  if (crossChat) h.session.cards.clear();
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  h.supervisor.sendOwnerMessage = async () => { await blocked; return { delivery: { status: "sent" } }; };
+  const before = h.upstream.types().filter((type) => type === "response.create").length;
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "yes" });
+  const pending = h.session.onTranscript("yes", `yes ${readback.code}`);
+  assert.equal(await h.session.awaitTranscript("yes"), `yes ${readback.code}`);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(h.upstream.types().filter((type) => type === "response.create").length, before);
+  assert.ok(h.events.some((event) => event.type === "notice"));
+  release();
+  await pending;
+  await flush();
+  assert.equal(h.events.find((event) => event.type === "confirm").status, "done");
+  const notes = h.upstream.sent.filter((event) => event.item?.role === "system");
+  assert.match(notes.at(-1).item.content[0].text, /handled by the hub/);
+  assert.equal(h.upstream.types().filter((type) => type === "response.create").length, before + 1);
+});
+
+test("a model paraphrase cannot authorize a gated action; the hub description and code must be read", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
+  await h.session.onTranscript("request", "What is amman stuck on?");
+  await h.session.onResponseDone(callDone("fleet_thread", { key: "codex:t1" }).response);
+  await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "git push --force origin main" }).response);
+  const readback = h.events.find((event) => event.type === "confirmation.readback");
+  assert.match(readback.text, /git push --force origin main/);
+  assert.match(h.upstream.last("response.create").response.instructions, /git push --force origin main/);
+  assert.equal(h.upstream.last("response.create").response.tool_choice, "none");
+  h.upstream.event(sayDone(`I'll mark amman as read. Say yes ${readback.code}.`));
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "misled" });
+  await h.session.onTranscript("misled", `yes ${readback.code}`);
+  assert.equal(h.sent.length, 0);
+  // Only an accurate completed readback makes a subsequent turn eligible.
+  h.upstream.event(sayDone(readback.text));
+  await flush();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "informed" });
+  await h.session.onTranscript("informed", `yes ${readback.code}`);
+  assert.equal(h.sent.length, 1);
 });

@@ -292,3 +292,44 @@ test("a slow text device hits the same outbound backlog cap as audio", { timeout
   assert.equal((await client.next()).code, "client_backlog");
   assert.equal((await client.closed).code, 1011);
 });
+
+test("start followed immediately by audio and controls preserves their order", { timeout: 3000 }, async (t) => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const calls = [];
+  const f = await fixture(t, { createSession: async () => {
+    await gate;
+    return {
+      appendAudio(pcm) { calls.push(["audio", pcm.length]); return true; },
+      commit() { calls.push(["commit"]); },
+      setFocus(focus) { calls.push(["context", focus]); },
+      close() {}
+    };
+  } });
+  const client = connect(f.origin, OWNER);
+  await client.opened;
+  client.send({ type: "start", gesture: "hotkey" });
+  client.ws.send(Buffer.alloc(4800));
+  client.send({ type: "commit" });
+  client.send({ type: "context", focus: { view: "supervisor" } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release();
+  await until(() => calls.length === 3);
+  assert.deepEqual(calls, [["audio", 4800], ["commit"], ["context", { view: "supervisor" }]]);
+  client.send({ type: "stop" });
+  assert.equal((await client.closed).code, 1000);
+});
+
+test("startup audio is still paced and startup frames are bounded", { timeout: 3000 }, async (t) => {
+  const f = await fixture(t, { createSession: () => new Promise(() => {}) });
+  const fast = connect(f.origin, OWNER);
+  await fast.opened;
+  fast.send({ type: "start", gesture: "mic" });
+  for (let i = 0; i < 3; i++) fast.ws.send(Buffer.alloc(48_000));
+  assert.equal((await fast.next()).code, "audio_rate");
+  const tiny = connect(f.origin, PHONE);
+  await tiny.opened;
+  tiny.send({ type: "start", gesture: "mic" });
+  for (let i = 0; i < 501; i++) tiny.ws.send(Buffer.alloc(2));
+  assert.equal((await tiny.next()).code, "upstream_backlog");
+});
