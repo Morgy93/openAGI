@@ -702,3 +702,16 @@ test("a refreshed row wins over cached detail after dismissing its question", as
   text = rowOf(page, "Capacity fix").textContent;
   assert.doesNotMatch(text, /Stale PR|Stale decision|Current PR|Current decision/);
 });
+
+
+test("Antigravity thread details show how to open the conversation as plain text", async () => {
+  const state = sampleState();
+  const thread = state.snapshot.threads[0];
+  thread.kind = "antigravity";
+  const note = "Open Antigravity and pick it in the sidebar. <img src=x>";
+  thread.openChat = { note };
+  const page = boot({ state });
+  await settle();
+  assert.ok(page.el("fleetList").textContent.includes(note));
+  assert.equal(findAll(page.el("fleetList"), (e) => e.tagName === "IMG").length, 0);
+});

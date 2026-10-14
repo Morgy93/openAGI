@@ -2,7 +2,7 @@
 // interface's shared authentication/Origin gate. Never touches res: returns
 // { status, body }, or null for paths it does not own.
 
-import { MODES } from "./contracts.js";
+import { MODES, THREAD_KEY_PATTERN } from "./contracts.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 
 const PREFIX = "/fleet/api/";
@@ -10,7 +10,7 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const ANSWER_MAX = 200;
 const SEND_MAX = 2000;
 const LABEL_MAX = 80;
-const THREAD_KEY = /^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/;
+const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
 const THREAD_ACTIONS = new Set(["push", "mute", "unmute"]);

@@ -69,7 +69,7 @@ function report(state, now) {
   const out = [];
   const counts = snap.counts;
   const src = counts.sources ?? {};
-  out.push(`FLEET ${new Date(snap.at).toLocaleTimeString()} · ${Math.round(snap.durationMs / 100) / 10}s · codex ${src.codex ?? 0} · claude ${src.claude ?? 0} · conductor ${src.conductor ?? 0} → ${counts.inScope} in scope`);
+  out.push(`FLEET ${new Date(snap.at).toLocaleTimeString()} · ${Math.round(snap.durationMs / 100) / 10}s · codex ${src.codex ?? 0} · claude ${src.claude ?? 0} · conductor ${src.conductor ?? 0} · antigravity ${src.antigravity ?? 0} → ${counts.inScope} in scope`);
   out.push("DRY RUN observe mode: sends nothing to any agent, no phone push");
   out.push("");
   out.push(`NEEDS YOU (${state.questions.length})`);

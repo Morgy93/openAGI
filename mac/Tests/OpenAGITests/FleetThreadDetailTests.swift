@@ -79,6 +79,14 @@ final class FleetThreadDetailTests: XCTestCase {
     XCTAssertNil(FleetChatOpener.buttonTitle(claude))
   }
 
+  func testAntigravityHasGuidanceWithoutAConversationLink() {
+    let chat = FleetOpenChat(app: "antigravity", url: nil, label: "api · Auth (Antigravity)", note: "Open it in Antigravity.")
+    XCTAssertEqual(chat.appName, "Antigravity")
+    XCTAssertNil(chat.link)
+    XCTAssertEqual(FleetChatOpener.target(chat), .nowhere)
+    XCTAssertEqual(FleetConsumer.threadPath("antigravity:a1"), "/fleet/api/threads/antigravity%3Aa1")
+  }
+
   func testThreadPathEncodesTheColon() {
     XCTAssertEqual(FleetConsumer.threadPath("conductor:d1dbe71a"), "/fleet/api/threads/conductor%3Ad1dbe71a")
   }

@@ -211,7 +211,8 @@ export function threadHealth(state, error = null) {
 
 // A Claude transcript and a Conductor session are the same agent when the
 // Conductor row points at the transcript's session id. Conductor owns status.
-export function mergeThreads({ codex = [], claude = [], conductor = [] } = {}) {
+// Antigravity conversations stand alone.
+export function mergeThreads({ codex = [], claude = [], conductor = [], antigravity = [] } = {}) {
   const merged = conductor.filter(Boolean).map((thread) => ({ ...thread }));
   const byClaudeId = new Map();
   for (const thread of merged) if (thread.claudeSessionId) byClaudeId.set(thread.claudeSessionId, thread);
@@ -221,7 +222,7 @@ export function mergeThreads({ codex = [], claude = [], conductor = [] } = {}) {
     if (target) foldClaudeInto(target, thread);
     else loose.push({ ...thread });
   }
-  return [...codex.filter(Boolean).map((thread) => ({ ...thread })), ...merged, ...loose];
+  return [...codex.filter(Boolean).map((thread) => ({ ...thread })), ...merged, ...loose, ...antigravity.filter(Boolean).map((thread) => ({ ...thread }))];
 }
 
 function foldClaudeInto(target, claude) {
