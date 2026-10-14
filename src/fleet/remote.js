@@ -1,5 +1,10 @@
 // Fleet stays on the coding computer. Main reaches it over the existing
 // enrolled-node control channel; no owner token, shell, or arbitrary URL crosses it.
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { resolveFleetConfig } from "./contracts.js";
+import { fixRevision } from "./feedback.js";
+import { FleetStore } from "./store.js";
 import { createFleetRoute } from './routes.js';
 
 export function createFleetCapability(supervisor) {
@@ -37,10 +42,11 @@ const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send)$/;
 
 export class RemoteFleetSupervisor {
-  constructor({ runtime, nodeId, intervalMs = 30000 }) {
+  constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
     this.runtime = runtime;
     this.nodeId = nodeId;
     this.intervalMs = intervalMs;
+    this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
     this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
     this.timer = null;
@@ -48,7 +54,14 @@ export class RemoteFleetSupervisor {
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
   }
-  getState() { return structuredClone(this.state); }
+  getState() {
+    const state = structuredClone(this.state);
+    if (this.selfFixHub) {
+      state.fixes = this.selfFixHub.store.fixes();
+      state.questions = [...state.questions, ...this.selfFixHub.store.openQuestions()];
+    }
+    return state;
+  }
   beginOutreachDecision(id) {
     this.pendingOutreachDecisions.set(id, (this.pendingOutreachDecisions.get(id) ?? 0) + 1);
   }
@@ -76,17 +89,19 @@ export class RemoteFleetSupervisor {
   refresh() {
     if (!this.refreshing) {
       this.refreshing = this.request('GET', '/fleet/api/state')
+        .then(async (body) => { await this.selfFixHub?.sync().catch(() => {}); return body; })
         .then(async (body) => { await this.replayDismissals(); return body; })
         .finally(() => { this.refreshing = null; });
     }
     return this.refreshing;
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
-  async setMode(mode) { await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
-  async answerQuestion(id, answer) { return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
+  async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
+  async answerQuestion(id, answer) { if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer); return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
   async dismissQuestion(id, { replay = false } = {}) {
+    if (this.selfFixHub?.store.question(id)) return this.selfFixHub.store.dismissQuestion(id);
     try {
       const body = await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true });
       this.pendingDismissals.delete(id);
@@ -119,10 +134,10 @@ export class RemoteFleetSupervisor {
   // Feedback and self-fix requests live with the fleet, on the computer.
   async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
   async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
-  async queueFix(input) { return (await this.request('POST', '/fleet/api/fixes', input)).fix; }
-  async fixes() { return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
-  async reviseFix(id, instructions) { return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }
-  async stopFix(id) { return (await this.request('POST', `/fleet/api/fixes/${id}/stop`)).stopped ?? []; }
+  async queueFix(input) { if (this.selfFixHub) return this.selfFixHub.queue(input); return (await this.request('POST', '/fleet/api/fixes', input)).fix; }
+  async fixes() { if (this.selfFixHub) return this.selfFixHub.store.fixes(); return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
+  async reviseFix(id, instructions) { if (this.selfFixHub) return this.selfFixHub.revise(id, instructions); return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }
+  async stopFix(id) { if (this.selfFixHub) return this.selfFixHub.stop(id); return (await this.request('POST', `/fleet/api/fixes/${id}/stop`)).stopped ?? []; }
   async runningInApp(app) {
     return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;
   }
@@ -139,7 +154,7 @@ export class RemoteFleetSupervisor {
   mirrorQuestions() {
     const outreach = this.runtime.outreach;
     if (!outreach) return;
-    const openIds = new Set(this.state.questions.map(q => q.id));
+    const openIds = new Set(this.getState().questions.map(q => q.id));
     for (const item of outreach.list()) {
       if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
           && (item.sourceRef.nodeId !== this.nodeId
@@ -148,8 +163,8 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
-    for (const q of this.state.questions) {
-      const shown = { title: q.title, summary: q.body, actions: [...(q.options ?? []), "dismiss"] };
+    for (const q of this.getState().questions) {
+      const shown = { title: q.title, summary: q.card || q.body, actions: [...(q.options ?? []), "dismiss"] };
       // A question the computer closed on a blip and reopened keeps its id:
       // its old copy comes back, so the glasses do not ping for it again.
       const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;
@@ -159,5 +174,91 @@ export class RemoteFleetSupervisor {
       // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
       if (item?.id) outreach.update?.(item.id, shown);
     }
+  }
+}
+
+// Hub-owned records survive a Mac outage. Only the pinned coding node runs fixes.
+export class SelfFixHub {
+  constructor({ store, runtime, config = resolveFleetConfig(), nodeId = process.env.OPENAGI_CODING_SUPERVISOR_NODE }) {
+    this.store = store; this.runtime = runtime; this.config = config; this.nodeId = nodeId;
+
+  }
+  async dispatch(operation, payload = {}) {
+    if (!this.nodeId || !this.runtime?.nodeCapabilities?.dispatch) throw new Error("Coding node is offline or not configured.");
+    const snapshot = await this.runtime.nodeCapabilities.dispatch(this.nodeId, "self-fix", operation, payload, { timeoutMs: 30000 });
+    if (!Array.isArray(snapshot?.fixes) || !Array.isArray(snapshot?.selfSessions)) throw new Error("Invalid self-fix response.");
+    for (const fix of snapshot.fixes) {
+      const existing = this.store.fix(fix.id);
+      if (!existing) continue;
+      // A stop the Mac has not received yet wins over stale status.
+      if (existing.state === "abandoned" && fix.state !== "abandoned") continue;
+      const stateChanged = existing.state !== fix.state;
+      this.store.updateFix(fix.id, fix);
+      if (stateChanged && !snapshot.actions?.length) this.store.recordAction({ kind: "self-fix", fixId: fix.id, state: fix.state, status: fix.state === "failed" ? "failed" : "done" });
+    }
+    const knownActions = new Set(this.store.actions(1000).map((action) => action.id));
+    for (const action of snapshot.actions ?? []) {
+      if (action.kind === "self-fix" && this.store.fix(action.fixId) && !knownActions.has(action.id)) this.store.recordAction(action);
+    }
+    if (snapshot.areaLocks && typeof snapshot.areaLocks === "object") {
+      this.store.state.fixLocks = structuredClone(snapshot.areaLocks);
+      this.store._save();
+    }
+    for (const session of snapshot.selfSessions) this.store.addSelfSession(session.id, session.fixId);
+    for (const question of snapshot.questions ?? []) this.store.upsertQuestion(question);
+    for (const fix of snapshot.fixes.filter((item) => ["done", "abandoned"].includes(item.state))) {
+      const question = this.store.openQuestions().find((item) => item.dedupeKey === "self-fix:" + fix.id);
+      if (question) this.store.resolveQuestion(question.id);
+    }
+    return snapshot;
+  }
+  async queue(input) {
+    if (this.config.selfFix.mode === "off") throw new Error("Self-fix is off.");
+    if (input.auto && (this.config.selfFix.mode !== "auto" || !(input.confidence >= 0.8))) throw new Error("Auto fixes need high confidence and auto mode.");
+    const fix = this.store.queueFix(input);
+    if (input.auto) this.store.updateFix(fix.id, { auto: true, confidence: input.confidence });
+    this.store.recordAction({ kind: "self-fix", fixId: fix.id, state: "queued", status: "done" });
+    await this.dispatch("start", { fix: this.store.fix(fix.id), auto: input.auto, confidence: input.confidence }).catch(() => {});
+    return this.store.fix(fix.id);
+  }
+  async sync() {
+    if (!this.nodeId || !this.runtime?.nodeCapabilities?.dispatch) return;
+    for (const [key, command] of Object.entries(this.store.fixCommands()).filter(([, command]) => command.operation === "stop")) {
+      await this.dispatch(command.operation, command.payload);
+      this.store.clearFixCommand(key);
+    }
+    for (const fix of this.store.fixes().filter((item) => item.state === "queued")) await this.dispatch("start", { fix, auto: fix.auto, confidence: fix.confidence });
+    for (const [key, command] of Object.entries(this.store.fixCommands()).filter(([, command]) => command.operation !== "stop")) {
+      await this.dispatch(command.operation, command.payload);
+      this.store.clearFixCommand(key);
+    }
+    if (this.store.fixes().some((fix) => !["done", "failed", "abandoned"].includes(fix.state))) await this.dispatch("list");
+  }
+  async revise(id, instructions) {
+    const fix = this.store.fix(id);
+    if (!fix) return null;
+    if (["done", "failed", "abandoned"].includes(fix.state)) throw new Error("Only running or open fixes can be revised.");
+    const command = { operation: "revise", payload: { id, instructions, requestId: randomUUID() } };
+    // Validate locally but do not duplicate the revision on node readback.
+    fixRevision(fix, instructions);
+    this.store.queueFixCommand("revise:" + id, command);
+    await this.dispatch(command.operation, command.payload).then(() => this.store.clearFixCommand("revise:" + id)).catch(() => {});
+    return this.store.fix(id);
+  }
+  async stop(id) {
+    const stopped = this.store.stopFix(id);
+    for (const [key, command] of Object.entries(this.store.fixCommands())) if (command.operation === "revise" && (id === "all" || command.payload.id === id)) this.store.clearFixCommand(key);
+    const command = { operation: "stop", payload: { id } };
+    this.store.queueFixCommand("stop:" + id, command);
+    await this.dispatch(command.operation, command.payload).then(() => this.store.clearFixCommand("stop:" + id)).catch(() => {});
+    return stopped;
+  }
+  async answer(id, answer) {
+    const question = this.store.question(id);
+    if (!question || question.status !== "open" || !question.options.includes(answer)) return null;
+    const fixId = question.meta?.fixId;
+    if (answer === "Request changes") return { question, delivery: { status: "blocked", detail: "Use self_fix_revise or POST fixes/" + fixId + "/revise with your change instructions." } };
+    if (answer === "Close PR") await this.dispatch("close", { id: fixId });
+    return { question: this.store.answerQuestion(id, answer), delivery: { status: "sent", detail: answer === "Review PR" ? question.prRef : "PR closed" } };
   }
 }

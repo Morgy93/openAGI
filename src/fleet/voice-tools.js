@@ -1,7 +1,7 @@
 // Tools the voice Supervisor adds to the fleet set: a walkthrough to narrate,
 // what the owner is looking at, a diagnose (current counts until the full
-// diagnose lands), owner feedback, and self-fix requests (stored until the
-// runner lands; nothing runs yet). Text chats can use them too. A voice
+// diagnose lands), owner feedback, and repairs on the coding node.
+// Text chats can use them too. A voice
 // call carries context.__voice (built by the broker per call): the owner's
 // on-screen focus, the device source and the owner's own last words.
 
@@ -51,7 +51,6 @@ async function readFixes(supervisor) {
 const compactFix = (fix) => ({
   id: fix.id, title: clip(fix.title, 100), area: fix.area ?? null, state: fix.state ?? null,
   createdAt: fix.createdAt ?? null, revisions: Array.isArray(fix.revisions) ? fix.revisions.length : 0,
-  // The runner fills these in once it exists.
   prUrl: fix.prUrl ?? null, round: fix.round ?? 0, costUsd: fix.costUsd ?? null
 });
 
@@ -160,14 +159,14 @@ export function registerVoiceTools(registry, supervisor) {
       return { feedbackId: record?.id ?? null, status: record?.status ?? null, target: record?.target ?? null };
     } });
   if (typeof supervisor.fixes === "function") registry.register({ name: "self_fix_list", source: SOURCE, sideEffects: false,
-    description: "The supervisor's self-fix requests, newest first: state, area, PR link, review round and cost once a fixer runs them. The fixer runner is not built yet, so requests stay queued.",
+    description: "The supervisor's self-fix requests, newest first: state, area, PR link, review round and cost once a fixer runs them. Offline coding nodes leave requests queued.",
     parameters: { type: "object", properties: { status: { type: "string", enum: FIX_STATES } }, additionalProperties: false },
     handler: async (args) => {
       const fixes = (await readFixes(supervisor)).filter((fix) => !args?.status || fix.state === args.status);
-      return { fixes: fixes.slice(0, 20).map(compactFix), runner: "not built yet: requests are stored, nothing runs" };
+      return { fixes: fixes.slice(0, 20).map(compactFix), runner: "coding node; owner merges" };
     } });
   if (typeof supervisor.queueFix === "function") registry.register({ name: "self_fix_start", source: SOURCE, needsConfirmation: true,
-    description: `Queue a fix to the supervisor's own code: a fixer agent will work it on a branch and open a PR the owner merges. Read the title, area and caps back first (${FIX_CAPS}; "I'll open a PR, you merge") and run it only on the owner's confirmation. Areas: ${FIX_AREAS.join(", ")}. For now the request is stored; the runner ships later.`,
+    description: `Queue a fix to the supervisor's own code: a fixer agent will work it on a branch and open a PR the owner merges. Read the title, area and caps back first (${FIX_CAPS}; "I'll open a PR, you merge") and run it only on the owner's confirmation. Areas: ${FIX_AREAS.join(", ")}.`,
     parameters: { type: "object", properties: {
       title: { type: "string", minLength: 1, maxLength: 100 },
       problem: { type: "string", minLength: 1, maxLength: 2000 },
@@ -189,7 +188,7 @@ export function registerVoiceTools(registry, supervisor) {
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
       const fix = await supervisor.queueFix(args);
-      return { fixId: fix?.id ?? null, state: fix?.state ?? null, note: "Queued and kept. The fixer runner is not built yet, so no work starts until it ships." };
+      return { fixId: fix?.id ?? null, state: fix?.state ?? null, note: "Queued on the coding node. I will open a PR; you merge." };
     } });
   if (typeof supervisor.reviseFix === "function") registry.register({ name: "self_fix_revise", source: SOURCE, needsConfirmation: true,
     description: "Send the owner's change requests into a self-fix that is running or has a PR open (one extra round). Read the instructions back and run it only on the owner's confirmation.",

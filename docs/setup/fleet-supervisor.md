@@ -493,3 +493,53 @@ proactive inbox when Approvals notifications are enabled; this requires the
 backend update, not a glasses firmware update. Answering remains on the phone
 or main dashboard. Offline Macs retain their last snapshot with an unavailable
 status; no successful delivery is inferred from cached data.
+
+### Self-fix runner
+
+The hub keeps repair requests and dispatches them only to
+`OPENAGI_CODING_SUPERVISOR_NODE` through the `self-fix` capability. The Mac's
+outbound coding worker and enrolled Mac daemon advertise that capability.
+An offline Mac leaves requests queued. The agent opens and reviews PRs; the
+owner merges. There is no merge, release, deploy or restart operation.
+
+`OPENAGI_FLEET_SELF_FIX` accepts `off`, `propose` (default) or `auto`.
+Auto requests require confidence at least 0.8 and count toward the three starts
+per UTC day. Explicit owner requests also count. Limits can be lowered with
+`OPENAGI_FLEET_SELF_FIX_DAILY_CAP`, `OPENAGI_FLEET_SELF_FIX_WALL_MS`,
+`OPENAGI_FLEET_SELF_FIX_TOKEN_CAP` and `OPENAGI_FLEET_SELF_FIX_ROUNDS`.
+The hard ceilings are three starts/day, two hours, six million tokens and
+three review repairs, plus one owner revision. Stop all or switching Fleet to
+Observe cancels the process group. Failed and stopped worktrees are retained.
+
+On the Mac, configure Codex's codex-lb provider to use `CODEX_LB_API_KEY` and
+put that key in `~/.codex/codex-lb.env`. The runner uses
+`~/.ccodex/bin/codex`, only gpt-6.1-sol, and Node 22.21.1 from nvm.
+It prepares a dedicated clone under `~/Dev/openagi-fixes/_repo`. Prepare that
+clone's dependencies ahead of time, or set `OPENAGI_SELF_FIX_NODE_MODULES` to
+an existing compatible dependency cache. Worktrees link that cache; the runner
+does not install packages. It never uses the owner's development checkout.
+
+Create a dedicated fine-grained GitHub token: Settings > Developer settings >
+Personal access tokens > Fine-grained tokens > Generate new token. Select
+resource owner Spshulem, only repository openAGI, and repository permissions
+Contents: Read and write, Pull requests: Read and write, Metadata: Read.
+Protect main with required owner review: those write permissions alone do not
+prevent GitHub's merge endpoint. Save the token in
+`~/.openagi/self-fix-gh-token` owned by the Mac user with mode 0600, or supply
+`OPENAGI_SELF_FIX_GH_TOKEN`. No owner gh login is used. Missing or unsafe token
+files fail preflight and raise one deduplicated setup card on the hub.
+
+`GET /fleet/api/fixes` lists runs. `POST /fleet/api/fixes/:id/stop` stops one
+(or use id `all`); `POST /fleet/api/fixes/:id/revise` takes `{instructions}`.
+The owner card has Review PR, Request changes and Close PR. The web Request
+changes button collects instructions and uses the same revision path as the
+voice tool. A completed repair cleans up its own worktree and branch only
+when the owner's merge or closure is observed. Recovery after a runner crash
+fails closed and retains the interrupted worktree for inspection.
+
+Replay copies fleet state, action history and playbooks into temporary data
+directories. Both revisions see the same frozen sources and clock; external
+commands, notifications, pushes and delivery are disabled. A target metric
+must improve and untouched playbooks may not increase questions or sends by
+more than 10%. An unknown metric fails closed. P4's richer diagnostic metrics
+can extend this replay contract later.

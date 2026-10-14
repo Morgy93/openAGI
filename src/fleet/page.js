@@ -101,6 +101,7 @@ details.thread>summary{padding:0}
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
   <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
   <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
+  <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section>
 </main>
 </div>
 <script>
@@ -324,7 +325,7 @@ details.thread>summary{padding:0}
       if (t) el('span', null, t.workspace || threadName(t), ctx);
       if (q.prRef) link(shortRef(q.prRef), prHref(t && t.pr, q.prRef), ctx);
       if (q.createdAt) el('span', null, ago(q.createdAt), ctx);
-      if (q.body) el('p', null, q.body, card);
+      if (q.card || q.body) el('p', null, q.card || q.body, card);
       reviewNote(q, card);
       var opts = el('div', 'opts', null, card);
       var buttons = [];
@@ -389,6 +390,11 @@ details.thread>summary{padding:0}
   }
 
   async function decide(q, body, buttons) {
+    if (q.kind === 'self-fix' && body.answer === 'Request changes') {
+      var instructions = window.prompt('What should the fixer change?');
+      if (!instructions || !instructions.trim()) return;
+      body.instructions = instructions.trim();
+    }
     buttons.forEach(function (b) { b.disabled = true; });
     try {
       var r = await api('/fleet/api/questions/' + encodeURIComponent(q.id), body);
@@ -659,6 +665,18 @@ details.thread>summary{padding:0}
     renderDoing(Array.isArray(s.actions) ? s.actions : [], byKey);
     renderInfra(snap);
     renderFleet(snap);
+    var fixes = document.getElementById('self-fixes');
+    if (fixes) {
+      fixes.textContent = '';
+      (Array.isArray(s.fixes) ? s.fixes : []).forEach(function (fix) {
+        var row = document.createElement('p');
+        row.textContent = fix.title + ' · ' + fix.state + ' · round ' + (fix.round || 0);
+        if (fix.prUrl && /^https:\/\/github\.com\/Spshulem\/openAGI\/pull\/[0-9]+$/i.test(fix.prUrl)) {
+          var link = document.createElement('a'); link.href = fix.prUrl; link.textContent = ' Review PR'; row.appendChild(link);
+        }
+        fixes.appendChild(row);
+      });
+    }
     focusQuestion();
   }
 

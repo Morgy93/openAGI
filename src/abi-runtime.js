@@ -245,7 +245,7 @@ export class AbiRuntime {
     // Watches every recent Codex/Claude/Conductor coding thread. The
     // constructor has no side effects; hosted-interface starts it on listen.
     this.fleetSupervisor = options.fleetSupervisor ?? (process.env.OPENAGI_FLEET_NODE
-      ? new RemoteFleetSupervisor({ runtime: this, nodeId: process.env.OPENAGI_FLEET_NODE })
+      ? new RemoteFleetSupervisor({ runtime: this, nodeId: process.env.OPENAGI_FLEET_NODE, dataDir: options.dataDir ?? resolveDataDir() })
       : new FleetSupervisor({ ...options.fleetSupervisorOptions, dataDir: options.dataDir, runtime: this }));
     if (this.outreachConfig.enabled) {
       this.outreachMapper = new OutreachMapper({ store: this.outreach, events: this.events });

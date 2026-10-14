@@ -4279,3 +4279,15 @@ test("answers kept under keys an older build saved are still typed after the upg
   // The answered ask holds: not put to the owner again under its new key.
   assert.deepEqual(supervisor.getState().questions.filter((q) => q.kind === "agent-ask"), []);
 });
+
+
+test("self-fix sessions, branches and worktrees are never classified for nudges", async (t) => {
+  const threads = [makeThread({ id: "own-session", key: "codex:own-session" }), makeThread({ id: "fix-branch", key: "codex:fix-branch", branch: "selffix/fix-one" }), makeThread({ id: "fix-path", key: "codex:fix-path", cwd: "/work/fix-one/subdir" })];
+  const { supervisor, delivered } = fixture(t, { threads, mode: "auto" });
+  const fix = supervisor.store.queueFix({ title: "Repair", problem: "Failure", acceptance: "Pass", area: "policy" });
+  supervisor.store.updateFix(fix.id, { worktree: "/work/fix-one" });
+  supervisor.store.addSelfSession("own-session", fix.id);
+  await supervisor.tick();
+  assert.equal(delivered.length, 0);
+  assert.equal(supervisor.store.actions(100).filter((action) => action.kind === "nudge").length, 0);
+});
