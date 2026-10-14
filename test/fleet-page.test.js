@@ -430,3 +430,16 @@ test("Watching groups threads by what the supervisor waits on, longest first, wi
   assert.ok(text.indexOf("Long wait") < text.indexOf("Short wait"), "longest wait first");
   assert.ok(text.includes("Turn running"));
 });
+
+
+test("Antigravity thread details show how to open the conversation as plain text", async () => {
+  const state = sampleState();
+  const thread = state.snapshot.threads[0];
+  thread.kind = "antigravity";
+  const note = "Open Antigravity and pick it in the sidebar. <img src=x>";
+  thread.openChat = { note };
+  const page = boot({ state });
+  await settle();
+  assert.ok(page.el("fleetList").textContent.includes(note));
+  assert.equal(findAll(page.el("fleetList"), (e) => e.tagName === "IMG").length, 0);
+});

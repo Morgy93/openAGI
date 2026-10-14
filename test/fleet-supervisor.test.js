@@ -66,6 +66,7 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
       listCodexThreads: async () => threads.filter((thread) => thread.kind === "codex"),
       listClaudeThreads: async () => threads.filter((thread) => thread.kind === "claude"),
       listConductorThreads: async () => threads.filter((thread) => thread.kind === "conductor"),
+      listAntigravityThreads: async () => threads.filter((thread) => thread.kind === "antigravity"),
       readCodexLbErrors: async () => [],
       findLocalHeavyVerification: async () => [],
       readLocalGit: async () => ({ head: HEAD, branch: "spencer/fix", upstream: "origin/spencer/fix", ahead: 0, remote: "acme/app" }),
@@ -1500,6 +1501,20 @@ test("a question stays open when its thread was only pushed out by the scan cap"
   threads = [newer(1), newer(2)];
   await supervisor.tick();
   assert.equal(supervisor.store.question(question.id).status, "open");
+});
+
+test("excluded Antigravity rows do not make a missing conversation look capped", async (t) => {
+  let threads = [makeThread({ key: "antigravity:asking", kind: "antigravity", id: "asking", prRefs: [], meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } })];
+  const { supervisor } = fixture(t, { limits: { maxThreads: 2 }, deps: { listAntigravityThreads: async () => threads } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.ok(question);
+  threads = [1, 2].map((n) => makeThread({ key: `antigravity:loose-${n}`, kind: "antigravity", id: `loose-${n}`, prRefs: [], excluded: "no-repo" }));
+  supervisor.uiBlockedSince.set("antigravity:asking", NOW - MIN);
+  supervisor.trackUiBlocked([], { mode: "auto", delivery: { ready: false }, threads, sourceErrors: {}, started: NOW, config: supervisor.config });
+  assert.equal(supervisor.uiBlockedSince.has("antigravity:asking"), false);
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
 });
 
 test("an open agent question closes itself once its PR merges after the ask, and stays for an ask made after the merge", async (t) => {
@@ -4314,4 +4329,37 @@ test("answers kept under keys an older build saved are still typed after the upg
   assert.equal(supervisor.store.question("fq_old_judge").askedBy, "judge");
   // The answered ask holds: not put to the owner again under its new key.
   assert.deepEqual(supervisor.getState().questions.filter((q) => q.kind === "agent-ask"), []);
+});
+
+test("an Antigravity conversation stopped on its quota resumes through agentapi after the reset", async (t) => {
+  const limited = (resetAt) => makeThread({
+    key: "antigravity:a1", kind: "antigravity", id: "a1", title: "Data room", cwd: "/work/a1", agentStatus: "error", prRefs: [],
+    error: { kind: "usage-limit", text: "Individual quota reached. Resets in 37m19s.", resetAt }, meta: { app: "antigravity" }
+  });
+  const waiting = fixture(t, { mode: "auto", threads: [limited(new Date(NOW + 30 * MIN).toISOString())] });
+  const before = await waiting.supervisor.tick({ reason: "test" });
+  assert.equal(waiting.delivered.length, 0);
+  assert.equal(before.counts.sources.antigravity, 1);
+  const row = before.threads.find((thread) => thread.key === "antigravity:a1");
+  assert.equal(row.state, "infra-blocked");
+  assert.equal(row.route, "antigravity-send");
+  const passed = fixture(t, { mode: "auto", threads: [limited(new Date(NOW - 5 * MIN).toISOString())] });
+  await passed.supervisor.tick({ reason: "test" });
+  assert.equal(passed.delivered.length, 1);
+  assert.equal(passed.delivered[0].route, "antigravity-send");
+  assert.equal(passed.delivered[0].thread.key, "antigravity:a1");
+  assert.equal(passed.delivered[0].playbook, "resume");
+  // A failed Antigravity read is a source error, not zero conversations.
+  const broken = fixture(t, { deps: { listAntigravityThreads: async () => { throw new Error("Antigravity database unavailable"); } } });
+  const snapshot = await broken.supervisor.tick({ reason: "test" });
+  assert.match(snapshot.sourceErrors.antigravity, /unavailable/);
+});
+
+
+test("Antigravity open-chat guidance reaches the public fleet snapshot", async (t) => {
+  const openChat = { app: "antigravity", url: null, label: "Data room", note: "Open Antigravity and pick it in the sidebar." };
+  const thread = makeThread({ key: "antigravity:a1", kind: "antigravity", id: "a1", prRefs: [], meta: { openChat } });
+  const { supervisor } = fixture(t, { threads: [thread] });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(snapshot.threads[0].openChat, openChat);
 });

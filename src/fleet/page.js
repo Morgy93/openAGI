@@ -139,7 +139,7 @@ details.thread>summary{padding:0}
   var WATCH_TONE = { you: 'hot', working: 'good', waiting: 'good', push: 'warn', blocked: 'warn', quiet: 'dim' };
   var ACTION_LABEL = { planned: 'Planned', proposed: 'Proposed', sent: 'Sent', 'dry-run': 'Dry run', blocked: 'Blocked', failed: 'Failed', done: 'Done' };
   var ACTION_TONE = { planned: 'dim', proposed: 'warn', sent: 'good', 'dry-run': 'dim', blocked: 'hot', failed: 'hot', done: 'good' };
-  var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app' };
+  var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app', 'antigravity-send': 'Antigravity message' };
   var INFRA_NAME = { 'infra:bb3': 'BuildBot3', 'infra:lb': 'Codex load balancer' };
   var CLEARED_LABEL = { stale: 'Stale', junk: 'Junk', duplicate: 'Duplicate', 'done-elsewhere': 'Done elsewhere' };
   var DOING_MAX = 20;
@@ -568,6 +568,7 @@ details.thread>summary{padding:0}
 
     var more = el('div', 'more', null, d);
     line(more, 'Agent', [t.kind, t.agentStatus].filter(Boolean).join(', '));
+    if (t.kind === 'antigravity' && t.openChat) line(more, 'Open chat', t.openChat.note);
     var w = t.watch || null;
     if (w && w.runningSince) line(more, 'Turn running', 'for ' + dur(w.runningSince) + ' (since ' + when(w.runningSince) + ')');
     if (w && w.waitSince && w.group !== 'waiting') line(more, 'Waiting', 'for ' + dur(w.waitSince));
