@@ -620,6 +620,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   });
 
+  let closing = false;
   let tickerHandle = null;
   let heartbeatHandle = null;
   let nodeControlWorker = null;
@@ -715,6 +716,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return localCapabilityCache;
   };
   const ensureImessageBridge = () => {
+    if (closing) return imessageBridgeRuntime;
     imessageBridgeRuntime ??= options.imessageBridgeRuntime
       ?? createImessageBridgeRuntime({
         dataDir,
@@ -726,6 +728,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return imessageBridgeRuntime;
   };
   const ensureNodeControlWorker = () => {
+    if (closing) return null;
     if (nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
     const pairing = readNodeConfig(dataDir);
     if (!pairing?.remote || !pairing.nodeToken || pairing.nodeEnrollmentConfirmed !== true) return null;
@@ -3546,6 +3549,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      closing = true;
       for (const unobserve of unobserveSharedThreads) unobserve();
       g2Requests?.close();
       clearInterval(g2RetentionTimer);

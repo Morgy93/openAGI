@@ -5,7 +5,7 @@
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
 import {
-  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isMainHealthCheck, liveCardItems, msSince, parsePrRef,
+  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isMainHealthCheck, kindName, liveCardItems, msSince, parsePrRef,
   redactSecrets, shortHash, uiTargetFor
 } from "./contracts.js";
 import { blockedOnSection, deliberateStop, ownerStoppedNudge } from "./classify.js";
@@ -48,7 +48,6 @@ const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailabl
 const LB_TRANSIENT_KINDS = new Set(["connection", "unavailable"]);
 const LB_TRANSIENT_MIN = 3;
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
-const KIND_NAMES = { codex: "Codex", claude: "Claude", conductor: "Conductor" };
 // Thread-level and infra-level escalations of one incident share a cooldown.
 const ESCALATION_KEYS = { "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" };
 
@@ -80,6 +79,10 @@ const TOPIC_TITLES = {
 // ready. apps maps bundleId -> running; false means that app is closed.
 export function chooseRoute(thread, mode, delivery = null) {
   if (!thread || thread.archived) return null;
+  // Antigravity takes messages through its own API (agentapi send-message):
+  // nothing is typed or forked, the app shows it in the conversation, so
+  // every delivery mode may use it.
+  if (thread.kind === "antigravity") return "antigravity-send";
   const ui = deliveryOf(delivery);
   if (ui.mode !== "cli") {
     const target = uiTargetFor(thread);
@@ -160,12 +163,13 @@ function isManager(ctx) {
 
 // options.escalationLedger: lastEscalation(key) for shared incident keys
 // ("infra:bb3", "infra:lb"). options.mutedKeys: thread keys the owner muted.
+// options.ownerPush: the owner's Push now, which no pacing wait holds.
 export function decideThread(classified, thread, options = {}) {
   const ctx = makeContext(classified, thread, options);
   if (ctx.mutedKeys.has(thread?.key)) return { ...baseDecision(ctx), reason: "muted by owner" };
   // No nudge, resume or stuck question about a thread whose owner just
   // stopped the supervisor's own turn there. An open card is still asked.
-  const decision = ownerStoppedNudge(thread)
+  const decision = ownerStoppedNudge(thread) && !ctx.ownerPush
     ? { ...baseDecision(ctx), reason: "owner stopped the supervisor's turn" }
     : resolveIntent(ctx, intentFor(ctx));
   // A Codex card beside the thread's own decision (a resume, a nudge, a
@@ -181,6 +185,8 @@ function makeContext(classified, thread, options) {
   const delivery = options.delivery ?? config?.delivery ?? null;
   return {
     classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery, config,
+    // The owner's own Push now (supervisor pushNow): see resolveNudge.
+    ownerPush: options.ownerPush === true,
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
     progressMark: progressMarkFor(classified, thread, ledger),
@@ -231,6 +237,11 @@ function nudge(playbook, reason, extra = {}) {
   return { type: "nudge", playbook, reason, ...extra };
 }
 
+// The agent whose account hit a cap or logged out: Conductor chats run Claude.
+function agentName(thread) {
+  return thread.kind === "conductor" ? "Claude" : kindName(thread.kind);
+}
+
 // Which process the laptop check saw, so the agent can look at that one.
 function localVerifyVars(proc) {
   const pid = Number(proc?.pid);
@@ -247,7 +258,7 @@ function infraIntent(ctx) {
     if (!resetAt || !Number.isFinite(Date.parse(resetAt))) return backoffIntent(ctx, errorAt, kind);
     const resumeAt = addMs(resetAt, limits.sessionLimitGraceMs);
     if (Date.parse(resetAt) - now > FAR_RESET_MS) {
-      const who = thread.kind === "codex" ? "Codex" : "Claude";
+      const who = agentName(thread);
       return {
         type: "ask", notBefore: resumeAt, reason: `${kind} until ${ctx.facts.reset}`,
         question: question(ctx, `${ctx.facts.label}: ${who} cap. Reset ${ctx.facts.reset}. Add acct?`,
@@ -274,7 +285,7 @@ function infraIntent(ctx) {
     return { type: "wait", reason: `waiting on ${INFRA_NAMES[kind]}` };
   }
   if (kind === "logged-out") {
-    const who = thread.kind === "codex" ? "Codex" : "Claude";
+    const who = agentName(thread);
     return {
       type: "ask", reason: "logged out",
       question: question(ctx, `${who} logged out. Run /login?`, `${ctx.facts.label} stopped: ${who} is not logged in.`,
@@ -593,7 +604,7 @@ function resolveIntent(ctx, intent) {
   // Typing in the composer does not answer a card: it is asked whatever the owner does.
   if (intent.type === "ask" && intent.card) return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: null };
   // The owner typing into this thread outranks anything that touches it.
-  const ownerUntil = ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
+  const ownerUntil = ctx.ownerPush ? null : ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
   if (ownerUntil) return { ...base, action: "wait", reason: "owner active in thread", notBefore: ownerUntil };
   if (intent.type === "ask") {
     return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: intent.notBefore ?? null };
@@ -606,6 +617,7 @@ function resolveNudge(ctx, intent, base) {
   const decision = { ...base, playbook: intent.playbook, reason: intent.reason };
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
+  if (ctx.ownerPush) return pushedNudge(ctx, intent, decision, playbook);
   if (deliberateStop(thread)) return { ...decision, reason: "owner stopped this turn" };
   const drivenUntil = ownerDrivenUntil(ctx);
   if (drivenUntil) return { ...decision, action: "wait", reason: "owner is driving this thread", notBefore: drivenUntil };
@@ -672,6 +684,20 @@ function resolveNudge(ctx, intent, base) {
     return { ...decision, action: "wait", reason: why };
   }
   return { ...decision, action: "nudge", route, message, messageHash, factsKey: reply.factsKey, facts: reply.facts };
+}
+
+// The owner's Push now: the playbook's words go out now. The waits that only
+// pace automatic nudges (the owner's own recent words or stop, a reply hold,
+// idle, cooldown, a failing route's backoff, the attempt budget, a repeat)
+// are the owner's to skip; an ask, a wait on CI or an outage still decides
+// before this (resolveIntent), and a thread with no route stays unsent.
+function pushedNudge(ctx, intent, decision, playbook) {
+  const route = chooseRoute(ctx.thread, ctx.mode, ctx.delivery);
+  if (!route) return { ...decision, reason: uiWaitReason(ctx.thread, ctx.delivery) ?? uiBlockedReason(ctx.thread, ctx.delivery) ?? "no delivery route" };
+  const vars = { ...ctx.facts, attempts: String(attemptsWithoutProgress(ctx.ledger, ctx.progressMark)), ...(intent.vars ?? {}) };
+  const reply = replyCheck(ctx, intent.playbook);
+  const message = `${reply.prefix}${renderTemplate(playbook.body, vars)}`;
+  return { ...decision, action: "nudge", route, message, messageHash: shortHash(message), factsKey: reply.factsKey, facts: reply.facts };
 }
 
 // Nudges that report on the PR. Resume, status checks and limit retries
@@ -1371,7 +1397,7 @@ export function ownerLabel(thread, prNumber, repo) {
   const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
     || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
   if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
-  return place || `${KIND_NAMES[thread.kind] ?? "Agent"} chat`;
+  return place || `${kindName(thread.kind)} chat`;
 }
 
 function ciSummary(pr) {

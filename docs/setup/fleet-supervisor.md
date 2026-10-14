@@ -1,6 +1,6 @@
 # Fleet supervisor
 
-Watches every recent Codex, Claude Code, and Conductor coding thread on this Mac.
+Watches every recent Codex, Claude Code, Conductor, and Antigravity coding thread on this Mac.
 Judges each PR from GitHub and BuildBot3, not from the agent's "done".
 Nudges stuck threads with your own wording. Asks you only for real decisions.
 
@@ -81,6 +81,7 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_JUDGE` | off | `1` turns on the [nudge judge](#judge) (needs a model too) |
 | `OPENAGI_FLEET_JUDGE_MODEL` | unset (judge off) | Model for the judge, run with `codex exec` through codex-lb, e.g. `gpt-6.1-sol` |
 | `OPENAGI_FLEET_STORAGE` | on with the supervisor | `0` turns off the [storage manager](#storage) |
+| `OPENAGI_FLEET_ANTIGRAVITY` | on | `0` stops reading and messaging [Antigravity](#antigravity) conversations |
 | `OPENAGI_FLEET_STORAGE_SD` | `/Volumes/Xtra` | The SD card the storage manager archives to |
 | `OPENAGI_FLEET_STORAGE_LOW_GB` | `100` | Mac free space below this starts safe cleanup and archiving |
 | `OPENAGI_FLEET_STORAGE_TARGET_GB` | `150` | Cleanup stops once the Mac has this much free |
@@ -144,6 +145,38 @@ To keep these files in version control, make `~/.openagi/skills` its own private
 - Deletes files only through the [storage manager](#storage) rules, and asks
   first for anything not clearly regenerable.
 - Agent text is untrusted: shown as plain text, never forwarded to other agents.
+
+## Antigravity
+
+Antigravity conversations show as `antigravity:<conversation id>` threads.
+
+**Read.** `~/.gemini/antigravity/conversation_summaries.db` lists them, and
+`conversations/<id>.db` holds each one's steps (protobuf). Both are the app's
+live SQLite (WAL) files. The supervisor opens one read-only only while the app
+has it open (its `-wal` and `-shm` exist); otherwise it reads an immutable
+snapshot, which creates and locks nothing. It never writes either.
+
+- Subagent conversations (research, self) are skipped; their parent shows.
+- A conversation with no workspace folder is out of scope (no repo).
+- Running: the run status, background commands or subagents (`not_fully_idle`).
+- Waiting on you: a tool step waits for your approval. Answer it in the app.
+
+**Limits.** "Individual quota reached ... Resets in 37m19s" (QUOTA_EXHAUSTED)
+is a usage limit. The reset comes from the error's `quotaResetTimeStamp`. If
+the app is running, the quota it reports wins: quota back means resume now;
+none left means the family's window reset. After reset + 2 min the thread
+gets one resume message, like a Claude or Codex cap.
+
+**Send.** Route `antigravity-send`: `agentapi send-message --title "OpenAGI
+supervisor" <id> <text>`, the app's own API. It finds the running language
+server from `ps` and `lsof` and gives its address and csrf token to that one
+child only; they are never logged. The conversation is read again first: a
+running turn, an open approval, or a message from you since the scan blocks
+the send. Antigravity shows the text as a "OpenAGI supervisor" message block,
+not as your bubble. Nothing is typed, so it works in every delivery mode.
+
+**Open.** Antigravity has no link to one conversation (its `antigravity://`
+scheme only imports from AI Studio). Open the app and pick it in the sidebar.
 
 ## Storage
 
