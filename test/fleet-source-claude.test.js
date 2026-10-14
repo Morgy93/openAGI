@@ -55,6 +55,18 @@ function rowsFor(id, cwd, { entrypoint = "cli", branch = "spencer/feature", side
       type: "user", timestamp: at, promptSource: "system", turnOrigin: "task_notification", origin: { kind: "task-notification" },
       message: { role: "user", content: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>completed</status>\n</task-notification>` }
     }),
+    // A Workflow tool report, as written on 2026-09-26: the status says
+    // completed even when every agent failed.
+    workflowReport: (taskId, failures, at, { done = 0 } = {}) => base({
+      type: "user", timestamp: at, promptSource: "system", turnOrigin: "task_notification", origin: { kind: "task-notification" },
+      message: { role: "user", content: [
+        "<task-notification>", `<task-id>${taskId}</task-id>`, "<status>completed</status>",
+        `<summary>Dynamic workflow "Build" completed</summary>`, '<result>{"built":[]}</result>',
+        failures.length ? `<failures>${failures.join("\n")}</failures>` : "",
+        `<usage><agent_count>${failures.length + done}</agent_count><agents_done>${done}</agents_done><agents_error>${failures.length}</agents_error></usage>`,
+        "</task-notification>"
+      ].filter(Boolean).join("\n") }
+    }),
     peer: (text, at) => base({
       type: "user", timestamp: at, promptSource: "system", turnOrigin: "peer",
       origin: { kind: "peer", name: "remote-dev-d4", body: text },
@@ -653,4 +665,38 @@ test("an answer the agent sent back to a relay with SendMessage is read as its r
   writeTranscript(home, cwd, "relay-1", [...r.history(60 * MIN), r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)), mixed], NOW - 18 * MIN);
   const [again] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
   assert.equal(again.lastAgentFull, answer);
+});
+
+test("a workflow whose agents all hit the session limit makes the stopped session a session limit", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/openAGI";
+  const limit = (name) => `[${name}] failed: You've hit your session limit · resets 2:50am (America/Los_Angeles)`;
+  const write = (id, tail, mtimeAgo = 20 * MIN) => {
+    const r = rowsFor(id, cwd);
+    writeTranscript(home, cwd, id, [...r.history(120 * MIN), ...tail(r)], NOW - mtimeAgo);
+  };
+  // (a) The main agent still answers after the report (another model's cap): idle.
+  write("replied", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
+    r.workflowReport("w1", [limit("build:app"), limit("build:core")], iso(30 * MIN)), r.text("The workflow failed on the session limit.", iso(29 * MIN))]);
+  // (b) The report is the last row: the turn never ran, so it stalls.
+  write("last", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
+    r.workflowReport("w1", [limit("verify")], iso(30 * MIN))]);
+  // One agent finished, or a failure that is not a limit: nothing to wait for.
+  write("partial", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(30 * MIN), { done: 1 }), r.text("Partly done.", iso(29 * MIN))]);
+  write("mixed", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a"), "[b] failed: tests are red"], iso(30 * MIN)), r.text("One broke.", iso(29 * MIN))]);
+  // A later clean report, or a new prompt, clears it.
+  write("cleared", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(40 * MIN)),
+    r.workflowReport("w2", [], iso(30 * MIN), { done: 2 }), r.text("All built.", iso(29 * MIN))]);
+  write("resumed", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(40 * MIN)),
+    r.prompt("[OpenAGI supervisor] The limit reset; resume.", iso(32 * MIN), { promptSource: "system" }), r.text("Resumed and finished.", iso(29 * MIN))]);
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  for (const id of ["replied", "last"]) {
+    const error = threads[id].error;
+    assert.equal(error?.kind, "session-limit", id);
+    assert.ok(Date.parse(error.resetAt) > Date.parse(iso(30 * MIN)), `${id}: reset after the report`);
+    assert.match(error.text, /hit your session limit/);
+  }
+  assert.equal(threads.replied.agentStatus, "idle");
+  assert.equal(threads.last.agentStatus, "stalled");
+  for (const id of ["partial", "mixed", "cleared", "resumed"]) assert.equal(threads[id].error, null, id);
 });

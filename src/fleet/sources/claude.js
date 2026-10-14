@@ -26,6 +26,8 @@ const FIRST_PROMPTS_KEPT = 2000;
 const firstPrompts = new Map();
 // ps lstart can trail the registry's startedAt by a few seconds, never by more.
 const PROC_START_SKEW_MS = 10 * 60_000;
+// Account limits: one agent's limit stops every agent on the account.
+const ACCOUNT_LIMITS = new Set(["session-limit", "usage-limit"]);
 
 function safeAlive(isPidAlive, pid) {
   try { return Boolean(isPidAlive(pid)); } catch { return false; }
@@ -161,7 +163,7 @@ function emptySummary() {
     customTitle: null, aiTitle: null, agentName: null,
     prRefs: [], textTurns: 0, phase: null, model: null,
     lastAgentText: "", lastAgentAt: null, lastUserText: "", lastUserAt: null, turnStartedAt: null, lastSupervisorAt: null,
-    lastTurnAt: null, abortedAt: null, apiError: null, retryError: null, firstUserText: null,
+    lastTurnAt: null, abortedAt: null, apiError: null, retryError: null, workflowLimit: null, firstUserText: null,
     toolDescriptions: new Map(), tasks: new Map()
   };
 }
@@ -171,6 +173,26 @@ function emptySummary() {
 function closeNotifiedTasks(summary, text) {
   if (typeof text !== "string" || !text.includes("<task-notification>")) return;
   for (const match of text.matchAll(/<task-id>([^<]+)<\/task-id>/g)) summary.tasks.delete(match[1].trim());
+}
+
+// A workflow's or subagents' report (a <task-notification> with <usage> or
+// <failures>) where every agent failed on an account limit, as
+// "[build] failed: You've hit your session limit · resets 10pm (...)": the
+// session can do nothing until the reset, even when the main agent still
+// answers (another model's cap) or the report is its last row. Returns
+// { text, at } for that limit, or null (a report with a finished agent or any
+// other failure says nothing about the account).
+export function workflowLimitOf(text, at) {
+  const failures = /<failures>([\s\S]*?)<\/failures>/.exec(text)?.[1];
+  if (!failures) return null;
+  if (Number(/<agents_done>(\d+)<\/agents_done>/.exec(text)?.[1] ?? 0) > 0) return null;
+  const lines = failures.split("\n").map((line) => line.trim()).filter(Boolean);
+  // "resets 10pm" is relative to when the report was written.
+  const when = new Date(Number.isFinite(Date.parse(at ?? "")) ? Date.parse(at) : Date.now());
+  const classified = lines.map((line) => ({ line, error: classifyErrorText(line, when) }));
+  if (!classified.length || !classified.every(({ error }) => ACCOUNT_LIMITS.has(error?.kind))) return null;
+  const pick = classified.find(({ error }) => error.resetAt) ?? classified[0];
+  return { text: pick.line, at: at ?? null };
 }
 
 function onUser(summary, row) {
@@ -193,6 +215,8 @@ function onUser(summary, row) {
   const text = blockText(content);
   if (!text) return;
   closeNotifiedTasks(summary, text);
+  // A later agent report replaces the limit one: limited again, or not.
+  if (text.includes("<task-notification>") && /<(?:usage|failures)>/.test(text)) summary.workflowLimit = workflowLimitOf(text, row.timestamp ?? null);
   if (text.startsWith("[Request interrupted")) {
     summary.phase = "interrupted";
     summary.abortedAt = toIso(row.timestamp);
@@ -205,11 +229,14 @@ function onUser(summary, row) {
   // The first prompt read names a supervisor display chat (firstPromptOf
   // reads the real one when the tail starts mid-session).
   summary.firstUserText ??= text;
+  // A new prompt (the owner's, or the supervisor's resume) starts work again.
   if (isOwnerText(row, text)) {
     summary.lastUserText = text;
     summary.lastUserAt = toIso(row.timestamp);
+    summary.workflowLimit = null;
   } else if (text.startsWith(SUPERVISOR_PREFIX)) {
     summary.lastSupervisorAt = toIso(row.timestamp);
+    summary.workflowLimit = null;
   }
 }
 
@@ -356,6 +383,9 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     ? "waiting"
     : agentStatusFor(summary, { recent: now - mtimeMs <= limits.runningWindowMs, peer, openTasks });
   const errorSource = agentStatus === "error" ? summary.apiError : agentStatus === "stalled" ? summary.retryError : null;
+  // Every workflow agent failed on an account limit and the session stopped
+  // (no running turn, no owner stop): it waits for the reset like a limit.
+  const limitSource = !errorSource && !["running", "aborted"].includes(agentStatus) ? summary.workflowLimit : null;
   const prRefs = newestFirstUnique(summary.prRefs);
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const cwd = summary.cwd;
@@ -382,7 +412,7 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,
-    error: threadError(errorSource, now, limits.excerptMax),
+    error: threadError(errorSource ?? limitSource, now, limits.excerptMax),
     openTasks,
     prRefs,
     live: peer ? { peerName: peer.peerName, pid: peer.pid, status: peer.status } : null,
