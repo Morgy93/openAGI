@@ -13,6 +13,11 @@ final class OverlayDragTests: XCTestCase {
   private var wasExpanded = false
 
   override func setUp() async throws {
+    // These show the real Quick Ask panel on screen and drag it around, which
+    // takes over the owner's screen and focus during routine QA. Run them on
+    // purpose: OPENAGI_UI_TESTS=1 swift test --filter OverlayDragTests
+    try XCTSkipUnless(ProcessInfo.processInfo.environment["OPENAGI_UI_TESTS"] == "1",
+                      "On-screen drag tests: set OPENAGI_UI_TESTS=1 to run them.")
     _ = NSApplication.shared
     suiteName = "OverlayDragTests-\(UUID().uuidString)"
     defaults = UserDefaults(suiteName: suiteName)
@@ -21,6 +26,8 @@ final class OverlayDragTests: XCTestCase {
   }
 
   override func tearDown() async throws {
+    // Nothing was set up when setUp skipped.
+    guard let defaults else { return }
     for c in controllers { c.panel?.close() }
     controllers = []
     defaults.removePersistentDomain(forName: suiteName)
