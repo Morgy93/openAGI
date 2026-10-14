@@ -500,16 +500,27 @@ function createClaudeReview({ config, run, env, model }) {
   };
 }
 
+// The top-level model_provider of the owner's Codex config, or null.
+function codexProviderName(toml) {
+  for (const raw of String(toml ?? "").split(/\r?\n/)) {
+    if (/^\s*\[/.test(raw)) break;
+    const match = /^\s*model_provider\s*=\s*["']([^"']+)["']/.exec(raw);
+    if (match) return match[1];
+  }
+  return null;
+}
+
 // Which model runs the review. config.review.provider "codex" or "claude"
 // pins it; unset, a Claude model name means claude, else codex when the
-// owner's Codex config names a model provider (codex-lb), else claude.
+// owner's Codex config uses codex-lb (another provider would get a model
+// name and key it does not know), else claude.
 export function reviewProvider(config, read = fs.readFileSync) {
   const review = config?.review ?? {};
   if (review.provider === "codex" || review.provider === "claude") return review.provider;
   if (/^claude/i.test(String(review.model ?? ""))) return "claude";
   let toml = "";
   try { toml = read(path.join(config?.paths?.codexHome ?? path.join(os.homedir(), ".codex"), "config.toml"), "utf8"); } catch { /* no Codex here */ }
-  return judgeCodexConfig(toml) ? "codex" : "claude";
+  return codexProviderName(toml) === "codex-lb" && judgeCodexConfig(toml) ? "codex" : "claude";
 }
 
 // codex output back to the review's own contract: a null optional field is

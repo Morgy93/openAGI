@@ -2310,7 +2310,7 @@ export class FleetSupervisor {
         verdicts = await reviewQuestions({ questions: remaining, others: rest, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now, ownerNotes: loadOwnerNotes(this.dataDir) });
       } catch (error) {
         const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
-        this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
+        this.lastReview = { ...this.lastReview, failedAt: now, error: detail, ran: this.reviewRunner?.lastRun ?? null };
         store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
         break;
       }

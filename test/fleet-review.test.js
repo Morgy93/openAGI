@@ -430,13 +430,13 @@ const CODEX_FEATURES = [
 const OK = { code: 0, stdout: "", stderr: "", timedOut: false, error: null };
 const CLAUDE_OUT = { reviews: [{ id: "fq_a", decision: "keep", category: "live", reason: "from claude" }] };
 
-function codexConfig(t, review = { enabled: true }, { provider = true } = {}) {
+function codexConfig(t, review = { enabled: true }, { provider = true, providerName = "codex-lb" } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-review-codex-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
   fs.writeFileSync(path.join(home, ".codex", "codex-lb.env"), "CODEX_LB_API_KEY=lb-key-review-1\n");
   fs.writeFileSync(path.join(home, ".codex", "config.toml"), provider
-    ? ['model = "gpt-6.1-sol"', 'model_provider = "codex-lb"', "", "[mcp_servers.x]", 'url = "https://mcp.example"', "", "[model_providers.codex-lb]", 'name = "openai"', 'base_url = "http://lb.local:2455/backend-api/codex"', 'env_key = "CODEX_LB_API_KEY"'].join("\n")
+    ? ['model = "gpt-6.1-sol"', `model_provider = "${providerName}"`, "", "[mcp_servers.x]", 'url = "https://mcp.example"', "", `[model_providers.${providerName}]`, 'name = "openai"', 'base_url = "http://lb.local:2455/backend-api/codex"', 'env_key = "CODEX_LB_API_KEY"'].join("\n")
     : 'model = "gpt-6.1-sol"\n');
   return resolveFleetConfig({}, { home, bins: { codex: "/bin/codex-test", claude: "/bin/claude" }, paths: { relayCwd: path.join(home, "relay") }, review });
 }
@@ -544,6 +544,8 @@ test("the provider: codex when codex-lb is configured, else Claude; OPENAGI_FLEE
   assert.equal(reviewProvider(codexConfig(t)), "codex");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { provider: false })), "claude");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true, provider: "claude" })), "claude");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { providerName: "ollama" })), "claude", "only codex-lb is picked on its own");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true, provider: "codex" }, { providerName: "ollama" })), "codex", "an explicit pin still wins");
   assert.equal(reviewProvider(codexConfig(t, { enabled: true, model: "claude-opus-5" })), "claude", "a Claude model means Claude");
   // Pinned to Claude: claude -p with the named model, no codex call.
   const { run, codex, claudeCalls } = reviewRun();
