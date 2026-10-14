@@ -98,6 +98,11 @@ class VoiceFramesTest {
         assertEquals("0", VoiceFrames.field(VoiceFrames.decode(VoiceFrames.control("barge", -1))!!, "playedMs"))
         assertEquals("{\"type\":\"commit\"}", VoiceFrames.control("commit"))
         assertEquals("{\"type\":\"stop\"}", VoiceFrames.control("stop"))
+        val playback = VoiceFrames.decode(VoiceFrames.playback("item1", 125.5))!!
+        assertEquals(setOf("type", "itemId", "playedMs"), playback.keys)
+        assertEquals("playback", VoiceFrames.field(playback, "type"))
+        assertEquals("item1", VoiceFrames.field(playback, "itemId"))
+        assertEquals("125.5", VoiceFrames.field(playback, "playedMs"))
     }
     @Test fun malformedAndFutureEventsAreSafe() {
         assertNull(VoiceFrames.decode("not json"))
@@ -122,10 +127,13 @@ class VoiceSessionTest {
         @Volatile var recording = false
         @Volatile var onAudio: ((ByteArray) -> Unit)? = null
         @Volatile var onError: (() -> Unit)? = null
+        val completions = LinkedBlockingQueue<() -> Unit>()
+        val durations = LinkedBlockingQueue<Double>()
         var barges = 0
         override fun startCapture(onAudio: (ByteArray) -> Unit, onError: () -> Unit) { recording = true; this.onAudio = onAudio; this.onError = onError }
         override fun stopCapture() { recording = false }
         override fun play(pcm: ByteArray) = true
+        override fun completeReply(audioMs: Double, onPlayed: () -> Unit) { durations.offer(audioMs); completions.offer(onPlayed) }
         override fun barge(): Long { barges++; return 125 }
         override fun close() { recording = false }
     }
@@ -271,5 +279,105 @@ class VoiceSessionTest {
         assertEquals(VoicePhase.IDLE, invalid.status.value.phase)
         assertFalse(audio.recording)
         assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun playbackAcknowledgedOnlyAfterPlayerFinishes() {
+        val voice = connect()
+        voice.press()
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        voice.release()
+        event()
+        ws.send(byteArrayOf(0, 1).toByteString())
+        ws.send("""{"type":"reply.done","text":"Say yes 42","itemId":"readback1","audioMs":125.5}""")
+        val complete = audio.completions.poll(3, TimeUnit.SECONDS)!!
+        assertEquals(125.5, audio.durations.poll()!!, 0.0)
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+        complete()
+        assertEquals(VoiceFrames.playback("readback1", 125.5), event())
+        voice.press()
+        assertTrue(audio.recording)
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+        ws.send("""{"type":"speech_started"}""")
+        ws.send("""{"type":"transcript","role":"owner","text":"yes 42"}""")
+        await { voice.status.value.ownerText == "yes 42" }
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun bargeCancelsPlaybackAcknowledgementEvenAfterHubAllowsNewAudio() {
+        val voice = connect()
+        voice.press()
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        voice.release()
+        event()
+        ws.send(byteArrayOf(0, 1).toByteString())
+        ws.send("""{"type":"reply.done","text":"Say yes 42","itemId":"readback1","audioMs":500}""")
+        val complete = audio.completions.poll(3, TimeUnit.SECONDS)!!
+        voice.press()
+        assertEquals(VoiceFrames.control("barge", 125), event())
+        ws.send("""{"type":"barged"}""")
+        ws.send("""{"type":"reply.delta","text":"Next reply"}""")
+        await { voice.status.value.replyText == "Next reply" }
+        complete()
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun stopCancelsPendingPlaybackAcknowledgement() {
+        val voice = connect()
+        voice.handsFree(true)
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        ws.send("""{"type":"reply.done","text":"Readback","itemId":"item1","audioMs":500}""")
+        val complete = audio.completions.poll(3, TimeUnit.SECONDS)!!
+        voice.stop()
+        assertEquals(VoiceFrames.control("stop"), event())
+        complete()
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun earlierPlaybackDoesNotSuppressBargeForNextReply() {
+        val voice = connect()
+        voice.handsFree(true)
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        ws.send(byteArrayOf(0, 1).toByteString())
+        ws.send("""{"type":"reply.done","text":"First","itemId":"first","audioMs":500}""")
+        val complete = audio.completions.poll(3, TimeUnit.SECONDS)!!
+        ws.send(byteArrayOf(0, 1).toByteString())
+        ws.send("""{"type":"reply.done","text":"Second","itemId":"second","audioMs":250}""")
+        val second = audio.completions.poll(3, TimeUnit.SECONDS)!!
+        complete()
+        assertEquals(VoiceFrames.playback("first", 500.0), event())
+        ws.send("""{"type":"speech_started"}""")
+        assertEquals(VoiceFrames.control("barge", 125), event())
+        second()
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun interruptedDoneAndTextOnlyDoneDoNotScheduleAcknowledgements() {
+        val voice = connect()
+        voice.handsFree(true)
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        ws.send("""{"type":"reply.done","text":"Text only","itemId":null,"audioMs":0}""")
+        await { voice.status.value.replyText == "Text only" }
+        assertNull(audio.completions.poll(100, TimeUnit.MILLISECONDS))
+        ws.send("""{"type":"speech_started"}""")
+        assertEquals(VoiceFrames.control("barge", 125), event())
+        ws.send("""{"type":"reply.done","text":"Interrupted","itemId":"old","audioMs":500}""")
+        await { voice.status.value.replyText == "Interrupted" }
+        assertNull(audio.completions.poll(100, TimeUnit.MILLISECONDS))
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
     }
 }

@@ -55,6 +55,12 @@ object VoiceFrames {
         put("handsFree", handsFree)
     }.toString()
 
+    fun playback(itemId: String, playedMs: Double): String = buildJsonObject {
+        put("type", "playback")
+        put("itemId", itemId)
+        put("playedMs", playedMs)
+    }.toString()
+
     fun decode(text: String): JsonObject? = runCatching { json.parseToJsonElement(text) as? JsonObject }.getOrNull()
     fun field(frame: JsonObject, key: String): String? = (frame[key] as? JsonPrimitive)?.content
 }
@@ -134,6 +140,7 @@ interface VoiceAudioIO {
     fun startCapture(onAudio: (ByteArray) -> Unit, onError: () -> Unit)
     fun stopCapture()
     fun play(pcm: ByteArray): Boolean
+    fun completeReply(audioMs: Double, onPlayed: () -> Unit)
     fun barge(): Long
     fun close()
 }
@@ -155,6 +162,9 @@ class VoiceSession(
     private var closed = false
     private var opened = false
     private var captureGeneration = 0
+    private var playbackGeneration = 0
+    private var replyPlayed = false
+    private var replyRevision = 0
 
     @Synchronized
     fun press() {
@@ -192,6 +202,7 @@ class VoiceSession(
         machine.start(handsFree, held)
         mutableStatus.value = VoiceStatus(phase = VoicePhase.CONNECTING, handsFree = handsFree, message = "Connecting voice…")
         replyDone = true
+        replyPlayed = false
         discardAudio = false
         try {
             require(Regex("^[A-Za-z0-9._~+-]{16,512}$").matches(token))
@@ -220,6 +231,8 @@ class VoiceSession(
                 "ready" -> { mutableStatus.value = mutableStatus.value.copy(message = null); apply(machine.ready()) }
                 "transcript" -> if (field("role") == "owner") mutableStatus.value = mutableStatus.value.copy(ownerText = field("text").orEmpty().take(4000))
                 "reply.delta" -> {
+                    replyRevision++
+                    replyPlayed = false
                     val previous = if (replyDone) "" else mutableStatus.value.replyText
                     replyDone = false
                     mutableStatus.value = mutableStatus.value.copy(replyText = (previous + field("text").orEmpty()).take(4000))
@@ -227,9 +240,20 @@ class VoiceSession(
                 "reply.done" -> {
                     replyDone = true
                     mutableStatus.value = mutableStatus.value.copy(replyText = field("text").orEmpty().take(4000))
+                    val itemId = field("itemId")
+                    val audioMs = field("audioMs")?.toDoubleOrNull()
+                    if (!discardAudio && !itemId.isNullOrBlank() && itemId != "null" && audioMs != null && audioMs.isFinite() && audioMs > 0) {
+                        val generation = playbackGeneration
+                        val revision = replyRevision
+                        audio.completeReply(audioMs) { synchronized(this@VoiceSession) {
+                            if (webSocket === socket && generation == playbackGeneration && !discardAudio) {
+                                if (send(VoiceFrames.playback(itemId, audioMs)) && revision == replyRevision) replyPlayed = true
+                            }
+                        } }
+                    }
                 }
                 "speech_started" -> barge()
-                "barged" -> { audio.barge(); discardAudio = false }
+                "barged" -> { playbackGeneration++; audio.barge(); discardAudio = false }
                 "end" -> finish(field("reason")?.take(200) ?: "Voice ended.")
                 "error", "notice" -> mutableStatus.value = mutableStatus.value.copy(message = field("message")?.take(240))
                 "confirmation.readback" -> mutableStatus.value = mutableStatus.value.copy(message = field("text")?.take(1000))
@@ -239,6 +263,8 @@ class VoiceSession(
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) = synchronized(this@VoiceSession) {
             if (webSocket !== socket || discardAudio) return@synchronized
+            replyPlayed = false
+            replyRevision++
             if (bytes.size == 0 || bytes.size % 2 != 0 || !audio.play(bytes.toByteArray())) finish("Reply audio fell behind. Start voice again.")
         }
 
@@ -269,6 +295,9 @@ class VoiceSession(
     }
 
     private fun barge() {
+        // A new push-to-talk hold must not invalidate a fully heard readback.
+        if (replyPlayed) return
+        playbackGeneration++
         val played = audio.barge()
         discardAudio = true
         send(VoiceFrames.control("barge", played))
@@ -299,6 +328,7 @@ class VoiceSession(
     }
 
     private fun finish(message: String?, graceful: Boolean = false) {
+        playbackGeneration++
         apply(machine.stop())
         audio.close()
         val ws = socket

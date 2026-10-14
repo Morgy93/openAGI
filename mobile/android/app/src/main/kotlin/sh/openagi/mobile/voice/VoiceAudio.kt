@@ -9,6 +9,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class VoiceAudio : VoiceAudioIO {
@@ -17,8 +18,7 @@ class VoiceAudio : VoiceAudioIO {
     private var track: AudioTrack? = null
     private var player: Thread? = null
     private var queue = ArrayBlockingQueue<ByteArray>(250)
-    private var headStart = 0L
-    private var playbackStarted = false
+    private var playback = VoicePlayback(RATE)
 
     @SuppressLint("MissingPermission")
     @Synchronized
@@ -82,7 +82,12 @@ class VoiceAudio : VoiceAudioIO {
             player = thread(name = "voice-playback") {
                 try {
                     while (!Thread.currentThread().isInterrupted) {
-                        val chunk = pending.take()
+                        val callbacks = synchronized(this) {
+                            if (track !== created || pending !== queue) return@thread
+                            playback.played(created.playbackHeadPosition.toLong() and 0xffffffffL)
+                        }
+                        callbacks.forEach { it() }
+                        val chunk = pending.poll(10, TimeUnit.MILLISECONDS) ?: continue
                         var offset = 0
                         while (offset < chunk.size) {
                             val count = synchronized(this) {
@@ -97,10 +102,6 @@ class VoiceAudio : VoiceAudioIO {
                 } catch (_: InterruptedException) { /* stopped */ }
             }
         }
-        if (!playbackStarted) {
-            headStart = track!!.playbackHeadPosition.toLong() and 0xffffffffL
-            playbackStarted = true
-        }
         // Five seconds of reply audio is plenty; fail instead of growing memory.
         var offset = 0
         while (offset < pcm.size) {
@@ -108,14 +109,18 @@ class VoiceAudio : VoiceAudioIO {
             if (!queue.offer(pcm.copyOfRange(offset, end))) return false
             offset = end
         }
+        playback.append(pcm.size)
         return true
     }
 
     @Synchronized
+    override fun completeReply(audioMs: Double, onPlayed: () -> Unit) { playback.complete(audioMs, onPlayed) }
+
+    @Synchronized
     override fun barge(): Long {
         val current = track
-        val head = current?.playbackHeadPosition?.toLong()?.and(0xffffffffL) ?: headStart
-        val played = if (playbackStarted) ((head - headStart).coerceAtLeast(0) * 1000 / RATE) else 0
+        val head = current?.playbackHeadPosition?.toLong()?.and(0xffffffffL) ?: 0
+        val played = playback.playedMs(head)
         stopPlayback()
         return played
     }
@@ -127,7 +132,7 @@ class VoiceAudio : VoiceAudioIO {
         queue = ArrayBlockingQueue(250)
         track?.let { runCatching { it.pause(); it.flush() }; it.release() }
         track = null
-        playbackStarted = false
+        playback = VoicePlayback(RATE)
     }
 
     @Synchronized
