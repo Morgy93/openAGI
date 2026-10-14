@@ -281,3 +281,14 @@ test("end to end through the G2 server hook: real broker, fake OpenAI, key never
   assert.equal(await denied(`${f.origin}/nodes/other`, [VOICE_PROTOCOL, OWNER]), 404);
   client.ws.close();
 });
+
+test("a slow text device hits the same outbound backlog cap as audio", { timeout: 3000 }, async (t) => {
+  const f = await fixture(t);
+  const client = connect(f.origin, G2);
+  await client.opened;
+  client.send({ type: "start", gesture: "tap" });
+  await until(() => f.sessions.length === 1);
+  f.sessions[0].io.send({ type: "reply.delta", text: "x".repeat(512_001) });
+  assert.equal((await client.next()).code, "client_backlog");
+  assert.equal((await client.closed).code, 1011);
+});

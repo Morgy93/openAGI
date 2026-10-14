@@ -11,7 +11,7 @@ import { matchConfirmation, ownerPrincipal } from "../src/owner-authority.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { VoiceSession, createVoiceSpend, digitsFromWords, voiceDailyCapUsd, voiceEnabled, voiceModel } from "../src/voice/broker.js";
-import { realtimeCostUsd, resamplePcm16 } from "../src/voice/audio.js";
+import { createResampler, realtimeCostUsd, resamplePcm16 } from "../src/voice/audio.js";
 
 const KEY = "sk-test-server-only-key";
 
@@ -87,6 +87,7 @@ function harness(t, { handsFree = false, capUsd = 5, spentToday = 0, focus = nul
     handsFree, focus, spend, transcriptWaitMs: 300, truncateWaitMs: 50,
     io: { send: (event) => events.push(event), sendAudio: (pcm) => audio.push(pcm), end: (reason, code) => ends.push({ reason, code }) }
   });
+  t.after(() => session.close());
   session.start();
   const ready = () => { upstream.event({ type: "session.created", session: {} }); upstream.event({ type: "session.updated", session: {} }); };
   return { session, get upstream() { return upstream; }, ready, events, audio, ends, thread, ledger, sent, pendingActions, fleet, registry };
@@ -121,7 +122,8 @@ test("session.update: push-to-talk, transcription, truncation, tools; the key st
   assert.equal(s.audio.input.format.rate, 24000);
   assert.equal(s.audio.input.transcription.model, "gpt-4o-mini-transcribe");
   assert.match(s.audio.input.transcription.prompt, /Conductor/);
-  assert.deepEqual(s.truncation, { type: "retention_ratio", retention_ratio: 0.8 });
+  assert.deepEqual(s.truncation, { type: "retention_ratio", retention_ratio: 0.8, token_limits: { post_instructions: 8000 } });
+  assert.equal(s.max_output_tokens, 1024);
   assert.deepEqual(s.reasoning, { effort: "low" });
   assert.equal(s.audio.output.voice, "marin");
   assert.deepEqual(s.output_modalities, ["audio"]);
@@ -335,4 +337,144 @@ test("a code the transcriber spells out is read as digits; other number words st
   assert.equal(digitsFromWords("yes that one"), "yes that one");
   assert.deepEqual(matchConfirmation(digitsFromWords("yes that one")), { decision: "approve", code: null });
   assert.equal(matchConfirmation(digitsFromWords("we have two threads and forty two tests")), null);
+});
+
+test("voice approvals require a code that existed before the committed owner turn", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
+  await h.session.onTranscript("request", "Tell amman to rebase.");
+  await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
+  const card = h.events.find((event) => event.status === "awaiting_confirmation");
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "bare" });
+  await h.session.onTranscript("bare", "yes");
+  assert.equal(h.sent.length, 0);
+  // A duplicate of a transcript already processed cannot become a later approval.
+  await h.session.onTranscript("request", `yes ${card.code}`);
+  assert.equal(h.sent.length, 0);
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "coded" });
+  await h.session.onTranscript("coded", `yes ${card.code}`);
+  assert.equal(h.sent.length, 1);
+});
+
+test("an old transcript cannot approve a card raised after its commit", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "old" });
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "new" });
+  await h.session.onTranscript("new", "Tell amman to rebase.");
+  const outcome = await h.session.runTool({ name: "fleet_send_message", arguments: JSON.stringify({ key: "codex:t1", message: "Rebase." }) }, "new");
+  await h.session.onTranscript("old", `yes ${outcome.result.code}`);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.session.ownerText, "Tell amman to rebase.");
+});
+
+test("tool outputs finish before the next response and retain their own input transcript", async (t) => {
+  const h = harness(t);
+  h.ready();
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  h.registry.get("feedback_record").handler = async (_args, context) => {
+    await blocked;
+    return { words: context.__voice.ownerText };
+  };
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "first" });
+  await h.session.onTranscript("first", "I dislike the first question.");
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event(callDone("feedback_record", { utterance: "invented", intent: "change" }));
+  await flush();
+  const count = h.upstream.types().filter((type) => type === "response.create").length;
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "second" });
+  await h.session.onTranscript("second", "Explain the second question.");
+  assert.equal(h.upstream.types().filter((type) => type === "response.create").length, count);
+  release();
+  await flush();
+  const output = h.upstream.last("conversation.item.create");
+  assert.equal(JSON.parse(output.item.output).result.words, "I dislike the first question.");
+  assert.equal(h.upstream.types().at(-1), "response.create");
+  assert.equal(h.session.responseItem, "second");
+});
+
+test("missing transcription fails closed and barge-in cancels a tool waiting for input", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.session.transcriptWaitMs = 10;
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "first" });
+  await h.session.onTranscript("first", "I dislike this.");
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "missing" });
+  const keepAlive = setTimeout(() => {}, 100);
+  t.after(() => clearTimeout(keepAlive));
+  const unavailable = await h.session.runTool({ name: "feedback_record", arguments: JSON.stringify({ utterance: "model invention", intent: "change" }) }, "missing");
+  assert.equal(unavailable.ok, false);
+  assert.equal(h.fleet.feedback().length, 0);
+  assert.equal(h.session.ownerText, null);
+  h.session.transcriptWaitMs = 100;
+  h.upstream.event({ type: "response.created" });
+  const pending = h.session.onResponseDone(callDone("feedback_record", { utterance: "model invention", intent: "change" }).response);
+  h.session.barge({});
+  await h.session.onTranscript("missing", "New complaint.");
+  await pending;
+  assert.equal(h.fleet.feedback().length, 0);
+  assert.equal(h.session.responding, false);
+});
+
+test("the daily cap reserves concurrent work and unfinished work survives a meter restart", () => {
+  const held = {};
+  let actual = 0;
+  const budget = {
+    channelUsdToday: () => actual,
+    voiceReservationsToday: () => ({ ...held }),
+    setVoiceReservation: (id, usd) => { if (usd) held[id] = usd; else delete held[id]; },
+    recordUsd: (usd) => { actual += usd; }
+  };
+  const spend = createVoiceSpend({ budget, capUsd: 1 });
+  assert.equal(spend.reserve("mac", 0.7), true);
+  assert.equal(spend.reserve("phone", 0.4), false);
+  assert.equal(spend.reserve("phone", 0.2), true);
+  assert.ok(spend.today() <= 1);
+  spend.add(0.1, "gpt-realtime-2.1", {}, "phone");
+  const restarted = createVoiceSpend({ budget, capUsd: 1 });
+  assert.ok(Math.abs(restarted.today() - 0.8) < 1e-9);
+  assert.equal(restarted.reserve("reconnect", 0.3), false);
+  restarted.add(0.15, "gpt-realtime-2.1", {}, "mac");
+  assert.equal(restarted.reserve("reconnect", 0.3), true);
+});
+
+test("reservation persistence failure closes voice before billable audio is sent", (t) => {
+  const h = harness(t);
+  h.ready();
+  h.session.spend = createVoiceSpend({ budget: { setVoiceReservation: () => { throw new Error("disk full"); } } });
+  assert.equal(h.session.appendAudio(Buffer.alloc(4800)), false);
+  assert.equal(h.upstream.types().includes("input_audio_buffer.append"), false);
+  assert.equal(h.ends.at(-1).code, "voice_cap");
+});
+
+test("a session already open cannot upload or respond after another session consumes the cap", (t) => {
+  const h = harness(t);
+  h.ready();
+  h.session.spend.add(5, "gpt-realtime-2.1");
+  assert.equal(h.session.appendAudio(Buffer.alloc(4800)), false);
+  h.session.respond();
+  assert.equal(h.upstream.types().includes("response.create"), false);
+  assert.equal(h.ends.at(-1).code, "voice_cap");
+});
+
+test("credential-bearing provider errors and tool diagnostics never reach clients or the model", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.upstream.event({ type: "error", error: { code: KEY, message: `Invalid bearer ${KEY}` } });
+  assert.ok(!JSON.stringify(h.events).includes(KEY));
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "owner" });
+  await h.session.onTranscript("owner", "What is the fleet status?");
+  h.registry.get("fleet_status").handler = () => { throw new Error(`Provider echoed ${KEY}`); };
+  await h.session.onResponseDone(callDone("fleet_status", {}).response);
+  assert.ok(!JSON.stringify(h.upstream.sent).includes(KEY));
+});
+
+test("streaming resampling matches a whole waveform across irregular frame boundaries", () => {
+  const pcm = Buffer.alloc(3200);
+  for (let i = 0; i < 1600; i++) pcm.writeInt16LE(Math.round(16000 * Math.sin(i / 13)), i * 2);
+  const resample = createResampler(16000, 24000);
+  const streamed = Buffer.concat([resample(pcm.subarray(0, 202)), resample(pcm.subarray(202, 804)), resample(pcm.subarray(804))]);
+  assert.deepEqual(streamed, resamplePcm16(pcm, 16000, 24000));
 });
