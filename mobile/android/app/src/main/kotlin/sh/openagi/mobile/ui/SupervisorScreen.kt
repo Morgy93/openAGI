@@ -2,6 +2,24 @@
 
 package sh.openagi.mobile.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.onClick
+import androidx.lifecycle.LifecycleEventObserver
+import sh.openagi.mobile.voice.VoiceAudio
+import sh.openagi.mobile.voice.VoiceSession
+import sh.openagi.mobile.voice.VoiceStatus
+import sh.openagi.mobile.voice.VoicePhase
+import sh.openagi.mobile.voice.VoiceFocus
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -146,6 +164,47 @@ fun SupervisorScreen(
     // Push now, Mute and Unmute: one at a time, and their result, by thread.
     var busyThread by remember { mutableStateOf<String?>(null) }
     var threadNote by remember { mutableStateOf<Pair<String, SupervisorFormat.Note>?>(null) }
+    val voice = remember(credentials) { VoiceSession(credentials.server, credentials.token, VoiceAudio()) }
+    val voiceStatus by voice.status.collectAsState()
+    var voiceQuestion by remember { mutableStateOf<FleetQuestion?>(null) }
+    var voiceAction by remember { mutableStateOf<FleetAction?>(null) }
+    var permissionNote by remember { mutableStateOf<String?>(null) }
+    var pendingHandsFree by remember { mutableStateOf(false) }
+    val voiceLifecycle = LocalLifecycleOwner.current
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        permissionNote = if (granted) "Microphone allowed. Hold the mic to talk." else "Microphone permission is needed for voice. Allow it in Android Settings."
+        if (granted && pendingHandsFree && voiceLifecycle.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) voice.handsFree(true)
+        pendingHandsFree = false
+    }
+    fun microphoneAllowed(): Boolean = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    fun pressMic() {
+        if (microphoneAllowed()) { permissionNote = null; voice.press() }
+        else { pendingHandsFree = false; micPermission.launch(Manifest.permission.RECORD_AUDIO) }
+    }
+    fun toggleHandsFree() {
+        if (voiceStatus.handsFree || microphoneAllowed()) {
+            permissionNote = null
+            voice.handsFree(!voiceStatus.handsFree)
+        } else { pendingHandsFree = true; micPermission.launch(Manifest.permission.RECORD_AUDIO) }
+    }
+    val voiceControls: @Composable () -> Unit = {
+        SupervisorVoiceControls(voiceStatus, permissionNote, ::pressMic, { voice.release(it) }, ::toggleHandsFree, { voice.stop() })
+    }
+    DisposableEffect(voice, voiceLifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE) { pendingHandsFree = false; voice.stop() }
+        }
+        voiceLifecycle.lifecycle.addObserver(observer)
+        onDispose { voiceLifecycle.lifecycle.removeObserver(observer); voice.close() }
+    }
+    LaunchedEffect(openThread, voiceQuestion, voiceAction) {
+        voice.setFocus(VoiceFocus(
+            threadKey = voiceQuestion?.threadKey ?: voiceAction?.threadKey ?: openThread?.key,
+            actionId = voiceAction?.id,
+            questionId = voiceQuestion?.id,
+            prRef = voiceQuestion?.prRef ?: openThread?.pr?.ref,
+        ))
+    }
     var chatOpen by chatOpenState
     // The clock the Watching durations read; ticks while the list is visible.
     var now by remember { mutableStateOf(Instant.now()) }
@@ -324,6 +383,8 @@ fun SupervisorScreen(
     fun openSheet(thread: FleetThread) {
         if (openThread?.key != thread.key) detail = null
         openThread = thread
+        voiceQuestion = null
+        voiceAction = null
         actionNote = null
         threadNote = null
     }
@@ -361,6 +422,8 @@ fun SupervisorScreen(
             }
         }
     }
+
+    LaunchedEffect(chatOpen) { if (chatOpen) { pendingHandsFree = false; voice.stop() } }
 
     if (chatOpen) {
         BackHandler { chatOpen = false }
@@ -428,6 +491,10 @@ fun SupervisorScreen(
                                 onAsk = { chatOpen = true },
                             )
                         }
+                        item(key = "voice") {
+                            voiceControls()
+                            voiceQuestion?.let { Text("Voice context: " + (it.title ?: "Question"), style = OpenAGIType.caption) }
+                        }
                         item(key = "needs") {
                             NeedsYouSection(
                                 state = current,
@@ -436,6 +503,7 @@ fun SupervisorScreen(
                                 note = questionNote,
                                 onAnswer = { question, option -> decide(question, option) },
                                 onDismiss = { question -> decide(question, null) },
+                                onVoiceFocus = { voiceQuestion = it; voiceAction = null },
                                 onOpenThread = { key -> current.snapshot?.threads?.firstOrNull { it.key == key }?.let(::openSheet) },
                             )
                         }
@@ -498,6 +566,13 @@ fun SupervisorScreen(
             questionNote = questionNote?.takeIf { questionNoteThreads.contains(thread.key) },
             onAnswer = { question, option -> decide(question, option) },
             onDismissQuestion = { question -> decide(question, null) },
+            onVoiceFocus = { voiceQuestion = it; voiceAction = null },
+            onVoiceAction = { voiceAction = it; voiceQuestion = null },
+            voiceControls = {
+                voiceControls()
+                voiceQuestion?.let { Text("Voice context: " + (it.title ?: "Question"), style = OpenAGIType.caption) }
+                voiceAction?.let { Text("Voice context: proposed nudge", style = OpenAGIType.caption) }
+            },
             busy = busyThread == thread.key,
             anyBusy = busyThread != null,
             threadNote = threadNote?.takeIf { it.first == thread.key }?.second,
@@ -506,6 +581,8 @@ fun SupervisorScreen(
             onUnmute = { unmute(thread) },
             onDismiss = {
                 openThread = null
+                voiceQuestion = null
+                voiceAction = null
                 detail = null
             },
         )
@@ -723,6 +800,7 @@ private fun NeedsYouSection(
     note: Pair<String, SupervisorFormat.Note>?,
     onAnswer: (FleetQuestion, String) -> Unit,
     onDismiss: (FleetQuestion) -> Unit,
+    onVoiceFocus: (FleetQuestion) -> Unit,
     onOpenThread: (String) -> Unit,
 ) {
     val questions = state.questions.filter { it.id.isNotBlank() }
@@ -745,6 +823,7 @@ private fun NeedsYouSection(
                         note = note?.takeIf { it.first == question.id }?.second,
                         onAnswer = { onAnswer(question, it) },
                         onDismiss = { onDismiss(question) },
+                    onVoiceFocus = { onVoiceFocus(question) },
                         onOpenThread = onOpenThread,
                     )
                     if (index != questions.lastIndex) Hairline()
@@ -768,6 +847,7 @@ private fun QuestionRow(
     note: SupervisorFormat.Note?,
     onAnswer: (String) -> Unit,
     onDismiss: () -> Unit,
+    onVoiceFocus: () -> Unit,
     onOpenThread: ((String) -> Unit)? = null,
     // Off in the thread sheet, whose header already carries Open chat.
     showChat: Boolean = true,
@@ -827,6 +907,9 @@ private fun QuestionRow(
         ) {
             options.forEachIndexed { index, option ->
                 CompactButton(text = option, filled = index == 0, enabled = !anyBusy, onClick = { onAnswer(option) })
+            }
+            TextButton(onClick = onVoiceFocus, modifier = Modifier.heightIn(min = 44.dp)) {
+                Text("Talk about this", style = OpenAGIType.secondary, color = colors.live)
             }
             TextButton(onClick = onDismiss, enabled = !anyBusy, modifier = Modifier.heightIn(min = 44.dp)) {
                 Text("Dismiss", style = OpenAGIType.secondary, color = muted)
@@ -1058,6 +1141,9 @@ private fun ThreadDetailSheet(
     questionNote: Pair<String, SupervisorFormat.Note>?,
     onAnswer: (FleetQuestion, String) -> Unit,
     onDismissQuestion: (FleetQuestion) -> Unit,
+    onVoiceFocus: (FleetQuestion) -> Unit,
+    voiceControls: @Composable () -> Unit,
+    onVoiceAction: (FleetAction) -> Unit,
     busy: Boolean,
     anyBusy: Boolean,
     threadNote: SupervisorFormat.Note?,
@@ -1159,6 +1245,8 @@ private fun ThreadDetailSheet(
                 OpenChatLine(thread.openChat ?: detail?.openChat)
             }
 
+            voiceControls()
+
             if (questions.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Waiting on you", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
@@ -1173,6 +1261,7 @@ private fun ThreadDetailSheet(
                                 note = questionNote?.takeIf { it.first == question.id }?.second,
                                 onAnswer = { onAnswer(question, it) },
                                 onDismiss = { onDismissQuestion(question) },
+                                onVoiceFocus = { onVoiceFocus(question) },
                                 showChat = false,
                             )
                             if (index != questions.lastIndex) Hairline()
@@ -1233,6 +1322,7 @@ private fun ThreadDetailSheet(
 
             proposed.forEach { action ->
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { onVoiceAction(action) }) { Text("Talk about this nudge", style = OpenAGIType.secondary) }
                     Text("Proposed nudge", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
                     action.message?.takeIf { it.isNotBlank() }?.let { Text(it, style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface) }
                     (action.detail?.takeIf { it.isNotBlank() } ?: action.reason?.takeIf { it.isNotBlank() })?.let {
@@ -1250,5 +1340,60 @@ private fun ThreadDetailSheet(
             // A sent nudge leaves the proposed list; its result still shows.
             actionNote?.takeIf { note -> proposed.none { it.id == note.first } }?.let { NoteLine(it.second) }
         }
+    }
+}
+
+
+@Composable
+private fun SupervisorVoiceControls(
+    status: VoiceStatus,
+    permissionNote: String?,
+    onPress: () -> Unit,
+    onRelease: (Boolean) -> Unit,
+    onHandsFree: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val colors = LocalOpenAGIColors.current
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            val label = when {
+                status.handsFree -> "Mic · Hands-free"
+                status.recording -> "Mic · Listening…"
+                status.phase == VoicePhase.CONNECTING -> "Mic · Connecting…"
+                else -> "Mic · Hold to talk"
+            }
+            Surface(
+                color = if (status.recording) colors.live.copy(alpha = 0.15f) else colors.edge,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.weight(1f).heightIn(min = 48.dp)
+                    .semantics {
+                        role = Role.Button
+                        onClick(label = "Start or finish a voice turn") {
+                            if (status.handsFree) onStop() else if (status.recording) onRelease(true) else onPress()
+                            true
+                        }
+                    }
+                    .pointerInput(status.handsFree) {
+                        detectTapGestures(onPress = {
+                            if (status.handsFree) { onStop(); return@detectTapGestures }
+                            onPress()
+                            val released = tryAwaitRelease()
+                            onRelease(released)
+                        })
+                    },
+            ) {
+                Text(label, style = OpenAGIType.secondary, color = colors.live, modifier = Modifier.padding(12.dp))
+            }
+            TextButton(onClick = onHandsFree, modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(if (status.handsFree) "Hands-free off" else "Hands-free on", style = OpenAGIType.secondary)
+            }
+        }
+        if (status.phase != VoicePhase.IDLE) {
+            TextButton(onClick = onStop) { Text("End voice", style = OpenAGIType.secondary) }
+        }
+        (permissionNote ?: status.message)?.let { Text(it, style = OpenAGIType.caption, color = muted) }
+        if (status.ownerText.isNotBlank()) Text("You: " + status.ownerText, style = OpenAGIType.secondary)
+        if (status.replyText.isNotBlank()) Text("Supervisor: " + status.replyText, style = OpenAGIType.secondary)
     }
 }
