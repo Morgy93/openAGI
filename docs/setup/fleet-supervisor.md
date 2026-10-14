@@ -75,7 +75,8 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_IDLE_DRAIN` | on | `0` turns off the [idle watcher](#while-you-work) |
 | `OPENAGI_FLEET_IDLE_POLL_MS` | `15000` | How often the idle watcher reads idle time while sends wait |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
-| `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
+| `OPENAGI_FLEET_REVIEW_PROVIDER` | `codex` when `~/.codex/config.toml` uses codex-lb, else `claude` | Which model provider runs that review; `claude` pins the old behavior |
+| `OPENAGI_FLEET_REVIEW_MODEL` | `gpt-6-luna` on codex, `claude-sonnet-5` on claude | Model for that review (owner-confirmed); a `claude-*` name picks Claude |
 | `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
 | `OPENAGI_FLEET_JUDGE` | off | `1` turns on the [nudge judge](#judge) (needs a model too) |
 | `OPENAGI_FLEET_JUDGE_MODEL` | unset (judge off) | Model for the judge, run with `codex exec` through codex-lb, e.g. `gpt-6.1-sol` |
@@ -421,9 +422,13 @@ on; the same outreach item updates in place. The supervisor's own questions
 - It runs in every mode. It only edits the supervisor's own list; it never
   messages a thread.
 
-The default model is `claude-sonnet-5`, confirmed by the owner on 2026-09-29. On
-26 hand-audited questions it agreed with the audit on 20, versus 17 for Haiku 4.5.
-Set `OPENAGI_FLEET_REVIEW_MODEL` to use another model.
+With codex-lb configured the review runs on `gpt-6-luna` through it, tool-free
+like the judge (owner decision 2026-10-13, after Claude usage limits failed 35
+reviews in a day). If that call fails it falls back to `claude-sonnet-5`, which
+is also the default without codex-lb (confirmed 2026-09-29: on 26 hand-audited
+questions it agreed with the audit on 20, versus 17 for Haiku 4.5). Set
+`OPENAGI_FLEET_REVIEW_PROVIDER=claude` to keep the review on Claude, and
+`OPENAGI_FLEET_REVIEW_MODEL` to use another model. Settings show which ran.
 
 ## Judge
 

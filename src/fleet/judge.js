@@ -338,6 +338,16 @@ function tomlKeyPart(part) {
 // owner's own config, and with web search and JUDGE_FEATURES_OFF switched
 // off it reads untrusted chat text with no tools at hand.
 // Built from <codexHome>/config.toml; null when it names no provider.
+// The top-level model_provider of a Codex config.toml (quoted keys too), or null.
+export function codexModelProvider(text) {
+  for (const raw of String(text ?? "").split(/\r?\n/)) {
+    if (tomlHeader(raw)) break;
+    const entry = tomlStringEntry(raw);
+    if (entry?.name === "model_provider") return entry.value;
+  }
+  return null;
+}
+
 export function judgeCodexConfig(text) {
   const lines = String(text ?? "").split(/\r?\n/);
   const top = [];
@@ -406,13 +416,15 @@ function keyScrubber(secret) {
   };
 }
 
-// config.judge: { enabled, model, timeoutMs }. run: runCommand-like.
-export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now } = {}) {
-  const settings = config?.judge ?? {};
-  const model = String(settings.model ?? "").trim();
-  const enabled = Boolean(settings.enabled) && Boolean(model);
-  const timeoutMs = settings.timeoutMs ?? DEFAULT_JUDGE_TIMEOUT_MS;
-  const limits = { ...DEFAULTS, ...(config?.limits ?? {}) };
+// One tool-free codex exec through the owner's codex-lb, shared by the
+// nudge judge and the needs-you review: read-only, in a temp dir that is also
+// its HOME, with a minimal Codex home (judgeCodexConfig), and only once codex
+// itself reports the shell, the other tools and every MCP server off (fail
+// closed). Returns exec({ prompt, schema, model, timeoutMs, stdin }) -> the
+// first JSON object codex wrote (the LB key scrubbed out), or throws.
+// stdin: true hands the prompt over stdin ("-"), for a prompt too long for
+// an argument. tempPrefix names the call's temp dir.
+export function createLockedCodexExec({ config, run = runCommand, env = process.env, now = Date.now, tempPrefix = "openagi-judge-" } = {}) {
   const bin = config?.bins?.codex ?? "codex";
   // The binary the last good lockdown read was for, and when.
   let lockedDown = null;
@@ -475,7 +487,7 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
   };
 
   // Fail closed: codex skips a [features] key its version lacks, so the
-  // judge never runs on the config's say-so alone. codex features list, with
+  // call never runs on the config's say-so alone. codex features list, with
   // the call's own home and env, must show shell_tool there and off; read
   // again when the binary changes, and every LOCKDOWN_RECHECK_MS.
   async function checkLockdown(options) {
@@ -496,7 +508,7 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
     const shell = features.get("shell_tool");
     if (shell === undefined) throw new Error("tool lockdown unconfirmed: no shell_tool in codex features list");
     if (shell) throw new Error("tool lockdown failed: codex keeps shell_tool on");
-    // A system or managed layer outranks the judge's own config: every tool
+    // A system or managed layer outranks the call's own config: every tool
     // feature this codex knows must show off too. unified_exec is the shell
     // tool's backend and stays on in codex 0.162 whatever the config says;
     // with shell_tool off it offers no tool (checked live), so it is the one
@@ -523,33 +535,32 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
     return now() - began;
   }
 
-  // input.timeoutMs: a shorter cap for this call (the scan's time left).
-  async function judge(input) {
-    if (!enabled) throw new Error("judge off");
-    const limitMs = Math.min(timeoutMs, Number.isFinite(input?.timeoutMs) ? input.timeoutMs : Infinity);
-    const prompt = buildJudgePrompt(input);
+  return async function exec({ prompt, schema, model, timeoutMs, stdin = false }) {
     const key = lbKey();
     const scrub = keyScrubber(key);
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-judge-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), tempPrefix));
     try {
       const schemaPath = path.join(dir, "schema.json");
       const outPath = path.join(dir, "out.json");
-      fs.writeFileSync(schemaPath, JSON.stringify(JUDGE_SCHEMA));
-      const options = { cwd: dir, env: { ...childEnv(dir, key), CODEX_HOME: codexHome(dir) }, timeoutMs: limitMs };
-      // A lockdown read comes out of this call's time.
-      const execMs = Math.max(1_000, limitMs - await checkLockdown(options));
-      const args = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", model, "--output-schema", schemaPath, "-o", outPath, prompt];
+      fs.writeFileSync(schemaPath, JSON.stringify(schema));
+      const options = { cwd: dir, env: { ...childEnv(dir, key), CODEX_HOME: codexHome(dir) }, timeoutMs };
+      // A lockdown read comes out of this call's time; its error is scrubbed
+      // too, as codex stderr there runs with the key in its env.
+      let lockdownMs;
+      try { lockdownMs = await checkLockdown(options); } catch (error) { throw new Error(scrub(error?.message ?? String(error))); }
+      const execMs = Math.max(1_000, timeoutMs - lockdownMs);
+      const args = ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", model, "--output-schema", schemaPath, "-o", outPath, stdin ? "-" : prompt];
       let result;
       try {
-        // No input: runCommand closes stdin, which codex exec needs.
-        result = await run(bin, args, { ...options, timeoutMs: execMs, maxBytes: OUTPUT_MAX_BYTES });
+        // No input closes stdin, which codex exec needs with a prompt argument.
+        result = await run(bin, args, { ...options, timeoutMs: execMs, maxBytes: OUTPUT_MAX_BYTES, ...(stdin ? { input: prompt } : {}) });
       } catch (error) {
         result = { code: null, stdout: "", stderr: "", timedOut: false, error: error?.message ?? String(error) };
       }
       if (result?.timedOut) throw new Error(`timed out after ${Math.round(execMs / 1000)}s`);
       let out = "";
       try { out = fs.readFileSync(outPath, "utf8"); } catch { /* checked below */ }
-      // The key never leaves in a verdict or an error, plain or encoded.
+      // The key never leaves in an answer or an error, plain or encoded.
       const parsed = parseFirstJson(scrub(out));
       if (result?.error || result?.code !== 0 || !parsed) {
         const why = summariseExecFailure(scrub(`${result?.stdout ?? ""}\n${result?.stderr ?? ""}`))
@@ -557,10 +568,28 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
           || (result?.code === 0 ? "output was not JSON" : `exit ${result?.code}`);
         throw new Error(why);
       }
-      return validateVerdict(parsed, limits);
+      return parsed;
     } finally {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ }
     }
+  };
+}
+
+// config.judge: { enabled, model, timeoutMs }. run: runCommand-like.
+export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now } = {}) {
+  const settings = config?.judge ?? {};
+  const model = String(settings.model ?? "").trim();
+  const enabled = Boolean(settings.enabled) && Boolean(model);
+  const timeoutMs = settings.timeoutMs ?? DEFAULT_JUDGE_TIMEOUT_MS;
+  const limits = { ...DEFAULTS, ...(config?.limits ?? {}) };
+  const exec = createLockedCodexExec({ config, run, env, now });
+
+  // input.timeoutMs: a shorter cap for this call (the scan's time left).
+  async function judge(input) {
+    if (!enabled) throw new Error("judge off");
+    const limitMs = Math.min(timeoutMs, Number.isFinite(input?.timeoutMs) ? input.timeoutMs : Infinity);
+    const parsed = await exec({ prompt: buildJudgePrompt(input), schema: JUDGE_SCHEMA, model, timeoutMs: limitMs });
+    return validateVerdict(parsed, limits);
   }
 
   return { enabled, model, judge };

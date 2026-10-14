@@ -2016,6 +2016,42 @@ test("a failed review fails open: the question goes out and the failure is logge
   assert.equal(supervisor.getState().questions[0].reviewReason, "no verdict from the review");
 });
 
+test("settings show the review's provider, model, Claude fallback and which ran last", async (t) => {
+  const runModel = async () => {
+    runModel.lastRun = { provider: "claude", model: "claude-sonnet-5", fallbackReason: "codex: timed out after 180s" };
+    return { reviews: [] };
+  };
+  Object.assign(runModel, { provider: "codex", model: "gpt-6-luna", fallbackModel: "claude-sonnet-5", lastRun: null });
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, deps: { runModel } });
+  const before = supervisor.getState().settings.review;
+  assert.deepEqual([before.provider, before.model, before.fallbackModel, before.lastRun, before.lastError], ["codex", "gpt-6-luna", "claude-sonnet-5", null, null]);
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().settings.review.lastRun, { provider: "claude", model: "claude-sonnet-5", fallbackReason: "codex: timed out after 180s" });
+});
+
+test("a failed review clears the last run it no longer reflects", async (t) => {
+  let now = NOW;
+  let failing = false;
+  const runModel = async () => {
+    if (failing) {
+      runModel.lastRun = null;
+      throw new Error("codex: timed out after 180s; claude fallback: usage limit");
+    }
+    runModel.lastRun = { provider: "codex", model: "gpt-6-luna", fallbackReason: null };
+    return { reviews: [] };
+  };
+  Object.assign(runModel, { provider: "codex", model: "gpt-6-luna", fallbackModel: "claude-sonnet-5", lastRun: null });
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel } });
+  await supervisor.tick();
+  assert.equal(supervisor.getState().settings.review.lastRun?.provider, "codex");
+  failing = true;
+  now += 31 * MIN;
+  await supervisor.tick();
+  const review = supervisor.getState().settings.review;
+  assert.match(review.lastError, /timed out/);
+  assert.equal(review.lastRun, null);
+});
+
 test("a new question stays off the shared state until the review has seen it", async (t) => {
   let holder = null;
   let seen = null;
