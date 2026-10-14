@@ -8,7 +8,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor"]);
+export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity"]);
+// The one list every thread-key matcher is built from (server routes, the
+// broker's and the phone's allowlists): "kind:id", the id as sources mint it.
+export const THREAD_KIND_PATTERN = THREAD_KINDS.join("|");
+export const THREAD_KEY_PATTERN = new RegExp(`^(?:${THREAD_KIND_PATTERN}):[A-Za-z0-9_.-]{1,120}$`);
+
+export function isThreadKey(key) {
+  return typeof key === "string" && THREAD_KEY_PATTERN.test(key);
+}
+
+// What the owner calls each kind's app in questions and labels.
+export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity" });
+
+export function kindName(kind) {
+  return KIND_NAMES[kind] ?? "Agent";
+}
 
 // Provider-level status of the thread's last turn, before PR/infra context.
 export const AGENT_STATUS = Object.freeze(["running", "idle", "waiting", "stalled", "aborted", "error", "unknown"]);
@@ -679,8 +694,8 @@ export async function openReadOnlyDb(filePath) {
 
 /**
  * @typedef {Object} FleetThread
- * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>"
- * @property {"codex"|"claude"|"conductor"} kind
+ * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>" | "antigravity:<conversationId>"
+ * @property {"codex"|"claude"|"conductor"|"antigravity"} kind
  * @property {string} id
  * @property {string} title
  * @property {string|null} cwd

@@ -294,3 +294,17 @@ test("screen, click and app routes validate their input and reach the supervisor
     ["appAction", "conductor", "restart", ["conductor:s1"]]
   ]);
 });
+
+test("POST /fleet/api/send takes keys of every thread kind and refuses others", async () => {
+  const supervisor = fakeSupervisor();
+  const sent = [];
+  supervisor.sendOwnerMessage = async (threadKey, message) => { sent.push([threadKey, message]); return { delivery: { status: "sent" } }; };
+  const route = createFleetRoute({ supervisor });
+  const send = (threadKey) => route("POST", "/fleet/api/send", url("/fleet/api/send"), body({ threadKey, message: "hi" }));
+  for (const key of ["codex:t1", "claude:s1", "conductor:c1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) {
+    assert.equal((await send(key)).status, 200, key);
+  }
+  for (const key of ["gemini:x", "antigravity:", "antigravity:a/b", "codex"]) assert.equal((await send(key)).status, 400, key);
+  assert.equal(sent.length, 4);
+  assert.equal(sent[3][0], "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8");
+});

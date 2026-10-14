@@ -4,8 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ROUTES, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
-  repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
+  KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
@@ -191,4 +191,14 @@ test("a card item that says it needs nothing, or only acknowledges, asks nothing
   assert.equal(isAckItem(item("Please sign back into ZeroShot Staging.")), false);
   assert.equal(isAckItem(item("No input needed? Pick a region.", ["us-east-1", "eu-west-1"])), false);
   assert.deepEqual(liveCardItems({ app: "codex", items: [item("no action needed"), { ...item("Sign in?"), at: null }] }).map((entry) => entry.question), ["Sign in?"]);
+});
+
+test("thread keys come from the one kind list, Antigravity included", () => {
+  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity"]);
+  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity");
+  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
+  for (const key of ["gemini:x", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
+  for (const kind of THREAD_KINDS) assert.ok(KIND_NAMES[kind], kind);
+  assert.equal(kindName("antigravity"), "Antigravity");
+  assert.equal(kindName("other"), "Agent");
 });
