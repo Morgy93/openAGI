@@ -26,8 +26,12 @@ import sh.openagi.mobile.protocol.FleetAnswerRequest
 import sh.openagi.mobile.protocol.FleetDismissRequest
 import sh.openagi.mobile.protocol.FleetJson
 import sh.openagi.mobile.protocol.FleetModeRequest
+import sh.openagi.mobile.protocol.FleetMuteRequest
+import sh.openagi.mobile.protocol.FleetMuteResult
+import sh.openagi.mobile.protocol.FleetPushResult
 import sh.openagi.mobile.protocol.FleetQuestionResult
 import sh.openagi.mobile.protocol.FleetState
+import sh.openagi.mobile.protocol.FleetThreadDetailResult
 import sh.openagi.mobile.protocol.LifelogMoment
 import sh.openagi.mobile.protocol.LifelogMomentsResponse
 import sh.openagi.mobile.protocol.MobileSummary
@@ -303,6 +307,33 @@ class DaemonClient(
     suspend fun fleetSendAction(id: String): FleetActionResult =
         fleetCall(authorized("/fleet/api/actions/$id/send").post("".toRequestBody(JSON)).build(), relayClient, FleetActionResult.serializer(), missingMeansUnavailable = false)
 
+    // One thread expanded. 404: not in the last scan (or a daemon from before
+    // this route), which the sheet treats as "show the row as it is".
+    suspend fun fleetThread(key: String): FleetThreadDetailResult =
+        fleetCall(authorized(threadPath(key)).get().build(), client, FleetThreadDetailResult.serializer(), missingMeansUnavailable = false)
+
+    // The owner's Push now: the planned nudge goes out at once, by the same
+    // relay as an answer, so the same long wait. A refusal is a 200 with a
+    // blocked delivery.
+    suspend fun fleetPush(key: String): FleetPushResult =
+        fleetCall(authorized(threadPath(key) + "/push").post("".toRequestBody(JSON)).build(), relayClient, FleetPushResult.serializer(), missingMeansUnavailable = false)
+
+    suspend fun fleetMute(key: String, hours: Int = 24): FleetMuteResult {
+        val body = ProtocolJson.json.encodeToString(FleetMuteRequest.serializer(), FleetMuteRequest(hours))
+        return fleetCall(authorized(threadPath(key) + "/mute").post(body.toRequestBody(JSON)).build(), client, FleetMuteResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    suspend fun fleetUnmute(key: String): FleetMuteResult =
+        fleetCall(authorized(threadPath(key) + "/unmute").post("".toRequestBody(JSON)).build(), client, FleetMuteResult.serializer(), missingMeansUnavailable = false)
+
+    // "conductor:d1dbe71a" goes as it is: the daemon and the phone allowlist
+    // take a raw colon. A key outside that shape (never one the daemon
+    // sends) is refused here rather than sent as a path it would 404 on.
+    private fun threadPath(key: String): String {
+        if (!THREAD_KEY.matches(key)) throw DaemonException.NotFound()
+        return "/fleet/api/threads/$key"
+    }
+
     // 503 is always "no supervisor on this daemon". 404 means the same on the
     // routes every daemon with a supervisor has (state, scan, mode), but on a
     // question or action it means that one item is gone, so it stays NotFound.
@@ -422,6 +453,8 @@ class DaemonClient(
 
     companion object {
         private val JSON = "application/json".toMediaType()
+        // The fleet thread keys the daemon routes (src/mobile-node.js FLEET_THREAD).
+        private val THREAD_KEY = Regex("""^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$""")
 
         val defaultClient: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)
