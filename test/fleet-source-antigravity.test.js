@@ -214,7 +214,7 @@ test("maps a conversation to the fleet thread shape", async (t) => {
   assert.equal(thread.live, null);
   assert.equal(thread.meta.app, "antigravity");
   assert.equal(thread.meta.projectId, "p-9");
-  assert.deepEqual(thread.meta.openChat, { app: "antigravity", url: null, label: "Data Room Setup (Antigravity)", note: "Antigravity has no link to one conversation: open the app and pick it in the sidebar." });
+  assert.deepEqual(thread.meta.openChat, { app: "antigravity", url: null, label: "revops · Data Room Setup (Antigravity)", note: "Antigravity has no link to one conversation: open it in Antigravity and pick it in the sidebar." });
   const loose = threads.find((entry) => entry.id === "loose-1");
   assert.equal(loose.excluded, "no-repo");
   assert.equal(loose.title, "Antigravity conversation");

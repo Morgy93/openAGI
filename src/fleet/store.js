@@ -755,6 +755,29 @@ export class FleetStore {
     return new Set(Object.keys(this.state.muted).filter((key) => this.mutedUntil(key)));
   }
 
+  // The owner's Unmute: the thread is watched and nudged again.
+  unmute(key) {
+    if (!key || !Object.hasOwn(this.state.muted, key)) return false;
+    delete this.state.muted[key];
+    this._save();
+    return true;
+  }
+
+  // thread key -> when its latest closed question closed (answered,
+  // dismissed, resolved or expired), for the group its row falls back to.
+  closedAtByThread() {
+    const out = new Map();
+    for (const question of this.state.questions) {
+      if (question.status === "open") continue;
+      const at = question.answeredAt ?? question.expiredAt ?? null;
+      if (!Number.isFinite(toMs(at, NaN))) continue;
+      for (const key of [question.threadKey, ...(question.threadKeys ?? [])].filter(Boolean)) {
+        if (!out.has(key) || toMs(out.get(key), 0) < toMs(at, 0)) out.set(key, at);
+      }
+    }
+    return out;
+  }
+
   // ─── internals ──────────────────────────────────────────────────────────
 
   _findQuestion(id) {

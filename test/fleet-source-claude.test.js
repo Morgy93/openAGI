@@ -452,7 +452,7 @@ test("only the tail is read and agent text is redacted and clamped", async (t) =
   const home = makeHome(t);
   const cwd = "/Users/x/Dev/repo";
   const r = rowsFor("tail-1", cwd);
-  const secret = "sk-ant-abcdefghijklmnopqrstuv";
+  const secret = ["sk", "ant", "api03", "abcdefghijklmnop".repeat(4)].join("-");
   writeTranscript(home, cwd, "tail-1", [
     r.prLink("o/old", 1, iso(80 * MIN)),
     r.prompt("x".repeat(20_000), iso(79 * MIN)),

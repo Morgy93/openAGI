@@ -5,7 +5,13 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.openagi.mobile.protocol.FleetAgentMessage
+import sh.openagi.mobile.protocol.FleetDecision
+import sh.openagi.mobile.protocol.FleetOpenChat
+import sh.openagi.mobile.protocol.FleetPr
+import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetThread
+import sh.openagi.mobile.protocol.FleetThreadDetail
 import sh.openagi.mobile.protocol.FleetWatch
 import java.time.Instant
 
@@ -152,4 +158,155 @@ class WatchFormatTest {
         assertNull(WatchFormat.prShortRef(null))
         assertNull(WatchFormat.prShortRef(" "))
     }
+
+    // ─── Open chat, row actions, question cards ───────────────────────────
+
+    private val conductorChat = FleetOpenChat(
+        app = "conductor",
+        url = "conductor://workspace?id=w1&session=s1",
+        label = "remote-dev · Codex LB Transcript open (Conductor)",
+    )
+
+    @Test
+    fun aMacLinkNoAppHereTakesReadsOnYourMac() {
+        val link = WatchFormat.chatLink(conductorChat) { false }!!
+        assertNull(link.url)
+        assertTrue(link.onMac)
+        assertEquals("remote-dev · Codex LB Transcript open (Conductor)", link.label)
+        assertEquals("Conductor", link.app)
+    }
+
+    @Test
+    fun aMacLinkAnAppHereTakesOpensHere() {
+        val link = WatchFormat.chatLink(conductorChat) { true }!!
+        assertEquals("conductor://workspace?id=w1&session=s1", link.url)
+        assertFalse(link.onMac)
+    }
+
+    // An http(s) link points at the Mac's apps or its loopback: never opened
+    // from the phone, even though a browser here would take it.
+    @Test
+    fun anHttpLinkIsTheMacsEvenWhenABrowserCouldOpenIt() {
+        val link = WatchFormat.chatLink(FleetOpenChat(app = "claude", url = "http://127.0.0.1:43210/x", label = "s")) { true }!!
+        assertNull(link.url)
+        assertTrue(link.onMac)
+    }
+
+    @Test
+    fun noLinkKeepsTheNoteAndIsNotOnMac() {
+        val antigravity = WatchFormat.chatLink(FleetOpenChat(app = "antigravity", note = "Open it in Antigravity.")) { true }!!
+        assertEquals("Antigravity", antigravity.app)
+        assertNull(antigravity.url)
+        assertFalse(antigravity.onMac)
+        assertEquals("Open it in Antigravity.", antigravity.note)
+        val chat = FleetOpenChat(app = "claude", url = null, label = "amman · Docs (Claude Code)", note = "open it in its terminal")
+        val link = WatchFormat.chatLink(chat) { true }!!
+        assertNull(link.url)
+        assertFalse(link.onMac)
+        assertEquals("open it in its terminal", link.note)
+        assertNull(WatchFormat.chatLink(null) { true })
+        assertEquals("Codex", WatchFormat.chatLink(FleetOpenChat(app = "codex"), { false })!!.label)
+    }
+
+    @Test
+    fun rowActionsFollowTheGroupAndTheMute() {
+        val unplanned = watched("p", "push", 5)
+        assertEquals(listOf(WatchFormat.RowAction.MUTE), WatchFormat.rowActions(unplanned, now))
+        val push = unplanned.copy(decision = FleetDecision(action = "wait"), pushPreview = FleetDecision(action = "nudge", message = "Preview"))
+        assertEquals(listOf(WatchFormat.RowAction.PUSH, WatchFormat.RowAction.MUTE), WatchFormat.rowActions(push, now))
+        assertEquals(listOf(WatchFormat.RowAction.UNMUTE), WatchFormat.rowActions(push.copy(muted = now.plusSeconds(3600)), now))
+        // A mute that ran out is no mute.
+        assertEquals(listOf(WatchFormat.RowAction.PUSH, WatchFormat.RowAction.MUTE), WatchFormat.rowActions(push.copy(muted = now.minusSeconds(1)), now))
+        assertTrue(WatchFormat.rowActions(watched("w", "working", 5), now).isEmpty())
+    }
+
+    @Test
+    fun mutedLineSaysHowLongIsLeft() {
+        assertEquals("Muted, 23h left", WatchFormat.mutedLine(now.plusSeconds(23 * 3600), now))
+        assertNull(WatchFormat.mutedLine(now, now))
+        assertNull(WatchFormat.mutedLine(null, now))
+    }
+
+    @Test
+    fun askedLineNamesWhenAndWhichChat() {
+        val q = FleetQuestion(id = "q", askedAt = minutesAgo(180), createdAt = minutesAgo(10), chatLabel = "remote-dev · Codex LB Transcript open (Conductor)")
+        assertEquals("Asked 3h ago in remote-dev · Codex LB Transcript open (Conductor)", WatchFormat.askedLine(q, "remote-dev", now))
+        // No chat label from the daemon: the row's name stands in.
+        assertEquals("Asked 10m ago in docs", WatchFormat.askedLine(FleetQuestion(id = "q", createdAt = minutesAgo(10)), "docs", now))
+        assertNull(WatchFormat.askedLine(FleetQuestion(id = "q"), null, now))
+    }
+
+    @Test
+    fun questionsForFindsOwnAndGroupQuestions() {
+        val own = FleetQuestion(id = "a", threadKey = "codex:1")
+        val grouped = FleetQuestion(id = "b", threadKeys = listOf("codex:2", "codex:1"))
+        val other = FleetQuestion(id = "c", threadKey = "codex:3")
+        assertEquals(listOf("a", "b"), WatchFormat.questionsFor("codex:1", listOf(own, grouped, other)).map { it.id })
+    }
+
+    @Test
+    fun waitsOnUsesTheWaitStartOnAWaitingRow() {
+        val watch = FleetWatch(group = "waiting", since = minutesAgo(60), waitingOn = "BuildBot3 full run", waitSince = minutesAgo(23))
+        assertEquals("BuildBot3 full run, for 23m", WatchFormat.waitsOn(watch, now))
+        assertEquals("your answer, for 1h", WatchFormat.waitsOn(FleetWatch(group = "you", since = minutesAgo(60), waitingOn = "your answer"), now))
+        assertNull(WatchFormat.waitsOn(FleetWatch(group = "working", since = minutesAgo(5)), now))
+    }
+
+    @Test
+    fun pushNoteSaysWhyARefusalSentNothing() {
+        assertEquals(SupervisorFormat.Note("Not sent: waits on your answer first: Which fix?", isAlert = true), WatchFormat.pushNote("blocked", "waits on your answer first: Which fix?"))
+        assertEquals(SupervisorFormat.Note("Pushed. The agent has your nudge.", isAlert = false), WatchFormat.pushNote("sent", null))
+        assertEquals(SupervisorFormat.Note("Push failed.", isAlert = true), WatchFormat.pushNote("failed", " "))
+    }
+
+    @Test
+    fun nextStepNamesTheActionAndPlaybook() {
+        assertEquals("Nudge (pr-ci-failing)", WatchFormat.nextStep("nudge", "pr-ci-failing"))
+        assertEquals("Ask owner", WatchFormat.nextStep("ask-owner", null))
+        assertNull(WatchFormat.nextStep("none", "x"))
+        assertNull(WatchFormat.nextStep(null, null))
+    }
+
+    @Test
+    fun openThreadIsNotAnAnswerAndMacNavigationIsAnInstruction() {
+        assertEquals(listOf("Apply fix A"), WatchFormat.answerOptions(FleetQuestion(answerIn = "here", options = listOf("open thread", "dismiss", "Apply fix A"))))
+        val link = WatchFormat.chatLink(conductorChat) { false }!!
+        assertEquals("Open this chat on your Mac in Conductor.", WatchFormat.chatInstruction(link))
+    }
+
+    @Test
+    fun pushNoteOnlyClaimsDeliveryForSent() {
+        assertEquals(SupervisorFormat.Note("Queued. Waiting to reach the agent: app busy", isAlert = false), WatchFormat.pushNote("queued", "app busy"))
+        assertEquals(SupervisorFormat.Note("Dry run. Nothing sent: would type", isAlert = false), WatchFormat.pushNote("dry-run", "would type"))
+        for (status in listOf(null, "", "unknown")) {
+            assertEquals(SupervisorFormat.Note("Delivery not confirmed.", isAlert = true), WatchFormat.pushNote(status, null))
+        }
+    }
+
+    @Test
+    fun anOlderDaemonKeepsTheOpenThreadOptionAndAppHint() {
+        val old = FleetQuestion(options = listOf("open thread", "dismiss"))
+        assertTrue(old.answeredInAgentApp)
+        assertEquals(listOf("open thread"), WatchFormat.answerOptions(old))
+        assertFalse(old.copy(answerIn = "here").answeredInAgentApp)
+        assertTrue(WatchFormat.answerOptions(old.copy(answerIn = "here")).isEmpty())
+        assertTrue(WatchFormat.answerOptions(old.copy(answerIn = "agent app")).isEmpty())
+    }
+
+    @Test
+    fun theRefreshedRowWinsOverCachedDetailAndKeepsTheLongerMessage() {
+        val cached = FleetThreadDetail(key = "codex:t", pr = FleetPr(ref = "o/r#1"),
+            decision = FleetDecision(action = "ask-owner"), watch = FleetWatch(group = "you"),
+            lastAgentMessage = FleetAgentMessage(text = "The longer agent message"))
+        val row = FleetThread(key = cached.key, pr = FleetPr(ref = "o/r#2"),
+            decision = FleetDecision(action = "wait"), watch = FleetWatch(group = "push"))
+        val context = WatchFormat.detailContext(row, cached)
+        assertEquals(row.pr, context.pr)
+        assertEquals(row.decision, context.decision)
+        assertEquals(row.watch, context.watch)
+        assertEquals(cached.lastAgentMessage, context.lastAgentMessage)
+        assertEquals(cached, WatchFormat.detailContext(FleetThread(key = cached.key), cached))
+        assertEquals(row.pr, WatchFormat.detailContext(row, null).pr)
+    }
+
 }
