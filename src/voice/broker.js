@@ -21,7 +21,7 @@ import { authorityRecord, matchConfirmation } from "../owner-authority.js";
 import { normalizeTarget } from "../fleet/feedback.js";
 import { VOICE_SESSION_TOOLS } from "../fleet/voice-tools.js";
 import { sharedSessionId } from "../shared-conversations.js";
-import { realtimeCostUsd } from "./audio.js";
+import { REALTIME_PRICES, realtimeCostUsd } from "./audio.js";
 import { transcriptionPrompt, voiceInstructions } from "./instructions.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-realtime-2.1";
@@ -52,7 +52,7 @@ export function voiceEnabled(env = process.env) {
 // The mini realtime model calls tools unreliably, so it is never used.
 export function voiceModel(env = process.env) {
   const name = String(env.OPENAGI_VOICE_MODEL ?? "").trim();
-  return name && /^gpt-realtime[\w.-]*$/.test(name) && !/mini/.test(name) ? name : DEFAULT_VOICE_MODEL;
+  return name.startsWith("gpt-realtime") && Object.hasOwn(REALTIME_PRICES, name) && !/mini/.test(name) ? name : DEFAULT_VOICE_MODEL;
 }
 
 export function voiceDailyCapUsd(env = process.env) {
@@ -195,6 +195,7 @@ export class VoiceSession {
   constructor(options) {
     this.apiKey = options.apiKey;
     this.model = options.model ?? DEFAULT_VOICE_MODEL;
+    if (!this.model.startsWith("gpt-realtime") || !Object.hasOwn(REALTIME_PRICES, this.model)) throw new Error("Voice model has no known pricing.");
     this.upstreamFactory = options.upstreamFactory ?? ((url, opts) => new WebSocket(url, opts));
     this.registry = options.registry;
     this.toolNames = (options.toolNames ?? VOICE_SESSION_TOOLS).filter((name) => this.registry?.get?.(name));
@@ -226,6 +227,8 @@ export class VoiceSession {
     this.creates = 0;
     this.toolHops = 0;
     this.audioItem = null;
+    this.playbackItems = new Map();
+    this.responseAudioItem = null;
     this.responseId = null;
     this.pendingTruncate = null;
     this.replyText = "";
@@ -293,7 +296,8 @@ export class VoiceSession {
     }
     if (!this.ready) {
       if (this.queuedBytes + pcm.length > QUEUE_MAX_BYTES) return false;
-      this.queued.push(pcm);
+      this.queued.push({ type: "input_audio_buffer.append", audio: pcm.toString("base64") });
+      this.appendedBytes += pcm.length;
       this.queuedBytes += pcm.length;
       return true;
     }
@@ -306,19 +310,38 @@ export class VoiceSession {
   // Push-to-talk release: the owner's turn ends here.
   commit() {
     if (this.closed || this.handsFree) return;
-    if (!this.ready) { this.commitWhenReady = true; return; }
     if (this.appendedBytes < MIN_COMMIT_BYTES) {
       this.appendedBytes = 0;
       this.spend.release(this.audioReservation);
       this.audioBytes = 0;
-      this.sendUp({ type: "input_audio_buffer.clear" });
+      this.sendInput({ type: "input_audio_buffer.clear" });
       this.io.send({ type: "notice", message: "Too short to hear. Hold to talk a little longer." });
       return;
     }
     if (this.responding) this.barge({});
     this.appendedBytes = 0;
     this.pendingCommits.push(this.rotateAudioReservation());
-    this.sendUp({ type: "input_audio_buffer.commit" });
+    this.sendInput({ type: "input_audio_buffer.commit" });
+  }
+
+  sendInput(event) {
+    if (this.ready) this.sendUp(event);
+    else this.queued.push(event);
+  }
+
+  // Playback acknowledgements name the audio item, never the latest response.
+  playback({ itemId, playedMs } = {}) {
+    const item = this.playbackItems.get(itemId);
+    if (!item || !Number.isFinite(playedMs) || playedMs < 0) return;
+    item.playedMs = playedMs;
+    this.updateReadbacks(item);
+  }
+
+  updateReadbacks(item) {
+    for (const readback of item.readbacks) {
+      readback.heard = item.complete && !item.truncated && item.bytes > 0
+        && item.playedMs >= item.bytes / BYTES_PER_MS;
+    }
   }
 
   // The owner talked over the reply: stop it and cut what they did not hear.
@@ -342,6 +365,7 @@ export class VoiceSession {
       const sentMs = Math.floor(item.bytes / BYTES_PER_MS);
       const heard = Number.isFinite(playedMs) && playedMs >= 0 ? Math.min(Math.floor(playedMs), sentMs) : sentMs;
       item.truncated = true;
+      this.updateReadbacks(item);
       this.sendUp({ type: "conversation.item.truncate", item_id: item.id, content_index: 0, audio_end_ms: heard });
     }
   }
@@ -357,6 +381,13 @@ export class VoiceSession {
   setHandsFree(on) {
     const next = on === true;
     if (next === this.handsFree) return;
+    if (!next) {
+      this.appendedBytes = 0;
+      this.audioBytes = 0;
+      this.audioSpeech = false;
+      this.spend.release(this.audioReservation);
+      this.sendInput({ type: "input_audio_buffer.clear" });
+    }
     this.handsFree = next;
     if (this.ready) this.sendUp({ type: "session.update", session: { type: "realtime", audio: { input: { turn_detection: this.turnDetection() } } } });
   }
@@ -430,7 +461,7 @@ export class VoiceSession {
         this.createId = null;
         this.responding = true;
         this.responseId = event.response?.id ?? null;
-        this.audioItem = null;
+        this.responseAudioItem = null;
         this.replyText = "";
         return;
       case "response.output_audio.delta":
@@ -452,6 +483,10 @@ export class VoiceSession {
         if (this.createId && event.error?.event_id === this.createId && code !== "conversation_already_has_active_response") {
           this.createId = null;
           this.responding = false;
+          this.spend.release(this.responseReservation);
+          this.responseReservation = null;
+          this.responseReadbacks = [];
+          if (this.wantResponse) this.respond();
         }
         if (QUIET_ERRORS.has(code)) return;
         this.io.send({ type: "error", code: "model", message: "The voice model reported an error. Check the hub configuration and try again." });
@@ -463,22 +498,23 @@ export class VoiceSession {
 
   onReady() {
     this.ready = true;
-    for (const chunk of this.queued) {
-      this.appendedBytes += chunk.length;
-      this.sendUp({ type: "input_audio_buffer.append", audio: chunk.toString("base64") });
-    }
+    for (const event of this.queued) this.sendUp(event);
     this.queued = [];
     this.queuedBytes = 0;
     this.io.send({ type: "ready", model: this.model, mode: this.handsFree ? "handsfree" : "ptt", output: this.output, capUsd: this.spend.capUsd, todayUsd: round(this.spend.today()) });
-    if (this.commitWhenReady) { this.commitWhenReady = false; this.commit(); }
   }
 
   onAudio(itemId, delta, responseId = null) {
     if (responseId && this.responseId && responseId !== this.responseId) return;
     if (typeof delta !== "string" || !delta) return;
     const pcm = Buffer.from(delta, "base64");
-    if (this.audioItem?.id !== itemId) this.audioItem = { id: itemId, bytes: 0, truncated: false };
+    if (this.audioItem?.id !== itemId) {
+      this.audioItem = { id: itemId, bytes: 0, truncated: false, complete: false, playedMs: 0, readbacks: [...this.responseReadbacks] };
+      this.playbackItems.set(itemId, this.audioItem);
+      if (this.playbackItems.size > 50) this.playbackItems.delete(this.playbackItems.keys().next().value);
+    }
     if (this.audioItem.truncated) return;
+    this.responseAudioItem = this.audioItem;
     this.audioItem.bytes += pcm.length;
     this.io.sendAudio(pcm);
   }
@@ -523,7 +559,9 @@ export class VoiceSession {
 
   pendingCards() {
     const store = this.runtime?.pendingActions;
-    for (const id of this.cards) if (store?.get?.(id)?.status !== "pending") this.cards.delete(id);
+    for (const id of new Set([...this.cards, ...this.readbacks.keys()])) {
+      if (store?.get?.(id)?.status !== "pending") { this.cards.delete(id); this.readbacks.delete(id); }
+    }
     return [...this.cards];
   }
 
@@ -550,7 +588,7 @@ export class VoiceSession {
       const spoken = matchConfirmation(digitsFromWords(text));
       const card = spoken?.code ? this.runtime?.pendingActions?.findByCode?.(spoken.code) : null;
       if (spoken?.code && this.confirm && itemId === this.currentItem && turn.cards.has(card?.id)) {
-        if (spoken.decision === "approve" && !turn.readbacks.has(card.id)) {
+        if (spoken.decision === "approve" && (!turn.readbacks.has(card.id) || this.readbacks.get(card.id)?.heard === false)) {
           this.queueReadback(card);
           this.note("The action has not been read back accurately. Read the hub description before asking for a new yes with its code.");
           this.respond();
@@ -585,8 +623,7 @@ export class VoiceSession {
     this.toolAbort = new AbortController();
     if (generation !== this.generation) this.toolAbort.abort();
     this.responding = false;
-    // A captured truncate can finish after the server cancels the old reply.
-    this.audioItem = null;
+    // Keep the audio item until the device reports playback or barges.
     if (response.usage) this.meter(response.usage, this.model, this.responseReservation);
     this.responseReservation = null;
     if (this.closed) return;
@@ -596,12 +633,17 @@ export class VoiceSession {
     if (response.status === "completed") {
       const normalized = readbackText(said);
       for (const readback of this.responseReadbacks) {
-        readback.heard = normalized === readbackText(readback.text);
+        const accurate = normalized === readbackText(readback.text);
+        readback.heard = this.output === "text" && accurate;
+        if (this.responseAudioItem?.readbacks.includes(readback)) {
+          this.responseAudioItem.complete = accurate;
+          this.updateReadbacks(this.responseAudioItem);
+        }
       }
     }
     this.responseReadbacks = [];
     if (said) {
-      this.io.send({ type: "reply.done", text: clip(said, 4000) });
+      this.io.send({ type: "reply.done", text: clip(said, 4000), itemId: this.responseAudioItem?.id ?? null, audioMs: (this.responseAudioItem?.bytes ?? 0) / BYTES_PER_MS });
       this.appendThread({ role: "assistant", content: clip(said, 4000), metadata: { provider: "openai-realtime", model: this.model, voice: true, ownerTurn: { untrusted: this.turnState.untrusted === true } } });
     }
     const calls = response.status === "cancelled" ? [] : (response.output ?? []).filter((item) => item?.type === "function_call");
@@ -635,6 +677,7 @@ export class VoiceSession {
     this.wantResponse = false;
     this.responding = true;
     this.createId = `voice_create_${++this.creates}`;
+    this.pendingCards();
     this.responseReadbacks = [...this.readbacks.values()].filter((readback) => !readback.heard).slice(0, 1);
     const readback = this.responseReadbacks[0];
     const response = this.toolHops > this.maxToolHops ? { tools: [], tool_choice: "none" } : {};

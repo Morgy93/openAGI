@@ -215,8 +215,14 @@ export function registerVoiceTools(registry, supervisor) {
   if (typeof supervisor.stopFix === "function") registry.register({ name: "self_fix_stop", source: SOURCE,
     description: "Stop a self-fix now (fixId) or every one (\"all\"): kills its run and marks it abandoned; the worktree is kept. No confirmation needed.",
     parameters: { type: "object", properties: { fixId: { type: "string", maxLength: 80 } }, required: ["fixId"], additionalProperties: false },
-    handler: async (args) => {
+    handler: async (args, context) => {
+      const voice = voiceOf(context);
       const id = typeof args?.fixId === "string" ? args.fixId.trim() : "";
+      const words = String(voice?.ownerText ?? "").trim();
+      const stop = /^(?:(?:please|hey|okay|ok)[,!.]?\s+|(?:can|could|would) you\s+|i want (?:you )?to\s+)*(?:stop|cancel|abort|halt)(?:\s+(?:(?:all(?: of)?|the|that|this|my)\s+)*(?:self[- ]?fix(?:es)?|fix(?:es)?|everything|all|it))?[.!,]?$/i;
+      if ((voice || context?.channel === "voice") && (!stop.test(words) || (id === "all" && !/\b(?:all|everything)\b/i.test(words)))) {
+        throw new Error("Ask to stop the fix in your own words first.");
+      }
       if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new Error("Pass a fix id from self_fix_list, or \"all\".");
       const stopped = (await supervisor.stopFix(id)) ?? [];
       return { stopped: stopped.map((fix) => fix.id), note: stopped.length ? "Stopped." : "Nothing was running under that id." };

@@ -486,7 +486,11 @@ whole reply. Failed budget writes stop voice.
 
 Frames: binary PCM16 mono (24 kHz; G2 16 kHz, resampled on main). JSON
 control: `start {gesture, mode?, focus?}`, `commit` (push-to-talk release),
-`barge {playedMs}`, `context {focus}`, `mode {handsFree}`, `stop`.
+`barge {playedMs}`, `playback {itemId, playedMs}`, `context {focus}`, `mode {handsFree}`, `stop`.
+The device sends `playback` only after playing audio, using the `itemId` and
+full `audioMs` from `reply.done`. Audio readbacks need this acknowledgement
+before a later spoken approval is eligible; provider completion is insufficient.
+A barge invalidates the interrupted readback.
 `node scripts/voice-smoke.mjs` checks the live API with the key in
 `~/.openagi/.env`.
 

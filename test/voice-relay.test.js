@@ -23,6 +23,7 @@ function fakeSession() {
     appendAudio(pcm) { session.audio.push(pcm); return session.appendOk; },
     commit() { calls.push(["commit"]); },
     barge(options) { calls.push(["barge", options]); },
+    playback(options) { calls.push(["playback", options]); },
     setFocus(focus) { calls.push(["focus", focus]); },
     setHandsFree(on) { calls.push(["handsFree", on]); },
     close(reason) { calls.push(["close", reason]); }
@@ -348,4 +349,18 @@ test("startup audio is still paced and startup frames are bounded", { timeout: 3
   tiny.send({ type: "start", gesture: "mic" });
   for (let i = 0; i < 501; i++) tiny.ws.send(Buffer.alloc(2));
   assert.equal((await tiny.next()).code, "upstream_backlog");
+});
+
+
+test("device playback acknowledgements reach the broker with their audio item", { timeout: 3000 }, async (t) => {
+  const f = await fixture(t);
+  const client = connect(f.origin, OWNER);
+  await client.opened;
+  client.send({ type: "start", gesture: "hotkey" });
+  await until(() => f.sessions.length === 1);
+  client.send({ type: "playback", itemId: "audio_1", playedMs: 1250 });
+  await until(() => f.sessions[0].calls.length === 1);
+  assert.deepEqual(f.sessions[0].calls, [["playback", { itemId: "audio_1", playedMs: 1250 }]]);
+  client.send({ type: "stop" });
+  await client.closed;
 });

@@ -6,7 +6,7 @@
 //
 // Frames: binary = PCM16 mono at the declared rate (G2 16k, resampled here
 // to 24k); text = JSON control: start {gesture, mode?, focus?}, commit,
-// barge {playedMs?}, context {focus}, mode {handsFree}, stop.
+// barge {playedMs?}, playback {itemId, playedMs}, context {focus}, mode {handsFree}, stop.
 // The owner principal is minted only on start with a real gesture (hotkey,
 // mic button, tap); a wake word never opens a session. One session per
 // device (a newer one replaces it), idle 120 s, hard 55 min.
@@ -188,7 +188,7 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.type !== "string") return fail("Voice control must be an object with a type.");
       if (message.type === "start") return start(message);
       if (message.type === "stop") return end("Stopped.", 1000, "stopped");
-      if (!["commit", "barge", "context", "mode"].includes(message.type)) return fail("Unknown voice control.");
+      if (!["commit", "barge", "playback", "context", "mode"].includes(message.type)) return fail("Unknown voice control.");
       if (!session) {
         if (!starting) return fail("Send start before anything else.");
         return enqueue({ control: message }, data.length);
@@ -200,6 +200,7 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       switch (message.type) {
         case "commit": return session.commit();
         case "barge": return session.barge({ playedMs: Number.isFinite(message.playedMs) ? message.playedMs : null });
+        case "playback": return session.playback({ itemId: message.itemId, playedMs: message.playedMs });
         case "context": return session.setFocus(message.focus ?? null);
         case "mode":
           if (message.handsFree === true && !device.handsFreeAllowed) return fail("Hands-free is not available on this device.", "mode");
