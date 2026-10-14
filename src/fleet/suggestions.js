@@ -85,23 +85,27 @@ export function createDiagnoseModels({ config, run, env, now } = {}) {
 }
 
 export class SuggestionManager {
-  constructor({ store, config, queueFix, notify, now = Date.now, models }) {
-    Object.assign(this, { store, config, queueFix, notify, now, models });
+  constructor({ store, config, queueFix, notify, respondSuggestion, now = Date.now, models }) {
+    Object.assign(this, { store, config, queueFix, notify, respondSuggestion, now, models });
   }
 
   get mode() { return this.config.selfFix?.mode ?? "propose"; }
 
   async propose(report) {
     if (!report.anomalies.length || this.mode === "off") return [];
-    const explanation = validateExplanation(await this.models.explain({ anomalies: report.anomalies, metrics: report.metrics, evidence: report.evidence }));
-    const anomaly = report.anomalies.find((a) => a.id === explanation.anomalyId && a.area === explanation.area);
+    const records = this.store.suggestions();
+    const covered = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status)
+      || (s.status === "snoozed" && Date.parse(s.snoozedUntil) > this.now()));
+    const anomalies = report.anomalies.filter((a) => !covered.some((s) => s.metric === a.metric && s.area === a.area));
+    if (!anomalies.length) return [];
+    const explanation = validateExplanation(await this.models.explain({ anomalies, metrics: report.metrics, evidence: report.evidence }));
+    const anomaly = anomalies.find((a) => a.id === explanation.anomalyId && a.area === explanation.area);
     if (!anomaly) throw new Error("Diagnosis output has no matching anomaly.");
     const evidenceIds = new Set(anomaly.evidenceActionIds);
     const candidate = { ...explanation, metric: anomaly.metric, eventsPerDay: anomaly.eventsPerDay,
       evidence: { actionIds: explanation.evidenceActionIds.filter((id) => evidenceIds.has(id)), feedbackIds: anomaly.feedbackIds ?? [] },
       score: anomaly.eventsPerDay * explanation.minutesSavedPerDay * explanation.confidence };
     candidate.fingerprint = suggestionFingerprint(candidate);
-    const records = this.store.suggestions();
     if (records.some((s) => s.fingerprint === candidate.fingerprint)) return [];
     const compare = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status) || Date.parse(s.updatedAt) >= this.now() - 7 * DAY_MS);
     const fixes = this.store.fixes().filter((f) => ACTIVE_FIX.has(f.state));
@@ -157,7 +161,8 @@ export class SuggestionManager {
       }
       if (s.status !== "open") continue;
       if (autoGate(s, { mode: this.mode, fixes: this.store.fixes(), areaLocks: this.store.state.areaLocks, now })) {
-        this.respond(s.id, "Fix it");
+        if (this.respondSuggestion) this.respondSuggestion(s.id, "Fix it");
+        else this.respond(s.id, "Fix it");
         continue;
       }
       const question = this.store.upsertQuestion({ kind: "suggestion", dedupeKey: `suggestion:${s.id}`, title: clean(s.proposedFix, 100),

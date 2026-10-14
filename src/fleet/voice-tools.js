@@ -64,6 +64,7 @@ export async function fleetWalkthrough(supervisor, { scope = "all" } = {}) {
   const items = [];
   if (want === "all" || want === "questions") {
     for (const q of state.questions ?? []) {
+      if (q.kind === "suggestion") continue;
       items.push({ kind: "question", id: q.id, title: clip(q.title, 120), options: (q.options ?? []).slice(0, 4), threadKey: q.threadKey ?? null, prRef: q.prRef ?? null });
     }
   }

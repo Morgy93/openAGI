@@ -944,6 +944,7 @@ export class FleetSupervisor {
   get suggestionManager() {
     this._suggestionManager ??= new SuggestionManager({ store: this.store, config: this.config,
       queueFix: (input) => this.queueFix(input), now: () => this.now(), notify: (q, options) => this.notifier.notifyQuestion(q, options),
+      respondSuggestion: (id, choice) => this.respondSuggestion(id, choice),
       models: this.deps.diagnoseModels ?? createDiagnoseModels({ config: this.config, run: this.deps.runCommand, now: () => this.now() }) });
     return this._suggestionManager;
   }
@@ -971,7 +972,7 @@ export class FleetSupervisor {
     if (due.daily) {
       // Mark before the call: model outages never turn into a call every tick.
       this.store.saveDiagnosis({ dailyDay: localDay(now) });
-      const report = await this.diagnose({ window: "7d" });
+      const report = await this.diagnose({ window: "7d", completeDay: true });
       this.store.saveDiagnosis({ full: report });
       if (this.forceMode !== "observe") await this.suggestionManager.publish(report.suggestions);
     } else if (due.hourly && this.forceMode !== "observe") await this.suggestionManager.refresh();

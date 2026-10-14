@@ -62,6 +62,27 @@ test("fingerprint canonicalization, semantic dedupe and untrusted evidence filte
   assert.deepEqual(await f.manager.propose(report), []);
 });
 
+test("covered anomalies leave the explanation call for other metrics and areas", async (t) => {
+  for (const status of ["open", "fix-queued", "never", "snoozed"]) {
+    const f = fixture(t);
+    f.store.saveSuggestion({ ...f.candidate(0, { metric: report.anomalies[0].metric }), id: "existing", status,
+      updatedAt: new Date(NOW - 8 * DAY_MS).toISOString(), snoozedUntil: new Date(NOW + DAY_MS).toISOString() });
+    const otherMetric = { ...report.anomalies[0], id: "other-metric", metric: "repeat-nudge" };
+    const otherArea = { ...report.anomalies[0], id: "other-area", area: "review" };
+    let seen;
+    f.manager.models.explain = async ({ anomalies }) => {
+      f.calls.explain += 1; seen = anomalies;
+      return { ...explanation, anomalyId: anomalies[0].id };
+    };
+    const [candidate] = await f.manager.propose({ anomalies: [...report.anomalies, otherMetric, otherArea] });
+    assert.deepEqual(seen, [otherMetric, otherArea], status);
+    assert.equal(candidate.metric, "repeat-nudge");
+    assert.equal(f.calls.explain, 1);
+    assert.deepEqual(await f.manager.propose(report), []);
+    assert.equal(f.calls.explain, 1, "all covered means no model call");
+  }
+});
+
 test("at most three open and one push per local day, including repeated refresh", async (t) => {
   const f = fixture(t);
   await f.manager.publish([f.candidate(3), f.candidate(2), f.candidate(1), f.candidate(0)]);
@@ -153,6 +174,32 @@ test("auto queues once without a question or push; off never calls models or que
   assert.equal(off.calls.explain, 0);
   assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SELF_FIX: "0" }).selfFix.mode, "off");
   assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SELF_FIX: "auto" }).selfFix.mode, "auto");
+});
+
+test("auto acceptance after a lock clears resolves the existing outreach card once", async (t) => {
+  const f = fixture(t, "auto");
+  const resolved = [];
+  const items = [];
+  const runtime = { outreach: {
+    append: (item) => { items.push(item); return { id: `out-${items.length}` }; },
+    resolve: (...args) => resolved.push(args)
+  } };
+  const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.config, runtime, deps: { now: f.now } });
+  supervisor._store = f.store;
+  f.store.state.areaLocks = { policy: "busy" };
+  await supervisor.suggestionManager.publish([f.candidate()]);
+  const question = f.store.openQuestions()[0];
+  assert.equal(question.outreachId, "out-1");
+  assert.equal(items.length, 1);
+  assert.equal(f.store.fixes().length, 0);
+  f.store.state.areaLocks = {};
+  await supervisor.suggestionManager.refresh();
+  assert.equal(f.store.fixes().length, 1);
+  assert.equal(f.store.suggestions()[0].status, "fix-queued");
+  assert.equal(f.store.openQuestions().length, 0);
+  assert.deepEqual(resolved, [["out-1", "Fix it", { status: "acted" }]]);
+  await supervisor.suggestionManager.refresh();
+  assert.equal(resolved.length, 1);
 });
 
 test("suggestion responses work through question, routes, remote capability and phone allowlist", async (t) => {

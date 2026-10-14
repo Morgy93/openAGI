@@ -72,6 +72,68 @@ test("repeats, judge waits/failures, flicker, titles, escalation and spend thres
   assert.equal(diagnose({ now: NOW, actions: rows.map((r, i) => ({ ...r, progressMark: String(i) })) }).metrics.repeats.length, 0);
 });
 
+test("07:30 daily diagnosis checks the complete local day and its prior seven spend days", async (t) => {
+  const dataDir = temp(t);
+  const now = new Date(2026, 9, 14, 7, 31).getTime();
+  const yesterday = new Date(2026, 9, 13, 15).toISOString();
+  const config = resolveFleetConfig({}, { home: dataDir, selfFix: { mode: "off" }, limits: { quietHours: { start: 22, end: 7 } } });
+  const supervisor = new FleetSupervisor({ dataDir, config, deps: { now: () => now } });
+  for (const [kind, count] of [["judge", 3], ["review", 8], ["classify", 6]]) {
+    for (let i = 0; i < count; i += 1) supervisor.store.recordAction({ kind, at: yesterday, status: "failed",
+      reason: kind === "review" ? "usage limit" : kind === "classify" ? "Two threads share this title" : "failed" });
+  }
+  for (let i = 0; i < 6; i += 1) {
+    supervisor.store.upsertQuestion({ dedupeKey: `flicker-${i}`, title: "Ask", kind: "test" });
+    supervisor.store.state.questions.at(-1).reopenHistory = [yesterday];
+  }
+  const budget = [{ at: yesterday, channel: "voice", usd: 10 }];
+  for (let i = 1; i <= 7; i += 1) budget.push({ at: new Date(2026, 9, 13 - i, 0, 1).toISOString(), channel: "voice", usd: 1 });
+  // Today's partial spending must not enter yesterday's baseline or total.
+  budget.push({ at: new Date(now).toISOString(), channel: "voice", usd: 100 });
+  fs.mkdirSync(path.join(dataDir, "budget"));
+  fs.writeFileSync(path.join(dataDir, "budget", "ledger.jsonl"), budget.map((row) => JSON.stringify(row)).join("\n"));
+  await supervisor.diagnoseTick();
+  const report = supervisor.store.state.diagnosis.full;
+  assert.equal(report.metrics.day, "2026-10-13");
+  assert.equal(report.metrics.review.failures, 8);
+  assert.equal(report.metrics.judge.failures, 3);
+  assert.equal(report.metrics.sharedTitles, 6);
+  assert.equal(report.metrics.questions.reopens, 6);
+  assert.deepEqual(report.metrics.spend.voice, { today: 10, median: 1 });
+  for (const metric of ["judge-failures", "review-failures", "review-model-limits", "shared-title", "question-flicker", "spend:voice"]) {
+    assert.ok(report.anomalies.some((a) => a.metric === metric), metric);
+  }
+  const manual = await supervisor.diagnose();
+  assert.equal(manual.metrics.day, "2026-10-14");
+  assert.equal(manual.metrics.review.failures, 0);
+  assert.equal(manual.metrics.spend.voice.today, 100);
+});
+
+test("reopened owner holds exclude sends while the hold was lifted", (t) => {
+  let clock = new Date(2026, 9, 13, 10).getTime();
+  const store = new FleetStore({ dir: path.join(temp(t), "fleet"), now: () => clock });
+  const hold = { dedupeKey: "held:t:h", threadKey: "t", title: "Owner hold", kind: "owner-hold" };
+  const question = store.upsertQuestion(hold);
+  const action = (id) => store.recordAction({ id, kind: "nudge", threadKey: "t", status: "sent" });
+  clock += 45 * 60_000;
+  store.resolveQuestion(question.id);
+  clock += 15 * 60_000;
+  action("lifted");
+  clock += 30 * 60_000;
+  const reopened = store.upsertQuestion(hold);
+  assert.equal(reopened.id, question.id);
+  assert.ok(reopened.reopenedAt);
+  assert.equal(diagnose({ now: clock, cheap: true, actions: store.actions(), questions: store.state.questions }).metrics.ownerHoldViolations, 0);
+  action("reopened-hold");
+  clock += 10 * 60_000;
+  store.resolveQuestion(question.id);
+  action("resolved");
+  const report = diagnose({ now: clock, cheap: true, actions: store.actions(), questions: store.state.questions });
+  assert.deepEqual(report.anomalies.find((a) => a.metric === "owner-hold").evidenceActionIds, ["reopened-hold"]);
+  const live = { ...store.state.questions[0], reopenedAt: null, liveSince: reopened.reopenedAt };
+  assert.equal(diagnose({ now: clock, actions: store.actions(), questions: [live] }).metrics.ownerHoldViolations, 1);
+});
+
 test("hourly checks storage and actual sends inside owner holds; owner answers are exempt", () => {
   const actions = [
     { id: "send", at: at(-1000), kind: "nudge", status: "sent", threadKey: "t" },
@@ -141,7 +203,7 @@ test("supervisor daily diagnosis is once across reloads, hourly checks persist, 
   const deps = { now: () => NOW, diagnoseModels: { explain: async ({ anomalies }) => { calls += 1; return { anomalyId: anomalies.find((a) => a.area === "review").id, area: "review", rootCause: "Limits", proposedFix: "Use available review model", acceptance: "Reviews complete", confidence: 0.7, minutesSavedPerDay: 5, evidenceActionIds: [] }; }, duplicate: async () => false }, notifier: { notifyQuestion: async () => ({ pushed: false }) } };
   const config = resolveFleetConfig({}, { home: dataDir, selfFix: { mode: "propose" } });
   const supervisor = new FleetSupervisor({ dataDir, config, deps });
-  for (const row of october13(NOW).actions.filter((a) => a.kind === "review")) supervisor.store.recordAction(row);
+  for (const row of october13(NOW - DAY_MS).actions.filter((a) => a.kind === "review")) supervisor.store.recordAction(row);
   await supervisor.diagnoseTick();
   assert.equal(calls, 1); assert.equal(supervisor.suggestions().length, 1);
   assert.equal(supervisor.store.openQuestions()[0].kind, "suggestion");
