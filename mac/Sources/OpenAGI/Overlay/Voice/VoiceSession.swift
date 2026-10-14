@@ -21,7 +21,9 @@ struct VoiceControl: Encodable {
   var gesture: String? = nil
   var mode: String? = nil
   var focus: VoiceFocus? = nil
-  var playedMs: Int? = nil
+  var handsFree: Bool? = nil
+  var itemId: String? = nil
+  var playedMs: Double? = nil
 
   func message() throws -> URLSessionWebSocketTask.Message {
     .string(String(decoding: try JSONEncoder().encode(self), as: UTF8.self))
@@ -199,7 +201,7 @@ final class VoiceSession: ObservableObject {
         awaitingBarge = true
         // Audio's serial queue stops playback before new mic frames reach us.
         let played = audio.interrupt()
-        enqueue(VoiceControl(type: "barge", playedMs: played))
+        enqueue(VoiceControl(type: "barge", playedMs: Double(played)))
       case .commit:
         ignoreReply = awaitingBarge
         enqueue(VoiceControl(type: "commit"))
@@ -262,6 +264,8 @@ final class VoiceSession: ObservableObject {
           case "reply.done":
             if !ignoreReply {
               reply = String((event["text"] as? String ?? "").prefix(4000))
+              audio.finishReply(itemId: event["itemId"] as? String, audioMs: event["audioMs"] as? Double)
+              replyStarted = false
               replyFinished = true
               finishReplyIfDrained()
             }
@@ -272,7 +276,7 @@ final class VoiceSession: ObservableObject {
           case "error": notice = event["message"] as? String ?? "The hub reported a voice error."
           case "end":
             let reason = event["reason"] as? String ?? "Voice ended."
-            stop(); notice = reason
+            stop(sendControl: false); notice = reason
             return
           default: break
           }
@@ -322,19 +326,29 @@ final class VoiceSession: ObservableObject {
   }
 
   private func finishReplyIfDrained() {
+    guard !ignoreReply, !recording else { return }
+    for control in audio.playbackAcknowledgements() { enqueue(control) }
     guard replyFinished, audio.drained else { return }
     ptt.replyDone(); phase = ptt.phase
     replyStarted = false; replyFinished = false
   }
 
-  func stop() {
+  func stop(sendControl: Bool = true) {
     generation &+= 1
     connectionTask?.cancel(); receiver?.cancel(); sender?.cancel()
     deadline?.cancel(); deadline = nil
     connectionTask = nil; receiver = nil; sender = nil
-    socket?.cancel(with: .normalClosure, reason: nil)
+    let ws = socket
+    let session = transport
+    Task {
+      if sendControl, let ws, let message = try? VoiceControl(type: "stop").message() {
+        try? await ws.send(message)
+      }
+      ws?.cancel(with: .normalClosure, reason: nil)
+      session?.invalidateAndCancel()
+    }
     socket = nil
-    transport?.invalidateAndCancel(); transport = nil
+    transport = nil
     outbox = []; queuedBytes = 0
     audio.stop()
     ptt.reset(); phase = .idle; ignoreReply = false; awaitingBarge = false; micHeld = false
@@ -342,7 +356,7 @@ final class VoiceSession: ObservableObject {
   }
 
   private func fail(_ message: String) {
-    stop()
+    stop(sendControl: false)
     error = message
   }
 }

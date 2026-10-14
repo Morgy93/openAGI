@@ -1,5 +1,43 @@
 import AVFoundation
 
+struct VoicePlayback {
+  private struct Item {
+    let id: String
+    let audioMs: Double
+    let endFrame: Int64
+  }
+  private(set) var scheduledFrames: Int64 = 0
+  private(set) var completedFrames: Int64 = 0
+  private var itemStartFrame: Int64 = 0
+  private var items: [Item] = []
+
+  mutating func beginReply() { itemStartFrame = scheduledFrames }
+  mutating func schedule(_ frames: Int64) { scheduledFrames += frames }
+  mutating func complete(_ frames: Int64) { completedFrames += frames }
+
+  mutating func finishReply(itemId: String?, audioMs: Double?) {
+    guard let itemId, !itemId.isEmpty, let audioMs, audioMs.isFinite, audioMs > 0,
+          audioMs == Double(scheduledFrames - itemStartFrame) / 24 else { return }
+    items.append(Item(id: itemId, audioMs: audioMs, endFrame: scheduledFrames))
+  }
+
+  mutating func acknowledgements() -> [VoiceControl] {
+    var controls: [VoiceControl] = []
+    while let item = items.first, item.endFrame <= completedFrames {
+      items.removeFirst()
+      controls.append(VoiceControl(type: "playback", itemId: item.id, playedMs: item.audioMs))
+    }
+    return controls
+  }
+
+  func playedMs(renderedFrames: Int64?) -> Int {
+    let played = min(scheduledFrames, max(completedFrames, renderedFrames ?? completedFrames))
+    return Int(max(0, played - itemStartFrame) / 24)
+  }
+
+  mutating func reset() { self = VoicePlayback() }
+}
+
 final class VoiceAudio {
   private let queue = DispatchQueue(label: "app.openagi.voice.audio")
   private var engine: AVAudioEngine?
@@ -8,8 +46,8 @@ final class VoiceAudio {
   private var tapInstalled = false
   private var playerAttached = false
   private var capturing = false
-  private var scheduledFrames: Int64 = 0
-  private var completedFrames: Int64 = 0
+  private var playback = VoicePlayback()
+  private var renderedFrameOffset: Int64 = 0
   private var playbackGeneration: UInt = 0
   var onDrained: () -> Void = {}
   var onFailure: () -> Void = {}
@@ -87,12 +125,7 @@ final class VoiceAudio {
   }
 
   func beginReply() {
-    queue.sync {
-      player.stop()
-      playbackGeneration &+= 1
-      scheduledFrames = 0; completedFrames = 0
-      player.play()
-    }
+    queue.sync { playback.beginReply() }
   }
 
   func play(_ pcm: Data) throws {
@@ -112,35 +145,51 @@ final class VoiceAudio {
     queue.async {
       guard self.engine != nil else { return }
       // Bound queued playback to ten seconds rather than retaining a whole reply.
-      guard self.scheduledFrames - self.completedFrames + Int64(frames) <= 240_000 else {
+      guard self.playback.scheduledFrames - self.playback.completedFrames + Int64(frames) <= 240_000 else {
         self.onFailure()
         return
       }
-      self.scheduledFrames += Int64(frames)
+      // Idle time is not audio the owner heard.
+      if self.playback.scheduledFrames == self.playback.completedFrames {
+        self.player.stop()
+        self.renderedFrameOffset = self.playback.scheduledFrames
+        self.player.play()
+      }
+      self.playback.schedule(Int64(frames))
       let mine = self.playbackGeneration
       self.player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in
         self.queue.async {
           guard mine == self.playbackGeneration else { return }
-          self.completedFrames += Int64(frames)
-          if self.completedFrames == self.scheduledFrames { self.onDrained() }
+          self.playback.complete(Int64(frames))
+          self.onDrained()
         }
       }
     }
   }
 
+  func finishReply(itemId: String?, audioMs: Double?) {
+    queue.sync { playback.finishReply(itemId: itemId, audioMs: audioMs) }
+  }
+
+  func playbackAcknowledgements() -> [VoiceControl] {
+    queue.sync { playback.acknowledgements() }
+  }
+
   func interrupt() -> Int {
     queue.sync {
       let time = player.lastRenderTime.flatMap { player.playerTime(forNodeTime: $0) }
-      let played = time.map { Int(Double($0.sampleTime) * 1000 / $0.sampleRate) } ?? Int(completedFrames * 1000 / 24_000)
+      let frames = time.map { renderedFrameOffset + Int64(Double($0.sampleTime) * 24_000 / $0.sampleRate) }
+      let played = playback.playedMs(renderedFrames: frames)
       player.stop()
       playbackGeneration &+= 1
-      scheduledFrames = 0; completedFrames = 0
+      playback.reset()
+      renderedFrameOffset = 0
       if engine != nil { player.play() }
       return max(0, played)
     }
   }
 
-  var drained: Bool { queue.sync { scheduledFrames == completedFrames } }
+  var drained: Bool { queue.sync { playback.scheduledFrames == playback.completedFrames } }
 
   func stop() { queue.async { self.stopEngine() } }
 
@@ -155,6 +204,7 @@ final class VoiceAudio {
     }
     tapInstalled = false; playerAttached = false
     engine = nil; converter = nil
-    scheduledFrames = 0; completedFrames = 0
+    playback.reset()
+    renderedFrameOffset = 0
   }
 }

@@ -30,6 +30,103 @@ final class VoiceTests: XCTestCase {
     XCTAssertNil(barge["focus"])
   }
 
+  func testPlaybackModeAndStopFramesMatchRelayProtocol() throws {
+    let playback = try json(VoiceControl(type: "playback", itemId: "item_42", playedMs: 1000.125))
+    XCTAssertEqual(Set(playback.keys), ["type", "itemId", "playedMs"])
+    XCTAssertEqual(playback["type"] as? String, "playback")
+    XCTAssertEqual(playback["itemId"] as? String, "item_42")
+    XCTAssertEqual(playback["playedMs"] as? Double, 1000.125)
+    let mode = try json(VoiceControl(type: "mode", handsFree: true))
+    XCTAssertEqual(Set(mode.keys), ["type", "handsFree"])
+    XCTAssertEqual(mode["handsFree"] as? Bool, true)
+    XCTAssertEqual(try json(VoiceControl(type: "stop"))["type"] as? String, "stop")
+  }
+
+  func testPlaybackAcknowledgementWaitsForAllAudioToPlay() throws {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    playback.schedule(12_000)
+    playback.schedule(12_003)
+    playback.finishReply(itemId: "item_42", audioMs: 1000.125)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+    playback.complete(12_000)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+    playback.complete(12_003)
+    let frame = try json(XCTUnwrap(playback.acknowledgements().first))
+    XCTAssertEqual(frame["type"] as? String, "playback")
+    XCTAssertEqual(frame["itemId"] as? String, "item_42")
+    XCTAssertEqual(frame["playedMs"] as? Double, 1000.125)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+  }
+
+  func testAudioDrainingBeforeReplyDoneWaitsForItemMetadata() throws {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    playback.schedule(24_000)
+    playback.complete(24_000)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+    playback.finishReply(itemId: "item_late", audioMs: 1000)
+    XCTAssertEqual(try json(XCTUnwrap(playback.acknowledgements().first))["itemId"] as? String, "item_late")
+  }
+
+  func testBargeDropsInterruptedAcknowledgementAndCountsPartialPlayback() {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    playback.schedule(12_000)
+    playback.schedule(36_000)
+    playback.complete(12_000)
+    playback.finishReply(itemId: "item_interrupted", audioMs: 2000)
+    XCTAssertEqual(playback.playedMs(renderedFrames: 18_000), 750)
+    XCTAssertEqual(playback.playedMs(renderedFrames: nil), 500)
+    playback.reset()
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+    XCTAssertEqual(playback.playedMs(renderedFrames: 18_000), 0)
+  }
+
+  func testBargeBeforeReplyDoneDoesNotAcknowledgeOldItem() {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    playback.schedule(24_000)
+    playback.complete(12_000)
+    playback.reset()
+    playback.finishReply(itemId: "item_interrupted", audioMs: 1000)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+  }
+
+  func testConsecutiveItemsAcknowledgeTheirOwnPlaybackBoundary() throws {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    playback.schedule(24_000)
+    playback.finishReply(itemId: "item_first", audioMs: 1000)
+    playback.beginReply()
+    playback.schedule(48_000)
+    playback.finishReply(itemId: "item_second", audioMs: 2000)
+    XCTAssertEqual(playback.playedMs(renderedFrames: 12_000), 0)
+    playback.complete(24_000)
+    let first = try json(XCTUnwrap(playback.acknowledgements().first))
+    XCTAssertEqual(first["itemId"] as? String, "item_first")
+    XCTAssertEqual(first["playedMs"] as? Double, 1000)
+    XCTAssertEqual(playback.playedMs(renderedFrames: 30_000), 250)
+    playback.complete(48_000)
+    let second = try json(XCTUnwrap(playback.acknowledgements().first))
+    XCTAssertEqual(second["itemId"] as? String, "item_second")
+    XCTAssertEqual(second["playedMs"] as? Double, 2000)
+  }
+
+  func testMissingOrMismatchedReplyMetadataNeverAcknowledgesPlayback() {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    playback.schedule(24_000)
+    playback.complete(24_000)
+    playback.finishReply(itemId: nil, audioMs: 1000)
+    playback.finishReply(itemId: "", audioMs: 1000)
+    playback.finishReply(itemId: "item_42", audioMs: nil)
+    playback.finishReply(itemId: "item_42", audioMs: .infinity)
+    playback.finishReply(itemId: "item_42", audioMs: 0)
+    playback.finishReply(itemId: "item_42", audioMs: 2000)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+  }
+
   func testContextFrameKeepsQuestionAndThreadTogether() throws {
     let question = try JSONDecoder().decode(FleetQuestion.self, from: Data("""
       {"id":"fq_42","threadKey":"codex:thread-7","title":"Which branch?"}
