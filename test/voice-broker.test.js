@@ -48,7 +48,7 @@ function fleetState() {
   };
 }
 
-function harness(t, { handsFree = false, capUsd = 5, spentToday = 0, focus = null } = {}) {
+function harness(t, { handsFree = false, capUsd = 5, spentToday = 0, focus = null, tick = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-broker-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const pendingActions = new PendingActionStore({ dir: path.join(dir, "pending") });
@@ -57,6 +57,7 @@ function harness(t, { handsFree = false, capUsd = 5, spentToday = 0, focus = nul
   const fleet = new FleetStore({ dir: path.join(dir, "fleet") });
   const sent = [];
   const supervisor = {
+    ...(tick ? { tick } : {}),
     getState: () => fleetState(),
     sendOwnerMessage: async (key, message) => { sent.push([key, message]); return { delivery: { status: "sent", route: "computer-use" } }; },
     recordFeedback: (input) => fleet.recordFeedback(input),
@@ -174,6 +175,45 @@ test("function_call -> registry -> function_call_output + response.create", asyn
   assert.match(h.upstream.last("conversation.item.create").item.output, /not available by voice/);
 });
 
+test("voice cannot advertise or invoke a fleet scan that can send Auto-mode nudges", async (t) => {
+  let scans = 0;
+  const h = harness(t, { tick: async () => { scans++; } });
+  h.ready();
+  assert.ok(h.registry.get("fleet_scan"), "scanning remains available outside voice");
+  assert.ok(!h.upstream.sent[0].session.tools.some((tool) => tool.name === "fleet_scan"));
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "scan" });
+  await h.session.onTranscript("scan", "Refresh fleet status");
+  h.upstream.event(callDone("fleet_scan", {}));
+  await flush();
+  assert.match(h.upstream.last("conversation.item.create").item.output, /not available by voice/);
+  assert.equal(scans, 0);
+});
+
+test("the tool-hop limit requests one final spoken answer with tools disabled", async (t) => {
+  const h = harness(t, { capUsd: 50 });
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "status" });
+  await h.session.onTranscript("status", "What's the fleet status?");
+  for (let i = 0; i <= h.session.maxToolHops; i++) {
+    h.upstream.event({ type: "response.created" });
+    h.upstream.event(callDone("fleet_status", {}, `call_${i}`));
+    await flush();
+  }
+  assert.equal(h.events.filter((event) => event.type === "tool" && event.status === "running").length, h.session.maxToolHops);
+  assert.match(h.upstream.last("conversation.item.create").item.output, /Tool limit/);
+  assert.deepEqual(h.upstream.last("response.create").response, { tools: [], tool_choice: "none" });
+  const creates = h.upstream.types().filter((type) => type === "response.create").length;
+  assert.equal(creates, h.session.maxToolHops + 2);
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event(sayDone("One thread needs you."));
+  await flush();
+  assert.equal(h.events.at(-1).type, "reply.done");
+  assert.equal(h.events.at(-1).text, "One thread needs you.");
+  assert.equal(h.upstream.types().filter((type) => type === "response.create").length, creates);
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "next" });
+  assert.equal(h.upstream.last("response.create").response, undefined, "tools return on the next owner turn");
+});
+
 test("a gated action runs only on the owner's transcript, never on model text or tool text", async (t) => {
   const h = harness(t);
   h.ready();
@@ -257,6 +297,35 @@ test("hands-free: semantic VAD without auto replies; speech over the reply trunc
   assert.equal(h.upstream.last("conversation.item.truncate").audio_end_ms, 100);
   h.session.setHandsFree(false);
   assert.equal(h.upstream.last("session.update").session.audio.input.turn_detection, null);
+});
+
+test("a VAD commit clears audio byte accounting before switching to push-to-talk", (t) => {
+  const h = harness(t, { handsFree: true });
+  h.ready();
+  h.session.appendAudio(Buffer.alloc(9600));
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "vad" });
+  assert.equal(h.session.appendedBytes, 0);
+  h.session.setHandsFree(false);
+  for (const bytes of [0, 1000]) {
+    if (bytes) h.session.appendAudio(Buffer.alloc(bytes));
+    h.session.commit();
+    assert.equal(h.upstream.types().includes("input_audio_buffer.commit"), false);
+    assert.equal(h.events.at(-1).type, "notice");
+    assert.match(h.events.at(-1).message, /Too short/);
+  }
+  h.session.appendAudio(Buffer.alloc(4800));
+  h.session.commit();
+  assert.equal(h.upstream.last("input_audio_buffer.commit").type, "input_audio_buffer.commit");
+});
+
+test("voice ledger token totals count cached input only as cache reads", (t) => {
+  const h = harness(t);
+  const usage = { input_tokens: 1000, output_tokens: 100, input_token_details: { text_tokens: 1000, cached_tokens: 800 } };
+  h.session.meter(usage, "gpt-realtime-2.1");
+  assert.deepEqual(h.ledger[0].tokens, { input: 200, output: 100, cacheRead: 800, cacheWrite: 0 });
+  assert.equal(h.ledger[0].usd, realtimeCostUsd(usage, "gpt-realtime-2.1"));
+  h.session.meter({ ...usage, input_tokens: 100 }, "gpt-realtime-2.1");
+  assert.equal(h.ledger[1].tokens.input, 0);
 });
 
 test("spend goes to the ledger as channel voice, and the daily cap ends the session", async (t) => {
@@ -455,6 +524,30 @@ test("reservation persistence failure closes voice before billable audio is sent
   assert.equal(h.session.appendAudio(Buffer.alloc(4800)), false);
   assert.equal(h.upstream.types().includes("input_audio_buffer.append"), false);
   assert.equal(h.ends.at(-1).code, "voice_cap");
+});
+
+test("a failed voice ledger append stays closed even when reservation writes succeed", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-ledger-failure-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const budget = new BudgetGuard({ storePath: path.join(dir, "usage.json"), ledger: {
+    query: () => [], record: () => { throw new Error("ledger unavailable"); }
+  } });
+  const spend = createVoiceSpend({ budget });
+  assert.equal(spend.reserve("in-flight", 0.2), true);
+  const h = harness(t);
+  h.ready();
+  h.session.spend = spend;
+  h.session.meter({ input_tokens: 100, output_tokens: 50 }, "gpt-realtime-2.1", "in-flight");
+  assert.equal(h.session.closed, true);
+  assert.equal(h.ends.at(-1).code, "voice_cap");
+  budget.setVoiceReservation("probe", 0.01);
+  assert.equal(spend.capped(), true);
+  spend.release("probe");
+  assert.equal(spend.capped(), true, "a successful release must not clear the ledger failure");
+  assert.equal(spend.reserve("next", 0.01), false);
+  assert.equal(h.session.appendAudio(Buffer.alloc(4800)), false);
+  assert.equal(h.upstream.types().includes("input_audio_buffer.append"), false);
+  assert.equal(new BudgetGuard({ storePath: budget.storePath }).voiceReservationsToday()["in-flight"], 0.2);
 });
 
 test("a session already open cannot upload or respond after another session consumes the cap", (t) => {

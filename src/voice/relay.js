@@ -69,7 +69,7 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
     if (!voiceEnabled(env)) return deny(404);
     if (closing || req.method !== "GET") return deny(503);
     const protocols = String(req.headers["sec-websocket-protocol"] ?? "").split(",").map((value) => value.trim());
-    if (protocols.length !== 2 || protocols[0] !== VOICE_PROTOCOL || !/^[A-Za-z0-9._~+-]{16,512}$/.test(protocols[1])) return deny(403);
+    if (protocols.length !== 2 || protocols[0] !== VOICE_PROTOCOL || !/^[A-Za-z0-9._~+-]{1,512}$/.test(protocols[1])) return deny(403);
     const token = protocols[1];
     const device = voiceDevice(token, { nodeRegistry, ownerToken: getAuthToken() });
     if (!device) return deny(403);

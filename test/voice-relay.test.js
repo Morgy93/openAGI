@@ -30,7 +30,7 @@ function fakeSession() {
   return session;
 }
 
-async function fixture(t, { env = { OPENAGI_VOICE: "1" }, createSession, viaG2 = false, ...timing } = {}) {
+async function fixture(t, { env = { OPENAGI_VOICE: "1" }, createSession, viaG2 = false, ownerToken = OWNER, ...timing } = {}) {
   const server = http.createServer();
   let revoked = false;
   const nodeRegistry = {
@@ -41,7 +41,7 @@ async function fixture(t, { env = { OPENAGI_VOICE: "1" }, createSession, viaG2 =
   };
   const sessions = [];
   const relay = attachVoiceRelay({
-    nodeRegistry, env, getAuthToken: () => OWNER,
+    nodeRegistry, env, getAuthToken: () => ownerToken,
     createSession: createSession ?? (async (params, io) => { const session = fakeSession(); session.params = params; session.io = io; sessions.push(session); return session; }),
     ...timing
   });
@@ -130,6 +130,22 @@ test("the principal needs a gesture: a wake word or audio before start never ope
   early.ws.send(Buffer.alloc(320));
   assert.equal((await early.closed).code, 1008);
   assert.equal(f.sessions.length, 0);
+});
+
+test("voice accepts the exact configured owner token even below 16 characters", { timeout: 3000 }, async (t) => {
+  const token = "abc123";
+  const f = await fixture(t, { ownerToken: token });
+  const url = `${f.origin}/nodes/voice`;
+  assert.equal(await denied(url, [VOICE_PROTOCOL, "abc124"]), 403);
+  assert.equal(await denied(url, [VOICE_PROTOCOL, "abc12"]), 403);
+  const client = connect(f.origin, token);
+  await client.opened;
+  client.send({ type: "start", gesture: "hotkey" });
+  await until(() => f.sessions.length === 1);
+  assert.equal(f.sessions[0].params.device.kind, "owner");
+  assert.equal(isOwnerPrincipal(f.sessions[0].params.principal), true);
+  client.send({ type: "stop" });
+  assert.equal((await client.closed).code, 1000);
 });
 
 test("push-to-talk controls reach the session: commit, barge with played ms, context, mode", { timeout: 3000 }, async (t) => {

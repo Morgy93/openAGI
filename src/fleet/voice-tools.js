@@ -11,9 +11,10 @@ import { threadHealth } from "./classify.js";
 const SOURCE = "integration:fleet-supervisor";
 export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough", "fleet_diagnose", "feedback_record", "self_fix_list", "self_fix_start", "self_fix_revise", "self_fix_stop"]);
 // Everything a voice session may call: the fleet set plus the above. No
-// merge, release, deploy or restart-hub tool exists on purpose.
+// merge, release, deploy or restart-hub tool exists on purpose. Scans can
+// send nudges in Auto mode, so voice uses the read-only fleet_status.
 export const VOICE_SESSION_TOOLS = Object.freeze([
-  "fleet_status", "fleet_thread", "fleet_screen", "fleet_scan", "fleet_send_message", "fleet_answer_question", "fleet_click", "fleet_app",
+  "fleet_status", "fleet_thread", "fleet_screen", "fleet_send_message", "fleet_answer_question", "fleet_click", "fleet_app",
   ...VOICE_TOOL_NAMES
 ]);
 const SCOPES = ["questions", "blocked", "fixes", "suggestions", "all"];
