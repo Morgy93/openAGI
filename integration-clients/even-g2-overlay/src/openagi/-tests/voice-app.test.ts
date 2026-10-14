@@ -51,6 +51,36 @@ it('Supervisor hold commits on release, including release before ready, once', a
   } finally { await f.app.systemExit() }
 })
 
+it('ignores connecting clicks and bounces after sending but accepts a quick listening stop', async () => {
+  const f = await fixture()
+  try {
+    f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap()
+    await f.ready()
+    expect(f.sockets[0].frames()).not.toContainEqual({ type: 'commit' })
+    f.receive(new Uint8Array(6400)); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.sockets[0].frames()).toContainEqual({ type: 'commit' })
+    f.app.tap(); await vi.advanceTimersByTimeAsync(399)
+    expect(f.sockets[0].frames()).not.toContainEqual({ type: 'barge' })
+    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.sockets[0].frames()).toContainEqual({ type: 'barge' })
+  } finally { await f.app.systemExit() }
+})
+
+it('an interrupt tap during native stop resumes listening once stop finishes', async () => {
+  const f = await fixture()
+  try {
+    f.app.tap(); await f.ready(); f.receive(new Uint8Array(6400))
+    let stopped!: () => void
+    f.audio.stop.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+    f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    stopped(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledTimes(2)
+    expect(f.renderer.listening).toHaveBeenCalledTimes(2)
+    expect(f.sockets[0].frames()).toContainEqual({ type: 'barge' })
+  } finally { await f.app.systemExit() }
+})
+
 it('a new tap while reply text streams barges and resumes capture on the same session', async () => {
   const f = await fixture()
   try {

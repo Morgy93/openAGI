@@ -75,6 +75,75 @@ it('passes spoken confirmations as audio and never interprets or submits them lo
   f.session.close()
 })
 
+it('discards a barged partial reply even when its completion arrives after the next release', async () => {
+  const f = fixture(); f.press(); await f.ready(); f.session.release(); await vi.advanceTimersByTimeAsync(1)
+  f.sockets[0].event({ type: 'reply.delta', text: 'Old partial' })
+  f.press(); await vi.advanceTimersByTimeAsync(1); f.receive(new Uint8Array(6400)); f.session.release(); await vi.advanceTimersByTimeAsync(1)
+  f.sockets[0].event({ type: 'reply.delta', text: ' cancelled tail' })
+  f.sockets[0].event({ type: 'reply.done', text: 'Old cancelled reply' })
+  expect(f.callbacks.reply).toHaveBeenCalledExactlyOnceWith('Old partial', false)
+  expect(f.session.state).toBe('waiting')
+  f.sockets[0].event({ type: 'reply.delta', text: 'New reply' })
+  f.sockets[0].event({ type: 'reply.done', text: 'New reply' })
+  expect(f.callbacks.reply).toHaveBeenLastCalledWith('New reply', true)
+  f.session.close()
+})
+
+it('queues an interrupt during microphone stop and commits before barging and reopening', async () => {
+  const f = fixture(); f.press(); await f.ready()
+  let stopped!: () => void
+  f.audio.stop.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+  f.session.release(); f.press(); f.press()
+  expect(f.audio.start).toHaveBeenCalledOnce()
+  stopped(); await vi.advanceTimersByTimeAsync(1)
+  expect(f.sockets[0].frames().slice(-3)).toEqual([{ type: 'commit' }, { type: 'barge' }, { type: 'context', focus: { view: 'supervisor', questionId: 'fq_1' } }])
+  expect(f.audio.start).toHaveBeenCalledTimes(2)
+  expect(f.session.state).toBe('listening')
+  f.session.close()
+})
+
+it('remembers a hold release while the interrupt is queued behind microphone stop', async () => {
+  const f = fixture(); f.press(); await f.ready()
+  let stopped!: () => void
+  f.audio.stop.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+  f.session.release(); f.press(); f.session.release()
+  stopped(); await vi.advanceTimersByTimeAsync(1)
+  expect(f.audio.start).toHaveBeenCalledTimes(2)
+  expect(f.sockets[0].frames().filter(frame => 'type' in frame && frame.type === 'commit')).toHaveLength(2)
+  f.session.close()
+})
+
+it('accepts the next press after close while an old microphone open is unresolved', async () => {
+  const f = fixture(); let opened!: () => void
+  f.audio.start.mockImplementationOnce(() => new Promise<void>(resolve => { opened = resolve }))
+  f.press(); f.sockets[0].open(); f.sockets[0].event({ type: 'ready' }); f.session.close()
+  let reopened!: () => void
+  f.audio.start.mockImplementationOnce(() => new Promise<void>(resolve => { reopened = resolve }))
+  f.press(); f.sockets[1].open(); f.sockets[1].event({ type: 'ready' })
+  expect(f.factory).toHaveBeenCalledTimes(2)
+  opened(); await vi.advanceTimersByTimeAsync(1)
+  f.session.release()
+  expect(f.sockets[1].frames()).not.toContainEqual({ type: 'commit' })
+  expect(f.audio.stop).toHaveBeenCalledOnce()
+  reopened(); await vi.advanceTimersByTimeAsync(1)
+  expect(f.sockets[1].frames()).toContainEqual({ type: 'commit' })
+  f.session.close()
+})
+
+it('accepts the next press after close while an old microphone stop is unresolved', async () => {
+  const f = fixture(); f.press(); await f.ready()
+  let stopped!: () => void
+  f.audio.stop.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+  f.session.release(); f.press(); f.session.close(); f.press()
+  f.sockets[1].open(); f.sockets[1].event({ type: 'ready' }); await vi.advanceTimersByTimeAsync(1)
+  stopped(); await vi.advanceTimersByTimeAsync(1)
+  expect(f.factory).toHaveBeenCalledTimes(2)
+  expect(f.audio.start).toHaveBeenCalledTimes(2)
+  expect(f.session.state).toBe('listening')
+  expect(f.sockets[0].frames()).not.toContainEqual({ type: 'commit' })
+  f.session.close()
+})
+
 it('ends at idle and reconnects only on a new gesture, ignoring events from the old socket', async () => {
   const f = fixture(); f.press(); await f.ready(); f.session.release(); await vi.advanceTimersByTimeAsync(1)
   f.sockets[0].event({ type: 'reply.done', text: 'Done' })

@@ -525,7 +525,8 @@ export class OpenAGIG2App {
   tap(): void {
     if (this.exited || this.exitDialogOpening) return
     if (this.displaySleeping) { this.toggleDisplay(); return }
-    if (this.homeMode === 'supervisor' && this.supervisorVoice && ['connecting', 'listening'].includes(this.supervisorVoice.state)) { this.supervisorVoice.release(); return }
+    if (this.homeMode === 'supervisor' && this.supervisorVoice?.state === 'connecting') return
+    if (this.homeMode === 'supervisor' && this.supervisorVoice?.state === 'listening') { this.lastTapAt = Date.now(); this.supervisorVoice.release(); return }
     // A second tap to stop talking is never treated as a bounce.
     if (this.mode !== 'listening' && Date.now() - this.lastTapAt < 400) return
     if (this.navigationBusy) { this.flash('One moment', 'Finishing the last action…'); return }

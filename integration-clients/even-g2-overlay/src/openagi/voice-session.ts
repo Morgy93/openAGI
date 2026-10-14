@@ -24,6 +24,8 @@ export class G2VoiceSession {
   private pressed = false
   private opening = false
   private stopping = false
+  private pendingPress: { relay: { url: string; token: string }; focus: VoiceFocus; released: boolean } | null = null
+  private discardReply = false
   private released = false
   private focus: VoiceFocus = { view: 'supervisor' }
   private text = ''
@@ -36,7 +38,13 @@ export class G2VoiceSession {
     private readonly socketFactory: (url: string, protocols: string[]) => VoiceSocket = (url, protocols) => new WebSocket(url, protocols)) {}
 
   press(relay: { url: string; token: string }, focus: VoiceFocus): void {
-    if (this.pressed || this.opening || this.stopping) return
+    if (this.stopping) {
+      this.pendingPress ??= { relay, focus, released: false }
+      this.setState('connecting')
+      return
+    }
+    if (this.pressed || this.opening) return
+    if (this.state === 'replying') this.discardReply = true
     clearTimeout(this.timer)
     this.pressed = true; this.released = false; this.focus = focus; this.text = ''; this.bytes = 0
     if (this.socket && this.ready) {
@@ -59,6 +67,7 @@ export class G2VoiceSession {
   }
 
   release(): void {
+    if (this.pendingPress) { this.pendingPress.released = true; return }
     if (!this.pressed || this.released) return
     this.released = true
     if (!this.ready || this.opening) return
@@ -77,13 +86,13 @@ export class G2VoiceSession {
         this.bytes += chunk.length
         if (this.bytes >= 960_000) { this.callbacks.notice('30-second limit: sending what you said.'); this.release() }
       })
-      if (this.socket !== socket) { await this.audio.stop(); return }
+      if (this.socket !== socket) return
       this.opening = false
       this.setState('listening')
       this.captureTimer = setTimeout(() => { this.callbacks.notice('30-second limit: sending what you said.'); this.release() }, 30_000)
       if (this.released) void this.commit()
     } catch { if (this.socket === socket) this.fail('Could not open the glasses microphone. Check its connection and permission.') }
-    finally { this.opening = false }
+    finally { if (this.socket === socket) this.opening = false }
   }
 
   private async commit(): Promise<void> {
@@ -94,9 +103,15 @@ export class G2VoiceSession {
     this.setState('waiting')
     try { await this.audio.stop() }
     catch { if (this.socket === socket) this.fail('Could not stop the glasses microphone.'); return }
-    finally { this.stopping = false }
+    finally { if (this.socket === socket) this.stopping = false }
     if (this.socket !== socket) return
     this.send({ type: 'commit' }); this.armIdle()
+    const pending = this.pendingPress; this.pendingPress = null
+    if (pending) {
+      this.setState('waiting')
+      this.press(pending.relay, pending.focus)
+      if (pending.released) this.release()
+    }
   }
 
   private receive(data: unknown): void {
@@ -109,7 +124,15 @@ export class G2VoiceSession {
       this.send({ type: 'context', focus: this.focus })
       if (this.socket) void this.openMicrophone(this.socket)
     } else if (event.type === 'reply.delta' || event.type === 'reply.done') {
-      if (this.pressed || this.opening) return
+      // A cancelled partial reply can finish after the next recording sends.
+      if (this.discardReply) {
+        if (event.type === 'reply.done') this.discardReply = false
+        return
+      }
+      if (this.pressed || this.opening) {
+        if (event.type === 'reply.delta') this.discardReply = true
+        return
+      }
       if (typeof event.text !== 'string') return
       const final = event.type === 'reply.done'
       this.text = final ? event.text.slice(0, 4000) : (this.text + event.text).slice(0, 4000)
@@ -142,6 +165,7 @@ export class G2VoiceSession {
     const socket = this.socket; this.socket = null; this.ready = false; this.pressed = false; this.released = false
     if (socket) { socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; socket.close() }
     if (this.audio.active || this.opening) void this.audio.stop().catch(() => undefined)
+    this.opening = false; this.stopping = false; this.pendingPress = null; this.discardReply = false
     this.setState('idle')
   }
 }
