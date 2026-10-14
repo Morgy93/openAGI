@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Network
 import XCTest
@@ -28,6 +29,108 @@ final class VoiceTests: XCTestCase {
     VoiceSession(audio: audio,
       connection: { try VoiceConnection(base: "https://fixture.invalid", token: "test-daemon-token-1234") },
       microphoneAccess: microphoneAccess, makeSocket: { _ in socket }, connectionTimeout: timeout)
+  }
+
+  func testLongReplyBuffersAheadOfPlaybackWithinABoundedQueue() throws {
+    var playback = VoicePlayback()
+    playback.beginReply()
+    // A twenty-second answer arrives before the speaker has drained any audio.
+    for _ in 0..<200 { XCTAssertTrue(playback.schedule(2400)) }
+    playback.finishReply(itemId: "long_reply", audioMs: 20_000)
+    XCTAssertTrue(playback.acknowledgements().isEmpty)
+    playback.complete(24_000 * 20)
+    XCTAssertEqual(try json(XCTUnwrap(playback.acknowledgements().first))["itemId"] as? String, "long_reply")
+    XCTAssertTrue(playback.schedule(24_000 * 120))
+    XCTAssertFalse(playback.schedule(1))
+    playback.complete(24_000)
+    XCTAssertTrue(playback.schedule(24_000))
+    playback.reset()
+    XCTAssertTrue(playback.schedule(24_000 * 120))
+  }
+
+  func testEngineConfigurationChangeFailsAndRemovesTheObserver() async throws {
+    let center = NotificationCenter()
+    let engine = AVAudioEngine()
+    let audio = VoiceAudio(notificationCenter: center)
+    let failed = expectation(description: "Device change ends audio")
+    failed.assertForOverFulfill = true
+    audio.onFailure = { failed.fulfill() }
+    audio.prepareEngine(engine)
+    center.post(name: .AVAudioEngineConfigurationChange, object: AVAudioEngine())
+    XCTAssertTrue(audio.drained) // Wait for the audio queue.
+    center.post(name: .AVAudioEngineConfigurationChange, object: engine)
+    await fulfillment(of: [failed], timeout: 2)
+    center.post(name: .AVAudioEngineConfigurationChange, object: engine)
+    XCTAssertEqual(audio.interrupt(), 0)
+    XCTAssertTrue(audio.drained)
+  }
+
+  func testStoppedEngineFailsBeforeReplyPlaybackOrBargeIn() async throws {
+    for barge in [false, true] {
+      let audio = VoiceAudio()
+      let engine = AVAudioEngine()
+      XCTAssertFalse(engine.isRunning)
+      audio.prepareEngine(engine)
+      let failed = expectation(description: barge ? "Barge detects stopped engine" : "Reply detects stopped engine")
+      audio.onFailure = { failed.fulfill() }
+      if barge { XCTAssertEqual(audio.interrupt(), 0) }
+      else { try audio.play(Data(repeating: 0, count: 4800)) }
+      await fulfillment(of: [failed], timeout: 2)
+      XCTAssertTrue(audio.drained)
+    }
+  }
+
+  @MainActor
+  func testAudioDeviceFailureEndsCaptureAndClosesTheSession() async throws {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    let voice = session(audio: audio, socket: socket)
+    voice.press(.mic, focus: VoiceFocus())
+    try await waitUntil { socket.types == ["start"] }
+    socket.push(.string("{\"type\":\"ready\"}"))
+    try await waitUntil { voice.recording }
+    audio.onFailure()
+    try await waitUntil { !voice.active }
+    XCTAssertFalse(audio.capturing)
+    XCTAssertNotNil(voice.error)
+    try await waitUntil { socket.closed }
+  }
+
+  @MainActor
+  func testHeaderCollapseStopsToggleCaptureWithoutShowingAPanel() async throws {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    let voice = session(audio: audio, socket: socket)
+    let state = OverlayState(voiceSession: voice)
+    state.expanded = true
+    voice.press(.mic, focus: VoiceFocus())
+    try await waitUntil { socket.types == ["start"] }
+    socket.push(.string("{\"type\":\"ready\"}"))
+    try await waitUntil { voice.recording }
+    // The header's close button writes expanded directly.
+    state.expanded = false
+    XCTAssertFalse(voice.active)
+    XCTAssertFalse(audio.capturing)
+    XCTAssertFalse(voice.micHeld)
+    try await waitUntil { socket.closed }
+    XCTAssertEqual(socket.types, ["start", "stop"])
+  }
+
+  @MainActor
+  func testDisabledQuickAskIgnoresVoiceHotkeyBeforeAnyStateChange() {
+    let audio = VoiceTestAudio()
+    let socket = VoiceTestSocket()
+    let voice = session(audio: audio, socket: socket)
+    let state = OverlayState(voiceSession: voice, isEnabled: { false })
+    // If activation gets past the setting, fail without opening a window.
+    state.isLoading = true
+    state.beginVoice(.hotkey)
+    XCTAssertNil(state.error)
+    XCTAssertFalse(state.expanded)
+    XCTAssertEqual(state.tab, .tasks)
+    XCTAssertFalse(voice.active)
+    XCTAssertTrue(socket.types.isEmpty)
+    XCTAssertFalse(audio.capturing)
   }
 
   @MainActor
@@ -427,7 +530,7 @@ private final class VoiceTestSocket: VoiceSocket {
   var startPending: CheckedContinuation<Void, Never>?
   private var pendingReceive: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
   private var incoming: [URLSessionWebSocketTask.Message] = []
-  private var closed = false
+  private(set) var closed = false
   private var concurrentSends = 0
   private(set) var maxConcurrentSends = 0
 

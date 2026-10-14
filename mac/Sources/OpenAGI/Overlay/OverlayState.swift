@@ -12,7 +12,11 @@ enum OverlayTab: Equatable {
 final class OverlayState: ObservableObject {
   static let shared = OverlayState()
 
-  @Published var expanded = false
+  @Published var expanded = false {
+    didSet { if !expanded { voiceSession.stop() } }
+  }
+  private let voiceSession: VoiceSession
+  private let isEnabled: @MainActor () -> Bool
   @Published var question = ""
   @Published var answer: String = ""
   @Published var isLoading = false
@@ -32,7 +36,14 @@ final class OverlayState: ObservableObject {
   @Published private(set) var composerFocusRequest: UInt = 0
   @Published private(set) var voiceFocus = VoiceFocus()
 
+  init(voiceSession: VoiceSession? = nil,
+       isEnabled: @escaping @MainActor () -> Bool = { OverlayController.isEnabled }) {
+    self.voiceSession = voiceSession ?? .shared
+    self.isEnabled = isEnabled
+  }
+
   func beginVoice(_ source: VoicePTT.Source) {
+    guard isEnabled() else { return }
     guard !isLoading, !isDetached else {
       error = "Wait for the current question to finish before starting voice."
       return
@@ -40,12 +51,12 @@ final class OverlayState: ObservableObject {
     selectTab(.supervisor)
     expanded = true
     OverlayController.shared.show()
-    VoiceSession.shared.press(source, focus: voiceFocus)
+    voiceSession.press(source, focus: voiceFocus)
   }
 
   func selectVoiceContext(_ focus: VoiceFocus) {
     voiceFocus = focus
-    VoiceSession.shared.updateFocus(focus)
+    voiceSession.updateFocus(focus)
   }
 
   func pruneVoiceContext(openIDs: Set<String>, threadKeys: Set<String>) {
@@ -101,7 +112,7 @@ final class OverlayState: ObservableObject {
     guard tab != newTab, !isLoading, !isDetached else { return }
     tab = newTab
     if newTab == .tasks {
-      VoiceSession.shared.stop()
+      voiceSession.stop()
       FleetConsumer.shared.supervisorTabLeft()
     }
     answer = ""

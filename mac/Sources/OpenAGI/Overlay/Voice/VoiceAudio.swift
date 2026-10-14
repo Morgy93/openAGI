@@ -12,7 +12,13 @@ struct VoicePlayback {
   private var items: [Item] = []
 
   mutating func beginReply() { itemStartFrame = scheduledFrames }
-  mutating func schedule(_ frames: Int64) { scheduledFrames += frames }
+  @discardableResult
+  mutating func schedule(_ frames: Int64) -> Bool {
+    // Realtime can deliver an entire spoken reply ahead of playback.
+    guard scheduledFrames - completedFrames + frames <= 24_000 * 120 else { return false }
+    scheduledFrames += frames
+    return true
+  }
   mutating func complete(_ frames: Int64) { completedFrames += frames }
 
   mutating func finishReply(itemId: String?, audioMs: Double?) {
@@ -56,6 +62,8 @@ protocol VoiceAudioDevice: AnyObject {
 final class VoiceAudio: VoiceAudioDevice {
   private let queue = DispatchQueue(label: "app.openagi.voice.audio")
   private var engine: AVAudioEngine?
+  private let notificationCenter: NotificationCenter
+  private var configurationObserver: NSObjectProtocol?
   private let player = AVAudioPlayerNode()
   private var converter: AVAudioConverter?
   private var tapInstalled = false
@@ -71,12 +79,34 @@ final class VoiceAudio: VoiceAudioDevice {
   private let wireFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
   private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
 
+  init(notificationCenter: NotificationCenter = .default) {
+    self.notificationCenter = notificationCenter
+  }
+
+  func prepareEngine(_ engine: AVAudioEngine) {
+    queue.sync { attachEngine(engine) }
+  }
+
+  private func attachEngine(_ engine: AVAudioEngine) {
+    stopEngine()
+    self.engine = engine
+    configurationObserver = notificationCenter.addObserver(
+      forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+    ) { [weak self, weak engine] _ in
+      guard let self, let engine else { return }
+      self.queue.async {
+        guard self.engine === engine, !engine.isRunning else { return }
+        self.failEngine()
+      }
+    }
+  }
+
   func start(onPCM: @escaping () -> Void) async throws {
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       queue.async {
         do {
           let engine = AVAudioEngine()
-          self.engine = engine
+          self.attachEngine(engine)
           let input = engine.inputNode
           try input.setVoiceProcessingEnabled(true)
           let format = input.outputFormat(forBus: 0)
@@ -109,6 +139,7 @@ final class VoiceAudio: VoiceAudioDevice {
           self.tapInstalled = true
           engine.prepare()
           try engine.start()
+          guard engine.isRunning else { throw VoiceFailure("The audio device stopped.") }
           self.player.play()
           continuation.resume()
         } catch {
@@ -171,19 +202,20 @@ final class VoiceAudio: VoiceAudioDevice {
       }
     }
     queue.async {
-      guard self.engine != nil else { return }
-      // Bound queued playback to ten seconds rather than retaining a whole reply.
-      guard self.playback.scheduledFrames - self.playback.completedFrames + Int64(frames) <= 240_000 else {
-        self.onFailure()
+      guard let engine = self.engine else { return }
+      guard engine.isRunning else { self.failEngine(); return }
+      let wasDrained = self.playback.scheduledFrames == self.playback.completedFrames
+      guard self.playback.schedule(Int64(frames)) else {
+        self.failEngine()
         return
       }
       // Idle time is not audio the owner heard.
-      if self.playback.scheduledFrames == self.playback.completedFrames {
+      if wasDrained {
         self.player.stop()
-        self.renderedFrameOffset = self.playback.scheduledFrames
+        self.renderedFrameOffset = self.playback.completedFrames
+        guard engine.isRunning else { self.failEngine(); return }
         self.player.play()
       }
-      self.playback.schedule(Int64(frames))
       let mine = self.playbackGeneration
       self.player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { _ in
         self.queue.async {
@@ -205,6 +237,8 @@ final class VoiceAudio: VoiceAudioDevice {
 
   func interrupt() -> Int {
     queue.sync {
+      guard let engine else { return 0 }
+      guard engine.isRunning else { failEngine(); return 0 }
       let time = player.lastRenderTime.flatMap { player.playerTime(forNodeTime: $0) }
       let frames = time.map { renderedFrameOffset + Int64(Double($0.sampleTime) * 24_000 / $0.sampleRate) }
       let played = playback.playedMs(renderedFrames: frames)
@@ -212,7 +246,8 @@ final class VoiceAudio: VoiceAudioDevice {
       playbackGeneration &+= 1
       playback.reset()
       renderedFrameOffset = 0
-      if engine != nil { player.play() }
+      guard engine.isRunning else { failEngine(); return max(0, played) }
+      player.play()
       return max(0, played)
     }
   }
@@ -221,7 +256,14 @@ final class VoiceAudio: VoiceAudioDevice {
 
   func stop() { queue.async { self.stopEngine() } }
 
+  private func failEngine() {
+    stopEngine()
+    onFailure()
+  }
+
   private func stopEngine() {
+    if let configurationObserver { notificationCenter.removeObserver(configurationObserver) }
+    configurationObserver = nil
     capturing = false
     capturedPCM = []
     playbackGeneration &+= 1
