@@ -1,5 +1,7 @@
 package sh.openagi.mobile.ui
 
+import sh.openagi.mobile.protocol.FleetOpenChat
+import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetThread
 import sh.openagi.mobile.protocol.FleetWatch
 import java.time.Duration
@@ -125,6 +127,103 @@ object WatchFormat {
         if (ref.isNullOrBlank()) return null
         return PR_REF.matchEntire(ref)?.let { it.groupValues[1] + "#" + it.groupValues[2] } ?: ref
     }
+
+    // "you wrote 2h ago": the owner's own last message in the chat.
+    fun ownerLine(at: Instant?, now: Instant): String? = at?.let { "You wrote " + ago(it, now) }
+
+    // "your answer, for 3h" / "BuildBot3 full run, for 23m": what the row
+    // waits on, from when; null when the daemon names nothing.
+    fun waitsOn(watch: FleetWatch?, now: Instant): String? {
+        val on = watch?.waitingOn?.takeIf { it.isNotBlank() } ?: return null
+        val from = (if (watch.group == "waiting") watch.waitSince else null) ?: watch.since ?: watch.waitSince
+        return on + (from?.let { ", for " + duration(it, now) } ?: "")
+    }
+
+    // "Muted, 23h left"; null once it has run out (the daemon drops it too).
+    fun mutedLine(muted: Instant?, now: Instant): String? {
+        muted ?: return null
+        if (!muted.isAfter(now)) return null
+        return "Muted, " + duration(Duration.between(now, muted).seconds) + " left"
+    }
+
+    // What the owner can do to a row besides answering its questions: Push
+    // now and Mute on "Needs a push", Unmute on any muted row. A muted row
+    // offers nothing else, since the daemon refuses to push it.
+    enum class RowAction { PUSH, MUTE, UNMUTE }
+
+    fun rowActions(thread: FleetThread, now: Instant): List<RowAction> = when {
+        mutedLine(thread.muted, now) != null -> listOf(RowAction.UNMUTE)
+        thread.watch?.group == "push" -> listOf(RowAction.PUSH, RowAction.MUTE)
+        else -> emptyList()
+    }
+
+    // The open questions about one thread, its own or a group's.
+    fun questionsFor(key: String, questions: List<FleetQuestion>): List<FleetQuestion> =
+        questions.filter { it.id.isNotBlank() && (it.threadKey == key || it.threadKeys.orEmpty().contains(key)) }
+
+    // "Asked 3h ago in remote-dev · Codex LB Transcript open (Conductor)":
+    // when the agent asked, and in which chat, so two chats with one
+    // workspace name are told apart.
+    fun askedLine(question: FleetQuestion, fallbackChat: String?, now: Instant): String? {
+        val at = (question.askedAt ?: question.createdAt)?.let { "Asked " + ago(it, now) }
+        val chat = question.chatLabel?.takeIf { it.isNotBlank() } ?: fallbackChat?.takeIf { it.isNotBlank() }
+        return when {
+            at != null && chat != null -> "$at in $chat"
+            at != null -> at
+            chat != null -> "In $chat"
+            else -> null
+        }
+    }
+
+    fun appName(app: String?): String? = when (app) {
+        "conductor" -> "Conductor"
+        "codex" -> "Codex"
+        "claude" -> "Claude Code"
+        null, "" -> null
+        else -> app.replaceFirstChar { it.uppercase() }
+    }
+
+    // Open chat as the phone can offer it. url: a link this phone opens
+    // (only the Mac apps' own schemes, and only when an app here claims
+    // them). onMac: the chat has a link, but only the Mac opens it; an
+    // http(s) link is the Mac's too, since it points at the Mac's apps or
+    // its loopback. Neither: no link opens the chat anywhere, and note
+    // says where to find it.
+    data class ChatLink(val label: String, val app: String?, val url: String?, val onMac: Boolean, val note: String?)
+
+    fun chatLink(chat: FleetOpenChat?, canOpen: (String) -> Boolean): ChatLink? {
+        chat ?: return null
+        val app = appName(chat.app)
+        val label = chat.label?.takeIf { it.isNotBlank() } ?: app ?: return null
+        val url = chat.url?.trim()?.takeIf { it.isNotEmpty() }
+        val here = url?.takeIf { APP_LINK.containsMatchIn(it) && canOpen(it) }
+        return ChatLink(label, app, here, onMac = url != null && here == null, note = chat.note?.takeIf { it.isNotBlank() })
+    }
+
+    // "open thread" brings the chat up on the Mac; on the phone it says so.
+    fun optionLabel(option: String): String = if (option == "open thread") "Open on your Mac" else option
+
+    // What happened to a Push now. A refusal sends nothing, so nothing is
+    // "saved" the way an answer is: it says why, in the daemon's words.
+    fun pushNote(status: String?, detail: String?): SupervisorFormat.Note {
+        val why = detail?.trim()?.takeIf { it.isNotEmpty() }
+        return when (status) {
+            "sent" -> SupervisorFormat.Note("Pushed. The agent has your nudge.", isAlert = false)
+            "blocked" -> SupervisorFormat.Note("Not sent" + (why?.let { ": $it" } ?: "."), isAlert = true)
+            "failed" -> SupervisorFormat.Note("Push failed" + (why?.let { ": $it" } ?: "."), isAlert = true)
+            else -> SupervisorFormat.Note("Pushed.", isAlert = false)
+        }
+    }
+
+    // The supervisor's next step in words: "Nudge (pr-ci-failing), not
+    // before 3:40 PM" without the clock, which the screen formats.
+    fun nextStep(action: String?, playbook: String?): String? {
+        val what = action?.takeIf { it.isNotBlank() && it != "none" } ?: return null
+        val named = what.replace('-', ' ').replaceFirstChar { it.uppercase() }
+        return named + (playbook?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: "")
+    }
+
+    private val APP_LINK = Regex("""^(conductor|codex)://""", RegexOption.IGNORE_CASE)
 
     private val PR_REF = Regex("""^[\w.-]+/([\w.-]+)#(\d+)$""")
 }
