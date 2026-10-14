@@ -138,7 +138,7 @@ test("a journal update can recover its missing record fields from the state tail
 test("supervisor daily diagnosis is once across reloads, hourly checks persist, on-demand is read-only", async (t) => {
   const dataDir = temp(t);
   let calls = 0;
-  const deps = { now: () => NOW, diagnoseModels: { explain: async () => { calls += 1; return { area: "review", rootCause: "Limits", proposedFix: "Use available review model", acceptance: "Reviews complete", confidence: 0.7, minutesSavedPerDay: 5, evidenceActionIds: [] }; }, duplicate: async () => false }, notifier: { notifyQuestion: async () => ({ pushed: false }) } };
+  const deps = { now: () => NOW, diagnoseModels: { explain: async ({ anomalies }) => { calls += 1; return { anomalyId: anomalies.find((a) => a.area === "review").id, area: "review", rootCause: "Limits", proposedFix: "Use available review model", acceptance: "Reviews complete", confidence: 0.7, minutesSavedPerDay: 5, evidenceActionIds: [] }; }, duplicate: async () => false }, notifier: { notifyQuestion: async () => ({ pushed: false }) } };
   const config = resolveFleetConfig({}, { home: dataDir, selfFix: { mode: "propose" } });
   const supervisor = new FleetSupervisor({ dataDir, config, deps });
   for (const row of october13(NOW).actions.filter((a) => a.kind === "review")) supervisor.store.recordAction(row);
@@ -167,7 +167,12 @@ test("diagnose models share the locked-down judge, exact models, schemas and fai
     assert.equal(options.env.OPENAI_API_KEY, undefined);
     assert.equal(options.env.HOST_BRIDGE_TOKEN, undefined);
     assert.ok(args.includes("--output-schema"));
-    const out = args[args.indexOf("-m") + 1] === "gpt-6-luna" ? { duplicate: false } : { area: "review", rootCause: "Limits", proposedFix: "Retry review", acceptance: "Passes", confidence: 0.8, minutesSavedPerDay: 2, evidenceActionIds: [] };
+    if (args[args.indexOf("-m") + 1] === "gpt-6.1-sol") {
+      const schema = JSON.parse(fs.readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
+      assert.ok(schema.required.includes("anomalyId"));
+      assert.match(args.at(-1), /exact anomalyId/);
+    }
+    const out = args[args.indexOf("-m") + 1] === "gpt-6-luna" ? { duplicate: false } : { anomalyId: "anomaly-0", area: "review", rootCause: "Limits", proposedFix: "Retry review", acceptance: "Passes", confidence: 0.8, minutesSavedPerDay: 2, evidenceActionIds: [] };
     fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify(out));
     return { code: 0, stdout: "" };
   };
@@ -178,4 +183,82 @@ test("diagnose models share the locked-down judge, exact models, schemas and fai
   assert.deepEqual(calls.map((a) => a[a.indexOf("-m") + 1]), ["gpt-6.1-sol", "gpt-6-luna"]);
   const unsafe = createDiagnoseModels({ config, run: async () => ({ code: 0, stdout: "shell_tool stable true" }) });
   await assert.rejects(unsafe.explain({}), /lockdown failed/);
+});
+
+test("blocked-day evidence stays inside the selected window", () => {
+  const actions = [2, 3].map((day) => ({ id: `old-${day}`, at: at(-day * DAY_MS), kind: "nudge", route: "computer-use", status: "blocked" }));
+  const daily = diagnose({ now: NOW, actions });
+  assert.equal(daily.metrics.plannedNudges, 0);
+  assert.deepEqual(daily.metrics.blockedByDay, {});
+  assert.equal(daily.anomalies.some((a) => a.metric === "computer-use-blocked"), false);
+  const weekly = diagnose({ now: NOW, actions, window: "7d" });
+  assert.deepEqual(weekly.anomalies.find((a) => a.metric === "computer-use-blocked").evidenceActionIds, ["old-2", "old-3"]);
+});
+
+test("storage diagnosis uses default and configured policy thresholds", async (t) => {
+  const storage = { freeBytes: 20 * 1024 ** 3 };
+  const low = (value) => diagnose({ now: NOW, cheap: true, storage: value }).anomalies.some((a) => a.metric === "storage-free");
+  assert.equal(low(storage), true);
+  assert.equal(low({ ...storage, lowGb: 10 }), false);
+  assert.equal(low({ ...storage, lowGb: 20 }), false);
+  assert.equal(low({ ...storage, lowGb: 30 }), true);
+  const dataDir = temp(t);
+  const config = resolveFleetConfig({}, { home: dataDir, storage: { lowGb: 42 } });
+  const supervisor = new FleetSupervisor({ dataDir, config, deps: { now: () => NOW } });
+  const report = await supervisor.diagnose({ cheap: true });
+  assert.equal(report.metrics.storage.lowGb, 42);
+  assert.equal(report.anomalies.some((a) => a.metric === "storage-free"), report.metrics.storage.freeBytes < 42 * 1024 ** 3);
+});
+
+test("action history keeps the latest failures after the in-state tail fills", (t) => {
+  const store = new FleetStore({ dir: path.join(temp(t), "fleet"), now: () => NOW, limits: { maxActionsKept: 3 } });
+  for (let i = 0; i < 30; i += 1) store.recordAction({ id: `a${i}`, at: at(-30000 + i * 1000), kind: "nudge", route: "peer-relay", status: "failed" });
+  store.updateAction("a29", { detail: "latest failure" });
+  const actions = store.actionHistory();
+  assert.deepEqual(actions.map((a) => a.id), Array.from({ length: 30 }, (_, i) => `a${i}`));
+  assert.equal(actions.at(-1).detail, "latest failure");
+  const anomaly = diagnose({ now: NOW, actions }).anomalies.find((a) => a.metric === "send-failure:peer-relay");
+  assert.deepEqual(anomaly.evidenceActionIds, Array.from({ length: 20 }, (_, i) => `a${i + 10}`));
+  assert.deepEqual(anomaly.evidenceActionIds.slice(-5), ["a25", "a26", "a27", "a28", "a29"]);
+});
+
+test("cached hourly diagnoses are exposed through state and survive reload", async (t) => {
+  const dataDir = temp(t);
+  const config = resolveFleetConfig({}, { home: dataDir, selfFix: { mode: "off" } });
+  const deps = { now: () => new Date(2026, 9, 13, 6).getTime() };
+  const supervisor = new FleetSupervisor({ dataDir, config, deps });
+  supervisor.store.recordAction({ kind: "nudge", ownerHold: true, status: "sent" });
+  await supervisor.diagnoseTick();
+  const cached = supervisor.getState().diagnosis;
+  assert.equal(cached.cheap.anomalies.find((a) => a.metric === "owner-hold").severity, "high");
+  cached.cheap.anomalies.length = 0;
+  assert.ok(supervisor.getState().diagnosis.cheap.anomalies.length);
+  const reloaded = new FleetSupervisor({ dataDir, config, deps });
+  assert.deepEqual(reloaded.getState().diagnosis, supervisor.getState().diagnosis);
+});
+
+test("occasional spend without a positive median is not a spike", () => {
+  const budget = [0, 1, 3, 5].map((day) => ({ at: at(-day * DAY_MS), channel: "voice", usd: 1 }));
+  const report = diagnose({ now: NOW, budget });
+  assert.equal(report.metrics.spend.voice.median, 0);
+  assert.equal(report.anomalies.some((a) => a.metric === "spend:voice"), false);
+  assert.equal(diagnose({ now: NOW, budget: [budget[0]] }).anomalies.length, 0);
+  budget.push({ at: at(-2 * DAY_MS), channel: "voice", usd: 1 });
+  assert.equal(diagnose({ now: NOW, budget }).anomalies.length, 0);
+  budget[0].usd = 3;
+  assert.ok(diagnose({ now: NOW, budget }).anomalies.some((a) => a.metric === "spend:voice"));
+});
+
+test("event rates use each metric's actual lookback", () => {
+  const questions = Array.from({ length: 7 }, (_, i) => ({ createdAt: at(-i * DAY_MS), status: "resolved" }));
+  const actions = Array.from({ length: 7 }, (_, i) => ({ id: `judge-${i}`, at: at(-i * DAY_MS), kind: "judge", status: "done", verdict: "wait" }));
+  actions.push(...Array.from({ length: 5 }, (_, i) => ({ id: `review-${i}`, at: at(), kind: "review", status: "failed" })));
+  const feedback = Array.from({ length: 7 }, (_, i) => ({ id: `f${i}`, at: at(-i * DAY_MS), intent: "change", status: "new", target: { threadKey: "t" } }));
+  for (const window of ["24h", "7d"]) {
+    const report = diagnose({ now: NOW, window, questions, actions, feedback });
+    for (const metric of ["questions-unanswered", "judge-wait", 'feedback:[["threadKey","t"]]']) {
+      assert.equal(report.anomalies.find((a) => a.metric === metric).eventsPerDay, 1, `${window} ${metric}`);
+    }
+    assert.equal(report.anomalies.find((a) => a.metric === "review-failures").eventsPerDay, 5);
+  }
 });

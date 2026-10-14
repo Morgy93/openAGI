@@ -823,6 +823,7 @@ export class FleetSupervisor {
       reviewClosed: store.reviewClosed(),
       actions: store.actions(50),
       suggestions: store.suggestions(),
+      diagnosis: structuredClone(store.state.diagnosis),
       settings: {
         tickMinutes: Math.round(this.config.tickMs / MIN),
         lookbackHours: this.config.lookbackHours,
@@ -955,7 +956,7 @@ export class FleetSupervisor {
   }
 
   diagnose(options = {}) {
-    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(),
+    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(), storageConfig: this.config.storage,
       state: { ...this.store.state, lastError: this.lastError, lastReview: this.lastReview }, options, models: this.suggestionManager });
   }
 

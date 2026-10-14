@@ -14,8 +14,8 @@ import { isMobileRouteAllowed } from "../src/mobile-node.js";
 import { createNotifier } from "../src/fleet/notify.js";
 
 const NOW = new Date(2026, 9, 13, 12).getTime();
-const explanation = { area: "policy", rootCause: "The same unanswered ask returns", proposedFix: "Keep closed asks closed", acceptance: "No repeated ask", evidenceActionIds: ["a1"], confidence: 0.85, minutesSavedPerDay: 4 };
-const report = { anomalies: [{ metric: "questions-unanswered", area: "policy", eventsPerDay: 10, evidenceActionIds: ["a1"], feedbackIds: [] }] };
+const explanation = { anomalyId: "anomaly-0", area: "policy", rootCause: "The same unanswered ask returns", proposedFix: "Keep closed asks closed", acceptance: "No repeated ask", evidenceActionIds: ["a1"], confidence: 0.85, minutesSavedPerDay: 4 };
+const report = { anomalies: [{ id: "anomaly-0", metric: "questions-unanswered", area: "policy", eventsPerDay: 10, evidenceActionIds: ["a1"], feedbackIds: [] }] };
 function fixture(t, mode = "propose") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-suggestions-test-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -177,4 +177,36 @@ test("suggestion responses work through question, routes, remote capability and 
   assert.equal(isMobileRouteAllowed("GET", "/fleet/api/diagnose"), true);
   assert.equal(isMobileRouteAllowed("POST", "/fleet/api/suggestions/sg_abc"), true);
   assert.equal(isMobileRouteAllowed("POST", "/fleet/api/suggestions/sg_abc/merge"), false);
+});
+
+test("explanations bind exactly to one anomaly without action evidence", async (t) => {
+  const f = fixture(t);
+  const feedback = f.store.recordFeedback({ intent: "change", utterance: "Too many asks", target: { threadKey: "t" } });
+  const anomalies = [
+    { id: "unanswered", metric: "questions-unanswered", area: "policy", eventsPerDay: 20, evidenceActionIds: [] },
+    { id: "feedback", metric: "feedback:t", area: "policy", eventsPerDay: 2, evidenceActionIds: [], feedbackIds: [feedback.id] },
+    { id: "feedback-other", metric: "feedback:t", area: "policy", eventsPerDay: 5, evidenceActionIds: [] }
+  ];
+  f.manager.models.explain = async () => ({ ...explanation, anomalyId: "feedback", evidenceActionIds: [] });
+  const [suggestion] = await f.manager.propose({ anomalies });
+  assert.equal(suggestion.metric, "feedback:t");
+  assert.equal(suggestion.eventsPerDay, 2);
+  assert.equal(suggestion.score, 2 * explanation.minutesSavedPerDay * explanation.confidence);
+  assert.deepEqual(suggestion.evidence.feedbackIds, [feedback.id]);
+  await f.manager.publish([suggestion]);
+  assert.equal(f.store.feedback()[0].status, "triaged");
+  for (const patch of [{ anomalyId: "missing" }, { anomalyId: undefined }, { anomalyId: "feedback", area: "review" }]) {
+    f.manager.models.explain = async () => ({ ...explanation, ...patch });
+    await assert.rejects(f.manager.propose({ anomalies }), /Invalid diagnosis|no matching anomaly/);
+  }
+});
+
+test("explicit self-fix overrides win over environment modes", async (t) => {
+  for (const value of ["off", "0", "auto", "propose"]) {
+    for (const mode of ["off", "propose", "auto"]) assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SELF_FIX: value }, { selfFix: { mode } }).selfFix.mode, mode);
+  }
+  const f = fixture(t);
+  f.manager.config = resolveFleetConfig({ OPENAGI_FLEET_SELF_FIX: "off" }, { home: f.dir, selfFix: { mode: "propose" } });
+  assert.equal((await f.manager.propose(report)).length, 1);
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SELF_FIX: "off" }).selfFix.mode, "off");
 });

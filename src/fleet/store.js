@@ -613,7 +613,7 @@ export class FleetStore {
         try { return [JSON.parse(line)]; } catch { return []; }
       });
     } catch (error) { if (error.code !== "ENOENT") throw error; }
-    return foldActions([...this.state.actions, ...rows]);
+    return foldActions([...this.state.actions, ...rows]).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   }
 
   // Keep complete folded records, newest first in priority, in a bounded log.

@@ -1,4 +1,5 @@
 // Deterministic fleet metrics. No disk, network, clock or model calls here.
+import { STORAGE_DEFAULTS } from "./contracts.js";
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 export const ACTION_LOG_MAX = 5 * 1024 * 1024;
@@ -32,9 +33,9 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
   const today = history.filter((a) => localDay(a.at) === localDay(now));
   const week = history.filter((a) => inRange(a.at, now - 7 * DAY_MS));
   const anomalies = [];
-  const add = (metric, targetArea, events, evidence = [], extra = {}) => {
+  const add = (metric, targetArea, events, evidence = [], { days = window === "7d" ? 7 : 1, ...extra } = {}) => {
     if (area && area !== targetArea) return;
-    anomalies.push({ metric, area: targetArea, events, eventsPerDay: events / (window === "7d" ? 7 : 1),
+    anomalies.push({ id: `anomaly-${anomalies.length}`, metric, area: targetArea, events, eventsPerDay: events / days,
       evidenceActionIds: evidence.map((a) => a.id).filter(Boolean).slice(-20), severity: "normal", ...extra });
   };
   const nudges = recent.filter((a) => a.kind === "nudge");
@@ -55,14 +56,14 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
       && ms(a.startedAt ?? a.at) < (ms(q.answeredAt ?? q.expiredAt) || (q.status === "open" ? Infinity : 0)))));
   metrics.ownerHoldViolations = violations.length;
   if (violations.length) add("owner-hold", "policy", violations.length, violations, { severity: "high" });
-  if (Number.isFinite(storage.freeBytes) && storage.freeBytes < 5 * 1024 ** 3) add("storage-free", "sources", 1);
+  if (Number.isFinite(storage.freeBytes) && storage.freeBytes < (storage.lowGb ?? STORAGE_DEFAULTS.lowGb) * 1024 ** 3) add("storage-free", "sources", 1);
   const staleTmp = (storage.tmpFiles ?? []).filter((f) => f.size === 0 && now - ms(f.mtimeMs ?? f.mtime) > 60 * 60_000);
   if (staleTmp.length) add("storage-tmp", "sources", staleTmp.length);
   if (storage.actionsBytes > ACTION_LOG_MAX) add("storage-actions", "sources", 1);
   if (cheap) return { at: new Date(now).toISOString(), window, area, metrics, anomalies };
 
   const days = new Map();
-  for (const a of history.filter((a) => a.kind === "nudge")) {
+  for (const a of nudges) {
     const key = localDay(a.at);
     const d = days.get(key) ?? { planned: 0, blocked: 0 };
     d.planned += 1;
@@ -75,7 +76,7 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
     const previous = new Date(day); previous.setDate(previous.getDate() - 1);
     const consecutive = [days.get(localDay(day)), days.get(localDay(previous))];
     if (consecutive.every((d) => d && ratio(d.blocked, d.planned) > 0.5)) {
-      add("computer-use-blocked", "ui-delivery", consecutive.reduce((n, d) => n + d.blocked, 0), history.filter((a) => a.kind === "nudge" && a.route === "computer-use" && a.status === "blocked" && [localDay(day), localDay(previous)].includes(localDay(a.at))));
+      add("computer-use-blocked", "ui-delivery", consecutive.reduce((n, d) => n + d.blocked, 0), blocked.filter((a) => [localDay(day), localDay(previous)].includes(localDay(a.at))));
       break;
     }
   }
@@ -100,26 +101,26 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
   const unanswered = asked.filter((q) => q.status !== "open" && q.status !== "answered" && !q.answer);
   const reopens = questions.flatMap((q) => q.reopenHistory ?? (q.reopenedAt ? [q.reopenedAt] : [])).filter((at) => inRange(at) && localDay(at) === localDay(now));
   metrics.questions = { asked: asked.length, closedUnanswered: unanswered.length, unansweredRate: ratio(unanswered.length, asked.length), reopens: reopens.length };
-  if (asked.length && unanswered.length / asked.length > 0.6) add("questions-unanswered", "policy", unanswered.length);
-  if (reopens.length > 5) add("question-flicker", "policy", reopens.length);
+  if (asked.length && unanswered.length / asked.length > 0.6) add("questions-unanswered", "policy", unanswered.length, [], { days: 7 });
+  if (reopens.length > 5) add("question-flicker", "policy", reopens.length, [], { days: 1 });
   const judged = week.filter((a) => a.kind === "judge" && !failed(a));
   const waits = judged.filter((a) => a.verdict === "wait");
   const judgeFailures = today.filter((a) => a.kind === "judge" && failed(a));
   metrics.judge = { total: judged.length, waits: waits.length, waitShare: ratio(waits.length, judged.length), failures: judgeFailures.length };
-  if (judged.length && waits.length / judged.length > 0.7) add("judge-wait", "judge", waits.length, waits);
-  if (judgeFailures.length >= 3) add("judge-failures", "judge", judgeFailures.length, judgeFailures);
+  if (judged.length && waits.length / judged.length > 0.7) add("judge-wait", "judge", waits.length, waits, { days: 7 });
+  if (judgeFailures.length >= 3) add("judge-failures", "judge", judgeFailures.length, judgeFailures, { days: 1 });
   const reviews = today.filter((a) => a.kind === "review" && failed(a));
   const limits = reviews.filter((a) => /(?:usage|rate|session|message|token|model|spending).{0,30}limit|(?:hit|reached|exceeded).{0,30}limit|quota|\b429\b/i.test(text(a)));
   metrics.review = { failures: reviews.length, modelLimitFailures: limits.length };
-  if (reviews.length >= 5) add("review-failures", "review", reviews.length, reviews);
-  if (limits.length) add("review-model-limits", "review", limits.length, limits);
+  if (reviews.length >= 5) add("review-failures", "review", reviews.length, reviews, { days: 1 });
+  if (limits.length) add("review-model-limits", "review", limits.length, limits, { days: 1 });
   const escalations = recent.filter((a) => a.kind === "escalate-manager");
   const succeeded = escalations.filter((a) => ["sent", "escalated", "done"].includes(a.status));
   metrics.escalation = { attempts: escalations.length, succeeded: succeeded.length, successRate: ratio(succeeded.length, escalations.length) };
   if (escalations.length && succeeded.length / escalations.length < 0.5) add("escalation-success", "policy", escalations.length - succeeded.length, escalations.filter((a) => !succeeded.includes(a)));
   const titles = today.filter((a) => /two threads share this title/i.test(text(a)));
   metrics.sharedTitles = titles.length;
-  if (titles.length > 5) add("shared-title", "classify", titles.length, titles);
+  if (titles.length > 5) add("shared-title", "classify", titles.length, titles, { days: 1 });
   for (const channel of ["autopilot", "voice", "self-fix"]) {
     const totals = new Map();
     for (const row of budget.filter((r) => r.channel === channel && inRange(r.at, now - 8 * DAY_MS))) {
@@ -132,7 +133,7 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
     prior.sort((a, b) => a - b);
     const spend = totals.get(localDay(now)) ?? 0;
     metrics.spend[channel] = { today: spend, median: prior[3] };
-    if (spend > 2 * prior[3]) add(`spend:${channel}`, channel === "voice" ? "voice" : "self-fix", 1);
+    if (prior[3] > 0 && spend > 2 * prior[3]) add(`spend:${channel}`, channel === "voice" ? "voice" : "self-fix", 1, [], { days: 1 });
   }
   const complaints = new Map();
   for (const f of feedback.filter((f) => f.intent === "change" && ["new", "triaged"].includes(f.status) && f.target && inRange(f.at, now - 7 * DAY_MS))) {
@@ -142,7 +143,7 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
   }
   for (const [target, group] of complaints) if (group.length >= 2) {
     metrics.feedback.push({ target, count: group.length });
-    add(`feedback:${target}`, "policy", group.length, [], { feedbackIds: group.map((f) => f.id), complaints: group.map((f) => f.utterance) });
+    add(`feedback:${target}`, "policy", group.length, [], { days: 7, feedbackIds: group.map((f) => f.id), complaints: group.map((f) => f.utterance) });
   }
   return { at: new Date(now).toISOString(), window, area, metrics, anomalies };
 }
