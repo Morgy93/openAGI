@@ -23,6 +23,7 @@ function fakeSession() {
     appendAudio(pcm) { session.audio.push(pcm); return session.appendOk; },
     commit() { calls.push(["commit"]); },
     barge(options) { calls.push(["barge", options]); },
+    playback(options) { calls.push(["playback", options]); },
     setFocus(focus) { calls.push(["focus", focus]); },
     setHandsFree(on) { calls.push(["handsFree", on]); },
     close(reason) { calls.push(["close", reason]); }
@@ -30,7 +31,7 @@ function fakeSession() {
   return session;
 }
 
-async function fixture(t, { env = { OPENAGI_VOICE: "1" }, createSession, viaG2 = false, ...timing } = {}) {
+async function fixture(t, { env = { OPENAGI_VOICE: "1" }, createSession, viaG2 = false, ownerToken = OWNER, ...timing } = {}) {
   const server = http.createServer();
   let revoked = false;
   const nodeRegistry = {
@@ -41,7 +42,7 @@ async function fixture(t, { env = { OPENAGI_VOICE: "1" }, createSession, viaG2 =
   };
   const sessions = [];
   const relay = attachVoiceRelay({
-    nodeRegistry, env, getAuthToken: () => OWNER,
+    nodeRegistry, env, getAuthToken: () => ownerToken,
     createSession: createSession ?? (async (params, io) => { const session = fakeSession(); session.params = params; session.io = io; sessions.push(session); return session; }),
     ...timing
   });
@@ -130,6 +131,22 @@ test("the principal needs a gesture: a wake word or audio before start never ope
   early.ws.send(Buffer.alloc(320));
   assert.equal((await early.closed).code, 1008);
   assert.equal(f.sessions.length, 0);
+});
+
+test("voice accepts the exact configured owner token even below 16 characters", { timeout: 3000 }, async (t) => {
+  const token = "abc123";
+  const f = await fixture(t, { ownerToken: token });
+  const url = `${f.origin}/nodes/voice`;
+  assert.equal(await denied(url, [VOICE_PROTOCOL, "abc124"]), 403);
+  assert.equal(await denied(url, [VOICE_PROTOCOL, "abc12"]), 403);
+  const client = connect(f.origin, token);
+  await client.opened;
+  client.send({ type: "start", gesture: "hotkey" });
+  await until(() => f.sessions.length === 1);
+  assert.equal(f.sessions[0].params.device.kind, "owner");
+  assert.equal(isOwnerPrincipal(f.sessions[0].params.principal), true);
+  client.send({ type: "stop" });
+  assert.equal((await client.closed).code, 1000);
 });
 
 test("push-to-talk controls reach the session: commit, barge with played ms, context, mode", { timeout: 3000 }, async (t) => {
@@ -280,4 +297,70 @@ test("end to end through the G2 server hook: real broker, fake OpenAI, key never
   // Other paths are still the G2 relay's to refuse.
   assert.equal(await denied(`${f.origin}/nodes/other`, [VOICE_PROTOCOL, OWNER]), 404);
   client.ws.close();
+});
+
+test("a slow text device hits the same outbound backlog cap as audio", { timeout: 3000 }, async (t) => {
+  const f = await fixture(t);
+  const client = connect(f.origin, G2);
+  await client.opened;
+  client.send({ type: "start", gesture: "tap" });
+  await until(() => f.sessions.length === 1);
+  f.sessions[0].io.send({ type: "reply.delta", text: "x".repeat(512_001) });
+  assert.equal((await client.next()).code, "client_backlog");
+  assert.equal((await client.closed).code, 1011);
+});
+
+test("start followed immediately by audio and controls preserves their order", { timeout: 3000 }, async (t) => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const calls = [];
+  const f = await fixture(t, { createSession: async () => {
+    await gate;
+    return {
+      appendAudio(pcm) { calls.push(["audio", pcm.length]); return true; },
+      commit() { calls.push(["commit"]); },
+      setFocus(focus) { calls.push(["context", focus]); },
+      close() {}
+    };
+  } });
+  const client = connect(f.origin, OWNER);
+  await client.opened;
+  client.send({ type: "start", gesture: "hotkey" });
+  client.ws.send(Buffer.alloc(4800));
+  client.send({ type: "commit" });
+  client.send({ type: "context", focus: { view: "supervisor" } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release();
+  await until(() => calls.length === 3);
+  assert.deepEqual(calls, [["audio", 4800], ["commit"], ["context", { view: "supervisor" }]]);
+  client.send({ type: "stop" });
+  assert.equal((await client.closed).code, 1000);
+});
+
+test("startup audio is still paced and startup frames are bounded", { timeout: 3000 }, async (t) => {
+  const f = await fixture(t, { createSession: () => new Promise(() => {}) });
+  const fast = connect(f.origin, OWNER);
+  await fast.opened;
+  fast.send({ type: "start", gesture: "mic" });
+  for (let i = 0; i < 3; i++) fast.ws.send(Buffer.alloc(48_000));
+  assert.equal((await fast.next()).code, "audio_rate");
+  const tiny = connect(f.origin, PHONE);
+  await tiny.opened;
+  tiny.send({ type: "start", gesture: "mic" });
+  for (let i = 0; i < 501; i++) tiny.ws.send(Buffer.alloc(2));
+  assert.equal((await tiny.next()).code, "upstream_backlog");
+});
+
+
+test("device playback acknowledgements reach the broker with their audio item", { timeout: 3000 }, async (t) => {
+  const f = await fixture(t);
+  const client = connect(f.origin, OWNER);
+  await client.opened;
+  client.send({ type: "start", gesture: "hotkey" });
+  await until(() => f.sessions.length === 1);
+  client.send({ type: "playback", itemId: "audio_1", playedMs: 1250 });
+  await until(() => f.sessions[0].calls.length === 1);
+  assert.deepEqual(f.sessions[0].calls, [["playback", { itemId: "audio_1", playedMs: 1250 }]]);
+  client.send({ type: "stop" });
+  await client.closed;
 });

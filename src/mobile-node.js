@@ -1,3 +1,5 @@
+import { THREAD_KIND_PATTERN } from "./fleet/contracts.js";
+
 // The phone is a full client, so its credential is broader than the G2
 // wearable's. Breadth is only safe when it is explicit: this module is the
 // single enumerated answer to "what may a phone token do", kept as pure data
@@ -49,6 +51,8 @@ export const MOBILE_NODE_NAME_MAX = 60;
 // A task/action id as minted by createId(): letters, digits, underscore, dash.
 // Deliberately excludes "." and "/" so no id can carry a path segment.
 const ID = "[a-zA-Z0-9_-]{1,120}";
+// A fleet thread key ("conductor:<id>"), its colon raw or percent-encoded.
+const FLEET_THREAD = `(?:${THREAD_KIND_PATTERN})(?::|%3A)[A-Za-z0-9_.-]{1,120}`;
 
 const EXACT = new Set([
   "GET /mobile/summary",
@@ -91,7 +95,10 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/approve$`) },
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
-  { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) }
+  { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
+  // One fleet thread's detail, and the owner's Push now, Mute and Unmute.
+  { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute)$`) }
 ];
 
 export function isMobileRouteAllowed(method, pathname) {

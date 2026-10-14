@@ -52,3 +52,24 @@ test("a yearless reset date that already passed rolls into next year", () => {
   const dec30 = new Date(2026, 11, 30, 10, 0, 0);
   assert.equal(parseResetAt("resets Jan 2 at 9am (America/Los_Angeles)", dec30), new Date(2027, 0, 2, 9, 0).toISOString());
 });
+
+test("Antigravity quota errors are a usage limit with the exact reset", () => {
+  // Real ERROR_MESSAGE text and details from an Antigravity step, 2026-10-14.
+  const shown = "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 37m19s.";
+  const details = '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","metadata":{"model":"gemini-4-argon-high","quotaResetDelay":"37m19.269012167s","quotaResetTimeStamp":"2026-10-14T06:15:03Z"}}]}}';
+  const at = new Date("2026-10-14T05:37:43Z");
+  // 429 alone reads as overloaded; the quota wording wins.
+  assert.deepEqual(classifyErrorText(`${shown}\n${details}`, at), { kind: "usage-limit", resetAt: "2026-10-14T06:15:03.000Z" });
+  // Without the details, the delay counts from the error's own time.
+  assert.deepEqual(classifyErrorText(shown, at), { kind: "usage-limit", resetAt: "2026-10-14T06:15:02.000Z" });
+  assert.equal(classifyErrorText("RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h6m11s.", at).resetAt, "2026-10-14T07:43:54.000Z");
+  assert.equal(classifyErrorText("You have exhausted your quota on this model.", at).kind, "usage-limit");
+  // Escaped JSON (the rpc error details) still gives the stamp.
+  assert.equal(parseResetAt('{\\"quotaResetTimeStamp\\":\\"2026-10-14T06:15:03Z\\"}', at), "2026-10-14T06:15:03.000Z");
+  assert.equal(parseResetAt("Resets in 45s.", at), "2026-10-14T05:38:28.000Z");
+  assert.equal(classifyErrorText("Our servers are experiencing high traffic right now, please try again in a minute.", at).kind, "overloaded");
+  assert.equal(classifyErrorText("MODEL_CAPACITY_EXHAUSTED", at).kind, "overloaded");
+  // A plain 429 is still overloaded, and Claude's reset wording still parses.
+  assert.equal(classifyErrorText("HTTP 429 Too Many Requests", at).kind, "overloaded");
+  assert.ok(classifyErrorText("You've hit your session limit · resets 2:50am (America/Los_Angeles)", at).resetAt);
+});

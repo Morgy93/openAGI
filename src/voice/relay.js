@@ -6,7 +6,7 @@
 //
 // Frames: binary = PCM16 mono at the declared rate (G2 16k, resampled here
 // to 24k); text = JSON control: start {gesture, mode?, focus?}, commit,
-// barge {playedMs?}, context {focus}, mode {handsFree}, stop.
+// barge {playedMs?}, playback {itemId, playedMs}, context {focus}, mode {handsFree}, stop.
 // The owner principal is minted only on start with a real gesture (hotkey,
 // mic button, tap); a wake word never opens a session. One session per
 // device (a newer one replaces it), idle 120 s, hard 55 min.
@@ -69,7 +69,7 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
     if (!voiceEnabled(env)) return deny(404);
     if (closing || req.method !== "GET") return deny(503);
     const protocols = String(req.headers["sec-websocket-protocol"] ?? "").split(",").map((value) => value.trim());
-    if (protocols.length !== 2 || protocols[0] !== VOICE_PROTOCOL || !/^[A-Za-z0-9._~+-]{16,512}$/.test(protocols[1])) return deny(403);
+    if (protocols.length !== 2 || protocols[0] !== VOICE_PROTOCOL || !/^[A-Za-z0-9._~+-]{1,512}$/.test(protocols[1])) return deny(403);
     const token = protocols[1];
     const device = voiceDevice(token, { nodeRegistry, ownerToken: getAuthToken() });
     if (!device) return deny(403);
@@ -111,6 +111,8 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
     let controlAt = Date.now();
     let session = null;
     let starting = false;
+    let queued = [];
+    let queuedBytes = 0;
     let done = false;
     let alive = true;
     let lastActivity = Date.now();
@@ -120,7 +122,9 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       send(event) {
         if (done || client.readyState !== WebSocket.OPEN) return;
         lastActivity = Date.now();
-        client.send(JSON.stringify(event));
+        const text = JSON.stringify(event);
+        if (client.bufferedAmount + Buffer.byteLength(text) > CLIENT_BACKLOG) { end("Voice events fell behind the connection.", 1011, "client_backlog"); return; }
+        client.send(text);
       },
       sendAudio(pcm) {
         if (done || client.readyState !== WebSocket.OPEN) return;
@@ -135,6 +139,8 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       if (done) return;
       if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "end", code, reason: String(reason ?? "").slice(0, 200) }));
       done = true;
+      queued = [];
+      queuedBytes = 0;
       clearTimeout(startTimer); clearTimeout(hardTimer); clearInterval(heartbeat);
       if (active.get(device.key) === connection) active.delete(device.key);
       try { session?.close?.(reason); } catch { /* closing */ }
@@ -158,6 +164,13 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
         const created = await createSession({ device, principal, handsFree: wantsHandsFree, focus: control.focus ?? null, output: device.output, gesture: control.gesture }, io);
         if (done) { created?.close?.("client left"); return; }
         session = created;
+        const frames = queued;
+        queued = [];
+        queuedBytes = 0;
+        for (const frame of frames) {
+          if (done) break;
+          if (frame.pcm) upload(frame.pcm); else dispatch(frame.control);
+        }
       } catch (error) {
         end(String(error?.message ?? "Voice is unavailable.").slice(0, 200), error?.code === "voice_cap" ? 4002 : 1011, String(error?.code ?? "unavailable").slice(0, 40));
       } finally {
@@ -175,10 +188,19 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.type !== "string") return fail("Voice control must be an object with a type.");
       if (message.type === "start") return start(message);
       if (message.type === "stop") return end("Stopped.", 1000, "stopped");
-      if (!session) return starting ? undefined : fail("Send start before anything else.");
+      if (!["commit", "barge", "playback", "context", "mode"].includes(message.type)) return fail("Unknown voice control.");
+      if (!session) {
+        if (!starting) return fail("Send start before anything else.");
+        return enqueue({ control: message }, data.length);
+      }
+      return dispatch(message);
+    }
+
+    function dispatch(message) {
       switch (message.type) {
         case "commit": return session.commit();
         case "barge": return session.barge({ playedMs: Number.isFinite(message.playedMs) ? message.playedMs : null });
+        case "playback": return session.playback({ itemId: message.itemId, playedMs: message.playedMs });
         case "context": return session.setFocus(message.focus ?? null);
         case "mode":
           if (message.handsFree === true && !device.handsFreeAllowed) return fail("Hands-free is not available on this device.", "mode");
@@ -187,15 +209,25 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       }
     }
 
+    function enqueue(frame, bytes) {
+      queuedBytes += bytes;
+      if (queuedBytes > 5_000 * VOICE_RATE * 2 / 1000 || queued.length >= 500) return end("Voice startup backlog is full.", 1011, "upstream_backlog");
+      queued.push(frame);
+    }
+
+    function upload(pcm) {
+      if (!session.appendAudio(pcm)) end("Voice upload backed up. Start again.", 1011, "upstream_backlog");
+    }
+
     function audio(data) {
-      if (!session) return fail("Audio arrived before start.");
+      if (!session && !starting) return fail("Audio arrived before start.");
       if (!data.length || data.length % 2) return fail("Invalid PCM frame: expected 16-bit mono audio.", "invalid_pcm");
       const now = Date.now();
       audioBudget = Math.min(audioBurst, audioBudget + Math.max(0, now - budgetAt) * bytesPerMs); budgetAt = now;
       if (data.length > audioBudget) return fail("Audio arrived faster than real time. Check pacing and the declared rate.", "audio_rate");
       audioBudget -= data.length;
       const pcm = resample ? resample(data) : data;
-      if (!session.appendAudio(pcm)) end("Voice upload backed up. Start again.", 1011, "upstream_backlog");
+      if (!session) enqueue({ pcm }, pcm.length); else upload(pcm);
     }
 
     client.on("error", () => end("Voice connection interrupted.", 1011, "client"));

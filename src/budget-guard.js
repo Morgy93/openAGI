@@ -76,10 +76,11 @@ export class BudgetGuard {
     };
   }
 
-  check() {
+  check(additionalUsd = 0) {
     const today = this.todayKey();
     const day = this.state.days[today] ?? { usd: 0 };
-    if (day.usd >= this.dailyUsdLimit) {
+    const reservedUsd = Object.values(this.voiceReservationsToday()).reduce((sum, usd) => sum + usd, 0);
+    if (day.usd + reservedUsd + additionalUsd >= this.dailyUsdLimit) {
       const error = new Error(
         `Daily budget reached: $${day.usd.toFixed(4)} of $${this.dailyUsdLimit.toFixed(2)}. ` +
         `Raise OPENAGI_DAILY_USD_LIMIT or wait until tomorrow.`
@@ -136,6 +137,7 @@ export class BudgetGuard {
     day.output += tokens.output;
     day.cacheRead += tokens.cacheRead;
     day.usd += added;
+    if (meta.channel === "voice") day.voiceUsd = (day.voiceUsd ?? 0) + added;
     day.calls += 1;
     try {
       this.ledger?.record({
@@ -143,7 +145,7 @@ export class BudgetGuard {
         channel: meta.channel ?? null, agentId: meta.agentId ?? null, sessionId: meta.sessionId ?? null,
         from: meta.from ?? null, tools: Array.isArray(meta.tools) ? meta.tools : []
       });
-    } catch { /* ledger is best-effort */ }
+    } catch (error) { if (meta.channel === "voice") throw error; }
     this.persist();
     return { added, today: day.usd, limit: this.dailyUsdLimit };
   }
@@ -151,10 +153,25 @@ export class BudgetGuard {
   // USD one channel spent today (UTC day, as todayKey), from the ledger.
   channelUsdToday(channel) {
     try {
-      return (this.ledger?.query({ days: 1 }) ?? []).filter((row) => row.channel === channel).reduce((sum, row) => sum + Number(row.usd ?? 0), 0);
+      const ledgerUsd = (this.ledger?.query({ days: 1 }) ?? []).filter((row) => row.channel === channel).reduce((sum, row) => sum + Number(row.usd ?? 0), 0);
+      return channel === "voice" ? Math.max(ledgerUsd, this.state.days[this.todayKey()]?.voiceUsd ?? 0) : ledgerUsd;
     } catch {
-      return 0;
+      return channel === "voice" ? (this.state.days[this.todayKey()]?.voiceUsd ?? 0) : 0;
     }
+  }
+
+  voiceReservationsToday() {
+    return { ...(this.state.voiceReservations?.[this.todayKey()] ?? {}) };
+  }
+
+  setVoiceReservation(id, usd) {
+    const day = this.todayKey();
+    this.state.voiceReservations ??= {};
+    this.state.voiceReservations[day] ??= {};
+    if (usd > 0) this.state.voiceReservations[day][id] = usd;
+    else delete this.state.voiceReservations[day][id];
+    for (const key of Object.keys(this.state.voiceReservations)) if (key !== day) delete this.state.voiceReservations[key];
+    this.persist();
   }
 
   // Estimated USD for one call's usage, without recording it. Providers use

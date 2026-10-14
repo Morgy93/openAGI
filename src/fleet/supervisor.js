@@ -8,8 +8,8 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
-import { WATCH_GROUPS, classifyThread, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
+import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
@@ -21,6 +21,7 @@ import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
+import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -407,6 +408,36 @@ function withHealth(snapshot) {
   return { ...snapshot, threads: snapshot.threads.map((row) => (row?.health ? row : { ...row, health: threadHealth(row?.state, row?.error ?? null) })) };
 }
 
+// thread key -> when the earliest open question naming it was put to the
+// owner (lastAskedAt is refreshed every scan, so it would restart the clock
+// after each daemon restart). Only questions the owner can see.
+function askTimes(questions) {
+  const out = new Map();
+  for (const question of questions) {
+    for (const key of [question.threadKey, ...(question.threadKeys ?? [])].filter(Boolean)) {
+      const at = question.reopenedAt ?? question.createdAt ?? null;
+      if (at && !(out.get(key) <= at)) out.set(key, at);
+    }
+  }
+  return out;
+}
+
+// The owner's last message in the chat: null when the last user turn is the
+// supervisor's own (it arrives as a user turn too) or none was read.
+function ownerSpokeAt(thread) {
+  return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
+}
+
+// How much of the agent's last message a thread's detail shows.
+const DETAIL_EXCERPT_MAX = 1200;
+// Options that only send the owner to the chat: a question with no other is
+// answered in the agent's app, never here.
+const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
+// Asks the owner must read in full before any button: a release or deploy,
+// a delete, a merge.
+const RISKY_ASK = /\b(?:prod(?:uction)?|releas(?:e|es|ed|ing)|deploy(?:s|ed|ing|ment)?|delet(?:e|es|ed|ing|ion)|destroy|wipe|merg(?:e|es|ed|ing)|force[- ]push|rewrite (?:git )?history)\b|--admin\b/i;
+const MUTE_HOURS_DEFAULT = 24;
+
 // Delivery that failed only because typing into the app has to wait (a
 // strict computer-use Mac that cannot type now, or a typed send held back by
 // the owner at the keyboard or a running turn). A CLI fallback's failure is
@@ -478,6 +509,12 @@ export class FleetSupervisor {
     this.lastError = null;
     this.lastThreads = new Map();
     this.lastPrs = new Map();
+    // threadKey -> { classified, pr } and the infra and manager the last scan
+    // read: what the owner's Push now decides from (pushNow).
+    this.lastItems = new Map();
+    this.pushing = new Set();
+    this.lastInfra = null;
+    this.lastManager = null;
     // key -> { group, since }: when each thread entered its watch group.
     this.watchSince = new Map();
     this.branchLookups = new Map();
@@ -500,7 +537,7 @@ export class FleetSupervisor {
     this.tickCount = 0;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
-    this.lastReview = { at: null, failedAt: null, error: null };
+    this.lastReview = { at: null, failedAt: null, error: null, ran: null };
     // New questions waiting on the review: hidden from the state the main
     // mirrors until the review has seen them.
     this.awaitingReview = new Set();
@@ -767,17 +804,20 @@ export class FleetSupervisor {
 
   getState() {
     const store = this.store;
-    const questions = store.openQuestions().filter((question) => !this.awaitingReview.has(question.id));
+    const open = store.openQuestions().filter((question) => !this.awaitingReview.has(question.id));
     // A read can expire a question too (the /fleet page, the main's refresh)
     // while no tick runs.
     this.closeExpired();
+    const snapshot = this.liveSnapshot(withHealth(store.snapshot), open);
+    const rows = new Map((snapshot?.threads ?? []).map((row) => [row?.key, row]));
+    const questions = open.map((question) => this.questionView(question, rows));
     return {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
       running: Boolean(this.running),
       lastTickAt: this.lastTickAt ?? store.snapshot?.at ?? null,
       lastError: this.lastError,
-      snapshot: withHealth(store.snapshot),
+      snapshot,
       questions,
       // So the owner can reopen a wrong close.
       reviewClosed: store.reviewClosed(),
@@ -794,11 +834,70 @@ export class FleetSupervisor {
         deliveryDetail: this.lastDelivery.detail,
         review: {
           enabled: Boolean(this.config.review?.enabled),
-          model: this.config.review?.model ?? null,
+          // What the review tries first, and the Claude model behind codex.
+          provider: this.reviewRunner?.provider ?? this.config.review?.provider ?? null,
+          model: this.reviewRunner?.model ?? this.config.review?.model ?? null,
+          fallbackModel: this.reviewRunner?.fallbackModel ?? null,
           lastAt: this.lastReview.at ? new Date(this.lastReview.at).toISOString() : null,
+          // Which ran last: { provider, model, fallbackReason }.
+          lastRun: this.lastReview.ran ?? null,
           lastError: this.lastReview.error
         }
       }
+    };
+  }
+
+  // The last scan's rows brought up to now. Watching follows the questions
+  // open now: one answered or dismissed since the scan takes its row out of
+  // "Waiting on you" at once (codex:01a13388 sat there 3 minutes after its
+  // only question was dismissed, until the next scan), and a new one puts
+  // it in. Each row also says whether the owner muted it, and what opens it.
+  liveSnapshot(snapshot, open) {
+    if (!Array.isArray(snapshot?.threads)) return snapshot;
+    const askedAt = askTimes(open);
+    const closedAt = this.store.closedAtByThread();
+    const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
+    const threads = snapshot.threads.map((row) => {
+      if (!row?.key) return row;
+      const muted = this.store.mutedUntil(row.key);
+      const watch = liveWatch(row.watch ?? null, { state: row.state, askedAt: askedAt.get(row.key) ?? null, closedAt: closedAt.get(row.key) ?? null, muted });
+      if (watch) byWatch[watch.group] = (byWatch[watch.group] ?? 0) + 1;
+      // A snapshot saved before rows carried openChat: this process's read.
+      const openChat = row.openChat !== undefined ? row.openChat : openChatFor(this.lastThreads.get(row.key));
+      const preview = this.lastItems.get(row.key)?.pushPreview;
+      const thread = this.lastThreads.get(row.key);
+      const pending = this.store.openQuestions().some((q) => q.threadKey === row.key || (q.threadKeys ?? []).includes(row.key));
+      const canPush = preview?.action === "nudge" && preview.message && !muted && !pending
+        && !this.ownerAnswerThreads(Infinity).has(row.key) && !repeatsLastSend(thread, this.store.ledgerFor(row.key), preview.messageHash);
+      return { ...row, lastAgentText: redactSecrets(row.lastAgentText), watch, muted, openChat: openChat ?? null,
+        pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
+    });
+    return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.length } };
+  }
+
+  // One open question as the cards show it: when the agent asked (else when
+  // the supervisor first put it to the owner), in which chat (label and the
+  // link that opens it), whether it is answered here or only in the agent's
+  // app, and whether it is a risky ask whose full text comes before any
+  // button. A group names each of its chats.
+  questionView(question, rows) {
+    const chatOf = (key) => {
+      const thread = this.lastThreads.get(key);
+      return (thread ? openChatFor(thread) : rows.get(key)?.openChat) ?? null;
+    };
+    const openChat = question.threadKey ? chatOf(question.threadKey) : null;
+    const chats = (question.threadKeys ?? []).map((key) => ({ threadKey: key, ...(chatOf(key) ?? { app: null, url: null, label: key, note: null }) }));
+    const options = question.options ?? [];
+    const inApp = question.kind === "agent-card" || !options.some((option) => !APP_ONLY_OPTIONS.has(option));
+    const text = [question.title, question.body, ...options].filter(Boolean).join(" ");
+    return {
+      ...question,
+      askedAt: question.agentAskedAt ?? question.createdAt ?? null,
+      chatLabel: openChat?.label ?? (chats.length ? `${chats[0].label}${chats.length > 1 ? ` +${chats.length - 1} more` : ""}` : null),
+      answerIn: inApp ? "agent app" : "here",
+      openChat,
+      ...(chats.length ? { chats } : {}),
+      risky: Boolean(question.mergeAsk) || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
     };
   }
 
@@ -964,7 +1063,7 @@ export class FleetSupervisor {
       // infra:bb3 and infra:lb belong to their probes, not a thread source.
       const [kind, probe] = String(key).split(":");
       if (kind === "infra") return Boolean(sourceErrors[probe]);
-      const capped = threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads;
+      const capped = threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads;
       return !seen.has(key) && (Boolean(sourceErrors[kind]) || capped);
     };
     for (const key of [...this.uiBlockedSince.keys()]) if (!now.has(key) && !hidden(key)) this.uiBlockedSince.delete(key);
@@ -1082,11 +1181,17 @@ export class FleetSupervisor {
   // can show it (Codex and Conductor). A thread the last scan saw that this
   // read does not list (a full page) keeps its last state. null when a
   // source failed: unknown is not idle.
-  // One Conductor chat read again now (a background send re-checks it).
+  // One Conductor chat or Antigravity conversation read again now (a
+  // background or agentapi send re-checks it).
   async refreshThread(thread) {
-    if (thread?.kind !== "conductor") return null;
     const config = { ...this.config, mode: this.mode };
     const d = this.deps;
+    if (thread?.kind === "antigravity") {
+      const read = Promise.resolve().then(() => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: this.now(), only: [thread.id] }));
+      const fresh = await withTimeout(read, SOURCE_TIMEOUT_MS, "antigravity");
+      return (fresh ?? []).find((entry) => entry.key === thread.key) ?? null;
+    }
+    if (thread?.kind !== "conductor") return null;
     let peers = new Map();
     try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch { /* peers only label sessions */ }
     const read = Promise.resolve().then(() => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: this.now(), peers, only: [thread.id] }));
@@ -1472,6 +1577,101 @@ export class FleetSupervisor {
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) } };
   }
 
+  // One thread, expanded for the owner: the agent's last message and when,
+  // the owner's last word, its PR, what it waits on, the supervisor's next
+  // step and why, its open questions, and what opens its chat. Built from
+  // the last scan's row (kept across a restart), with this process's own
+  // read of the chat when it has one. null: not in the last scan.
+  threadDetail(threadKey) {
+    const state = this.getState();
+    const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey);
+    if (!row) return null;
+    const thread = this.lastThreads.get(threadKey) ?? null;
+    const reply = thread ? agentReply(thread) : { text: row.lastAgentText ?? "", at: row.lastAgentAt ?? null };
+    return {
+      key: row.key, kind: row.kind, title: row.title ?? null, workspace: row.workspace ?? null, repo: row.repo ?? null, branch: row.branch ?? null,
+      app: row.app ?? null, agentStatus: row.agentStatus ?? null, live: Boolean(row.live), state: row.state ?? null, health: row.health ?? null,
+      reason: row.reason ?? null, blockers: row.blockers ?? [], error: row.error ?? null,
+      lastAgentMessage: { text: clampTail(redactSecrets(reply.text), DETAIL_EXCERPT_MAX), at: reply.at ?? null },
+      lastOwnerAt: thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? null),
+      lastActivityAt: row.lastActivityAt ?? null,
+      pr: row.pr ?? null,
+      watch: row.watch ?? null,
+      decision: row.decision ?? null,
+      pushPreview: row.pushPreview ?? null,
+      pushing: row.pushing === true,
+      ...(row.prompt ? { prompt: row.prompt } : {}),
+      muted: row.muted ?? null,
+      questions: state.questions.filter((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey)),
+      openChat: row.openChat ?? null,
+      scannedAt: state.snapshot?.at ?? null
+    };
+  }
+
+  // Send the scan's preview verbatim. Only pacing waits are skipped;
+  // an unanswered question or a nudge already sent still holds it.
+  async pushNow(threadKey, { deadlineAt = null } = {}) {
+    const startedAt = Date.now();
+    const blocked = (detail) => ({ delivery: { status: "blocked", route: null, detail }, action: null });
+    if (this.pushing.has(threadKey)) return blocked("a push to this thread is already being sent");
+    this.pushing.add(threadKey);
+    try {
+      const thread = this.lastThreads.get(threadKey);
+      const item = this.lastItems.get(threadKey);
+      if (!thread || !item) return blocked("thread not seen since restart: scan first");
+      if (this.store.mutedUntil(threadKey)) return blocked("muted: unmute it to push");
+      const asking = this.store.openQuestions().find((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
+      if (asking) return blocked(`waits on your answer first: ${asking.title}`);
+      if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
+      const deliveryState = await this.probeDelivery({ deadlineAt });
+      const preview = item.pushPreview;
+      const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
+      const decision = preview ? { ...preview, route } : null;
+      if (decision?.action !== "nudge" || !decision.message || !route) return blocked(`nothing to push: ${preview?.reason ?? item.classified.reason}`);
+      if (repeatsLastSend(thread, this.store.ledgerFor(threadKey), decision.messageHash)) return blocked("this nudge was already sent; waiting for the agent's reply");
+      const settled = await this.prSettledBeforeSend(thread, item.pr, decision);
+      if (settled) return blocked(`not sent: ${settled}`);
+      const currentAsk = this.store.openQuestions().find((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
+      if (currentAsk) return blocked(`waits on your answer first: ${currentAsk.title}`);
+      if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
+      // The owner is speaking to this thread now: an automatic nudge a scan
+      // decided meanwhile is held, as for an owner answer.
+      this.ownerAnsweredAt.set(threadKey, this.now());
+      const at = new Date(this.now()).toISOString();
+      const record = {
+        threadKey, targetKey: threadKey, playbook: decision.playbook, route: decision.route, message: decision.message, kind: "nudge", by: "owner",
+        reason: clampText(`owner: push now; ${decision.reason}`, 300), progressMark: decision.progressMark ?? null,
+        messageHash: decision.messageHash ?? null, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null
+      };
+      // A planned or proposed copy of the same nudge is this one, sent.
+      const existing = this.store.actions(this.config.limits.maxActionsKept).find((action) => OPEN_ACTION.has(action.status) && action.threadKey === threadKey && action.playbook === decision.playbook);
+      const delivery = await this.executor.deliver({ thread, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null, spentMs: Date.now() - startedAt, deadlineAt });
+      if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(thread, delivery);
+      const id = existing?.id ?? delivery.actionId ?? null;
+      const action = id
+        ? this.store.updateAction(id, { ...record, status: delivery.status, detail: delivery.detail ?? null, at })
+        : this.store.recordAction({ ...record, status: delivery.status, detail: delivery.detail ?? null, at });
+      this.recordSend(record, delivery, at);
+      // A card in the way comes back with the block, as for an owner message.
+      const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
+      return { delivery: { status: delivery.status, route: delivery.route ?? decision.route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) }, action };
+    } finally { this.pushing.delete(threadKey); }
+  }
+
+  // The owner's Mute: no nudge or question for the thread until then
+  // (policy's "muted by owner"); its open asks close on the next scan.
+  muteThread(threadKey, { hours = MUTE_HOURS_DEFAULT } = {}) {
+    const until = this.store.mute(threadKey, this.now() + hours * 60 * MIN);
+    this.store.recordAction({ kind: "mute", playbook: "owner-mute", threadKey, status: "done", reason: `owner: mute for ${hours} h`, by: "owner" });
+    return { until };
+  }
+
+  unmuteThread(threadKey) {
+    const was = this.store.unmute(threadKey);
+    if (was) this.store.recordAction({ kind: "unmute", playbook: "owner-mute", threadKey, status: "done", reason: "owner: unmute", by: "owner" });
+    return { until: null };
+  }
+
   applyOverride(question, answer) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     for (const key of keys) {
@@ -1554,10 +1754,11 @@ export class FleetSupervisor {
     // The Codex keys whose open card this tick's scan settled (see act).
     const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
-    const [codexThreads, claudeThreads, conductorThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
+    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
       guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
       guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
       guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
+      guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
       guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
       guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
       this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
@@ -1567,7 +1768,7 @@ export class FleetSupervisor {
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
-    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [] }));
+    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [] }));
     const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
     const ranked = threads
@@ -1690,13 +1891,24 @@ export class FleetSupervisor {
     this.lastThreads = byKey;
     // Each thread's PR as this scan read it, for a proposal sent later.
     this.lastPrs = new Map(items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr]));
+    const decisionFor = effectiveDecisions(decisions);
+    this.lastItems = new Map(items.map((item) => {
+      const current = decisionFor.get(item.thread.key);
+      const pushPreview = current?.action === "nudge" ? current : decideThread(item.classified, item.thread, {
+        ledger: store.ledgerFor(item.thread.key), escalationLedger: store, playbooks: this.playbooks(), config,
+        now: started, pr: item.pr, mode: mode === "auto" ? "auto" : "propose", infra, manager, delivery, ownerPush: true
+      });
+      return [item.thread.key, { classified: item.classified, pr: item.pr, pushPreview }];
+    }));
+    this.lastInfra = infra;
+    this.lastManager = manager;
 
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
-    const unknownKinds = new Set(["codex", "claude", "conductor"].filter((kind) => sourceErrors[kind]));
+    const unknownKinds = new Set(THREAD_KINDS.filter((kind) => sourceErrors[kind]));
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
-    const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
+    const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
@@ -2251,7 +2463,7 @@ export class FleetSupervisor {
       // An owner answer that started after the judge read (during the
       // review, the notifications, the kept answers, an earlier send or the
       // PR read just above) goes first: checked again right before each send.
-      if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
+      if (decision.action === "nudge" && (this.pushing.has(decision.threadKey) || this.ownerAnswerThreads(started).has(decision.threadKey))) {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;
       }
@@ -2367,11 +2579,11 @@ export class FleetSupervisor {
         verdicts = await reviewQuestions({ questions: remaining, others: rest, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now, ownerNotes: loadOwnerNotes(this.dataDir) });
       } catch (error) {
         const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
-        this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
+        this.lastReview = { ...this.lastReview, failedAt: now, error: detail, ran: this.reviewRunner?.lastRun ?? null };
         store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
         break;
       }
-      this.lastReview = { at: now, failedAt: null, error: null };
+      this.lastReview = { at: now, failedAt: null, error: null, ran: this.reviewRunner?.lastRun ?? null };
       this.applyReview(verdicts, fingerprints);
       const answered = new Set(verdicts.map((verdict) => verdict.id));
       for (const verdict of verdicts) if (!verdict.deferred) settled.add(verdict.id);
@@ -2445,16 +2657,8 @@ export class FleetSupervisor {
     const byState = {};
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
-    const askedAt = new Map();
-    // Only questions the owner can see (getState hides ones held for review),
-    // dated by when they were put to the owner: lastAskedAt is refreshed
-    // every scan, so it would restart the clock after each daemon restart.
-    for (const question of this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id))) {
-      for (const key of [question.threadKey, ...(question.threadKeys ?? [])].filter(Boolean)) {
-        const at = question.reopenedAt ?? question.createdAt ?? null;
-        if (at && !(askedAt.get(key) <= at)) askedAt.set(key, at);
-      }
-    }
+    // Only questions the owner can see (getState hides ones held for review).
+    const askedAt = askTimes(this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id)));
     const seen = new Set();
     const rows = items.map(({ thread, classified, pr }) => {
       byState[classified.state] = (byState[classified.state] ?? 0) + 1;
@@ -2478,7 +2682,7 @@ export class FleetSupervisor {
           ? { ref: pr.ref, url: pr.url, state: pr.state, title: clampText(pr.title, 100), ci: pr.ci, unresolvedThreads: pr.unresolvedThreads, mergeState: pr.mergeState, head: String(pr.headOid ?? "").slice(0, 10) }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),
         lastActivityAt: thread.lastActivityAt ?? null,
-        lastAgentText: clampTail(thread.lastAgentText, 600),
+        lastAgentText: clampTail(redactSecrets(thread.lastAgentText), 600),
         error: thread.error ? { kind: thread.error.kind, resetAt: thread.error.resetAt ?? null } : null,
         live: Boolean(thread.live),
         // The app that shows it (fleet_app pins the chats an app action stops)
@@ -2486,15 +2690,20 @@ export class FleetSupervisor {
         app: uiTargetFor(thread)?.app ?? null,
         ...(thread.meta?.prompt ? { prompt: { text: clampText(thread.meta.prompt.text, 300), buttons: thread.meta.prompt.buttons, stateId: thread.meta.prompt.stateId } } : {}),
         route: chooseRoute(thread, mode, delivery),
-        decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null } : null,
+        // message: the words a nudge or escalation would send (playbook text
+        // and facts, or the judge's), what the owner's Push now sends.
+        decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
+        lastOwnerAt: ownerSpokeAt(thread),
+        // What opens this exact chat (contracts openChatFor).
+        openChat: openChatFor(thread),
         watch
       };
     });
     for (const key of this.watchSince.keys()) if (!seen.has(key)) this.watchSince.delete(key);
     const infraDecisions = decisions.filter((decision) => decision.threadKey.startsWith("infra:"))
       .map((decision) => ({ key: decision.threadKey, action: decision.action, reason: clampText(decision.reason, 200), notBefore: decision.notBefore ?? null }));
-    const sources = { codex: 0, claude: 0, conductor: 0 };
+    const sources = Object.fromEntries(THREAD_KINDS.map((kind) => [kind, 0]));
     for (const thread of threads) sources[thread.kind] = (sources[thread.kind] ?? 0) + 1;
     return {
       at: new Date(finished).toISOString(),

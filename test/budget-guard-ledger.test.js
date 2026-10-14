@@ -61,3 +61,47 @@ test("recordUsd writes a caller-priced voice row that counts toward the day and 
   assert.equal(guard.status().calls, 2);
   assert.ok(guard.status().spentUsd >= 0.0177);
 });
+
+test("voice reservations persist independently of reported spend and settle by id", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-budget-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const options = { storePath: path.join(dir, "usage.json") };
+  const guard = new BudgetGuard(options);
+  guard.setVoiceReservation("session:audio", 0.2);
+  guard.setVoiceReservation("session:response", 0.5);
+  const reloaded = new BudgetGuard(options);
+  assert.deepEqual(reloaded.voiceReservationsToday(), { "session:audio": 0.2, "session:response": 0.5 });
+  reloaded.recordUsd(0.03, "gpt-realtime-2.1", { channel: "voice" });
+  reloaded.setVoiceReservation("session:response", 0);
+  const settled = new BudgetGuard(options);
+  assert.deepEqual(settled.voiceReservationsToday(), { "session:audio": 0.2 });
+  assert.equal(settled.channelUsdToday("voice"), 0.03);
+  assert.equal(settled.status().spentUsd, 0.03);
+});
+
+test("voice metering fails closed when the ledger cannot be written", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-ledger-fail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const guard = new BudgetGuard({ storePath: path.join(dir, "usage.json"), ledger: { record: () => { throw new Error("disk full"); }, query: () => [] } });
+  guard.setVoiceReservation("in-flight", 0.5);
+  assert.throws(() => guard.recordUsd(0.1, "gpt-realtime-2.1", { channel: "voice" }), /disk full/);
+  assert.deepEqual(new BudgetGuard({ storePath: guard.storePath }).voiceReservationsToday(), { "in-flight": 0.5 });
+});
+
+test("outstanding voice holds reduce the shared budget for text and embedding callers", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-shared-budget-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const options = { storePath: path.join(dir, "usage.json"), dailyUsdLimit: 1 };
+  const guard = new BudgetGuard(options);
+  guard.recordUsd(0.25, "text-model");
+  guard.setVoiceReservation("audio", 0.25);
+  guard.setVoiceReservation("response", 0.5);
+  assert.throws(() => guard.check(), { code: "BUDGET_EXCEEDED" });
+  assert.throws(() => new BudgetGuard(options).check(), { code: "BUDGET_EXCEEDED" });
+  guard.setVoiceReservation("response", 0);
+  assert.doesNotThrow(() => guard.check());
+  assert.doesNotThrow(() => guard.check(0.49));
+  assert.throws(() => guard.check(0.5), { code: "BUDGET_EXCEEDED" });
+  guard.setVoiceReservation("audio", 0);
+  assert.doesNotThrow(() => guard.check(0.5));
+});

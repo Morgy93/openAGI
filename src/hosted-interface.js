@@ -620,9 +620,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   });
 
+  let closing = false;
   let tickerHandle = null;
   let heartbeatHandle = null;
-  let nodeServicesClosing = false;
   let nodeControlWorker = null;
   let computerExecutor = null;
   let imessageNodeCapability = null;
@@ -716,7 +716,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return localCapabilityCache;
   };
   const ensureImessageBridge = () => {
-    if (nodeServicesClosing) return null;
+    if (closing) return imessageBridgeRuntime;
     imessageBridgeRuntime ??= options.imessageBridgeRuntime
       ?? createImessageBridgeRuntime({
         dataDir,
@@ -728,7 +728,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return imessageBridgeRuntime;
   };
   const ensureNodeControlWorker = () => {
-    if (nodeServicesClosing || nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
+    if (closing) return null;
+    if (nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
     const pairing = readNodeConfig(dataDir);
     if (!pairing?.remote || !pairing.nodeToken || pairing.nodeEnrollmentConfirmed !== true) return null;
     const identity = readOrCreateIdentity(dataDir);
@@ -3482,11 +3483,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             const heartbeatBuild = resolveBuildInfo({ packageVersion: PACKAGE_VERSION });
             let heartbeatFailStreak = 0;
             const sendHeartbeat = async () => {
-              if (nodeServicesClosing) return;
+              if (closing) return;
               try {
                 const identity = readOrCreateIdentity(dataDir);
                 const scopedToken = await ensureScopedNodeToken(pairing, identity);
-                if (nodeServicesClosing) return;
+                if (closing) return;
                 const ctrl = new AbortController();
                 const heartbeatTimeoutMs = Math.max(1_000, Math.min(30_000,
                   Number(options.heartbeatTimeoutMs) || 15_000));
@@ -3550,7 +3551,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
-      nodeServicesClosing = true;
+      closing = true;
       for (const unobserve of unobserveSharedThreads) unobserve();
       g2Requests?.close();
       clearInterval(g2RetentionTimer);

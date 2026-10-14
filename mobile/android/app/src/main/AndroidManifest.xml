@@ -10,6 +10,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
+    <!-- Supervisor "Open chat": whether an app on this phone takes the Mac
+         apps' own links. Without this the answer is always no, and the row
+         says "on your Mac" even when something here could open it. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="conductor" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="codex" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="OpenAGI"

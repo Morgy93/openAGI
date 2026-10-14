@@ -1,6 +1,9 @@
 // Fleet stays on the coding computer. Main reaches it over the existing
 // enrolled-node control channel; no owner token, shell, or arbitrary URL crosses it.
+import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
+
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -13,7 +16,7 @@ export function createFleetCapability(supervisor) {
     // inside it.
     async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !THREAD_ROUTE.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
       const url = new URL(payload.path, 'http://localhost');
@@ -38,7 +41,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000 }) {
@@ -63,18 +66,21 @@ export class RemoteFleetSupervisor {
   }
   async request(method, path, body) {
     let reached = false;
+    let status = null;
     try {
       const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
       this.mirrorQuestions();
-      if (result.response?.status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
+      status = result.response?.status ?? null;
+      if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
-      this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
+      const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
+      if (!missingThread) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(this.state.lastError), { reached });
+      throw Object.assign(new Error(missingThread ? error.message : this.state.lastError), { reached, status });
     }
   }
   refresh() {
@@ -130,6 +136,26 @@ export class RemoteFleetSupervisor {
   async fixes() { return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
   async reviseFix(id, instructions) { return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }
   async stopFix(id) { return (await this.request('POST', `/fleet/api/fixes/${id}/stop`)).stopped ?? []; }
+  // A thread the computer's last scan does not have is null, not an outage.
+  async threadDetail(threadKey) {
+    try {
+      return (await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}`)).thread ?? null;
+    } catch (error) {
+      if (error.status === 404) return null;
+      throw error;
+    }
+  }
+  async pushNow(threadKey) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/push`);
+    return { delivery: body.delivery ?? null, action: body.action ?? null };
+  }
+  async muteThread(threadKey, { hours } = {}) {
+    return { until: (await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/mute`, hours === undefined ? {} : { hours })).muted ?? null };
+  }
+  async unmuteThread(threadKey) {
+    await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/unmute`);
+    return { until: null };
+  }
   async runningInApp(app) {
     return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;
   }
