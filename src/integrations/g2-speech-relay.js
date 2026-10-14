@@ -7,7 +7,9 @@ const MAX_AUDIO_BACKLOG = 64_000;
 // The websocket upgrade bypasses the HTTP handler, so it MUST self-authenticate
 // with an enrolled G2 token before opening any provider connection. No URL tokens,
 // owner credentials, arbitrary destinations, or provider keys from the client.
-export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstreamFactory = (url, options) => new WebSocket(url, options) }) {
+// Other self-authenticating sockets on the same server ({ path, upgrade },
+// e.g. the voice relay) get their own path; every other path is refused here.
+export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstreamFactory = (url, options) => new WebSocket(url, options), upgrades = [] }) {
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: MAX_AUDIO_BACKLOG, handleProtocols: () => PROTOCOL });
   const active = new Map();
   const attempts = new Map();
@@ -17,6 +19,8 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
     const deny = status => socket.end(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
     let url;
     try { url = new URL(req.url, "http://localhost"); } catch { return deny(400); }
+    const other = upgrades.find(entry => entry?.path === url.pathname);
+    if (other) return other.upgrade(req, socket, head);
     if (url.pathname !== PATH) return deny(404);
     if (closing || req.method !== "GET") return deny(503);
     const protocols = String(req.headers["sec-websocket-protocol"] ?? "").split(",").map(value => value.trim());

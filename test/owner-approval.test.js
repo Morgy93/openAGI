@@ -251,3 +251,16 @@ test("a code stays retired for a day after its card ends, so a late 'yes 42' can
   const later = store.enqueue({ toolName: "fleet_click", args: { key: "b" }, context: { sessionId: "s" } });
   assert.equal(later.confirmCode, "42", "a day later the code is free again");
 });
+
+test("a voice turn always asks for the spoken code, even on a clean owner instruction", async (t) => {
+  const h = harness(t);
+  const outcome = await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, h.ownerContext("voice", "click allow on the prompt"));
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.result.status, "awaiting_owner_confirmation");
+  assert.match(outcome.result.say, /^Say 'yes \d{2,3}'/);
+  assert.equal(h.calls.length, 0);
+  const [card] = h.store.list({ status: "pending" });
+  assert.equal(card.mode, "chat");
+  assert.equal(card.context.sessionId, "devices:supervisor:main");
+  assert.equal(announced(h.emitted).length, 0, "a chat card is not pushed as an inbox approval");
+});

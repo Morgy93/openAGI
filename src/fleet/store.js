@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "../file-utils.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
+import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
@@ -21,6 +22,9 @@ const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
 const INFRA_BLOCKED_KEPT = 200;
+const FEEDBACK_KEPT = 500;
+const FIXES_KEPT = 100;
+const SELF_SESSIONS_KEPT = 50;
 // The owner closed these; the same ask stays quiet for a TTL.
 const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 // A review close is the model's guess, so it holds only this long; then the
@@ -62,7 +66,10 @@ function emptyState() {
     pushes: [],
     muted: {},
     appRestarts: {},
-    restartedAt: {}
+    restartedAt: {},
+    feedback: [],
+    fixes: [],
+    selfSessions: []
   };
 }
 
@@ -755,6 +762,85 @@ export class FleetStore {
     return new Set(Object.keys(this.state.muted).filter((key) => this.mutedUntil(key)));
   }
 
+  // ─── owner feedback and self-fix requests ───────────────────────────────
+
+  // Throws on bad input (the caller's words go back to the owner); a disk
+  // error is kept in lastWriteError like every other write.
+  recordFeedback(input) {
+    const record = normalizeFeedback(input, { now: this.now() });
+    this.state.feedback.push(record);
+    if (this.state.feedback.length > FEEDBACK_KEPT) this.state.feedback.splice(0, this.state.feedback.length - FEEDBACK_KEPT);
+    this._save();
+    return { ...record };
+  }
+
+  // Newest first.
+  feedback({ status = null, limit = 50 } = {}) {
+    return this.state.feedback.filter((record) => !status || record.status === status)
+      .slice(-Math.max(0, limit)).reverse().map((record) => structuredClone(record));
+  }
+
+  updateFeedback(id, patch) {
+    const record = this.state.feedback.find((item) => item.id === id);
+    if (!record) return null;
+    Object.assign(record, feedbackPatch(record, patch));
+    this._save();
+    return structuredClone(record);
+  }
+
+  // A request only: the runner that works it lands later. Feedback it cites
+  // moves to fix-queued.
+  queueFix(input) {
+    const fix = normalizeFixRequest(input, { now: this.now() });
+    this.state.fixes.push(fix);
+    if (this.state.fixes.length > FIXES_KEPT) this.state.fixes.splice(0, this.state.fixes.length - FIXES_KEPT);
+    for (const id of fix.evidence.feedbackIds) {
+      const record = this.state.feedback.find((item) => item.id === id);
+      if (record && ["new", "triaged"].includes(record.status)) Object.assign(record, { status: "fix-queued", fixId: fix.id });
+    }
+    this._save();
+    return structuredClone(fix);
+  }
+
+  fixes({ state = null } = {}) {
+    return this.state.fixes.filter((fix) => !state || fix.state === state).slice().reverse().map((fix) => structuredClone(fix));
+  }
+
+  fix(id) {
+    const fix = this.state.fixes.find((item) => item.id === id);
+    return fix ? structuredClone(fix) : null;
+  }
+
+  reviseFix(id, instructions) {
+    const fix = this.state.fixes.find((item) => item.id === id);
+    if (!fix) return null;
+    Object.assign(fix, fixRevision(fix, instructions, { now: this.now() }));
+    this._save();
+    return structuredClone(fix);
+  }
+
+  // "all" stops every fix not already stopped. Returns the fixes it stopped.
+  stopFix(id) {
+    const at = iso(this.now());
+    const stopped = this.state.fixes.filter((fix) => (id === "all" || fix.id === id) && fix.state !== "abandoned");
+    for (const fix of stopped) Object.assign(fix, { state: "abandoned", stoppedAt: at, updatedAt: at });
+    if (stopped.length) this._save();
+    return stopped.map((fix) => structuredClone(fix));
+  }
+
+  // Codex session ids of the supervisor's own fixers, so it never nudges them.
+  selfSessions() {
+    return this.state.selfSessions.map((session) => session.id);
+  }
+
+  addSelfSession(id, fixId = null) {
+    if (typeof id !== "string" || !id.trim() || this.state.selfSessions.some((session) => session.id === id)) return false;
+    this.state.selfSessions.push({ id: id.slice(0, 200), fixId: typeof fixId === "string" ? fixId.slice(0, 80) : null, at: iso(this.now()) });
+    if (this.state.selfSessions.length > SELF_SESSIONS_KEPT) this.state.selfSessions.splice(0, this.state.selfSessions.length - SELF_SESSIONS_KEPT);
+    this._save();
+    return true;
+  }
+
   // ─── internals ──────────────────────────────────────────────────────────
 
   _findQuestion(id) {
@@ -946,7 +1032,10 @@ export class FleetStore {
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
       muted: isObject(raw.muted) ? raw.muted : {},
       appRestarts: isObject(raw.appRestarts) ? raw.appRestarts : {},
-      restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {}
+      restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {},
+      feedback: Array.isArray(raw.feedback) ? raw.feedback.filter(isObject) : [],
+      fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
+      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
     };
   }
 

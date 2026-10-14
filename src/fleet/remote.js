@@ -13,7 +13,7 @@ export function createFleetCapability(supervisor) {
     // inside it.
     async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
       const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
@@ -116,6 +116,13 @@ export class RemoteFleetSupervisor {
     const body = await this.request('POST', '/fleet/api/click', { threadKey, label, ...(stateId ? { stateId } : {}) });
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
   }
+  // Feedback and self-fix requests live with the fleet, on the computer.
+  async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
+  async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async queueFix(input) { return (await this.request('POST', '/fleet/api/fixes', input)).fix; }
+  async fixes() { return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
+  async reviseFix(id, instructions) { return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }
+  async stopFix(id) { return (await this.request('POST', `/fleet/api/fixes/${id}/stop`)).stopped ?? []; }
   async runningInApp(app) {
     return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;
   }

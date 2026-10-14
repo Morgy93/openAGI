@@ -49,3 +49,15 @@ test("priceFor bills nano/mini variants at their own rate, not flagship (longest
   // an unknown future variant matches the longest sensible prefix, not bare gpt-5
   assert.equal(g.priceFor("gpt-5.4-nano-2027").in, 0.2);
 });
+
+test("recordUsd writes a caller-priced voice row that counts toward the day and the channel", () => {
+  const { guard, ledger } = tmp();
+  guard.recordUsd(0.0177, "gpt-realtime-2.1", { channel: "voice", sessionId: "devices:supervisor:main", tokens: { input: 398, output: 86 } });
+  guard.record({ input_tokens: 1000, output_tokens: 500 }, "claude-haiku-4-5", { channel: "autopilot" });
+  const [row] = ledger.query({ days: 1 }).filter((entry) => entry.channel === "voice");
+  assert.equal(row.usd, 0.0177);
+  assert.equal(row.tokens.input, 398);
+  assert.equal(Number(guard.channelUsdToday("voice").toFixed(4)), 0.0177);
+  assert.equal(guard.status().calls, 2);
+  assert.ok(guard.status().spentUsd >= 0.0177);
+});

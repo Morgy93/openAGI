@@ -123,6 +123,40 @@ export class BudgetGuard {
     return { added: usd, today: day.usd, limit: this.dailyUsdLimit };
   }
 
+  // A call priced by its caller (realtime voice bills audio tokens, which the
+  // table above has no column for). Counts toward the day like any call and
+  // writes a ledger row with its channel.
+  recordUsd(usd, model, meta = {}) {
+    const added = Number.isFinite(Number(usd)) ? Math.max(0, Number(usd)) : 0;
+    const today = this.todayKey();
+    if (!this.state.days[today]) this.state.days[today] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
+    const day = this.state.days[today];
+    const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...(meta.tokens ?? {}) };
+    day.input += tokens.input;
+    day.output += tokens.output;
+    day.cacheRead += tokens.cacheRead;
+    day.usd += added;
+    day.calls += 1;
+    try {
+      this.ledger?.record({
+        at: nowIso(), model, tokens, usd: added,
+        channel: meta.channel ?? null, agentId: meta.agentId ?? null, sessionId: meta.sessionId ?? null,
+        from: meta.from ?? null, tools: Array.isArray(meta.tools) ? meta.tools : []
+      });
+    } catch { /* ledger is best-effort */ }
+    this.persist();
+    return { added, today: day.usd, limit: this.dailyUsdLimit };
+  }
+
+  // USD one channel spent today (UTC day, as todayKey), from the ledger.
+  channelUsdToday(channel) {
+    try {
+      return (this.ledger?.query({ days: 1 }) ?? []).filter((row) => row.channel === channel).reduce((sum, row) => sum + Number(row.usd ?? 0), 0);
+    } catch {
+      return 0;
+    }
+  }
+
   // Estimated USD for one call's usage, without recording it. Providers use
   // this to total a single agent turn across its tool hops.
   costOf(usage, model) {

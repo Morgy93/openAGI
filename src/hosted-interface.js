@@ -3,6 +3,8 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
+import { attachVoiceRelay } from "./voice/relay.js";
+import { createVoiceSessionFactory } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { g2ConnectPage } from "./g2-connect-page.js";
@@ -3442,7 +3444,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   });
 
-  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2 });
+  // WSS /nodes/voice (off unless OPENAGI_VOICE=1): owner, phone and G2 voice
+  // into one Realtime session per device; the OpenAI key stays here.
+  const voiceSessions = options.voiceSessionFactory ?? createVoiceSessionFactory({ runtime });
+  const voiceRelay = attachVoiceRelay({ nodeRegistry, getAuthToken, createSession: (params, io) => voiceSessions.create(params, io) });
+  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2, upgrades: [voiceRelay] });
   const app = {
     runtime,
     channels,
@@ -3546,6 +3552,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       g2Proactive.close();
       return new Promise((resolve, reject) => {
         speechRelay.close();
+        voiceRelay.close();
         approvalContinuationsClosing = true;
         for (const timer of approvalContinuationTimers) clearTimeout(timer);
         approvalContinuationTimers.clear();
