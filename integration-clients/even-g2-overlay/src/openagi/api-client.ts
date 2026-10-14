@@ -104,6 +104,12 @@ export class OpenAGIApiClient {
     url.searchParams.set('model', model); url.searchParams.set('wakePhrase', wakePhrase.slice(0, 40))
     return { url: url.href, token: credential.nodeToken }
   }
+  voiceRelay(): { url: string; token: string } {
+    const credential = this.requireCredential()
+    const url = new URL('/nodes/voice', this.validatedOrigin()); url.protocol = 'wss:'
+    url.searchParams.set('rate', '16000'); url.searchParams.set('mode', 'ptt')
+    return { url: url.href, token: credential.nodeToken }
+  }
   private validatedOrigin(): string {
     const origin = new URL(this.getOrigin()).origin
     if (this.config.allowedOrigins.length > 0 && !this.config.allowedOrigins.includes(origin)) throw new OpenAGIApiError('origin_not_allowed', 400, 'This agent URL is not allowed by the installed G2 package.')

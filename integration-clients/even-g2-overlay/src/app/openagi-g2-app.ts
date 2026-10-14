@@ -12,6 +12,7 @@ import type { OpenAGIGlassesRenderer, LifelogHomeState } from '../ui/openagi-gla
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
 import { G2ProactiveClient, type InboxItem, type MainConsent } from '../openagi/proactive'
 import type { SharedThreadMessage } from '../openagi/experience-client'
+import { G2VoiceSession, supervisorVoiceFocus, type VoiceCallbacks } from '../openagi/voice-session'
 
 type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 interface RecentEntry { question: string; reply: string; local?: number }
@@ -115,6 +116,7 @@ export class OpenAGIG2App {
   // A Supervisor-home press-and-hold is talking; its release sends.
   private pushToTalk = false
   private releasePending = false
+  private supervisorVoice: G2VoiceSession | null = null
   private recentEntries: RecentEntry[] = []
   private recentRequest = 0
   // The phone screen never gates the glasses. While it is locked, a long
@@ -161,6 +163,7 @@ export class OpenAGIG2App {
     // A hold cut short by leaving the glasses sends nothing, and the next
     // recording follows the review setting again.
     this.cancelHold()
+    this.supervisorVoice?.close()
     this.memoryRequest++; this.lifelogRequest++; this.voiceTarget = null
     clearTimeout(this.lifelogKickTimer); clearTimeout(this.lifelogRetryTimer)
     this.audioBuffer = null
@@ -208,6 +211,7 @@ export class OpenAGIG2App {
     private readonly phone: OpenAGIPhoneCompanion,
     private readonly allowedOrigins: string[],
     private readonly speechFactory: (callbacks: SpeechCallbacks) => LiveSpeech = callbacks => new LiveSpeech(callbacks),
+    private readonly voiceFactory: (callbacks: VoiceCallbacks) => G2VoiceSession = callbacks => new G2VoiceSession(audio, callbacks),
   ) {
     this.proactive = new G2ProactiveClient(api, {
       proactiveSettings: settings => {
@@ -320,6 +324,7 @@ export class OpenAGIG2App {
       this.phone.homeMode?.(previous); this.phone.set('Mode unchanged', 'Finish or discard the current question, then switch modes.'); return
     }
     await this.store.update({ homeMode: mode }); this.phone.homeMode?.(mode)
+    if (previous === 'supervisor') { this.supervisorVoice?.close(); this.voiceTarget = null }
     if (previous === 'lifelog') await this.revokeLifelog('Lifelog off: you switched modes. Microphone off and consent withdrawn on main. Choosing Lifelog again restarts it.')
     this.lifelogUserPaused = false; this.lifelogFailures = 0
     this.setLifelog(mode === 'lifelog' ? 'starting' : 'off')
@@ -520,6 +525,7 @@ export class OpenAGIG2App {
   tap(): void {
     if (this.exited || this.exitDialogOpening) return
     if (this.displaySleeping) { this.toggleDisplay(); return }
+    if (this.homeMode === 'supervisor' && this.supervisorVoice && ['connecting', 'listening'].includes(this.supervisorVoice.state)) { this.supervisorVoice.release(); return }
     // A second tap to stop talking is never treated as a bounce.
     if (this.mode !== 'listening' && Date.now() - this.lastTapAt < 400) return
     if (this.navigationBusy) { this.flash('One moment', 'Finishing the last action…'); return }
@@ -529,7 +535,7 @@ export class OpenAGIG2App {
       this.flash('Microphone opening', 'Wait for Listening, then tap to stop.'); return
     }
     this.lastTapAt = Date.now()
-    // A tap is never push-to-talk: its recording follows the review setting.
+    // Talk and Lifelog recordings follow the review setting.
     if (!this.askStarting && !this.microphoneOpening && this.mode !== 'listening') this.cancelHold()
     this.clearNotice()
     if (this.requestController) {
@@ -542,7 +548,7 @@ export class OpenAGIG2App {
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
-    else if (this.mode === 'home' && this.homeMode === 'supervisor') this.openInbox(undefined, true)
+    else if (this.homeMode === 'supervisor' && this.supervisorVoice && ['waiting', 'replying'].includes(this.supervisorVoice.state)) void this.startAsk()
     else if (['home', 'ambient', 'answer', 'status', 'reconnecting'].includes(this.mode)) void this.startAsk()
     else if (this.mode === 'listening') void this.finishAsk()
     else if (this.mode === 'recent') void this.openRecentEntry(this.recentIndex).catch(error => this.fail(error))
@@ -551,10 +557,10 @@ export class OpenAGIG2App {
     else if (this.mode === 'pairing') this.flash('Pairing', 'Finish pairing on the phone.')
     else this.flash('Working', 'One moment…')
   }
-  // Supervisor home: press and hold to talk to the supervisor, let go to
+  // Supervisor: press and hold to talk to the supervisor, let go to
   // send (no review step). Anywhere else a hold stays a plain tap.
   holdStart(): boolean {
-    if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || this.mode !== 'home') return false
+    if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || !['home', 'status', 'answer', 'thinking', 'inbox', 'inbox-detail', 'inbox-action'].includes(this.mode)) return false
     if (this.navigationBusy || this.microphoneOpening || this.askStarting || this.requestController) return false
     this.pushToTalk = true; this.releasePending = false; this.lastTapAt = Date.now(); this.clearNotice()
     void this.startAsk().then(() => { if (this.releasePending) { this.releasePending = false; void this.releaseToSend() } })
@@ -563,6 +569,7 @@ export class OpenAGIG2App {
   cancelHold(): void { this.pushToTalk = false; this.releasePending = false }
   holdRelease(): void {
     if (!this.pushToTalk) return
+    if (this.supervisorVoice) { this.supervisorVoice.release(); this.cancelHold(); return }
     // Let go before the microphone opened: send once it has.
     if (this.askStarting || this.microphoneOpening) { this.releasePending = true; return }
     void this.releaseToSend()
@@ -600,7 +607,7 @@ export class OpenAGIG2App {
     else if (this.mode === 'status') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.renderer.fleetStatus(this.pages[this.page] ?? '', this.page, this.pages.length) }
     else if (this.mode === 'home' || this.mode === 'ambient') {
       // Swipe up: Inbox. Swipe down: Recent (Talk), controls (Lifelog) or thread status (Supervisor).
-      if (direction < 0) this.openInbox()
+      if (direction < 0) this.openInbox(undefined, this.homeMode === 'supervisor')
       else if (this.homeMode === 'supervisor') void this.showFleetStatus()
       else if (this.homeMode === 'lifelog') this.openLifelogControls()
       else void this.openRecent()
@@ -680,6 +687,7 @@ export class OpenAGIG2App {
     if (this.exited || this.mode === 'pairing') return
     if (this.navigationBusy || this.microphoneOpening) { this.flash('Microphone opening', 'Double-tap again once Listening shows.'); return }
     this.lastTapAt = Date.now()
+    this.supervisorVoice?.close(); this.cancelHold()
     this.clearNotice(); this.voiceTarget = null
     if (this.requestController) {
       this.cancelConfirmation = !this.cancelConfirmation
@@ -739,6 +747,7 @@ export class OpenAGIG2App {
     // Local only: consent stays on main for the next time Agents opens.
     this.proactive.stop()
     this.exited = true
+    this.supervisorVoice?.close()
     this.stopLiveSpeech()
     // Closing the observer is not cancellation of main-owned accepted work.
     this.requestController?.abort()
@@ -798,6 +807,7 @@ export class OpenAGIG2App {
     if (this.mode === 'review') { this.phone.set('Question not sent', 'Send or discard the transcript before disconnecting.'); return }
     if (this.mode === 'thinking' || this.mode === 'listening' || this.ambientProcessing) { this.phone.set('Question in progress', 'Wait for the current question before disconnecting.'); return }
     this.memoryRequest++; clearTimeout(this.lifelogRetryTimer)
+    this.supervisorVoice?.close()
     await this.stopAmbient()
     if (this.audio.active) await this.audio.stop().catch(() => undefined)
     if (this.store.snapshot().connectionMode === 'enrollment') {
@@ -843,6 +853,7 @@ export class OpenAGIG2App {
       return
     }
     // Switching agents is an explicit choice: withdraw the old main's grant.
+    this.supervisorVoice?.close()
     this.memoryRequest++
     if (this.proactive.memoryActive) this.proactive.revokeMemory()
     this.proactive.stop()
@@ -864,6 +875,39 @@ export class OpenAGIG2App {
     try { await this.beginAsk() } finally { this.askStarting = false }
     if (['message'].includes(this.mode)) await this.resumeListening()
   }
+  private startSupervisorVoice(): void {
+    if (!this.store.snapshot().nodeToken) return
+    this.clearNotice()
+    this.renderer.autoSend?.(true)
+    if (this.mode.startsWith('inbox')) {
+      const selected = this.mode === 'inbox-action' || this.mode === 'inbox-confirm' ? this.actionTarget : this.inboxItems[this.inboxIndex]
+      this.voiceTarget = selected?.id ? { ...selected } : null
+    }
+    if (!this.supervisorVoice) this.supervisorVoice = this.voiceFactory({
+      state: state => {
+        if (this.exited || !this.foregroundActive) return
+        if (state === 'idle' && ['thinking', 'listening'].includes(this.mode)) this.showHome()
+        if (state === 'connecting') { this.mode = 'thinking'; this.renderer.progress?.('Connecting voice', 'Please wait') }
+        else if (state === 'listening') { this.mode = 'listening'; this.renderer.listening(); this.phone.set('Supervisor · listening', 'Tap again or release your hold to send. Maximum 30 seconds.') }
+        else if (state === 'waiting') { this.mode = 'thinking'; this.renderer.thinking(); this.phone.set('Supervisor · thinking', 'Tap to interrupt and talk again.') }
+      },
+      reply: (text, final) => {
+        if (this.exited || !this.foregroundActive || this.homeMode !== 'supervisor') return
+        this.pages = paginateText(plainAnswer(text), 260)
+        this.page = Math.min(this.page, Math.max(0, this.pages.length - 1)); this.showAnswer(this.page)
+        this.phone.preview?.(plainAnswer(text)); this.phone.set(final ? 'Supervisor replied' : 'Supervisor replying', 'Tap to talk again. Swipe to read the cards.')
+      },
+      transcript: text => this.phone.transcript?.(text),
+      notice: text => { this.mode = 'message'; this.renderer.message('Supervisor voice', text); this.phone.set('Supervisor voice', text) },
+      error: error => { if (!this.exited && this.foregroundActive) { this.cancelHold(); this.mode = 'message'; this.renderer.message('Supervisor voice unavailable', error.message); this.phone.set('Supervisor voice unavailable', error.message) } },
+    })
+    try {
+      const relay = this.api.voiceRelay()
+      this.page = 0
+      this.supervisorVoice.press(relay, supervisorVoiceFocus(this.voiceTarget))
+      if (this.releasePending) { this.releasePending = false; this.supervisorVoice.release() }
+    } catch (error) { this.cancelHold(); this.fail(error) }
+  }
   private async beginAsk(): Promise<void> {
     // A lifelog microphone that is opening finishes first, then hands over.
     if (this.lifelogStart) await this.lifelogStart.catch(() => undefined)
@@ -874,6 +918,11 @@ export class OpenAGIG2App {
     if (this.navigationBusy || this.microphoneOpening || this.requestController) { this.flash('Busy', 'Finish the current question first.'); return }
     if (!this.foregroundActive) { this.phone.set('Agents is in the background', 'Open Agents on the glasses, then tap to talk.'); return }
     if (this.mode === 'review') { await this.sendDraft(); return }
+    if (this.homeMode === 'supervisor') {
+      if (this.mode === 'listening') this.supervisorVoice?.release()
+      else this.startSupervisorVoice()
+      return
+    }
     if (this.mode === 'listening') { await this.finishAsk(); return }
     if (this.recoveringSpeech) { this.cancelSpeechRecovery(); this.memoryRequest++ }
     this.clearNotice()
@@ -911,6 +960,7 @@ export class OpenAGIG2App {
     finally { this.microphoneOpening = false }
   }
   async finishAsk(): Promise<void> {
+    if (this.homeMode === 'supervisor' && this.supervisorVoice) { this.supervisorVoice.release(); return }
     // Decided when the recording stops, so a release mid-finish cannot change it.
     const sendNow = this.sendsOnFinish()
     if (!this.microphoneOpening && this.mode === 'listening' && this.liveSpeech) {
@@ -1098,6 +1148,7 @@ export class OpenAGIG2App {
   private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
   private renderHome(items = this.proactive.items): void {
     const state = this.store.snapshot()
+    this.renderer.autoSend?.(state.homeMode === 'supervisor' || state.autoSend)
     if (state.homeMode === 'supervisor') this.renderer.supervisorHome(items.filter(i => i.supervisor).length)
     else if (state.homeMode === 'lifelog') this.renderer.lifelogHome?.(this.lifelogState === 'off' ? 'starting' : this.lifelogState, this.lifelogDetail)
     else this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined))
@@ -1114,7 +1165,7 @@ export class OpenAGIG2App {
       return
     }
     this.mode = 'home'; this.renderHome()
-    if (state.homeMode === 'supervisor') this.phone.set('Supervisor', 'Tap on the glasses for the supervisor’s questions, or thread status when there are none. Press and hold to talk to the supervisor; let go to send. Swipe down: thread status.')
+    if (state.homeMode === 'supervisor') this.phone.set('Supervisor', 'Tap to talk, tap again to send. Hold to talk and let go to send. Tap during a reply to interrupt. Swipe up: questions. Swipe down: thread status.')
     else if (state.homeMode === 'lifelog') this.phone.set(this.lifelogState === 'consent' ? 'Lifelog needs consent' : this.lifelogState === 'paused' ? 'Lifelog paused' : 'Lifelog', this.lifelogState === 'consent' ? CONSENT_NEEDED : this.lifelogDetail || 'Tap the glasses to talk to the agent. Swipe down for lifelog controls.')
     else this.phone.set('Talk', 'Tap the glasses to talk to the agent; tap again to send. Swipe down: recent. Swipe up: inbox. Double-tap at home: exit.')
   }

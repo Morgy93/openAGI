@@ -7,6 +7,17 @@ function jsonResponse(value: unknown, status = 200): Response {
 
 describe('OpenAGIApiClient', () => {
   const config = { origin: 'https://openagi.example.com', allowedOrigins: ['https://openagi.example.com'] }
+  it('pins voice to the selected HTTPS main with 16k PTT and the scoped G2 token outside the URL', () => {
+    const token = 'g'.repeat(43)
+    const api = new OpenAGIApiClient(config, () => ({ nodeToken: token }))
+    expect(api.voiceRelay()).toEqual({ url: 'wss://openagi.example.com/nodes/voice?rate=16000&mode=ptt', token })
+    expect(api.voiceRelay().url).not.toContain(token)
+    const blocked = new OpenAGIApiClient(config, () => ({ nodeToken: token }), globalThis.fetch, () => 'https://other.example.com')
+    expect(() => blocked.voiceRelay()).toThrow('not allowed')
+    const insecure = new OpenAGIApiClient({ ...config, allowedOrigins: [] }, () => ({ nodeToken: token }), globalThis.fetch, () => 'http://main.example.com')
+    expect(() => insecure.voiceRelay()).toThrow('HTTPS')
+    expect(() => new OpenAGIApiClient(config, () => null).voiceRelay()).toThrow()
+  })
   it('pins the speech relay to the selected HTTPS main and keeps the token out of its URL', () => {
     const api = new OpenAGIApiClient(config, () => ({ nodeToken: 't'.repeat(43) }))
     const relay = api.speechRelay('nova-3', 'Peri')

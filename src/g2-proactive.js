@@ -318,7 +318,7 @@ export class G2Proactive {
         const options = fleet ? (Array.isArray(i.actions) ? i.actions : []).filter(a => typeof a === "string" && a && a !== "dismiss").map(a => clean(a, 40)).slice(0, 4) : [];
         if (selected.has(category) || (fleet && n.settings.supervisorOnly)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
           important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: fleet && options.length ? "answer-fleet" : "review-on-main",
-          ...(fleet ? { supervisor: true, options } : {}),
+          ...(fleet ? { supervisor: true, options, questionId: i.sourceRef.id } : {}),
           ...(coding ? { codingTarget: { provider: i.sourceRef.provider, sessionId: i.sourceRef.sessionId } } : {}) });
       }
       if (selected.has("tasks") && !n.settings.supervisorOnly) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {

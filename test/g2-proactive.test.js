@@ -284,6 +284,7 @@ test("supervisor questions carry their choices and Supervisor mode keeps only th
   assert.deepEqual(fleet.options, ["merged", "later"]);
   assert.equal(fleet.action, "answer-fleet");
   assert.equal(fleet.supervisor, true);
+  assert.equal(fleet.questionId, "fq_1");
   assert.ok(all.some(i => i.id === "o-mail") && all.some(i => i.id.startsWith("due:")));
   // Supervisor mode: only supervisor items, even with approvals deselected.
   call({ op: "configure", settings: { supervisorOnly: true, categories: ["email"] } });
