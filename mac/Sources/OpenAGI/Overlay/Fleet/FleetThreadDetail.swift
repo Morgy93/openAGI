@@ -224,10 +224,10 @@ struct FleetThreadSummary: Equatable {
   static let excerptMax = 600
 
   init(thread: FleetThread?, detail: FleetThreadDetail?, now: Date = Date()) {
-    let text = (detail?.lastAgentText ?? thread?.lastAgentText)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    // Only the detail's words: the state's row text is not redacted.
+    let text = detail?.lastAgentText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     excerpt = text.isEmpty ? nil : Self.tail(text, Self.excerptMax)
-    let agentAt = detail?.lastAgentAt ?? thread?.lastAgentAt
-    excerptAge = agentAt.flatMap(FleetWatching.parseDate).map { Self.ago($0, now: now) }
+    excerptAge = excerpt == nil ? nil : (detail?.lastAgentAt ?? thread?.lastAgentAt).flatMap(FleetWatching.parseDate).map { Self.ago($0, now: now) }
 
     let row = thread ?? detail.map { FleetThread(key: $0.key, prRef: $0.pr?.ref, prURL: $0.pr?.url, watch: $0.watch) }
     let pr = thread?.pr ?? detail?.pr

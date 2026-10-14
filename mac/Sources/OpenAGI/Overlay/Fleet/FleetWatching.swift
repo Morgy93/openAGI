@@ -79,8 +79,8 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let watch: FleetWatch?
   /// The scan's PR read: state, title, CI, unresolved review threads.
   let pr: FleetPR?
-  /// The tail of the agent's last message as the scan read it (the
-  /// thread's detail has a longer, redacted one).
+  /// The tail of the agent's last message as the scan read it. Not
+  /// redacted: the opened row shows the detail's redacted one instead.
   let lastAgentText: String?
   let lastOwnerAt: String?
   /// When the owner's Mute ends; nil: not muted.

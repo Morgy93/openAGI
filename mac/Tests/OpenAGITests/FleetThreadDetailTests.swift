@@ -102,7 +102,7 @@ final class FleetThreadDetailTests: XCTestCase {
     XCTAssertEqual(row.prRef, "o/r#12")
 
     let summary = FleetThreadSummary(thread: row, detail: nil, now: now)
-    XCTAssertEqual(summary.excerpt, "Done downloading.")
+    XCTAssertNil(summary.excerpt, "the row's unredacted text is never shown")
     XCTAssertEqual(summary.prLine, "r#12 · open · CI failing: lint · 2 unresolved")
     XCTAssertEqual(summary.prLink?.absoluteString, "https://github.com/o/r/pull/12")
     XCTAssertEqual(summary.waitLine, "Stopped for 1h; the supervisor pushes it")
