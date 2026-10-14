@@ -182,15 +182,6 @@ final class OverlayDragTests: XCTestCase {
     XCTAssertFalse(OverlayState.shared.expanded)
   }
 
-  func testClampedFrameShrinksOntoShorterDisplayKeepingTop() {
-    // A tall expanded panel dropped on a short secondary display at negative x.
-    let visible = NSRect(x: -1280, y: 30, width: 1280, height: 690)
-    let fitted = OverlayController.clampedFrame(NSRect(x: -100, y: -100, width: 320, height: 1100), in: visible)
-    XCTAssertEqual(fitted, NSRect(x: -332, y: 42, width: 320, height: 666))
-    let inside = NSRect(x: -900, y: 200, width: 44, height: 44)
-    XCTAssertEqual(OverlayController.clampedFrame(inside, in: visible), inside)
-  }
-
   /// Spots where the old frame-derived collapse moved the dot: the bottom
   /// edge (expanded panel clamped upward), just either side of the screen's
   /// center (expanded panel's midX lands on the other half), and corners.
@@ -342,15 +333,6 @@ final class OverlayDragTests: XCTestCase {
 
   /// A dot parked in the menu-bar or Dock strip belongs to the display it is
   /// on, not whichever display is main.
-  func testDotInMenuBarStripStaysOnItsDisplay() throws {
-    let screen = try XCTUnwrap(NSScreen.main)
-    let strip = NSRect(x: screen.frame.midX, y: screen.frame.maxY - 10, width: 44, height: 44)
-      .intersection(screen.frame)
-    XCTAssertFalse(screen.visibleFrame.contains(strip))
-    XCTAssertTrue(OverlayController.screen(containing: strip) === screen)
-    XCTAssertNil(OverlayController.screen(containing: NSRect(x: -50_000, y: -50_000, width: 44, height: 44)))
-  }
-
   func testContentResizeWaitsForDrop() throws {
     let (c, panel) = try showPill()
     c.beginDrag()
@@ -467,4 +449,27 @@ final class OverlayDragTests: XCTestCase {
 
 private extension NSPoint {
   func offset(_ dx: CGFloat, _ dy: CGFloat) -> NSPoint { NSPoint(x: x + dx, y: y + dy) }
+}
+
+/// Quick Ask frame math with no panel on screen: these run on every
+/// swift test, unlike the on-screen drag tests above.
+@MainActor
+final class OverlayGeometryTests: XCTestCase {
+  func testClampedFrameShrinksOntoShorterDisplayKeepingTop() {
+    // A tall expanded panel dropped on a short secondary display at negative x.
+    let visible = NSRect(x: -1280, y: 30, width: 1280, height: 690)
+    let fitted = OverlayController.clampedFrame(NSRect(x: -100, y: -100, width: 320, height: 1100), in: visible)
+    XCTAssertEqual(fitted, NSRect(x: -332, y: 42, width: 320, height: 666))
+    let inside = NSRect(x: -900, y: 200, width: 44, height: 44)
+    XCTAssertEqual(OverlayController.clampedFrame(inside, in: visible), inside)
+  }
+
+  func testDotInMenuBarStripStaysOnItsDisplay() throws {
+    let screen = try XCTUnwrap(NSScreen.main)
+    let strip = NSRect(x: screen.frame.midX, y: screen.frame.maxY - 10, width: 44, height: 44)
+      .intersection(screen.frame)
+    XCTAssertFalse(screen.visibleFrame.contains(strip))
+    XCTAssertTrue(OverlayController.screen(containing: strip) === screen)
+    XCTAssertNil(OverlayController.screen(containing: NSRect(x: -50_000, y: -50_000, width: 44, height: 44)))
+  }
 }
