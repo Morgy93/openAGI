@@ -6,9 +6,13 @@
 // duplicates and cross-thread supersession. The model only ever returns
 // verdicts; the supervisor applies them to its own records, never to a thread.
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { DEFAULTS, DEFAULT_REVIEW_MODEL, DEFAULT_REVIEW_TIMEOUT_MS, SUPERVISOR_PREFIX, clampTail, clampText, parsePrRef, redactSecrets, runCommand, shortHash } from "./contracts.js";
+import { DEFAULTS, DEFAULT_REVIEW_CODEX_MODEL, DEFAULT_REVIEW_CODEX_TIMEOUT_MS, DEFAULT_REVIEW_MODEL, DEFAULT_REVIEW_TIMEOUT_MS, SUPERVISOR_PREFIX, clampTail, clampText, parsePrRef, redactSecrets, runCommand, shortHash } from "./contracts.js";
 import { fleetChildEnv, summariseRelayFailure } from "./executor.js";
+import { createLockedCodexExec, judgeCodexConfig } from "./judge.js";
 import { ownerLabel } from "./policy.js";
 
 export const REVIEW_CATEGORIES = Object.freeze(["live", "stale", "junk", "duplicate", "done-elsewhere"]);
@@ -56,6 +60,25 @@ export const REVIEW_SCHEMA = Object.freeze({
   },
   required: ["reviews"],
   additionalProperties: false
+});
+
+// The same contract for codex --output-schema, whose strict mode wants every
+// property required: the optional ones may be null instead, and a null is
+// dropped again before the verdicts are read (codexReviews).
+const REVIEW_OPTIONAL = new Set(["title", "options", "duplicateOf"]);
+export const REVIEW_SCHEMA_CODEX = Object.freeze({
+  ...REVIEW_SCHEMA,
+  properties: {
+    reviews: {
+      ...REVIEW_SCHEMA.properties.reviews,
+      items: {
+        ...REVIEW_SCHEMA.properties.reviews.items,
+        properties: Object.fromEntries(Object.entries(REVIEW_SCHEMA.properties.reviews.items.properties)
+          .map(([name, spec]) => [name, REVIEW_OPTIONAL.has(name) ? { ...spec, type: [spec.type, "null"] } : spec])),
+        required: Object.keys(REVIEW_SCHEMA.properties.reviews.items.properties)
+      }
+    }
+  }
 });
 
 export const REVIEW_SYSTEM_PROMPT = [
@@ -438,16 +461,15 @@ function parseResult(stdout) {
 // the result's structured_output). --safe-mode skips the owner's hooks,
 // CLAUDE.md, skills and MCP servers, so a Stop hook never pushes the phone;
 // --no-session-persistence keeps the run out of the fleet's own scan.
-export function createReviewRunner({ config, run = runCommand, env = process.env } = {}) {
-  const review = config?.review ?? {};
+function createClaudeReview({ config, run, env, model }) {
   const cwd = config?.paths?.relayCwd ?? null;
-  const timeoutMs = review.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
-  return async function runModel({ system, prompt, schema }) {
+  const timeoutMs = config?.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+  return async function runClaude({ system, prompt, schema }) {
     try { if (cwd) ensureDir(cwd); } catch { /* the run surfaces a real failure */ }
     const args = [
       "-p",
       "--safe-mode",
-      "--model", review.model ?? DEFAULT_REVIEW_MODEL,
+      "--model", model,
       "--output-format", "json",
       "--json-schema", JSON.stringify(schema),
       "--tools", "",
@@ -476,4 +498,70 @@ export function createReviewRunner({ config, run = runCommand, env = process.env
     if (!isObject(parsed.structured_output)) throw new Error("review returned no structured output");
     return parsed.structured_output;
   };
+}
+
+// Which model runs the review. config.review.provider "codex" or "claude"
+// pins it; unset, a Claude model name means claude, else codex when the
+// owner's Codex config names a model provider (codex-lb), else claude.
+export function reviewProvider(config, read = fs.readFileSync) {
+  const review = config?.review ?? {};
+  if (review.provider === "codex" || review.provider === "claude") return review.provider;
+  if (/^claude/i.test(String(review.model ?? ""))) return "claude";
+  let toml = "";
+  try { toml = read(path.join(config?.paths?.codexHome ?? path.join(os.homedir(), ".codex"), "config.toml"), "utf8"); } catch { /* no Codex here */ }
+  return judgeCodexConfig(toml) ? "codex" : "claude";
+}
+
+// codex output back to the review's own contract: a null optional field is
+// left out, as Claude leaves it out.
+function codexReviews(output) {
+  if (!isObject(output) || !Array.isArray(output.reviews)) throw new Error("returned no verdicts");
+  return {
+    reviews: output.reviews.map((raw) => (isObject(raw)
+      ? Object.fromEntries(Object.entries(raw).filter(([name, value]) => !(REVIEW_OPTIONAL.has(name) && value === null)))
+      : raw))
+  };
+}
+
+// runModel for reviewQuestions. On codex it runs tool-free through codex-lb
+// (createLockedCodexExec, as the nudge judge does; the system prompt leads
+// the prompt, which goes over stdin), and on Claude when that call fails for
+// any reason, the tool lockdown included. runModel.lastRun says which ran:
+// { provider, model, fallbackReason }. runModel.provider and .model are what
+// it tries first; .fallbackModel the Claude model behind codex.
+export function createReviewRunner({ config, run = runCommand, env = process.env, now = Date.now, read = fs.readFileSync } = {}) {
+  const review = config?.review ?? {};
+  const provider = reviewProvider(config, read);
+  const claudeModel = (provider === "claude" ? review.model : review.fallbackModel) ?? DEFAULT_REVIEW_MODEL;
+  const codexModel = provider === "codex" ? (review.model ?? DEFAULT_REVIEW_CODEX_MODEL) : null;
+  const runClaude = createClaudeReview({ config, run, env, model: claudeModel });
+  const codex = codexModel ? createLockedCodexExec({ config, run, env, now, tempPrefix: "openagi-review-" }) : null;
+  const codexTimeoutMs = review.codexTimeoutMs ?? DEFAULT_REVIEW_CODEX_TIMEOUT_MS;
+
+  async function runModel({ system, prompt, schema }) {
+    let fallbackReason = null;
+    if (codex) {
+      try {
+        const output = codexReviews(await codex({ prompt: `${system}\n\n${prompt}`, schema: REVIEW_SCHEMA_CODEX, model: codexModel, timeoutMs: codexTimeoutMs, stdin: true }));
+        runModel.lastRun = { provider: "codex", model: codexModel, fallbackReason: null };
+        return output;
+      } catch (error) {
+        fallbackReason = text(`codex: ${error?.message ?? String(error)}`, 160);
+      }
+    }
+    try {
+      const output = await runClaude({ system, prompt, schema });
+      runModel.lastRun = { provider: "claude", model: claudeModel, fallbackReason };
+      return output;
+    } catch (error) {
+      runModel.lastRun = null;
+      if (!fallbackReason) throw error;
+      throw new Error(`${fallbackReason}; claude fallback: ${error?.message ?? String(error)}`);
+    }
+  }
+  runModel.provider = provider;
+  runModel.model = codexModel ?? claudeModel;
+  runModel.fallbackModel = codexModel ? claudeModel : null;
+  runModel.lastRun = null;
+  return runModel;
 }
