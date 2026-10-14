@@ -198,12 +198,7 @@ fun SupervisorScreen(
         onDispose { voiceLifecycle.lifecycle.removeObserver(observer); voice.close() }
     }
     LaunchedEffect(openThread, voiceQuestion, voiceAction) {
-        voice.setFocus(VoiceFocus(
-            threadKey = voiceQuestion?.threadKey ?: voiceAction?.threadKey ?: openThread?.key,
-            actionId = voiceAction?.id,
-            questionId = voiceQuestion?.id,
-            prRef = voiceQuestion?.prRef ?: openThread?.pr?.ref,
-        ))
+        voice.setFocus(VoiceFocus.supervisor(voiceQuestion, voiceAction, openThread))
     }
     var chatOpen by chatOpenState
     // The clock the Watching durations read; ticks while the list is visible.

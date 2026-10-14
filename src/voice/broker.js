@@ -307,6 +307,15 @@ export class VoiceSession {
     return true;
   }
 
+  // A cancelled hold discards only the uncommitted turn.
+  cancel() {
+    if (this.closed || this.handsFree) return;
+    this.appendedBytes = 0;
+    this.audioBytes = 0;
+    this.spend.release(this.audioReservation);
+    this.sendInput({ type: "input_audio_buffer.clear" });
+  }
+
   // Push-to-talk release: the owner's turn ends here.
   commit() {
     if (this.closed || this.handsFree) return;

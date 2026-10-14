@@ -1,5 +1,7 @@
 package sh.openagi.mobile.voice
 
+import sh.openagi.mobile.protocol.FleetQuestion
+import sh.openagi.mobile.protocol.FleetQuestionChat
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
@@ -39,7 +41,7 @@ class VoiceStateMachineTest {
         val state = VoiceStateMachine()
         state.start(false, true)
         state.ready()
-        assertEquals(listOf(VoiceEffect.STOP_CAPTURE), state.release(false))
+        assertEquals(listOf(VoiceEffect.STOP_CAPTURE, VoiceEffect.CANCEL), state.release(false))
     }
     @Test fun handsFreeCapturesUntilDisabledWithoutCommit() {
         val state = VoiceStateMachine()
@@ -86,6 +88,17 @@ class VoiceFramesTest {
         val focus = VoiceFrames.decode(VoiceFrames.context(VoiceFocus()))!!["focus"]!!.jsonObject
         assertEquals(setOf("view"), focus.keys)
     }
+    @Test fun groupedQuestionFocusIncludesThreadAndQuestion() {
+        for (question in listOf(
+            FleetQuestion(id = "group", threadKeys = listOf("codex:first", "codex:second")),
+            FleetQuestion(id = "group", chats = listOf(FleetQuestionChat(), FleetQuestionChat(threadKey = "codex:first"))),
+            FleetQuestion(id = "group", threadKey = "codex:first", threadKeys = listOf("codex:second")),
+        )) {
+            val focus = VoiceFrames.decode(VoiceFrames.context(VoiceFocus.supervisor(question, null, null)))!!["focus"]!!.jsonObject
+            assertEquals("codex:first", focus["threadKey"]!!.jsonPrimitive.content)
+            assertEquals("group", focus["questionId"]!!.jsonPrimitive.content)
+        }
+    }
     @Test fun actionAndFixContextRoundTrip() {
         val focus = VoiceFrames.decode(VoiceFrames.context(VoiceFocus(actionId = "a1", fixId = "f1", suggestionId = "s1")))!!["focus"]!!.jsonObject
         assertEquals("a1", focus["actionId"]!!.jsonPrimitive.content)
@@ -127,12 +140,13 @@ class VoiceSessionTest {
         @Volatile var recording = false
         @Volatile var onAudio: ((ByteArray) -> Unit)? = null
         @Volatile var onError: (() -> Unit)? = null
+        @Volatile var playbackError: (() -> Unit)? = null
         val completions = LinkedBlockingQueue<() -> Unit>()
         val durations = LinkedBlockingQueue<Double>()
         var barges = 0
         override fun startCapture(onAudio: (ByteArray) -> Unit, onError: () -> Unit) { recording = true; this.onAudio = onAudio; this.onError = onError }
         override fun stopCapture() { recording = false }
-        override fun play(pcm: ByteArray) = true
+        override fun play(pcm: ByteArray, onError: () -> Unit): Boolean { playbackError = onError; return true }
         override fun completeReply(audioMs: Double, onPlayed: () -> Unit) { durations.offer(audioMs); completions.offer(onPlayed) }
         override fun barge(): Long { barges++; return 125 }
         override fun close() { recording = false }
@@ -199,6 +213,72 @@ class VoiceSessionTest {
         voice.press()
         assertEquals(VoiceFrames.control("barge", 125), event())
         assertTrue(audio.recording)
+    }
+    @Test fun cancelledHoldClearsTurnAndKeepsConnectionReady() {
+        val voice = connect()
+        voice.press()
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        val oldAudio = audio.onAudio!!
+        voice.release(false)
+        assertEquals(VoiceFrames.control("cancel"), event())
+        assertEquals(VoicePhase.READY, voice.status.value.phase)
+        assertFalse(audio.recording)
+        oldAudio(byteArrayOf(0, 1))
+        assertNull(binary.poll(100, TimeUnit.MILLISECONDS))
+        voice.release(false)
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+        voice.press()
+        assertEquals(VoiceFrames.control("barge", 125), event())
+        assertTrue(audio.recording)
+        voice.release()
+        assertEquals(VoiceFrames.control("commit"), event())
+        assertNull(peers.poll(100, TimeUnit.MILLISECONDS))
+    }
+    @Test fun cancelledHoldBeforeReadyDoesNotCloseOrRecordLater() {
+        val voice = connect()
+        voice.press()
+        val ws = peer()
+        event()
+        voice.release(false)
+        ws.send("""{"type":"ready"}""")
+        await { voice.status.value.phase == VoicePhase.READY }
+        assertFalse(audio.recording)
+        assertNull(events.poll(100, TimeUnit.MILLISECONDS))
+        voice.press()
+        assertEquals(VoiceFrames.control("barge", 125), event())
+        assertTrue(audio.recording)
+    }
+    @Test fun playbackWorkerErrorEndsSessionWithPlaybackMessage() {
+        val voice = connect()
+        voice.handsFree(true)
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        ws.send(byteArrayOf(0, 1).toByteString())
+        await { audio.playbackError != null }
+        audio.playbackError!!()
+        assertEquals(VoicePhase.IDLE, voice.status.value.phase)
+        assertEquals("Reply playback failed. Start voice again.", voice.status.value.message)
+        assertFalse(audio.recording)
+    }
+    @Test fun stalePlaybackErrorDoesNotEndNewPlayback() {
+        val voice = connect()
+        voice.handsFree(true)
+        val ws = peer()
+        event()
+        ws.send("""{"type":"ready"}""")
+        await { audio.recording }
+        ws.send(byteArrayOf(0, 1).toByteString())
+        await { audio.playbackError != null }
+        val oldError = audio.playbackError!!
+        ws.send("""{"type":"speech_started"}""")
+        assertEquals(VoiceFrames.control("barge", 125), event())
+        oldError()
+        assertEquals(VoicePhase.READY, voice.status.value.phase)
     }
     @Test fun transcriptsAndHandsFreeBargeFollowHubEvents() {
         val voice = connect()

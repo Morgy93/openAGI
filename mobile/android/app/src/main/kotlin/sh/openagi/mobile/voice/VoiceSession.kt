@@ -17,6 +17,9 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import sh.openagi.mobile.transport.HostAllowlist
+import sh.openagi.mobile.protocol.FleetAction
+import sh.openagi.mobile.protocol.FleetQuestion
+import sh.openagi.mobile.protocol.FleetThread
 import java.util.concurrent.TimeUnit
 
 @Serializable
@@ -28,7 +31,18 @@ data class VoiceFocus(
     val prRef: String? = null,
     val fixId: String? = null,
     val suggestionId: String? = null,
-)
+) {
+    companion object {
+        fun supervisor(question: FleetQuestion?, action: FleetAction?, thread: FleetThread?) = VoiceFocus(
+            threadKey = if (question != null) question.threadKey ?: question.threadKeys?.firstOrNull()
+                ?: question.chats.firstNotNullOfOrNull { it.threadKey }
+                else action?.threadKey ?: thread?.key,
+            questionId = question?.id,
+            actionId = action?.id,
+            prRef = question?.prRef ?: thread?.pr?.ref,
+        )
+    }
+}
 
 object VoiceFrames {
     private val json = Json { explicitNulls = false; encodeDefaults = true }
@@ -66,7 +80,7 @@ object VoiceFrames {
 }
 
 enum class VoicePhase { IDLE, CONNECTING, READY }
-enum class VoiceEffect { START_CAPTURE, STOP_CAPTURE, COMMIT, BARGE }
+enum class VoiceEffect { START_CAPTURE, STOP_CAPTURE, COMMIT, CANCEL, BARGE }
 
 // A release while connecting must never turn the microphone on later.
 class VoiceStateMachine {
@@ -101,7 +115,7 @@ class VoiceStateMachine {
     fun release(commit: Boolean = true): List<VoiceEffect> {
         val wasRecording = recording && !handsFree
         held = false
-        return reconcile() + if (wasRecording && commit) listOf(VoiceEffect.COMMIT) else emptyList()
+        return reconcile() + if (wasRecording) listOf(if (commit) VoiceEffect.COMMIT else VoiceEffect.CANCEL) else emptyList()
     }
 
     fun mode(on: Boolean): List<VoiceEffect> {
@@ -139,7 +153,7 @@ data class VoiceStatus(
 interface VoiceAudioIO {
     fun startCapture(onAudio: (ByteArray) -> Unit, onError: () -> Unit)
     fun stopCapture()
-    fun play(pcm: ByteArray): Boolean
+    fun play(pcm: ByteArray, onError: () -> Unit): Boolean
     fun completeReply(audioMs: Double, onPlayed: () -> Unit)
     fun barge(): Long
     fun close()
@@ -175,8 +189,6 @@ class VoiceSession(
     @Synchronized
     fun release(commit: Boolean = true) {
         apply(machine.release(commit))
-        // Cancelled gestures discard the captured turn rather than sending it later.
-        if (!commit && machine.phase != VoicePhase.IDLE && !machine.handsFree) stop()
     }
 
     @Synchronized
@@ -265,7 +277,10 @@ class VoiceSession(
             if (webSocket !== socket || discardAudio) return@synchronized
             replyPlayed = false
             replyRevision++
-            if (bytes.size == 0 || bytes.size % 2 != 0 || !audio.play(bytes.toByteArray())) finish("Reply audio fell behind. Start voice again.")
+            val generation = playbackGeneration
+            if (bytes.size == 0 || bytes.size % 2 != 0 || !audio.play(bytes.toByteArray()) { synchronized(this@VoiceSession) {
+                if (webSocket === socket && generation == playbackGeneration) finish("Reply playback failed. Start voice again.")
+            } }) finish("Reply audio fell behind. Start voice again.")
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) = synchronized(this@VoiceSession) {
@@ -315,6 +330,7 @@ class VoiceSession(
                 } catch (_: Exception) { finish("Microphone unavailable. Check microphone permission and try again."); return }
                 VoiceEffect.STOP_CAPTURE -> { captureGeneration++; audio.stopCapture() }
                 VoiceEffect.COMMIT -> if (!send(VoiceFrames.control("commit"))) return
+                VoiceEffect.CANCEL -> if (!send(VoiceFrames.control("cancel"))) return
                 VoiceEffect.BARGE -> barge()
             }
         }
