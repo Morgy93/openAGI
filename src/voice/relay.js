@@ -120,7 +120,9 @@ export function attachVoiceRelay({ nodeRegistry, getAuthToken = () => null, crea
       send(event) {
         if (done || client.readyState !== WebSocket.OPEN) return;
         lastActivity = Date.now();
-        client.send(JSON.stringify(event));
+        const text = JSON.stringify(event);
+        if (client.bufferedAmount + Buffer.byteLength(text) > CLIENT_BACKLOG) { end("Voice events fell behind the connection.", 1011, "client_backlog"); return; }
+        client.send(text);
       },
       sendAudio(pcm) {
         if (done || client.readyState !== WebSocket.OPEN) return;

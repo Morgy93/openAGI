@@ -459,7 +459,8 @@ paired phone token, or the G2 token. Main holds one `gpt-realtime-2.1` session
 per device, runs the fleet tools as the owner, and writes both sides into the
 shared Supervisor thread. Every action that changes something is read back
 with a code; only the owner's own words ("yes 42") run it, heard in the input
-transcript, never in the model's reply. Sessions close after 2 idle minutes
+transcript, never in the model's reply. Voice approvals require the spoken
+code; a bare yes does not approve a pending action. Sessions close after 2 idle minutes
 and at 55 minutes.
 
 | Var | Default | Means |
@@ -467,6 +468,16 @@ and at 55 minutes.
 | `OPENAGI_VOICE` | off | `1` opens the voice relay on main |
 | `OPENAGI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model (mini models are refused) |
 | `OPENAGI_VOICE_DAILY_USD` | `5` | Daily voice spend cap; the ledger channel is `voice` |
+
+The cap includes conservative reservations for audio and pending responses.
+Reservations are saved before work reaches OpenAI and settled when usage is
+reported, so concurrent devices and reconnects share the same remaining
+budget. An interrupted response whose usage never arrives keeps its reserve
+until the next UTC day. The displayed daily total includes those holds and
+can exceed reported usage. A reply reserves room for up to 1,024 output
+tokens and 8,000 conversation tokens plus instructions/tools, so voice may
+stop before the exact dollar ceiling when there is too little room for a
+whole reply. Failed budget writes stop voice.
 
 Frames: binary PCM16 mono (24 kHz; G2 16 kHz, resampled on main). JSON
 control: `start {gesture, mode?, focus?}`, `commit` (push-to-talk release),

@@ -129,6 +129,7 @@ async function run({ label, rate, sendRate }) {
           type: "realtime",
           instructions: "You are a terse voice assistant for a coding-agent fleet. Use fleet_status for fleet questions. Answer in one short sentence.",
           output_modalities: [textOut ? "text" : "audio"],
+          max_output_tokens: 1024,
           audio: {
             input: {
               format: { type: "audio/pcm", rate },
@@ -139,7 +140,7 @@ async function run({ label, rate, sendRate }) {
           },
           tools: [TOOL],
           tool_choice: "auto",
-          truncation: { type: "retention_ratio", retention_ratio: 0.8 },
+          truncation: { type: "retention_ratio", retention_ratio: 0.8, token_limits: { post_instructions: 8000 } },
           reasoning: { effort: "low" }
         } });
         return;
