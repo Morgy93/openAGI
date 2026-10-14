@@ -220,6 +220,9 @@ test("openChatFor: the link that opens exactly that chat, or a label that says w
   // With no Conductor tab showing it: no guessed link, its app named.
   assert.equal(openChatFor(hosted).url, null);
   assert.equal(openChatFor(hosted).app, "conductor");
+  const named = openChatFor({ ...hosted, cwd: "/work/remote-dev" });
+  assert.match(named.label, /remote-dev/);
+  assert.match(named.note, /remote-dev/);
   // A Claude Code terminal session: no app link opens it.
   const claude = openChatFor({ key: "claude:x", kind: "claude", id: "x", title: "fix auth", workspace: null, cwd: "/Users/me/Dev/api", meta: {} });
   assert.equal(claude.url, null);

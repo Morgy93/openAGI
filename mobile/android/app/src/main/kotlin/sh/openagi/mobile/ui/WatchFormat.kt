@@ -153,7 +153,8 @@ object WatchFormat {
 
     fun rowActions(thread: FleetThread, now: Instant): List<RowAction> = when {
         mutedLine(thread.muted, now) != null -> listOf(RowAction.UNMUTE)
-        thread.watch?.group == "push" -> listOf(RowAction.PUSH, RowAction.MUTE)
+        thread.watch?.group == "push" -> if (thread.pushPreview?.action == "nudge" && !thread.pushPreview.message.isNullOrBlank())
+            listOf(RowAction.PUSH, RowAction.MUTE) else listOf(RowAction.MUTE)
         else -> emptyList()
     }
 
@@ -200,8 +201,14 @@ object WatchFormat {
         return ChatLink(label, app, here, onMac = url != null && here == null, note = chat.note?.takeIf { it.isNotBlank() })
     }
 
-    // "open thread" brings the chat up on the Mac; on the phone it says so.
-    fun optionLabel(option: String): String = if (option == "open thread") "Open on your Mac" else option
+    // Open thread is navigation, never an answer sent to the agent.
+    fun chatInstruction(link: ChatLink): String = when {
+        link.onMac -> "Open this chat on your Mac" + (link.app?.let { " in $it" } ?: "") + "."
+        else -> link.note ?: ("On your Mac" + (link.app?.let { ", in $it" } ?: "") + ".")
+    }
+
+    fun answerOptions(question: FleetQuestion): List<String> =
+        question.options.filter { it.isNotBlank() && it != "dismiss" && it != "open thread" }
 
     // What happened to a Push now. A refusal sends nothing, so nothing is
     // "saved" the way an answer is: it says why, in the daemon's words.

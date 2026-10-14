@@ -4355,28 +4355,91 @@ test("a thread's detail: last agent message, owner's last word, PR, watch, next 
   assert.equal(own.threadDetail("codex:t1").lastOwnerAt, null);
 });
 
-test("Push now sends the planned nudge at once, inside the cooldown, recorded as the owner's", async (t) => {
-  let now = NOW;
-  const { supervisor, delivered } = fixture(t, { mode: "auto", now: () => now });
-  await supervisor.tick({ reason: "test" });
-  assert.equal(delivered.length, 1, "the scan's own nudge");
-  now += 60_000;
-  await supervisor.tick({ reason: "test" });
-  assert.equal(delivered.length, 1, "cooling down");
-  assert.equal(supervisor.getState().snapshot.threads[0].decision.action, "wait");
-  const result = await supervisor.pushNow("codex:t1");
+test("Push now previews a paced row and sends exactly those words once in observe", async (t) => {
+  const thread = makeThread({ lastUserAt: ago(MIN) });
+  const { supervisor, delivered } = fixture(t, { threads: [thread] });
+  await supervisor.tick();
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.watch.group, "push");
+  assert.equal(row.decision.action, "wait");
+  assert.ok(row.pushPreview.message);
+  const result = await supervisor.pushNow(thread.key);
   assert.equal(result.delivery.status, "sent");
-  assert.equal(delivered.length, 2);
-  assert.equal(delivered[1].playbook, "merge-ready");
-  assert.match(delivered[1].message, /Ready to merge\?/);
+  assert.equal(delivered[0].message, row.pushPreview.message);
   assert.equal(result.action.by, "owner");
-  assert.match(result.action.reason, /^owner: push now/);
-  assert.equal(supervisor.store.ledgerFor("codex:t1").nudges.at(-1).status, "sent");
-  // In Observe too: the owner's own push is no automatic send.
-  supervisor.setMode("observe");
-  assert.equal((await supervisor.pushNow("codex:t1")).delivery.status, "sent");
-  assert.equal(delivered.length, 3);
-  assert.equal(delivered[2].route, "codex-exec");
+  assert.equal(supervisor.getState().snapshot.threads[0].pushPreview, null);
+  assert.match((await supervisor.pushNow(thread.key)).delivery.detail, /already sent/);
+  assert.equal(delivered.length, 1);
+});
+
+test("a nudge already delivered automatically cannot be pushed again", async (t) => {
+  const { supervisor, delivered } = fixture(t, { mode: "auto" });
+  await supervisor.tick();
+  assert.equal(delivered.length, 1);
+  assert.equal(supervisor.getState().snapshot.threads[0].pushPreview, null);
+  assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already sent/);
+  assert.equal(delivered.length, 1);
+});
+
+test("Push now keeps the judge's full preview instead of re-rendering a template", async (t) => {
+  const message = "Check these exact details. ".repeat(30);
+  const judge = fakeJudge({ action: "send", reason: "needs work", message });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", deliverStatus: "blocked", deps: { judge } });
+  await supervisor.tick();
+  const preview = supervisor.getState().snapshot.threads[0].pushPreview;
+  assert.equal(preview.message, message);
+  const result = await supervisor.pushNow("codex:t1");
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(delivered.at(-1).message, preview.message);
+});
+
+test("one Push now holds the thread through delivery across clients", async (t) => {
+  let release;
+  const { supervisor } = fixture(t, { deps: { executor: {
+    deliver: async () => { await new Promise((resolve) => { release = resolve; }); return { status: "sent" }; },
+    inFlight: () => [], whenIdle: async () => {}
+  } } });
+  await supervisor.tick();
+  const first = supervisor.pushNow("codex:t1");
+  while (!release) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.getState().snapshot.threads[0].pushing, true);
+  assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already being sent/);
+  release();
+  assert.equal((await first).delivery.status, "sent");
+  assert.equal(supervisor.getState().snapshot.threads[0].pushing, false);
+});
+
+test("a question held for review blocks Push now and its preview", async (t) => {
+  const { supervisor, delivered } = fixture(t);
+  await supervisor.tick();
+  const question = supervisor.store.upsertQuestion({ dedupeKey: "held", kind: "agent-ask", threadKey: "codex:t1", title: "Merge?", options: ["yes"] });
+  supervisor.awaitingReview.add(question.id);
+  assert.equal(supervisor.getState().snapshot.threads[0].pushPreview, null);
+  assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /waits on your answer/);
+  assert.equal(delivered.length, 0);
+});
+
+test("mute immediately removes Waiting on you and snapshot excerpts redact secrets", async (t) => {
+  const thread = makeThread({ lastAgentText: "Done. API_KEY=fictional-secret. Want me to deploy to production?" });
+  const { supervisor } = fixture(t, { threads: [thread] });
+  await supervisor.tick();
+  assert.equal(supervisor.getState().snapshot.threads[0].watch.group, "you");
+  assert.doesNotMatch(supervisor.getState().snapshot.threads[0].lastAgentText, /fictional-secret/);
+  supervisor.muteThread(thread.key);
+  const state = supervisor.getState();
+  assert.equal(state.snapshot.threads[0].watch.group, "quiet");
+  assert.equal(state.snapshot.counts.byWatch.you, 0);
+  supervisor.unmuteThread(thread.key);
+  assert.equal(supervisor.getState().snapshot.threads[0].watch.group, "you");
+});
+
+test("risky classification reads the ask itself rather than incidental report context", async (t) => {
+  const { supervisor } = fixture(t);
+  const rows = new Map();
+  const question = { kind: "agent-ask", title: "Re-verify?", body: "Run the tests again?", askContext: "The release merged and production deployed.", options: ["run", "wait"] };
+  assert.equal(supervisor.questionView(question, rows).risky, false);
+  assert.equal(supervisor.questionView({ ...question, title: "Deploy to production?" }, rows).risky, true);
+  assert.equal(supervisor.questionView({ ...question, mergeAsk: true }, rows).risky, true);
 });
 
 test("Push now never goes ahead of an open question or a muted thread, and needs a scan", async (t) => {

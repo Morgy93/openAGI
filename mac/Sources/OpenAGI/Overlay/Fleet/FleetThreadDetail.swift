@@ -114,12 +114,13 @@ struct FleetThreadDetail: Decodable, Equatable {
   let pr: FleetPR?
   let watch: FleetWatch?
   let decision: FleetDecision?
+  let pushPreview: FleetDecision?
   let muted: String?
   let openChat: FleetOpenChat?
   let scannedAt: String?
 
   enum CodingKeys: String, CodingKey {
-    case key, title, workspace, branch, agentStatus, reason, blockers, lastAgentMessage, lastOwnerAt, pr, watch, decision, muted, openChat, scannedAt
+    case key, title, workspace, branch, agentStatus, reason, blockers, lastAgentMessage, lastOwnerAt, pr, watch, decision, pushPreview, muted, openChat, scannedAt
   }
   private enum MessageKeys: String, CodingKey { case text, at }
   private enum Envelope: String, CodingKey { case thread }
@@ -127,7 +128,7 @@ struct FleetThreadDetail: Decodable, Equatable {
   init(key: String, title: String? = nil, workspace: String? = nil, branch: String? = nil, agentStatus: String? = nil,
        reason: String? = nil, blockers: [String] = [], lastAgentText: String? = nil, lastAgentAt: String? = nil,
        lastOwnerAt: String? = nil, pr: FleetPR? = nil, watch: FleetWatch? = nil, decision: FleetDecision? = nil,
-       muted: String? = nil, openChat: FleetOpenChat? = nil, scannedAt: String? = nil) {
+       muted: String? = nil, openChat: FleetOpenChat? = nil, scannedAt: String? = nil, pushPreview: FleetDecision? = nil) {
     self.key = key
     self.title = title
     self.workspace = workspace
@@ -141,6 +142,7 @@ struct FleetThreadDetail: Decodable, Equatable {
     self.pr = pr
     self.watch = watch
     self.decision = decision
+    self.pushPreview = pushPreview
     self.muted = muted
     self.openChat = openChat
     self.scannedAt = scannedAt
@@ -162,6 +164,7 @@ struct FleetThreadDetail: Decodable, Equatable {
     pr = try? c.decodeIfPresent(FleetPR.self, forKey: .pr)
     watch = try? c.decodeIfPresent(FleetWatch.self, forKey: .watch)
     decision = try? c.decodeIfPresent(FleetDecision.self, forKey: .decision)
+    pushPreview = try? c.decodeIfPresent(FleetDecision.self, forKey: .pushPreview)
     muted = try? c.decodeIfPresent(String.self, forKey: .muted)
     openChat = try? c.decodeIfPresent(FleetOpenChat.self, forKey: .openChat)
     scannedAt = try? c.decodeIfPresent(String.self, forKey: .scannedAt)
@@ -224,7 +227,7 @@ struct FleetThreadSummary: Equatable {
   static let excerptMax = 600
 
   init(thread: FleetThread?, detail: FleetThreadDetail?, now: Date = Date()) {
-    // Only the detail's words: the state's row text is not redacted.
+    // The detail carries the longer excerpt.
     let text = detail?.lastAgentText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     excerpt = text.isEmpty ? nil : Self.tail(text, Self.excerptMax)
     excerptAge = excerpt == nil ? nil : (detail?.lastAgentAt ?? thread?.lastAgentAt).flatMap(FleetWatching.parseDate).map { Self.ago($0, now: now) }
@@ -239,7 +242,8 @@ struct FleetThreadSummary: Equatable {
 
     let decision = thread?.decision ?? detail?.decision
     nextLine = decision.flatMap { Self.nextLine($0, now: now) }
-    let message = decision?.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let preview = thread != nil ? thread?.pushPreview : detail?.pushPreview
+    let message = preview?.action == "nudge" ? (preview?.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") : ""
     pushMessage = message.isEmpty ? nil : message
 
     let mutedAt = (thread?.muted ?? detail?.muted).flatMap(FleetWatching.parseDate)

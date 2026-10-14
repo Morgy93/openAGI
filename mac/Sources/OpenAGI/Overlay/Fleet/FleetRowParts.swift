@@ -59,6 +59,10 @@ struct FleetQuestionAnswer: View {
         Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
+      if question.risky, let context = question.displayAskContext {
+        Text(context).font(.system(size: 11)).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
       if let asked = FleetQuestionAnswer.askedLine(question) {
         Text(asked).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
       }

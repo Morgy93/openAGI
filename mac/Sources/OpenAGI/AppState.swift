@@ -599,6 +599,7 @@ final class AppState: ObservableObject {
 
   nonisolated static func requestMayStillBeRunning(after error: Error) -> Bool {
     let ns = error as NSError
+    if ns.domain == NSURLErrorDomain, [NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorNotConnectedToInternet].contains(ns.code) { return false }
     return ns.domain == NSURLErrorDomain || ns.domain == "OpenAGI.Transport"
   }
 

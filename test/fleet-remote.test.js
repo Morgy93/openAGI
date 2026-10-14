@@ -469,3 +469,11 @@ test('main reads a thread\'s detail and pushes, mutes and unmutes it on the Mac 
   assert.equal((await route('GET', '/fleet/api/threads/codex:gone', null, async () => ({}))).status, 404);
   assert.equal((await route('POST', '/fleet/api/threads/conductor:s1/push', null, async () => ({}))).body.delivery.status, 'sent');
 });
+
+test('thread detail preserves computer errors other than not found', async t => {
+  const { remote, runtime, state } = fixture(t);
+  for (const status of [400, 500, 503]) {
+    runtime.nodeCapabilities.dispatch = async () => ({ state, response: { status, body: { error: 'unavailable' } } });
+    await assert.rejects(() => remote.threadDetail('codex:t1'), error => error.status === status);
+  }
+});

@@ -262,3 +262,28 @@ test("an unpaired instance never starts the heartbeat sender", async () => {
     assert.equal(app.__heartbeatHandle, undefined, "no heartbeat interval was created for an unpaired instance");
   } finally { await app.close(); }
 });
+
+test("a heartbeat finishing after close does not restart the bridge", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-hb-close-"));
+  writeNodeConfig({ remote: "http://127.0.0.1:1", nodeToken: "n".repeat(43), nodeEnrollmentConfirmed: true }, dataDir);
+  let finishHeartbeat;
+  let heartbeatStarted;
+  const started = new Promise((resolve) => { heartbeatStarted = resolve; });
+  let starts = 0;
+  const app = createHostedInterface(createDurableRuntime({ dataDir }), {
+    host: "127.0.0.1", port: 0, tickerMs: 0, dataDir, heartbeatIntervalMs: 60_000,
+    codingNodeEnabled: false, nodeControlEnabled: false,
+    imessageBridgeRuntime: { start() { starts += 1; }, stop() {} },
+    nodeControlFetch: async () => {
+      heartbeatStarted();
+      return new Promise((resolve) => { finishHeartbeat = () => resolve(new Response("{}", { status: 200 })); });
+    }
+  });
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  await app.listen();
+  await started;
+  await app.close();
+  finishHeartbeat();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(starts, 0);
+});

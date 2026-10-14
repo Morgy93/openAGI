@@ -59,18 +59,20 @@ export class RemoteFleetSupervisor {
   }
   async request(method, path, body) {
     let reached = false;
+    let status = null;
     try {
       const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
       this.mirrorQuestions();
-      if (result.response?.status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
+      status = result.response?.status ?? null;
+      if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
       this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(this.state.lastError), { reached });
+      throw Object.assign(new Error(this.state.lastError), { reached, status });
     }
   }
   refresh() {
@@ -121,7 +123,7 @@ export class RemoteFleetSupervisor {
     try {
       return (await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}`)).thread ?? null;
     } catch (error) {
-      if (error.reached) return null;
+      if (error.status === 404) return null;
       throw error;
     }
   }

@@ -79,8 +79,7 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let watch: FleetWatch?
   /// The scan's PR read: state, title, CI, unresolved review threads.
   let pr: FleetPR?
-  /// The tail of the agent's last message as the scan read it. Not
-  /// redacted: the opened row shows the detail's redacted one instead.
+  /// The redacted tail of the agent's last message.
   let lastAgentText: String?
   let lastOwnerAt: String?
   /// When the owner's Mute ends; nil: not muted.
@@ -89,19 +88,21 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let openChat: FleetOpenChat?
   /// The supervisor's next step, and the words Push now would send.
   let decision: FleetDecision?
+  let pushPreview: FleetDecision?
+  let pushing: Bool
 
   var id: String { key }
 
   enum CodingKeys: String, CodingKey {
     case key, title, workspace, repo, state, pr, lastActivityAt, lastAgentAt, watch
-    case lastAgentText, lastOwnerAt, muted, openChat, decision
+    case lastAgentText, lastOwnerAt, muted, openChat, decision, pushPreview, pushing
   }
   private enum PRKeys: String, CodingKey { case ref, url }
 
   init(key: String, title: String? = nil, workspace: String? = nil, repo: String? = nil, state: String? = nil,
        prRef: String? = nil, prURL: String? = nil, lastActivityAt: String? = nil, lastAgentAt: String? = nil,
        watch: FleetWatch?, pr: FleetPR? = nil, lastAgentText: String? = nil, lastOwnerAt: String? = nil,
-       muted: String? = nil, openChat: FleetOpenChat? = nil, decision: FleetDecision? = nil) {
+       muted: String? = nil, openChat: FleetOpenChat? = nil, decision: FleetDecision? = nil, pushPreview: FleetDecision? = nil, pushing: Bool = false) {
     self.key = key
     self.title = title
     self.workspace = workspace
@@ -118,6 +119,8 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     self.muted = muted
     self.openChat = openChat
     self.decision = decision
+    self.pushPreview = pushPreview
+    self.pushing = pushing
   }
 
   /// Only `key` is required. A daemon that sends no watch key at all predates
@@ -141,6 +144,8 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     muted = try? c.decodeIfPresent(String.self, forKey: .muted)
     openChat = try? c.decodeIfPresent(FleetOpenChat.self, forKey: .openChat)
     decision = try? c.decodeIfPresent(FleetDecision.self, forKey: .decision)
+    pushPreview = try? c.decodeIfPresent(FleetDecision.self, forKey: .pushPreview)
+    pushing = (try? c.decodeIfPresent(Bool.self, forKey: .pushing)) ?? false
     if c.contains(.watch), (try? c.decodeNil(forKey: .watch)) == true {
       watch = nil
     } else if let decoded = try? c.decodeIfPresent(FleetWatch.self, forKey: .watch) {

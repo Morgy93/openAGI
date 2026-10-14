@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.openagi.mobile.protocol.FleetDecision
 import sh.openagi.mobile.protocol.FleetOpenChat
 import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetThread
@@ -201,7 +202,9 @@ class WatchFormatTest {
 
     @Test
     fun rowActionsFollowTheGroupAndTheMute() {
-        val push = watched("p", "push", 5)
+        val unplanned = watched("p", "push", 5)
+        assertEquals(listOf(WatchFormat.RowAction.MUTE), WatchFormat.rowActions(unplanned, now))
+        val push = unplanned.copy(decision = FleetDecision(action = "wait"), pushPreview = FleetDecision(action = "nudge", message = "Preview"))
         assertEquals(listOf(WatchFormat.RowAction.PUSH, WatchFormat.RowAction.MUTE), WatchFormat.rowActions(push, now))
         assertEquals(listOf(WatchFormat.RowAction.UNMUTE), WatchFormat.rowActions(push.copy(muted = now.plusSeconds(3600)), now))
         // A mute that ran out is no mute.
@@ -257,8 +260,9 @@ class WatchFormatTest {
     }
 
     @Test
-    fun openThreadReadsAsTheMacAction() {
-        assertEquals("Open on your Mac", WatchFormat.optionLabel("open thread"))
-        assertEquals("Apply fix A", WatchFormat.optionLabel("Apply fix A"))
+    fun openThreadIsNotAnAnswerAndMacNavigationIsAnInstruction() {
+        assertEquals(listOf("Apply fix A"), WatchFormat.answerOptions(FleetQuestion(options = listOf("open thread", "dismiss", "Apply fix A"))))
+        val link = WatchFormat.chatLink(conductorChat) { false }!!
+        assertEquals("Open this chat on your Mac in Conductor.", WatchFormat.chatInstruction(link))
     }
 }

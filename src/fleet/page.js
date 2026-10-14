@@ -427,7 +427,7 @@ a.btn.primary{color:var(--ink)}
   // highlighted default.
   function answerButtons(q, parent, primary) {
     var buttons = [];
-    var options = Array.isArray(q.options) ? q.options.filter(function (o) { return o && o !== 'dismiss'; }) : [];
+    var options = Array.isArray(q.options) ? q.options.filter(function (o) { return o && o !== 'dismiss' && o !== 'open thread'; }) : [];
     options.forEach(function (option, index) {
       buttons.push(button(option, 'btn' + (primary && index === 0 && !q.risky ? ' primary' : ''), parent, function () {
         return decide(q, { answer: option }, buttons);
@@ -729,6 +729,7 @@ a.btn.primary{color:var(--ink)}
   // What the owner can do from the row: answer or dismiss the question it
   // waits on, Push now (only a planned nudge, the words shown first), Mute or
   // Unmute. Open chat sits on the row itself.
+  var pushing = new Set();
   function rowActions(t, parent) {
     var group = t.watch ? t.watch.group : '';
     var asks = group === 'you' ? questionsFor(t.key) : [];
@@ -745,18 +746,20 @@ a.btn.primary{color:var(--ink)}
       if (inApp) el('p', 'note', appNote(q), box);
     });
     if (!t.watch) return;
-    var dec = t.decision || null;
+    var dec = t.pushPreview || null;
+    var why = dec || t.decision || null;
     var plan = dec && dec.action === 'nudge' && typeof dec.message === 'string' ? dec.message : '';
     var canPush = Boolean(plan) && !t.muted && group !== 'you';
     if (canPush) {
       el('p', 'k', 'Push now sends:', parent);
       el('blockquote', 'quote', plan, parent);
     } else if (group === 'push' && !t.muted) {
-      el('p', 'why', 'No nudge planned yet' + (dec && dec.reason ? ': ' + clip(dec.reason, 160) : '.'), parent);
+      el('p', 'why', 'No nudge planned yet' + (why && why.reason ? ': ' + clip(why.reason, 160) : '.'), parent);
     }
     var acts = el('div', 'acts', null, parent);
     if (canPush) {
       var push = button('Push now', 'btn primary', acts, function () { return pushNow(t, push); });
+      push.disabled = t.pushing || pushing.has(t.key);
     }
     if (t.muted) {
       var un = button('Unmute', 'btn', acts, function () { return mute(t, false, un); });
@@ -817,12 +820,15 @@ a.btn.primary{color:var(--ink)}
 
   // The owner's Push now: the planned nudge goes out at once, as theirs.
   async function pushNow(t, b) {
+    if (pushing.has(t.key)) return;
+    pushing.add(t.key);
     b.disabled = true;
     b.textContent = 'Pushing…';
     try {
       var r = await api(threadPath(t.key) + '/push', {});
       var note = pushNote(r && r.delivery);
       details.delete(t.key);
+      pushing.delete(t.key);
       if (r && r.state) render(r.state); else await load();
       say(note.text, note.bad);
     } catch (e) {
@@ -830,7 +836,7 @@ a.btn.primary{color:var(--ink)}
       b.textContent = 'Push now';
       say(e.message, true);
       if (e.status === 404) await load();
-    }
+    } finally { pushing.delete(t.key); }
   }
 
   async function mute(t, on, b) {

@@ -91,6 +91,7 @@ final class FleetThreadDetailTests: XCTestCase {
         "watch":{"group":"push","since":"2026-10-14T03:00:00Z","otherwise":{"group":"push","waitingOn":null}},
         "muted":"2026-10-15T04:00:00Z","lastOwnerAt":"2026-10-14T02:00:00Z","lastAgentText":"Done downloading.",
         "openChat":{"app":"codex","url":"codex://threads/01a13388","label":"Download Amex Statements (Codex)"},
+        "pushPreview":{"action":"nudge","message":"Please finish."},"pushing":true,
         "decision":{"action":"nudge","playbook":"stopped","reason":"stopped with work left","message":"Please finish."},
         "pr":{"ref":"o/r#12","url":"https://github.com/o/r/pull/12","state":"OPEN","ci":{"state":"failure","failing":["lint",3]},"unresolvedThreads":2}}]}}
       """)
@@ -183,4 +184,30 @@ final class FleetThreadDetailTests: XCTestCase {
     XCTAssertEqual(AppState.overlayReply(in: session, requestId: "ask_3"), .failed("I couldn't complete that request: x"))
     XCTAssertNil(AppState.overlayReply(in: Data("{}".utf8), requestId: "ask_1"))
   }
+  func testPushPreviewWinsOverAutomaticDecisionAndClearsWithLiveRow() throws {
+    let row = try decode(FleetThread.self, """
+      {"key":"codex:t","watch":{"group":"push"},"decision":{"action":"wait","reason":"cooldown"},
+       "pushPreview":{"action":"nudge","message":"The approved words"},"pushing":true}
+      """)
+    XCTAssertEqual(FleetThreadSummary(thread: row, detail: nil).pushMessage, "The approved words")
+    XCTAssertTrue(row.pushing)
+    let cleared = FleetThread(key: row.key, watch: row.watch)
+    let stale = FleetThreadDetail(key: row.key, pushPreview: FleetDecision(action: "nudge", message: "Stale words"))
+    XCTAssertNil(FleetThreadSummary(thread: cleared, detail: stale).pushMessage)
+  }
+
+  func testRiskyAskContextKeepsEveryWordBeforeAnAnswer() throws {
+    let context = String(repeating: "Release details. ", count: 100) + "THE END"
+    let data = try JSONSerialization.data(withJSONObject: ["id": "q", "title": "Release?", "risky": true, "askContext": context])
+    let q = try JSONDecoder().decode(FleetQuestion.self, from: data)
+    XCTAssertEqual(q.displayAskContext, context)
+  }
+
+  func testUnreachableDaemonDoesNotClaimTheAskIsRunning() {
+    for code in [NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorNotConnectedToInternet] {
+      XCTAssertFalse(AppState.requestMayStillBeRunning(after: NSError(domain: NSURLErrorDomain, code: code)))
+    }
+    XCTAssertTrue(AppState.requestMayStillBeRunning(after: NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)))
+  }
+
 }

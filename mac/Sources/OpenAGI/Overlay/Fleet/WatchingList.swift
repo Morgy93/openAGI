@@ -174,17 +174,17 @@ struct WatchingList: View {
         Text("Push now sends:").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
         Text(message)
           .font(.system(size: 11))
-          .lineLimit(8)
+          .fixedSize(horizontal: false, vertical: true)
           .help(message)
           .padding(6)
           .frame(maxWidth: .infinity, alignment: .leading)
           .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
       }
       HStack(spacing: 8) {
-        if group == "push", !summary.muted {
+        if group == "push", !summary.muted, summary.pushMessage != nil {
           Button("Push now") { Task { await fleet.pushNow(thread.key) } }
             .controlSize(.small).buttonStyle(.borderedProminent)
-            .disabled(busy || offline)
+            .disabled(busy || offline || thread.pushing)
             .help("Send the supervisor's planned nudge now, as your own message")
         }
         Button(summary.muted ? "Unmute" : "Mute 24h") {

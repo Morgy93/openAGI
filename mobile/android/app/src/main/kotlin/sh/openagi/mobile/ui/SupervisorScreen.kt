@@ -819,14 +819,14 @@ private fun QuestionRow(
             }
         }
         // "dismiss" can arrive as an option; it is the Dismiss button below.
-        val options = question.options.filter { it.isNotBlank() && it != "dismiss" }
+        val options = WatchFormat.answerOptions(question)
         FlowRow(
             modifier = Modifier.padding(top = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             options.forEachIndexed { index, option ->
-                CompactButton(text = WatchFormat.optionLabel(option), filled = index == 0, enabled = !anyBusy, onClick = { onAnswer(option) })
+                CompactButton(text = option, filled = index == 0, enabled = !anyBusy, onClick = { onAnswer(option) })
             }
             TextButton(onClick = onDismiss, enabled = !anyBusy, modifier = Modifier.heightIn(min = 44.dp)) {
                 Text("Dismiss", style = OpenAGIType.secondary, color = muted)
@@ -868,10 +868,7 @@ private fun OpenChatLine(chat: FleetOpenChat?) {
             }
         } else {
             Text("Chat: " + link.label, style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurface)
-            val where = when {
-                link.onMac -> "Opens on your Mac" + (link.app?.let { " in $it" } ?: "") + ", not on this phone."
-                else -> link.note ?: ("On your Mac" + (link.app?.let { ", in $it" } ?: "") + ".")
-            }
+            val where = WatchFormat.chatInstruction(link)
             Text(where, style = OpenAGIType.caption, color = muted)
         }
     }
@@ -1190,14 +1187,14 @@ private fun ThreadDetailSheet(
             if (actions.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (WatchFormat.RowAction.PUSH in actions) {
-                        val message = decision?.message?.takeIf { it.isNotBlank() }
+                        val message = thread.pushPreview?.message?.takeIf { it.isNotBlank() }
                         Text("Push now", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
                         if (message != null) {
                             Text("Sends this to the agent now, as you:", style = OpenAGIType.caption, color = muted)
                             Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
                                 Text(message, style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.padding(10.dp))
                             }
-                            PrimaryButton(text = "Push now", onClick = onPush, enabled = !anyBusy, loading = busy)
+                            PrimaryButton(text = "Push now", onClick = onPush, enabled = !anyBusy && !thread.pushing, loading = busy || thread.pushing)
                         } else {
                             Text("The supervisor has nothing planned to send yet.", style = OpenAGIType.caption, color = muted)
                         }

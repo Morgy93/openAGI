@@ -509,6 +509,7 @@ export class FleetSupervisor {
     // threadKey -> { classified, pr } and the infra and manager the last scan
     // read: what the owner's Push now decides from (pushNow).
     this.lastItems = new Map();
+    this.pushing = new Set();
     this.lastInfra = null;
     this.lastManager = null;
     // key -> { group, since }: when each thread entered its watch group.
@@ -849,11 +850,18 @@ export class FleetSupervisor {
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const threads = snapshot.threads.map((row) => {
       if (!row?.key) return row;
-      const watch = liveWatch(row.watch ?? null, { state: row.state, askedAt: askedAt.get(row.key) ?? null, closedAt: closedAt.get(row.key) ?? null });
+      const muted = this.store.mutedUntil(row.key);
+      const watch = liveWatch(row.watch ?? null, { state: row.state, askedAt: askedAt.get(row.key) ?? null, closedAt: closedAt.get(row.key) ?? null, muted });
       if (watch) byWatch[watch.group] = (byWatch[watch.group] ?? 0) + 1;
       // A snapshot saved before rows carried openChat: this process's read.
       const openChat = row.openChat !== undefined ? row.openChat : openChatFor(this.lastThreads.get(row.key));
-      return { ...row, watch, muted: this.store.mutedUntil(row.key), openChat: openChat ?? null };
+      const preview = this.lastItems.get(row.key)?.pushPreview;
+      const thread = this.lastThreads.get(row.key);
+      const pending = this.store.openQuestions().some((q) => q.threadKey === row.key || (q.threadKeys ?? []).includes(row.key));
+      const canPush = preview?.action === "nudge" && preview.message && !muted && !pending
+        && !this.ownerAnswerThreads(Infinity).has(row.key) && !repeatsLastSend(thread, this.store.ledgerFor(row.key), preview.messageHash);
+      return { ...row, lastAgentText: redactSecrets(row.lastAgentText), watch, muted, openChat: openChat ?? null,
+        pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
     });
     return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.length } };
   }
@@ -872,7 +880,7 @@ export class FleetSupervisor {
     const chats = (question.threadKeys ?? []).map((key) => ({ threadKey: key, ...(chatOf(key) ?? { app: null, url: null, label: key, note: null }) }));
     const options = question.options ?? [];
     const inApp = question.kind === "agent-card" || !options.some((option) => !APP_ONLY_OPTIONS.has(option));
-    const text = [question.title, question.body, question.askContext, ...options].filter(Boolean).join(" ");
+    const text = [question.title, question.body, ...options].filter(Boolean).join(" ");
     return {
       ...question,
       askedAt: question.agentAskedAt ?? question.createdAt ?? null,
@@ -1520,6 +1528,8 @@ export class FleetSupervisor {
       pr: row.pr ?? null,
       watch: row.watch ?? null,
       decision: row.decision ?? null,
+      pushPreview: row.pushPreview ?? null,
+      pushing: row.pushing === true,
       ...(row.prompt ? { prompt: row.prompt } : {}),
       muted: row.muted ?? null,
       questions: state.questions.filter((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey)),
@@ -1528,55 +1538,51 @@ export class FleetSupervisor {
     };
   }
 
-  // The owner's Push now: the thread's planned nudge goes out at once, by
-  // the same delivery as any nudge, in every mode, and is recorded as the
-  // owner's (by: "owner"). Decided again from the last scan's read with
-  // policy's ownerPush, so the waits that only pace automatic nudges
-  // (cooldown, idle, a reply hold, the attempt budget) do not hold it. An
-  // open question about the thread, or an owner answer still on its way to
-  // it, does: the answer goes first. Never throws for a refusal: it comes
-  // back as a blocked delivery saying why.
+  // Send the scan's preview verbatim. Only pacing waits are skipped;
+  // an unanswered question or a nudge already sent still holds it.
   async pushNow(threadKey, { deadlineAt = null } = {}) {
     const startedAt = Date.now();
     const blocked = (detail) => ({ delivery: { status: "blocked", route: null, detail }, action: null });
-    const thread = this.lastThreads.get(threadKey);
-    const item = this.lastItems.get(threadKey);
-    if (!thread || !item) return blocked("thread not seen since restart: scan first");
-    if (this.store.mutedUntil(threadKey)) return blocked("muted: unmute it to push");
-    const asking = this.store.openQuestions().find((question) => !this.awaitingReview.has(question.id)
-      && (question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey)));
-    if (asking) return blocked(`waits on your answer first: ${asking.title}`);
-    if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
-    const deliveryState = await this.probeDelivery({ deadlineAt });
-    const mode = this.mode === "auto" ? "auto" : "propose";
-    const decision = decideThread(item.classified, thread, {
-      ledger: this.store.ledgerFor(threadKey), escalationLedger: this.store, playbooks: this.playbooks(), config: { ...this.config, mode },
-      now: this.now(), pr: item.pr, mode, infra: this.lastInfra, manager: this.lastManager, delivery: deliveryState, ownerPush: true
-    });
-    if (decision.action !== "nudge" || !decision.message || !decision.route) return blocked(`nothing to push: ${decision.reason}`);
-    const settled = await this.prSettledBeforeSend(thread, item.pr, decision);
-    if (settled) return blocked(`not sent: ${settled}`);
-    // The owner is speaking to this thread now: an automatic nudge a scan
-    // decided meanwhile is held, as for an owner answer.
-    this.ownerAnsweredAt.set(threadKey, this.now());
-    const at = new Date(this.now()).toISOString();
-    const record = {
-      threadKey, targetKey: threadKey, playbook: decision.playbook, route: decision.route, message: decision.message, kind: "nudge", by: "owner",
-      reason: clampText(`owner: push now; ${decision.reason}`, 300), progressMark: decision.progressMark ?? null,
-      messageHash: decision.messageHash ?? null, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null
-    };
-    // A planned or proposed copy of the same nudge is this one, sent.
-    const existing = this.store.actions(this.config.limits.maxActionsKept).find((action) => OPEN_ACTION.has(action.status) && action.threadKey === threadKey && action.playbook === decision.playbook);
-    const delivery = await this.executor.deliver({ thread, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null, spentMs: Date.now() - startedAt, deadlineAt });
-    if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(thread, delivery);
-    const id = existing?.id ?? delivery.actionId ?? null;
-    const action = id
-      ? this.store.updateAction(id, { ...record, status: delivery.status, detail: delivery.detail ?? null, at })
-      : this.store.recordAction({ ...record, status: delivery.status, detail: delivery.detail ?? null, at });
-    this.recordSend(record, delivery, at);
-    // A card in the way comes back with the block, as for an owner message.
-    const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
-    return { delivery: { status: delivery.status, route: delivery.route ?? decision.route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) }, action };
+    if (this.pushing.has(threadKey)) return blocked("a push to this thread is already being sent");
+    this.pushing.add(threadKey);
+    try {
+      const thread = this.lastThreads.get(threadKey);
+      const item = this.lastItems.get(threadKey);
+      if (!thread || !item) return blocked("thread not seen since restart: scan first");
+      if (this.store.mutedUntil(threadKey)) return blocked("muted: unmute it to push");
+      const asking = this.store.openQuestions().find((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
+      if (asking) return blocked(`waits on your answer first: ${asking.title}`);
+      if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
+      const deliveryState = await this.probeDelivery({ deadlineAt });
+      const preview = item.pushPreview;
+      const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
+      const decision = preview ? { ...preview, route } : null;
+      if (decision?.action !== "nudge" || !decision.message || !route) return blocked(`nothing to push: ${preview?.reason ?? item.classified.reason}`);
+      if (repeatsLastSend(thread, this.store.ledgerFor(threadKey), decision.messageHash)) return blocked("this nudge was already sent; waiting for the agent's reply");
+      const settled = await this.prSettledBeforeSend(thread, item.pr, decision);
+      if (settled) return blocked(`not sent: ${settled}`);
+      // The owner is speaking to this thread now: an automatic nudge a scan
+      // decided meanwhile is held, as for an owner answer.
+      this.ownerAnsweredAt.set(threadKey, this.now());
+      const at = new Date(this.now()).toISOString();
+      const record = {
+        threadKey, targetKey: threadKey, playbook: decision.playbook, route: decision.route, message: decision.message, kind: "nudge", by: "owner",
+        reason: clampText(`owner: push now; ${decision.reason}`, 300), progressMark: decision.progressMark ?? null,
+        messageHash: decision.messageHash ?? null, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null
+      };
+      // A planned or proposed copy of the same nudge is this one, sent.
+      const existing = this.store.actions(this.config.limits.maxActionsKept).find((action) => OPEN_ACTION.has(action.status) && action.threadKey === threadKey && action.playbook === decision.playbook);
+      const delivery = await this.executor.deliver({ thread, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null, spentMs: Date.now() - startedAt, deadlineAt });
+      if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(thread, delivery);
+      const id = existing?.id ?? delivery.actionId ?? null;
+      const action = id
+        ? this.store.updateAction(id, { ...record, status: delivery.status, detail: delivery.detail ?? null, at })
+        : this.store.recordAction({ ...record, status: delivery.status, detail: delivery.detail ?? null, at });
+      this.recordSend(record, delivery, at);
+      // A card in the way comes back with the block, as for an owner message.
+      const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
+      return { delivery: { status: delivery.status, route: delivery.route ?? decision.route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) }, action };
+    } finally { this.pushing.delete(threadKey); }
   }
 
   // The owner's Mute: no nudge or question for the thread until then
@@ -1811,7 +1817,15 @@ export class FleetSupervisor {
     this.lastThreads = byKey;
     // Each thread's PR as this scan read it, for a proposal sent later.
     this.lastPrs = new Map(items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr]));
-    this.lastItems = new Map(items.map((item) => [item.thread.key, { classified: item.classified, pr: item.pr }]));
+    const decisionFor = effectiveDecisions(decisions);
+    this.lastItems = new Map(items.map((item) => {
+      const current = decisionFor.get(item.thread.key);
+      const pushPreview = current?.action === "nudge" ? current : decideThread(item.classified, item.thread, {
+        ledger: store.ledgerFor(item.thread.key), escalationLedger: store, playbooks: this.playbooks(), config,
+        now: started, pr: item.pr, mode: mode === "auto" ? "auto" : "propose", infra, manager, delivery, ownerPush: true
+      });
+      return [item.thread.key, { classified: item.classified, pr: item.pr, pushPreview }];
+    }));
     this.lastInfra = infra;
     this.lastManager = manager;
 
@@ -2371,7 +2385,7 @@ export class FleetSupervisor {
       // An owner answer that started after the judge read (during the
       // review, the notifications, the kept answers, an earlier send or the
       // PR read just above) goes first: checked again right before each send.
-      if (decision.action === "nudge" && this.ownerAnswerThreads(started).has(decision.threadKey)) {
+      if (decision.action === "nudge" && (this.pushing.has(decision.threadKey) || this.ownerAnswerThreads(started).has(decision.threadKey))) {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;
       }
@@ -2590,7 +2604,7 @@ export class FleetSupervisor {
           ? { ref: pr.ref, url: pr.url, state: pr.state, title: clampText(pr.title, 100), ci: pr.ci, unresolvedThreads: pr.unresolvedThreads, mergeState: pr.mergeState, head: String(pr.headOid ?? "").slice(0, 10) }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),
         lastActivityAt: thread.lastActivityAt ?? null,
-        lastAgentText: clampTail(thread.lastAgentText, 600),
+        lastAgentText: clampTail(redactSecrets(thread.lastAgentText), 600),
         error: thread.error ? { kind: thread.error.kind, resetAt: thread.error.resetAt ?? null } : null,
         live: Boolean(thread.live),
         // The app that shows it (fleet_app pins the chats an app action stops)

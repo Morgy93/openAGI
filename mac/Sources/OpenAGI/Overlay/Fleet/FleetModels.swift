@@ -66,6 +66,11 @@ extension FleetQuestion {
   /// can't carry it to the agent and always hands it back.
   var tappableOptions: [String] { options.filter { $0 != Self.openThread } }
 
+  var displayAskContext: String? {
+    guard let text = askContext?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+    return risky ? text : FleetThreadSummary.tail(text, FleetThreadSummary.excerptMax)
+  }
+
   /// True when the answer has to be typed in the agent's own app.
   var answersInThread: Bool { answerIn.map { $0 == "agent app" } ?? options.contains(Self.openThread) }
 

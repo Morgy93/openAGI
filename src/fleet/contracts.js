@@ -455,8 +455,8 @@ export function openChatFor(thread) {
     const inConductor = thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR;
     return {
       app: inConductor ? "conductor" : "codex", url: null,
-      label: `${title || "untitled thread"} (${inConductor ? "Conductor" : "Codex"})`,
-      note: thread.archived ? "Archived in Codex: unarchive it to open." : inConductor ? "No Conductor tab shows this Codex thread now; open its workspace in Conductor." : "No link opens this thread."
+      label: `${[where, title].filter(Boolean).join(" · ") || "untitled thread"} (${inConductor ? "Conductor" : "Codex"})`,
+      note: thread.archived ? "Archived in Codex: unarchive it to open." : inConductor ? `No Conductor tab shows this Codex thread now; open ${where || "its workspace"} in Conductor.` : "No link opens this thread."
     };
   }
   return { app: "claude", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled session"} (Claude Code)`, note: `A Claude Code terminal session${folder ? ` in ${folder}` : ""}: no app link opens it; open it in its terminal.` };
@@ -819,3 +819,20 @@ export async function openReadOnlyDb(filePath) {
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */
+
+/**
+ * @typedef {Object} FleetPushPreview
+ * @property {"nudge"} action
+ * @property {string} playbook
+ * @property {string} reason
+ * @property {string} message             full text Push now sends verbatim
+ */
+
+/**
+ * @typedef {Object} FleetQuestionView
+ * @property {string|null} askContext     redacted agent context, for display only
+ * @property {boolean} risky             classify the ask and options, not context
+ */
+
+// Supervisor state and thread detail carry pushPreview (FleetPushPreview or
+// null) and pushing (a send is in flight). No repeat until the agent replies.

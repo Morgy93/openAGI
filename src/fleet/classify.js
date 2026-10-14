@@ -188,8 +188,9 @@ function ownWatchGroup(state) {
 // question was put to the owner (null: none open now). closedAt: when its
 // last one closed; the group it falls back to starts there unless that
 // group keeps its own clock (a wait, a turn).
-export function liveWatch(watch, { state = null, askedAt = null, closedAt = null } = {}) {
+export function liveWatch(watch, { state = null, askedAt = null, closedAt = null, muted = null } = {}) {
   if (!watch?.group) return watch ?? null;
+  if (muted) return { ...watch, group: "quiet", waitingOn: null };
   if (askedAt) {
     const otherwise = watch.group === "you" ? watch.otherwise : { group: watch.group, waitingOn: watch.waitingOn ?? null };
     return { ...watch, group: "you", since: askedAt, waitingOn: "your answer", ...(otherwise ? { otherwise } : {}) };

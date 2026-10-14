@@ -141,7 +141,8 @@ function boot({ search = "", state = sampleState(), confirmResult = true } = {})
   const fetch = async (path, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : undefined;
     requests.push({ path, method: init.method ?? "GET", body });
-    const next = responses.shift();
+    const pending = responses.shift();
+    const next = pending ? await pending : null;
     if (next) return { ok: next.status < 400, status: next.status, json: async () => next.body };
     return { ok: true, status: 200, json: async () => currentState };
   };
@@ -446,7 +447,8 @@ function watchState() {
   const threads = [
     row("conductor:d1", "Capacity fix", { group: "you", since: at(90), waitingOn: "your answer", waitSince: null, runningSince: null }),
     row("conductor:p1", "Stalled PR", { group: "push", since: at(30), waitingOn: null, waitSince: null, runningSince: null }, {
-      decision: { action: "nudge", playbook: "merge-ready", reason: "idle 30m with CI green", notBefore: null, message: "CI is green. Merge when ready." }
+      decision: { action: "wait", reason: "owner is driving this thread" },
+      pushPreview: { action: "nudge", playbook: "merge-ready", reason: "idle 30m with CI green", message: "CI is green. Merge when ready." }
     }),
     row("conductor:p2", "No plan", { group: "push", since: at(20), waitingOn: null, waitSince: null, runningSince: null }, {
       decision: { action: "wait", playbook: null, reason: "cooldown after the last nudge", notBefore: null, message: null }
@@ -634,4 +636,30 @@ test("a Waiting on you row carries its question's options and Dismiss", async ()
   const post = page.requests.find((r) => r.method === "POST");
   assert.equal(post.path, "/fleet/api/questions/fq_cap");
   assert.deepEqual(post.body, { answer: "Raise the timeout" });
+});
+
+test("open thread is a chat link, never an answer button", async () => {
+  const state = watchState();
+  state.questions[0].options = ["A", "open thread", "B"];
+  const page = boot({ state });
+  await settle();
+  const buttons = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON");
+  assert.deepEqual(buttons.map((b) => b.textContent), ["A", "B", "Dismiss"]);
+});
+
+test("Push now stays disabled through polling during a send", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  let release;
+  page.responses.push(new Promise((resolve) => { release = resolve; }));
+  const push = () => findAll(rowOf(page, "Stalled PR"), (e) => e.tagName === "BUTTON" && e.textContent === "Push now")[0];
+  const send = push().click();
+  await settle();
+  await page.timers.find((timer) => timer.ms === 30_000).fn();
+  await settle();
+  assert.equal(push().disabled, true);
+  await push().click();
+  assert.equal(page.requests.filter((r) => r.method === "POST").length, 1);
+  release({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
+  await send;
 });

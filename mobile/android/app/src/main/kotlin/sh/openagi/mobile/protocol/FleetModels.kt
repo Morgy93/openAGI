@@ -76,6 +76,8 @@ data class FleetThread(
     val live: Boolean = false,
     val route: String? = null,
     val decision: FleetDecision? = null,
+    val pushPreview: FleetDecision? = null,
+    val pushing: Boolean = false,
     // When the agent last said something, as opposed to any activity.
     @Serializable(with = OptionalInstantSerializer::class) val lastAgentAt: Instant? = null,
     // What the supervisor is watching this thread for, and since when. Null
@@ -116,6 +118,8 @@ data class FleetThreadDetail(
     val pr: FleetPr? = null,
     val watch: FleetWatch? = null,
     val decision: FleetDecision? = null,
+    val pushPreview: FleetDecision? = null,
+    val pushing: Boolean = false,
     @Serializable(with = OptionalInstantSerializer::class) val muted: Instant? = null,
     val questions: List<FleetQuestion> = emptyList(),
     val openChat: FleetOpenChat? = null,

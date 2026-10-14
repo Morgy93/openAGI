@@ -124,6 +124,10 @@ struct SupervisorSection: View {
           .lineLimit(full ? nil : 6)
           .fixedSize(horizontal: false, vertical: full)
       }
+      if question.risky && !open, let context = question.displayAskContext {
+        Text(context).font(.system(size: 11)).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
       if open { opened(question) }
       if let note = question.reviewNote {
         Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(2)
@@ -177,11 +181,11 @@ struct SupervisorSection: View {
   /// An opened card: the agent's words the ask came from, every chat a
   /// grouped question is about, and its thread's PR, wait and next step.
   @ViewBuilder private func opened(_ question: FleetQuestion) -> some View {
-    if let context = question.askContext?.trimmingCharacters(in: .whitespacesAndNewlines), !context.isEmpty {
+    if let context = question.displayAskContext {
       Text("The agent said:").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-      Text(FleetThreadSummary.tail(context, FleetThreadSummary.excerptMax))
+      Text(context)
         .font(.system(size: 11))
-        .lineLimit(12)
+        .lineLimit(question.risky ? nil : 12)
         .textSelection(.enabled)
     }
     if question.chats.count > 1 {
