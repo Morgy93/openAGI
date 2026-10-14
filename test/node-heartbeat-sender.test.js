@@ -262,3 +262,42 @@ test("an unpaired instance never starts the heartbeat sender", async () => {
     assert.equal(app.__heartbeatHandle, undefined, "no heartbeat interval was created for an unpaired instance");
   } finally { await app.close(); }
 });
+
+test("a heartbeat finishing after close cannot restart node services", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-hb-closing-"));
+  writeNodeConfig({ remote: "http://127.0.0.1:1", nodeToken: "n".repeat(43), nodeEnrollmentConfirmed: false }, dataDir);
+  let releaseHeartbeat;
+  let markHeartbeat;
+  const heartbeatStarted = new Promise((resolve) => { markHeartbeat = resolve; });
+  const heartbeatResponse = new Promise((resolve) => { releaseHeartbeat = resolve; });
+  let polls = 0;
+  let bridgeStarts = 0;
+  let closed = false;
+  const runtime = createDurableRuntime({ dataDir });
+  const app = createHostedInterface(runtime, {
+    host: "127.0.0.1", port: 0, tickerMs: 0, dataDir, heartbeatIntervalMs: 60_000,
+    codingNodeEnabled: true,
+    codingNodeCapability: { capability: { id: "coding", operations: [] }, stop() {} },
+    imessageBridgeRuntime: { start() { bridgeStarts += 1; }, stop() {} },
+    nodeControlFetch: async (url, options) => {
+      if (url.endsWith("/nodes/enroll")) return new Response(JSON.stringify({ enrolled: true }), { status: 200 });
+      if (url.endsWith("/nodes/heartbeat")) { markHeartbeat(); return heartbeatResponse; }
+      polls += 1;
+      return new Promise((_, reject) => {
+        options.signal.addEventListener("abort", () => reject(Object.assign(new Error("stopped"), { name: "AbortError" })), { once: true });
+      });
+    }
+  });
+  t.after(async () => {
+    if (!closed || polls) await app.close().catch((error) => { if (error.code !== "ERR_SERVER_NOT_RUNNING") throw error; });
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  await app.listen();
+  await heartbeatStarted;
+  await app.close();
+  closed = true;
+  releaseHeartbeat(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(polls, 0, "closed node must not start another control worker");
+  assert.equal(bridgeStarts, 0, "closed node must not restart its bridge");
+});

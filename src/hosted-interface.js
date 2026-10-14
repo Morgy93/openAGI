@@ -622,6 +622,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   let tickerHandle = null;
   let heartbeatHandle = null;
+  let nodeServicesClosing = false;
   let nodeControlWorker = null;
   let computerExecutor = null;
   let imessageNodeCapability = null;
@@ -715,6 +716,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return localCapabilityCache;
   };
   const ensureImessageBridge = () => {
+    if (nodeServicesClosing) return null;
     imessageBridgeRuntime ??= options.imessageBridgeRuntime
       ?? createImessageBridgeRuntime({
         dataDir,
@@ -726,7 +728,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return imessageBridgeRuntime;
   };
   const ensureNodeControlWorker = () => {
-    if (nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
+    if (nodeServicesClosing || nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
     const pairing = readNodeConfig(dataDir);
     if (!pairing?.remote || !pairing.nodeToken || pairing.nodeEnrollmentConfirmed !== true) return null;
     const identity = readOrCreateIdentity(dataDir);
@@ -3480,9 +3482,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             const heartbeatBuild = resolveBuildInfo({ packageVersion: PACKAGE_VERSION });
             let heartbeatFailStreak = 0;
             const sendHeartbeat = async () => {
+              if (nodeServicesClosing) return;
               try {
                 const identity = readOrCreateIdentity(dataDir);
                 const scopedToken = await ensureScopedNodeToken(pairing, identity);
+                if (nodeServicesClosing) return;
                 const ctrl = new AbortController();
                 const heartbeatTimeoutMs = Math.max(1_000, Math.min(30_000,
                   Number(options.heartbeatTimeoutMs) || 15_000));
@@ -3546,6 +3550,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      nodeServicesClosing = true;
       for (const unobserve of unobserveSharedThreads) unobserve();
       g2Requests?.close();
       clearInterval(g2RetentionTimer);
