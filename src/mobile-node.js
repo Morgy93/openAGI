@@ -1,3 +1,5 @@
+import { THREAD_KIND_PATTERN } from "./fleet/contracts.js";
+
 // The phone is a full client, so its credential is broader than the G2
 // wearable's. Breadth is only safe when it is explicit: this module is the
 // single enumerated answer to "what may a phone token do", kept as pure data
@@ -50,7 +52,7 @@ export const MOBILE_NODE_NAME_MAX = 60;
 // Deliberately excludes "." and "/" so no id can carry a path segment.
 const ID = "[a-zA-Z0-9_-]{1,120}";
 // A fleet thread key ("conductor:<id>"), its colon raw or percent-encoded.
-const FLEET_THREAD = "(?:codex|claude|conductor)(?::|%3A)[A-Za-z0-9_.-]{1,120}";
+const FLEET_THREAD = `(?:${THREAD_KIND_PATTERN})(?::|%3A)[A-Za-z0-9_.-]{1,120}`;
 
 const EXACT = new Set([
   "GET /mobile/summary",

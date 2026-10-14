@@ -171,12 +171,13 @@ struct FleetOpenChat: Decodable, Equatable {
 
   static let schemes: Set<String> = ["conductor", "codex"]
 
-  /// "Conductor", "Codex", "Claude Code".
+  /// The app that shows this chat.
   var appName: String? {
     switch app {
     case "conductor": return "Conductor"
     case "codex": return "Codex"
     case "claude": return "Claude Code"
+    case "antigravity": return "Antigravity"
     default: return nil
     }
   }

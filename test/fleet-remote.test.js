@@ -489,3 +489,28 @@ test('a missing thread keeps the lastError returned by the computer', async t =>
   await assert.rejects(() => remote.threadDetail('codex:gone'), /unavailable/);
   assert.match(remote.getState().lastError, /unavailable/);
 });
+
+
+test('remote Antigravity thread requests reach the supervisor with the broker deadline', async () => {
+  const seen = [];
+  const supervisor = {
+    getState: () => ({}),
+    threadDetail: async key => { seen.push(['detail', key]); return { key }; },
+    pushNow: async (key, options) => { seen.push(['push', key, options.deadlineAt]); return { delivery: { status: 'sent' } }; },
+    muteThread: async key => { seen.push(['mute', key]); return { until: null }; },
+    unmuteThread: async key => { seen.push(['unmute', key]); return { until: null }; }
+  };
+  const capability = createFleetCapability(supervisor);
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  for (const key of ['antigravity:a1', 'antigravity%3Aa1']) {
+    for (const action of ['detail', 'push', 'mute', 'unmute']) {
+      const path = '/fleet/api/threads/' + key + (action === 'detail' ? '' : '/' + action);
+      const result = await capability.invoke('request', { method: action === 'detail' ? 'GET' : 'POST', path }, { expiresAt });
+      assert.equal(result.response.status, 200);
+    }
+  }
+  assert.deepEqual(seen, [...Array(2)].flatMap(() => [['detail', 'antigravity:a1'], ['push', 'antigravity:a1', Date.parse(expiresAt)], ['mute', 'antigravity:a1'], ['unmute', 'antigravity:a1']]));
+  for (const key of ['antigravity:', 'antigravity:a/b', 'gemini:a1']) {
+    await assert.rejects(capability.invoke('request', { method: 'GET', path: '/fleet/api/threads/' + key }), /Unsupported fleet request/);
+  }
+});

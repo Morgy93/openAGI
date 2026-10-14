@@ -331,3 +331,35 @@ test("thread routes: detail, Push now, Mute and Unmute, by a key from the state"
     ["pushNow", "conductor:s-1", null], ["muteThread", "conductor:s-1", 4], ["muteThread", "conductor:s-1", undefined], ["unmuteThread", "conductor:s-1"]
   ]);
 });
+
+test("POST /fleet/api/send takes keys of every thread kind and refuses others", async () => {
+  const supervisor = fakeSupervisor();
+  const sent = [];
+  supervisor.sendOwnerMessage = async (threadKey, message) => { sent.push([threadKey, message]); return { delivery: { status: "sent" } }; };
+  const route = createFleetRoute({ supervisor });
+  const send = (threadKey) => route("POST", "/fleet/api/send", url("/fleet/api/send"), body({ threadKey, message: "hi" }));
+  for (const key of ["codex:t1", "claude:s1", "conductor:c1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) {
+    assert.equal((await send(key)).status, 200, key);
+  }
+  for (const key of ["gemini:x", "antigravity:", "antigravity:a/b", "codex"]) assert.equal((await send(key)).status, 400, key);
+  assert.equal(sent.length, 4);
+  assert.equal(sent[3][0], "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8");
+});
+
+
+test("Antigravity detail and owner actions accept raw and encoded thread keys", async () => {
+  const supervisor = fakeSupervisor();
+  const seen = [];
+  supervisor.threadDetail = async (key) => { seen.push(["detail", key]); return { key }; };
+  supervisor.pushNow = async (key) => { seen.push(["push", key]); return { delivery: { status: "sent", route: "antigravity-send" } }; };
+  supervisor.muteThread = async (key) => { seen.push(["mute", key]); return { until: "2026-10-15T00:00:00Z" }; };
+  supervisor.unmuteThread = async (key) => { seen.push(["unmute", key]); return { until: null }; };
+  const route = createFleetRoute({ supervisor });
+  for (const key of ["antigravity:a1", "antigravity%3Aa1"]) {
+    for (const action of ["detail", "push", "mute", "unmute"]) {
+      const path = "/fleet/api/threads/" + key + (action === "detail" ? "" : "/" + action);
+      assert.equal((await route(action === "detail" ? "GET" : "POST", path, url(path), body({}))).status, 200);
+    }
+  }
+  assert.deepEqual(seen, [...Array(2)].flatMap(() => ["detail", "push", "mute", "unmute"].map((action) => [action, "antigravity:a1"])));
+});

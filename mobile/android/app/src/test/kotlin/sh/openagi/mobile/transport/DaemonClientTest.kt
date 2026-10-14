@@ -582,6 +582,19 @@ class DaemonClientTest {
         assertEquals("/fleet/api/threads/claude:x1/unmute", unmute.path)
     }
 
+    @Test
+    fun antigravityThreadAndActionsUseTheThreadRoutes() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"thread":{"key":"antigravity:a1"}}"""))
+        repeat(3) { server.enqueue(MockResponse().setResponseCode(200).setBody("""{"muted":null}""")) }
+        assertEquals("antigravity:a1", client().fleetThread("antigravity:a1").thread!!.key)
+        client().fleetPush("antigravity:a1")
+        client().fleetMute("antigravity:a1", 24)
+        client().fleetUnmute("antigravity:a1")
+        listOf("", "/push", "/mute", "/unmute").forEach { suffix ->
+            assertEquals("/fleet/api/threads/antigravity:a1$suffix", server.takeRequest().path)
+        }
+    }
+
     // A key the daemon never sends goes nowhere: no path built from it.
     @Test
     fun aThreadKeyOutsideTheContractIsNotSent() = runBlocking {

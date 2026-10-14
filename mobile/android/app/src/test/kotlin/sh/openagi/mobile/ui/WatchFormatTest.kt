@@ -194,6 +194,11 @@ class WatchFormatTest {
 
     @Test
     fun noLinkKeepsTheNoteAndIsNotOnMac() {
+        val antigravity = WatchFormat.chatLink(FleetOpenChat(app = "antigravity", note = "Open it in Antigravity.")) { true }!!
+        assertEquals("Antigravity", antigravity.app)
+        assertNull(antigravity.url)
+        assertFalse(antigravity.onMac)
+        assertEquals("Open it in Antigravity.", antigravity.note)
         val chat = FleetOpenChat(app = "claude", url = null, label = "amman · Docs (Claude Code)", note = "open it in its terminal")
         val link = WatchFormat.chatLink(chat) { true }!!
         assertNull(link.url)
