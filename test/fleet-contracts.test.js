@@ -3,10 +3,39 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
-  ROUTES, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
-  linkUiHosts, openChatFor, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
+  linkUiHosts, openChatFor, KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  ANTIGRAVITY_LS, defaultBinaries, openImmutableDb, isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
+
+test("Antigravity binaries resolve the app shim and both app install locations without PATH", () => {
+  const home = "/home/fixture";
+  const shim = path.join(home, ".gemini", "antigravity", "bin", "agentapi");
+  const userApp = path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server");
+  const both = defaultBinaries(home, (file) => [shim, ANTIGRAVITY_LS, userApp].includes(file));
+  assert.equal(both.agentapi, shim);
+  assert.equal(both.antigravityLs, ANTIGRAVITY_LS);
+  const bundled = defaultBinaries(home, (file) => file === userApp);
+  assert.equal(bundled.agentapi, null);
+  assert.equal(bundled.antigravityLs, userApp);
+  assert.equal(defaultBinaries(home, () => false).agentapi, null);
+});
+
+test("immutable SQLite reads preserve special path characters and create no sidecars", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-contracts-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "space #question?percent%.db");
+  const setup = new DatabaseSync(file);
+  setup.exec("PRAGMA journal_mode=WAL; CREATE TABLE fixture (value); INSERT INTO fixture VALUES (42)");
+  setup.close();
+  const db = await openImmutableDb(file);
+  assert.ok(db);
+  try { assert.equal(db.prepare("SELECT value FROM fixture").get().value, 42); }
+  finally { db.close(); }
+  assert.equal(fs.existsSync(file + "-wal"), false);
+  assert.equal(fs.existsSync(file + "-shm"), false);
+});
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
   const config = resolveFleetConfig({}, { home: "/home/fixture" });
@@ -230,4 +259,27 @@ test("openChatFor: the link that opens exactly that chat, or a label that says w
   assert.equal(claude.label, "api · fix auth (Claude Code)");
   assert.match(claude.note, /terminal/);
   assert.equal(openChatFor(null), null);
+});
+
+test("thread keys come from the one kind list, Antigravity included", () => {
+  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity"]);
+  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity");
+  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
+  for (const key of ["gemini:x", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
+  for (const kind of THREAD_KINDS) assert.ok(KIND_NAMES[kind], kind);
+  assert.equal(kindName("antigravity"), "Antigravity");
+  assert.equal(kindName("other"), "Agent");
+});
+
+
+test("Antigravity openChatFor names the workspace and conversation without a guessed link", () => {
+  const thread = { key: "antigravity:a1", kind: "antigravity", id: "a1", workspace: "api", title: "Fix auth", cwd: "/work/api" };
+  const chat = openChatFor(thread);
+  assert.equal(chat.app, "antigravity");
+  assert.equal(chat.url, null);
+  assert.equal(chat.label, "api · Fix auth (Antigravity)");
+  assert.match(chat.note, /open it in Antigravity/);
+  assert.equal(openChatFor({ ...thread, workspace: null }).label, chat.label);
+  assert.equal(openChatFor({ ...thread, title: "API" }).label, "api (Antigravity)");
+  assert.equal(openChatFor({ ...thread, workspace: null, cwd: null, title: null }).label, "untitled conversation (Antigravity)");
 });

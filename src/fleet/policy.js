@@ -5,7 +5,7 @@
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
 import {
-  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isMainHealthCheck, liveCardItems, msSince, parsePrRef,
+  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isMainHealthCheck, kindName, liveCardItems, msSince, parsePrRef,
   redactSecrets, shortHash, uiTargetFor
 } from "./contracts.js";
 import { blockedOnSection, deliberateStop, ownerStoppedNudge } from "./classify.js";
@@ -48,7 +48,6 @@ const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailabl
 const LB_TRANSIENT_KINDS = new Set(["connection", "unavailable"]);
 const LB_TRANSIENT_MIN = 3;
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
-const KIND_NAMES = { codex: "Codex", claude: "Claude", conductor: "Conductor" };
 // Thread-level and infra-level escalations of one incident share a cooldown.
 const ESCALATION_KEYS = { "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" };
 
@@ -80,6 +79,10 @@ const TOPIC_TITLES = {
 // ready. apps maps bundleId -> running; false means that app is closed.
 export function chooseRoute(thread, mode, delivery = null) {
   if (!thread || thread.archived) return null;
+  // Antigravity takes messages through its own API (agentapi send-message):
+  // nothing is typed or forked, the app shows it in the conversation, so
+  // every delivery mode may use it.
+  if (thread.kind === "antigravity") return "antigravity-send";
   const ui = deliveryOf(delivery);
   if (ui.mode !== "cli") {
     const target = uiTargetFor(thread);
@@ -234,6 +237,11 @@ function nudge(playbook, reason, extra = {}) {
   return { type: "nudge", playbook, reason, ...extra };
 }
 
+// The agent whose account hit a cap or logged out: Conductor chats run Claude.
+function agentName(thread) {
+  return thread.kind === "conductor" ? "Claude" : kindName(thread.kind);
+}
+
 // Which process the laptop check saw, so the agent can look at that one.
 function localVerifyVars(proc) {
   const pid = Number(proc?.pid);
@@ -250,7 +258,7 @@ function infraIntent(ctx) {
     if (!resetAt || !Number.isFinite(Date.parse(resetAt))) return backoffIntent(ctx, errorAt, kind);
     const resumeAt = addMs(resetAt, limits.sessionLimitGraceMs);
     if (Date.parse(resetAt) - now > FAR_RESET_MS) {
-      const who = thread.kind === "codex" ? "Codex" : "Claude";
+      const who = agentName(thread);
       return {
         type: "ask", notBefore: resumeAt, reason: `${kind} until ${ctx.facts.reset}`,
         question: question(ctx, `${ctx.facts.label}: ${who} cap. Reset ${ctx.facts.reset}. Add acct?`,
@@ -277,7 +285,7 @@ function infraIntent(ctx) {
     return { type: "wait", reason: `waiting on ${INFRA_NAMES[kind]}` };
   }
   if (kind === "logged-out") {
-    const who = thread.kind === "codex" ? "Codex" : "Claude";
+    const who = agentName(thread);
     return {
       type: "ask", reason: "logged out",
       question: question(ctx, `${who} logged out. Run /login?`, `${ctx.facts.label} stopped: ${who} is not logged in.`,
@@ -1389,7 +1397,7 @@ export function ownerLabel(thread, prNumber, repo) {
   const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
     || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
   if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
-  return place || `${KIND_NAMES[thread.kind] ?? "Agent"} chat`;
+  return place || `${kindName(thread.kind)} chat`;
 }
 
 function ciSummary(pr) {
