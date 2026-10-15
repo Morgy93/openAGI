@@ -828,6 +828,22 @@ test("a rejected response.create services the queued owner turn and releases its
   assert.equal(h.ends.length, 0);
 });
 
+test("closing mid-reply releases the in-flight response reservation", (t) => {
+  const h = harness(t);
+  const persisted = {};
+  h.budget.setVoiceReservation = (id, usd) => { persisted[id] = usd; };
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "first" });
+  const reservation = h.session.responseReservation;
+  assert.equal(h.session.responding, true);
+  assert.ok(h.session.spend.amount(reservation) > 0);
+  assert.ok(persisted[reservation] > 0);
+  h.session.close();
+  assert.equal(h.session.responseReservation, null);
+  assert.equal(h.session.spend.amount(reservation), 0);
+  assert.equal(persisted[reservation], 0);
+});
+
 for (const beforeReady of [false, true]) test(`leaving hands-free clears uncommitted audio (startup: ${beforeReady})`, (t) => {
   const h = harness(t, { handsFree: true });
   if (!beforeReady) h.ready();
