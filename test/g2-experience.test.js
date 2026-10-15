@@ -33,6 +33,14 @@ test("experience requires live G2 credentials even without owner auth", async t 
   const ready = await post({ op: "capabilities" }, headers);
   assert.equal(ready.status, 200); assert.equal(ready.headers.get("access-control-allow-origin"), "*");
   assert.equal((await ready.json()).protocol, 1); assert.equal(turns, 0);
+  // The G2 explains a voice relay 404 with this flag (OPENAGI_VOICE, off by default).
+  const savedVoice = process.env.OPENAGI_VOICE;
+  try {
+    delete process.env.OPENAGI_VOICE;
+    assert.equal((await (await post({ op: "capabilities" }, headers)).json()).voice, false);
+    process.env.OPENAGI_VOICE = "1";
+    assert.equal((await (await post({ op: "capabilities" }, headers)).json()).voice, true);
+  } finally { if (savedVoice === undefined) delete process.env.OPENAGI_VOICE; else process.env.OPENAGI_VOICE = savedVoice; }
   assert.equal((await post({ op: "capabilities", nodeId: other }, headers)).status, 400);
   assert.ok([401, 403].includes((await post({ op: "capabilities" }, { ...headers, "x-openagi-node-id": other })).status));
   assert.equal((await fetch(`${url}/nodes/g2/experience`, { method: "OPTIONS" })).status, 204);
