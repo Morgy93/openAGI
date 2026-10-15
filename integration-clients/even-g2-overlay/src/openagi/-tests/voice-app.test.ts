@@ -10,7 +10,7 @@ async function fixture() {
   const sockets: FakeVoiceSocket[] = []
   let receive: (pcm: Uint8Array) => void = () => {}
   const audio = { active: false, start: vi.fn((callback: typeof receive) => { receive = callback; audio.active = true; return Promise.resolve() }), stop: vi.fn(() => { audio.active = false; return Promise.resolve() }) }
-  const api = { voiceRelay: vi.fn(() => ({ url: 'wss://main.example/nodes/voice?rate=16000&mode=ptt', token: 'g2-test-token-123456' })), ask: vi.fn(), askText: vi.fn(), listen: vi.fn() }
+  const api = { voiceRelay: vi.fn(() => ({ url: 'wss://main.example/nodes/voice?rate=16000&mode=ptt', token: 'g2-test-token-123456' })), ask: vi.fn(), askText: vi.fn(), listen: vi.fn(), hubVoiceEnabled: vi.fn(() => Promise.resolve<boolean | null>(null)) }
   const renderer = { supervisorHome: vi.fn(), home: vi.fn(), listening: vi.fn(), thinking: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), inboxList: vi.fn(), autoSend: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), preview: vi.fn(), transcript: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
@@ -122,6 +122,24 @@ it('an unavailable relay reports the problem and sends no legacy fallback reques
     f.sockets[0].onerror?.(new Event('error'))
     expect(f.renderer.message).toHaveBeenLastCalledWith('Supervisor voice unavailable', expect.stringContaining('enabled'))
     expect(f.api.ask).not.toHaveBeenCalled(); expect(f.api.askText).not.toHaveBeenCalled(); expect(f.audio.start).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})
+
+it('says voice is off on the hub when main reports OPENAGI_VOICE off, still with no fallback request', async () => {
+  const f = await fixture()
+  try {
+    f.api.hubVoiceEnabled.mockResolvedValue(false)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    f.sockets[0].onerror?.(new Event('error')); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.hubVoiceEnabled).toHaveBeenCalledOnce()
+    expect(f.renderer.message).toHaveBeenLastCalledWith('Supervisor voice unavailable', 'Voice is off on your hub. Set OPENAGI_VOICE=1.')
+    expect(f.phone.set).toHaveBeenLastCalledWith('Supervisor voice unavailable', 'Voice is off on your hub. Set OPENAGI_VOICE=1.')
+    expect(f.api.ask).not.toHaveBeenCalled(); expect(f.api.askText).not.toHaveBeenCalled(); expect(f.audio.start).not.toHaveBeenCalled()
+    f.api.hubVoiceEnabled.mockResolvedValue(true)
+    await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.sockets).toHaveLength(2)
+    f.sockets[1].onerror?.(new Event('error')); await vi.advanceTimersByTimeAsync(1)
+    expect(f.renderer.message).toHaveBeenLastCalledWith('Supervisor voice unavailable', expect.stringContaining('enabled'))
   } finally { await f.app.systemExit() }
 })
 

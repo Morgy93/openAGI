@@ -18,6 +18,19 @@ describe('OpenAGIApiClient', () => {
     expect(() => insecure.voiceRelay()).toThrow('HTTPS')
     expect(() => new OpenAGIApiClient(config, () => null).voiceRelay()).toThrow()
   })
+  it('reads the hub voice switch from G2 capabilities, null when main does not say', async () => {
+    let body: unknown = { protocol: 1, voice: false }
+    const bodies: unknown[] = []
+    const fetchImpl = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(typeof init?.body === 'string' ? init.body : '{}'))
+      return Promise.resolve(jsonResponse(body))
+    }) as unknown as typeof fetch
+    const api = new OpenAGIApiClient(config, () => ({ nodeId: crypto.randomUUID(), nodeToken: 'g'.repeat(43) }), fetchImpl)
+    expect(await api.hubVoiceEnabled()).toBe(false)
+    expect(bodies[0]).toEqual({ op: 'capabilities' })
+    body = { protocol: 1, voice: true }; expect(await api.hubVoiceEnabled()).toBe(true)
+    body = { protocol: 1 }; expect(await api.hubVoiceEnabled()).toBeNull()
+  })
   it('pins the speech relay to the selected HTTPS main and keeps the token out of its URL', () => {
     const api = new OpenAGIApiClient(config, () => ({ nodeToken: 't'.repeat(43) }))
     const relay = api.speechRelay('nova-3', 'Peri')

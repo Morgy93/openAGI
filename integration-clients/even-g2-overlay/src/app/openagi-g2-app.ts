@@ -900,7 +900,7 @@ export class OpenAGIG2App {
       },
       transcript: text => this.phone.transcript?.(text),
       notice: text => { this.mode = 'message'; this.renderer.message('Supervisor voice', text); this.phone.set('Supervisor voice', text) },
-      error: error => { if (!this.exited && this.foregroundActive) { this.cancelHold(); this.mode = 'message'; this.renderer.message('Supervisor voice unavailable', error.message); this.phone.set('Supervisor voice unavailable', error.message) } },
+      error: error => { if (!this.exited && this.foregroundActive) { this.cancelHold(); this.mode = 'message'; this.renderer.message('Supervisor voice unavailable', error.message); this.phone.set('Supervisor voice unavailable', error.message); void this.explainVoiceOff() } },
     })
     try {
       const relay = this.api.voiceRelay()
@@ -908,6 +908,14 @@ export class OpenAGIG2App {
       this.supervisorVoice.press(relay, supervisorVoiceFocus(this.voiceTarget))
       if (this.releasePending) { this.releasePending = false; this.supervisorVoice.release() }
     } catch (error) { this.cancelHold(); this.fail(error) }
+  }
+  // Main answers /nodes/voice with 404 while voice is off; a socket cannot see
+  // that status, so ask main and say so plainly. No fallback request is sent.
+  private async explainVoiceOff(): Promise<void> {
+    const enabled = await this.api.hubVoiceEnabled?.().catch(() => null)
+    if (enabled !== false || this.exited || !this.foregroundActive || this.mode !== 'message' || this.supervisorVoice?.state !== 'idle') return
+    const text = 'Voice is off on your hub. Set OPENAGI_VOICE=1.'
+    this.renderer.message('Supervisor voice unavailable', text); this.phone.set('Supervisor voice unavailable', text)
   }
   private async beginAsk(): Promise<void> {
     // A lifelog microphone that is opening finishes first, then hands over.

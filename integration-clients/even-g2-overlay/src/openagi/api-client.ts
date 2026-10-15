@@ -110,6 +110,11 @@ export class OpenAGIApiClient {
     url.searchParams.set('rate', '16000'); url.searchParams.set('mode', 'ptt')
     return { url: url.href, token: credential.nodeToken }
   }
+  /** Whether main has realtime voice on (OPENAGI_VOICE); null when main does not say. */
+  async hubVoiceEnabled(): Promise<boolean | null> {
+    const result = await this.json<{ voice?: unknown }>('/nodes/g2/experience', { method: 'POST', body: JSON.stringify({ op: 'capabilities' }), signal: AbortSignal.timeout(6000) })
+    return typeof result.voice === 'boolean' ? result.voice : null
+  }
   private validatedOrigin(): string {
     const origin = new URL(this.getOrigin()).origin
     if (this.config.allowedOrigins.length > 0 && !this.config.allowedOrigins.includes(origin)) throw new OpenAGIApiError('origin_not_allowed', 400, 'This agent URL is not allowed by the installed G2 package.')
