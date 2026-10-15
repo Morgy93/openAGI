@@ -1,0 +1,182 @@
+package sh.openagi.mobile.voice
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
+
+internal interface VoiceOutput {
+    val head: Long
+    fun start()
+    fun write(pcm: ByteArray, offset: Int, count: Int): Int
+    fun close()
+}
+
+class VoiceAudio internal constructor(
+    private val audioFocus: VoiceFocusControl,
+    private val outputFactory: () -> VoiceOutput? = { createOutput() },
+) : VoiceAudioIO {
+    constructor(context: Context) : this(VoiceAudioFocus(context))
+
+    private class Capture(val record: AudioRecord) { @Volatile var active = true }
+    private var capture: Capture? = null
+    private var track: VoiceOutput? = null
+    private var player: Thread? = null
+    private var queue = LinkedBlockingQueue<ByteArray>()
+    private var queuedBytes = 0
+    private var playback = VoicePlayback(RATE)
+
+    override fun open(onFocusLost: () -> Unit): Boolean = audioFocus.acquire(onFocusLost)
+
+    @SuppressLint("MissingPermission")
+    @Synchronized
+    override fun startCapture(onAudio: (ByteArray) -> Unit, onError: () -> Unit) {
+        if (capture != null) return
+        val minimum = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        check(minimum > 0)
+        val record = AudioRecord.Builder().setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+            .setAudioFormat(format(AudioFormat.CHANNEL_IN_MONO)).setBufferSizeInBytes(maxOf(minimum, FRAME_BYTES * 4)).build()
+        if (record.state != AudioRecord.STATE_INITIALIZED) { record.release(); error("Microphone unavailable") }
+        val current = Capture(record)
+        capture = current
+        thread(name = "voice-capture") {
+            var echo: AcousticEchoCanceler? = null
+            var noise: NoiseSuppressor? = null
+            try {
+                if (AcousticEchoCanceler.isAvailable()) echo = runCatching { AcousticEchoCanceler.create(record.audioSessionId)?.also { it.enabled = true } }.getOrNull()
+                if (NoiseSuppressor.isAvailable()) noise = runCatching { NoiseSuppressor.create(record.audioSessionId)?.also { it.enabled = true } }.getOrNull()
+                if (current.active) record.startRecording()
+                val buffer = ByteArray(FRAME_BYTES)
+                while (current.active) {
+                    val count = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+                    if (!current.active) break
+                    if (count <= 0 || count % 2 != 0) error("Microphone read failed")
+                    onAudio(buffer.copyOf(count))
+                }
+            } catch (_: Exception) {
+                if (current.active) onError()
+            } finally {
+                echo?.release()
+                noise?.release()
+                runCatching { record.stop() }
+                record.release()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun stopCapture() {
+        val current = capture ?: return
+        capture = null
+        current.active = false
+        runCatching { current.record.stop() }
+    }
+
+    @Synchronized
+    override fun play(pcm: ByteArray, onError: () -> Unit): Boolean {
+        if (track == null) {
+            val created = runCatching { outputFactory() }.getOrNull() ?: return false
+            track = created
+            try { created.start() } catch (_: Exception) { stopPlayback(); return false }
+            val pending = queue
+            player = thread(name = "voice-playback") {
+                try {
+                    while (!Thread.currentThread().isInterrupted) {
+                        val callbacks = synchronized(this) {
+                            if (track !== created || pending !== queue) return@thread
+                            playback.played(created.head)
+                        }
+                        callbacks.forEach { it() }
+                        val chunk = pending.poll(10, TimeUnit.MILLISECONDS) ?: continue
+                        var offset = 0
+                        while (offset < chunk.size) {
+                            val count = synchronized(this) {
+                                if (track !== created || pending !== queue) return@thread
+                                created.write(chunk, offset, minOf(FRAME_BYTES, chunk.size - offset))
+                            }
+                            if (count < 0) error("Reply playback failed")
+                            offset += count
+                            if (count == 0) Thread.sleep(5)
+                        }
+                        synchronized(this) {
+                            if (track !== created || pending !== queue) return@thread
+                            queuedBytes -= chunk.size
+                        }
+                    }
+                } catch (_: InterruptedException) { /* stopped */ }
+                catch (_: Exception) {
+                    val failed = synchronized(this) {
+                        if (track !== created || pending !== queue) false
+                        else { stopPlayback(); true }
+                    }
+                    // Session callbacks must run outside the audio lock.
+                    if (failed) onError()
+                }
+            }
+        }
+        // Replies arrive faster than playback; bound bytes rather than delta count.
+        if (pcm.size > MAX_QUEUED_BYTES - queuedBytes) return false
+        queuedBytes += pcm.size
+        queue.offer(pcm)
+        playback.append(pcm.size)
+        return true
+    }
+
+    @Synchronized
+    override fun completeReply(audioMs: Double, onPlayed: () -> Unit) { playback.complete(audioMs, onPlayed) }
+
+    @Synchronized
+    override fun barge(): Long {
+        val current = track
+        val head = current?.head ?: 0
+        val played = playback.playedMs(head)
+        stopPlayback()
+        return played
+    }
+
+    private fun stopPlayback() {
+        player?.interrupt()
+        player = null
+        queue.clear()
+        queue = LinkedBlockingQueue()
+        queuedBytes = 0
+        track?.let { runCatching { it.close() } }
+        track = null
+        playback = VoicePlayback(RATE)
+    }
+
+    @Synchronized
+    override fun close() { stopCapture(); stopPlayback(); audioFocus.release() }
+
+    companion object {
+        const val RATE = 24000
+        internal const val MAX_QUEUED_BYTES = RATE * 2 * 120 // Two minutes of PCM16 mono.
+        private const val FRAME_BYTES = 960 // 20 ms of PCM16 mono.
+        private fun format(channels: Int) = AudioFormat.Builder().setSampleRate(RATE)
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(channels).build()
+
+        private fun createOutput(): VoiceOutput? {
+            val minimum = AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            if (minimum <= 0) return null
+            val created = AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .setAudioFormat(format(AudioFormat.CHANNEL_OUT_MONO)).setBufferSizeInBytes(maxOf(minimum, FRAME_BYTES * 4))
+                .setTransferMode(AudioTrack.MODE_STREAM).build()
+            if (created.state != AudioTrack.STATE_INITIALIZED) { created.release(); return null }
+            return object : VoiceOutput {
+                override val head get() = created.playbackHeadPosition.toLong() and 0xffffffffL
+                override fun start() { created.play() }
+                override fun write(pcm: ByteArray, offset: Int, count: Int) = created.write(pcm, offset, count, AudioTrack.WRITE_NON_BLOCKING)
+                override fun close() { runCatching { created.pause(); created.flush() }; created.release() }
+            }
+        }
+    }
+}
