@@ -650,6 +650,11 @@ export class AbiRuntime {
         score: scrutiny.score
       });
     } else if (!options.ephemeral) {
+      // Integration content may be any JSON value accepted by /ingest.
+      // Serialize structured evidence before comparison and memory hashing.
+      const body = signal.content != null && typeof signal.content === "object"
+        ? JSON.stringify(signal.content)
+        : signal.content;
       memoryItem = this.memory.remember(
         {
           source: signal.source,
@@ -659,9 +664,9 @@ export class AbiRuntime {
           // limit as integration summaries. Chat summaries can also be a
           // shorter body prefix; omit that repetition to retain diagnostics.
           // Preserve the full body regardless of the comparison.
-          content: [signal.content, (
-            summarizeText(signal.content, Infinity).startsWith(summarizeText(signal.summary, Infinity)) ||
-            summarizeText(signal.content, 500) === summarizeText(signal.summary, 500)
+          content: [body, (
+            summarizeText(body, Infinity).startsWith(summarizeText(signal.summary, Infinity)) ||
+            summarizeText(body, 500) === summarizeText(signal.summary, 500)
           ) ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
             .filter((part) => part != null && part !== "")
             .join("\n"),

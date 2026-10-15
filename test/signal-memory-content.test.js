@@ -4,11 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createDefaultRuntime } from '../src/index.js';
+import { HashBagEmbedder } from '../src/embeddings.js';
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openagi-signal-memory-'));
   const runtime = createDefaultRuntime({
     dataDir, observationOptions: { dir: path.join(dataDir, 'observations') },
+    outcomeOptions: { dir: path.join(dataDir, 'outcomes') },
+    vectorStoreOptions: { dir: path.join(dataDir, 'vectors') },
+    embedder: new HashBagEmbedder(),
   });
   t.after(async () => {
     await runtime.sessionIndex.rebuildPromise;
@@ -123,4 +127,33 @@ test('a distinct summary remains alongside body evidence', (t) => {
   const runtime = fixture(t);
   const output = runtime.processSignal(signal('Delivery moved to Tuesday.'));
   assert.match(output.memory.content, /Delivery moved to Tuesday\. Project update Decision: observe/);
+});
+
+for (const [kind, body] of [
+  ['object', (day) => ({ delivery: day })],
+  ['array', (day) => [{ delivery: day }, 'confirmed']],
+]) {
+  test(`structured ${kind} integration bodies retain distinct evidence`, (t) => {
+    const runtime = fixture(t);
+    const [first] = runtime.processIntegrationEvent('abi', signal(body('Tuesday')));
+    const [second] = runtime.processIntegrationEvent('abi', signal(body('Friday')));
+    assert.ok(first.memory.content.startsWith(JSON.stringify(body('Tuesday'))));
+    assert.ok(second.memory.content.startsWith(JSON.stringify(body('Friday'))));
+    assert.doesNotMatch(first.memory.content, /\[object Object\]/);
+    assert.notEqual(first.memory.id, second.memory.id);
+    const [repeated] = runtime.processIntegrationEvent('abi', signal(body('Tuesday')));
+    assert.equal(repeated.memory.id, first.memory.id);
+    assert.equal(runtime.memory.snapshot().medium.length, 2);
+  });
+}
+
+test('fixture isolates persistent stores and uses offline embeddings', async (t) => {
+  const runtime = fixture(t);
+  assert.equal(runtime.embedder.name, 'hash-bag');
+  assert.equal(path.dirname(runtime.outcomes.dir), path.dirname(runtime.observations.dir));
+  assert.equal(path.dirname(runtime.vectorStore.dir), path.dirname(runtime.observations.dir));
+  assert.equal(runtime.outcomes.outcomes.size, 0);
+  assert.equal(runtime.vectorStore.entries.size, 0);
+  await runtime.vectorStore.upsert('memory', 'fixture-only', 'Synthetic delivery evidence');
+  assert.equal((await runtime.vectorStore.search('memory', 'delivery evidence'))[0].id, 'fixture-only');
 });
