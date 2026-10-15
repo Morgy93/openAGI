@@ -300,6 +300,7 @@ export class G2Proactive {
       // question off the glasses. A supervisor question asked for days stays
       // while its source keeps it current (refreshedAt).
       const open = (this.runtime?.outreach?.list?.() ?? []).filter(i => ["unseen", "seen"].includes(i.status));
+      const questions = new Map((open.some(i => i.sourceRef?.kind === "fleet") ? this.runtime?.fleetSupervisor?.getState?.()?.questions ?? [] : []).map(q => [q.id, q]));
       for (const i of open.slice(0, 200)) {
         if (Date.parse(i.refreshedAt ?? i.createdAt) < this.now() - 7 * DAY) continue;
         const kind = i.sourceRef?.kind === "draft"
@@ -307,6 +308,7 @@ export class G2Proactive {
           : i.sourceRef?.kind;
         const coding = kind === "coding-watch";
         const fleet = kind === "fleet";
+        const threadKey = fleet ? questions.get(i.sourceRef.id)?.threadKey : null;
         if (n.settings.supervisorOnly && !fleet) continue;
         const supervisor = this.runtime?.codingSupervisor;
         if (coding && (!supervisor?.configured || !supervisor.state.watches?.[i.sourceRef.id]
@@ -318,7 +320,7 @@ export class G2Proactive {
         const options = fleet ? (Array.isArray(i.actions) ? i.actions : []).filter(a => typeof a === "string" && a && a !== "dismiss").map(a => clean(a, 40)).slice(0, 4) : [];
         if (selected.has(category) || (fleet && n.settings.supervisorOnly)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
           important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: fleet && options.length ? "answer-fleet" : "review-on-main",
-          ...(fleet ? { supervisor: true, options } : {}),
+          ...(fleet ? { supervisor: true, options, questionId: i.sourceRef.id, ...(threadKey ? { threadKey } : {}) } : {}),
           ...(coding ? { codingTarget: { provider: i.sourceRef.provider, sessionId: i.sourceRef.sessionId } } : {}) });
       }
       if (selected.has("tasks") && !n.settings.supervisorOnly) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {
