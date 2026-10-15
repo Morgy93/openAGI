@@ -7,6 +7,8 @@
 // effects; hosted-interface calls start() on listen and stop() on close.
 
 import path from "node:path";
+import os from "node:os";
+import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
 import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
@@ -182,7 +184,7 @@ const GROUPED_KINDS = Object.freeze({
 });
 // A question card item is the agent's own words, read from the card itself:
 // the review never closes or rewrites one either.
-const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused", "storage", "agent-card"]);
+export const SELF_FINDING_KINDS = new Set(["self-fix", "suggestion", "open", "deliver", "stuck", "paused", "storage", "agent-card"]);
 // The owner's Scan now reviews at most this many batches (15 questions each).
 const FORCED_REVIEW_ROUNDS = 4;
 const GROUP_MAX = 50;
@@ -817,6 +819,7 @@ export class FleetSupervisor {
       lastError: this.lastError,
       snapshot,
       questions,
+      fixes: store.fixes(),
       // So the owner can reopen a wrong close.
       reviewClosed: store.reviewClosed(),
       actions: store.actions(50),
@@ -905,6 +908,7 @@ export class FleetSupervisor {
         if (action.status === "proposed") this.store.updateAction(action.id, { status: "stale", detail: "mode changed" });
       }
     }
+    if (mode === "observe") this.selfFixHub.stop("all").catch(() => {});
     return this.store.setMode(mode);
   }
 
@@ -926,10 +930,14 @@ export class FleetSupervisor {
   // where the runner will work them (voice tools and /fleet/api call these).
   recordFeedback(input) { return this.store.recordFeedback(input); }
   feedback(options) { return this.store.feedback(options); }
-  queueFix(input) { return this.store.queueFix(input); }
+  get selfFixHub() {
+    this._selfFixHub ??= new SelfFixHub({ store: this.store, runtime: this.runtime, config: this.config });
+    return this._selfFixHub;
+  }
+  queueFix(input) { return this.selfFixHub.queue(input); }
   fixes(options) { return this.store.fixes(options); }
-  reviseFix(id, instructions) { return this.store.reviseFix(id, instructions); }
-  stopFix(id) { return this.store.stopFix(id); }
+  reviseFix(id, instructions) { return this.selfFixHub.revise(id, instructions); }
+  stopFix(id) { return this.selfFixHub.stop(id); }
 
   // The owner reopens a question the review closed (a wrong call): same
   // record, and its outreach copy comes back. Pinned, so the review keeps
@@ -1398,6 +1406,7 @@ export class FleetSupervisor {
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
+    if (question.kind === "self-fix" && (question.options ?? []).includes(answer)) return this.selfFixHub.answer(id, answer);
     if (answer === "dismiss") return { question: this.dismissQuestion(id), delivery: null };
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
@@ -1688,9 +1697,10 @@ export class FleetSupervisor {
     // open question, not only the new, changed or due ones.
     this.forceReview = reason === "owner-scan" || reason === "chat";
     const mode = this.mode;
-    const config = { ...this.config, mode };
     const run = this.deps.run ?? runCommand;
     const d = this.deps;
+    if (!this.forceMode) await this.selfFixHub.sync().catch(() => {});
+    const config = { ...this.config, mode, selfSessionIds: [...this.config.selfSessionIds, ...this.store.selfSessions()] };
     const sourceErrors = {};
     const previous = this.store.snapshot;
     const guard = (name, fn, fallback) => withTimeout(Promise.resolve().then(fn), SOURCE_TIMEOUT_MS, name)
@@ -1720,6 +1730,13 @@ export class FleetSupervisor {
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [] }));
+    const ownPaths = this.store.fixes().map((fix) => fix.worktree).filter(Boolean);
+    const selfIds = new Set(config.selfSessionIds);
+    for (const thread of threads) {
+      if (selfIds.has(thread.id) || selfIds.has(thread.claudeSessionId) || thread.branch?.startsWith("selffix/")
+          || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
+          || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
+    }
     const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
     const ranked = threads

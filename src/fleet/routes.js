@@ -64,6 +64,10 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!open) return fail(404, "No open question with that id.");
     const options = Array.isArray(open.options) ? open.options : [];
     if (answer !== "dismiss" && !options.includes(answer)) return fail(400, "Pick one of the question's options.");
+    if (open.kind === "self-fix" && answer === "Request changes" && typeof body.instructions === "string") {
+      const fix = await supervisor.reviseFix(open.meta?.fixId, body.instructions);
+      return fix ? ok({ question: (state().questions ?? []).find((q) => q.id === id) ?? null, fix, delivery: { status: "sent", detail: "Changes sent to fixer." }, state: state() }) : fail(404, "No fix with that id.");
+    }
     const result = await supervisor.answerQuestion(id, answer, sendOptions);
     if (!result) return fail(409, "Question already closed.");
     return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
@@ -194,7 +198,7 @@ export function createFleetRoute({ supervisor } = {}) {
           return fail(400, String(error?.message ?? "Bad feedback.").slice(0, 200));
         }
       }
-      // Self-fix requests: stored until the runner exists. GET lists them,
+      // Self-fix runs: GET lists them,
       // POST queues one; stop and revise act on one ("all" stops every one).
       if (parts[0] === "fixes" && (parts.length === 1 || (parts.length === 3 && ["stop", "revise"].includes(parts[2])))) {
         if (typeof supervisor.queueFix !== "function") return fail(503, "Self-fix is not available.");

@@ -72,6 +72,7 @@ import {
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 import { executeApprovedAction } from "./approval-executor.js";
+import { createSelfFixCapability } from "./self-fix/runner.js";
 import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
 import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
@@ -673,9 +674,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
     };
   };
+  let selfFixNode = null;
+  const selfFixProvider = {
+    health: async () => ({ capability: { id: "self-fix", ready: true, operations: ["start", "list", "revise", "stop", "close"], detail: "Isolated repair runner; owner merges" } }),
+    invoke: (operation, payload) => {
+      selfFixNode ??= createSelfFixCapability({ dataDir });
+      return selfFixNode.execute({ capability: "self-fix", operation, payload });
+    }
+  };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
-    if (codingNodeEnabledHere()) providers.set(CODING_CAPABILITY, codingNodeProvider());
+    if (codingNodeEnabledHere()) {
+      providers.set(CODING_CAPABILITY, codingNodeProvider());
+      if (process.platform === "darwin") providers.set("self-fix", selfFixProvider);
+    }
     if (process.env.OPENAGI_FLEET_SUPERVISOR === "1" && !process.env.OPENAGI_FLEET_NODE && runtime.fleetSupervisor) {
       providers.set("fleet-supervisor", createFleetCapability(runtime.fleetSupervisor));
     }
@@ -3567,6 +3579,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         channels?.stop?.();
         runtime.codingSupervisor?.stop();
         codingNode?.stop?.();
+        selfFixNode?.stop?.();
         runtime.fleetSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();

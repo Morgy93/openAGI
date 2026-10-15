@@ -69,6 +69,8 @@ function emptyState() {
     restartedAt: {},
     feedback: [],
     fixes: [],
+    fixLocks: {},
+    fixCommands: {},
     selfSessions: []
   };
 }
@@ -281,13 +283,14 @@ export class FleetStore {
   // An agent's own ask (agent-ask) also carries mergeAsk (it asks to merge,
   // so it holds until answered or merged) and askedBy ("judge" when the
   // judge raised it, which reads the chat only before a nudge).
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null } = {}) {
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null, card = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
     // while the ask stays open.
     const origin = { askContext: clampTail(redactSecrets(askContext), ASK_CONTEXT_MAX) || null, agentAskedAt: agentAskedAt ?? null };
     const fields = {
+      ...(card ? { card: clampText(redactSecrets(card), this.limits.cardBodyMax) } : {}),
       threadKey: threadKey ?? null,
       prRef: prRef ?? null,
       title: clampText(redactSecrets(title), this.limits.titleMax) || "(untitled)",
@@ -788,8 +791,7 @@ export class FleetStore {
     return structuredClone(record);
   }
 
-  // A request only: the runner that works it lands later. Feedback it cites
-  // moves to fix-queued.
+  // Feedback cited by a repair moves to fix-queued.
   queueFix(input) {
     const fix = normalizeFixRequest(input, { now: this.now() });
     this.state.fixes.push(fix);
@@ -800,6 +802,54 @@ export class FleetStore {
     }
     this._save();
     return structuredClone(fix);
+  }
+
+  importFix(input) {
+    if (!input?.id) return this.queueFix(input);
+    if (!/^fix_[a-f0-9]{16}$/.test(input.id)) throw new Error("Invalid fix id.");
+    const existing = this.fix(input.id);
+    if (existing) return existing;
+    const fix = normalizeFixRequest(input, { now: this.now() });
+    fix.id = input.id;
+    this.state.fixes.push(fix);
+    this._save();
+    return structuredClone(fix);
+  }
+
+  updateFix(id, patch) {
+    const fix = this.state.fixes.find((item) => item.id === id);
+    if (!fix) return null;
+    const next = structuredClone(patch);
+    delete next.id;
+    Object.assign(fix, next, { updatedAt: iso(this.now()) });
+    for (const feedbackId of fix.evidence.feedbackIds) {
+      const record = this.state.feedback.find((item) => item.id === feedbackId);
+      const status = fix.outcome ?? (fix.prUrl ? "pr-open" : null);
+      if (record && status && !["merged", "declined"].includes(record.status)) Object.assign(record, { status });
+    }
+    this._save();
+    return structuredClone(fix);
+  }
+
+  fixCommands() { return structuredClone(this.state.fixCommands); }
+
+  queueFixCommand(key, command) {
+    this.state.fixCommands[key] = structuredClone(command);
+    this._save();
+  }
+
+  clearFixCommand(key) { delete this.state.fixCommands[key]; this._save(); }
+
+  acquireFixLock(id, area) {
+    if (Object.values(this.state.fixLocks).some((owner) => owner !== id)) return false;
+    this.state.fixLocks[area] = id;
+    this._save();
+    return !this.lastWriteError;
+  }
+
+  releaseFixLock(id) {
+    for (const [area, owner] of Object.entries(this.state.fixLocks)) if (owner === id) delete this.state.fixLocks[area];
+    this._save();
   }
 
   fixes({ state = null } = {}) {
@@ -819,10 +869,10 @@ export class FleetStore {
     return structuredClone(fix);
   }
 
-  // "all" stops every fix not already stopped. Returns the fixes it stopped.
+  // "all" stops every fix not already stopped, except open PRs awaiting the owner. Returns the fixes it stopped.
   stopFix(id) {
     const at = iso(this.now());
-    const stopped = this.state.fixes.filter((fix) => (id === "all" || fix.id === id) && fix.state !== "abandoned");
+    const stopped = this.state.fixes.filter((fix) => (id === "all" ? fix.state !== "owner-ask" : fix.id === id) && !["abandoned", "done", "failed"].includes(fix.state));
     for (const fix of stopped) Object.assign(fix, { state: "abandoned", stoppedAt: at, updatedAt: at });
     if (stopped.length) this._save();
     return stopped.map((fix) => structuredClone(fix));
@@ -1057,6 +1107,8 @@ export class FleetStore {
       appRestarts: isObject(raw.appRestarts) ? raw.appRestarts : {},
       restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {},
       feedback: Array.isArray(raw.feedback) ? raw.feedback.filter(isObject) : [],
+      fixCommands: isObject(raw.fixCommands) ? raw.fixCommands : {},
+      fixLocks: isObject(raw.fixLocks) ? raw.fixLocks : {},
       fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
       selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
     };

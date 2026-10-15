@@ -66,6 +66,7 @@ export function isSupervisorOwnPrompt(text) {
 const MIN = 60_000;
 
 export const DEFAULTS = Object.freeze({
+  selfFix: Object.freeze({ mode: "propose", concurrency: 1, dailyCap: 3, wallMs: 2 * 60 * MIN, tokenCap: 6_000_000, rounds: 3, replayRetries: 1, reviewWaitMs: 25 * MIN }),
   tickMs: 5 * MIN,
   lookbackHours: 48,
   // A transcript written within this window counts as a turn in progress.
@@ -321,6 +322,15 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     relayModel: overrides.relayModel ?? (String(env.OPENAGI_FLEET_RELAY_MODEL ?? "").trim() || DEFAULT_RELAY_MODEL),
     publicUrl: overrides.publicUrl ?? (String(env.OPENAGI_PUBLIC_URL ?? "").trim() || null),
     selfSessionIds,
+    selfFix: {
+      ...DEFAULTS.selfFix,
+      mode: envOff(env.OPENAGI_FLEET_SELF_FIX) ? "off" : (["off", "propose", "auto"].includes(env.OPENAGI_FLEET_SELF_FIX) ? env.OPENAGI_FLEET_SELF_FIX : "propose"),
+      dailyCap: Math.min(3, envNumber(env.OPENAGI_FLEET_SELF_FIX_DAILY_CAP, 3)),
+      wallMs: Math.min(DEFAULTS.selfFix.wallMs, envNumber(env.OPENAGI_FLEET_SELF_FIX_WALL_MS, DEFAULTS.selfFix.wallMs)),
+      tokenCap: Math.min(DEFAULTS.selfFix.tokenCap, envNumber(env.OPENAGI_FLEET_SELF_FIX_TOKEN_CAP, DEFAULTS.selfFix.tokenCap)),
+      rounds: Math.min(3, envNumber(env.OPENAGI_FLEET_SELF_FIX_ROUNDS, 3)),
+      ...overrides.selfFix
+    },
     // repo -> UI path prefixes that make visual QA required; github.js has
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},

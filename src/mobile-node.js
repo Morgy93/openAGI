@@ -73,6 +73,7 @@ const EXACT = new Set([
   // The /fleet supervisor's JSON API only. The /fleet page itself and any
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
+  "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
   "POST /fleet/api/mode",
   // Shared device threads and the read-only lifelog. Owner decision: paired
@@ -92,6 +93,7 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
   // One fleet thread's detail, and the owner's Push now, Mute and Unmute.
   { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute)$`) }

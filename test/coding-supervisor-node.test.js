@@ -3,8 +3,41 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { CodingSupervisor } from '../src/coding-supervisor.js';
 import { createCodingNodeCapability } from '../src/coding-supervisor-node.js';
+
+test('standalone node waits for fixer shutdown on SIGTERM and SIGINT', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-node-shutdown-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = fs.readFileSync(new URL('../scripts/coding-supervisor-node.mjs', import.meta.url), 'utf8')
+    .replace('../src/self-fix/runner.js', './fixer.mjs')
+    .replace('../src/node-control.js', './control.mjs')
+    .replace('../src/coding-supervisor-node.js', './coding.mjs');
+  fs.writeFileSync(path.join(dir, 'node.mjs'), script);
+  fs.writeFileSync(path.join(dir, 'fixer.mjs'), 'import fs from "node:fs"; export function createSelfFixCapability({ dataDir }) { return { capability: {}, async stop() { await new Promise(done => setTimeout(done, 100)); fs.writeFileSync(dataDir + "/cleaned", "yes"); } }; }');
+  fs.writeFileSync(path.join(dir, 'control.mjs'), 'export function createNodeControlWorker() { return { start() {}, async stop() {} }; }');
+  fs.writeFileSync(path.join(dir, 'coding.mjs'), 'export function createCodingNodeCapability() { return { capability: {}, stop() {} }; }');
+  fs.writeFileSync(path.join(dir, 'entry.mjs'), 'globalThis.fetch = async () => ({ ok: true }); await import("./node.mjs");');
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    const dataDir = path.join(dir, signal); fs.mkdirSync(dataDir);
+    const config = path.join(dataDir, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ dataDir, remote: 'https://fixture.invalid' }), { mode: 0o600 });
+    const child = spawn(process.execPath, [path.join(dir, 'entry.mjs'), config], { env: { PATH: process.env.PATH, HOME: dir }, stdio: ['ignore', 'pipe', 'pipe'] });
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+    const exit = once(child, 'exit');
+    let output = '';
+    await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', () => reject(new Error('Node exited before startup.')));
+      child.stdout.on('data', chunk => { output += chunk; if (output.includes('node started')) resolve(); });
+    });
+    child.kill(signal);
+    assert.deepEqual(await exit, [0, null]);
+    assert.equal(fs.readFileSync(path.join(dataDir, 'cleaned'), 'utf8'), 'yes');
+  }
+});
 
 test('optional discovery failures preserve managed sessions and propagate a safe warning', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-node-discovery-'));
