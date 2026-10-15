@@ -625,6 +625,7 @@ export class VoiceSession {
     this.responding = false;
     // Keep the audio item until the device reports playback or barges.
     if (response.usage) this.meter(response.usage, this.model, this.responseReservation);
+    else if (this.responseReservation) this.spend.release(this.responseReservation);
     this.responseReservation = null;
     if (this.closed) return;
     const said = (response.output ?? []).flatMap((item) => (item?.type === "message" ? item.content ?? [] : []))
