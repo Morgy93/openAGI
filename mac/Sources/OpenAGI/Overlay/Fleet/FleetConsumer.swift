@@ -198,9 +198,11 @@ final class FleetConsumer: ObservableObject {
   func toggleThread(_ key: String) {
     if expandedThread == key {
       expandedThread = nil
+      if OverlayState.shared.voiceFocus.threadKey == key { OverlayState.shared.selectVoiceContext(VoiceFocus()) }
       return
     }
     expandedThread = key
+    if let thread = thread(key) { OverlayState.shared.selectVoiceContext(.thread(thread)) }
     Task { await loadDetail(key) }
   }
 
@@ -209,9 +211,11 @@ final class FleetConsumer: ObservableObject {
   func toggleQuestion(_ question: FleetQuestion) {
     if expandedQuestions.contains(question.id) {
       expandedQuestions.remove(question.id)
+      if OverlayState.shared.voiceFocus.questionId == question.id { OverlayState.shared.selectVoiceContext(VoiceFocus()) }
       return
     }
     expandedQuestions.insert(question.id)
+    OverlayState.shared.selectVoiceContext(.question(question))
     if let key = question.threadKey { Task { await loadDetail(key) } }
   }
 
@@ -407,6 +411,7 @@ final class FleetConsumer: ObservableObject {
     // owner leaves it (supervisorTabLeft).
     available = hasSupervisor || OverlayState.shared.tab == .supervisor
     OverlayState.shared.pruneFleetContext(openIDs: open)
+    OverlayState.shared.pruneVoiceContext(openIDs: open, threadKeys: keys)
     if state.running { recheckWhileRunning() }
   }
 
@@ -427,6 +432,7 @@ final class FleetConsumer: ObservableObject {
     available = false
     OverlayState.shared.selectTab(.tasks)
     OverlayState.shared.pruneFleetContext(openIDs: [])
+    OverlayState.shared.pruneVoiceContext(openIDs: [], threadKeys: [])
   }
 
   /// The owner switched to Tasks: a supervisor with nothing to show loses

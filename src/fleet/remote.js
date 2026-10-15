@@ -129,6 +129,7 @@ export class RemoteFleetSupervisor {
   async fixes() { return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
   async reviseFix(id, instructions) { return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }
   async stopFix(id) { return (await this.request('POST', `/fleet/api/fixes/${id}/stop`)).stopped ?? []; }
+
   // A thread the computer's last scan does not have is null, not an outage.
   async threadDetail(threadKey) {
     try {

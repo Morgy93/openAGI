@@ -69,7 +69,10 @@ final class OverlayController {
     panel?.orderFrontRegardless()
   }
 
-  func hide() { panel?.orderOut(nil) }
+  func hide() {
+    VoiceSession.shared.stop()
+    panel?.orderOut(nil)
+  }
 
   var panelWindowNumber: Int? { panel?.windowNumber }
 
@@ -82,6 +85,7 @@ final class OverlayController {
       withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
         OverlayState.shared.expanded.toggle()
       }
+      if !OverlayState.shared.expanded { VoiceSession.shared.stop() }
       sizeToContent()
       if OverlayState.shared.expanded { panel?.makeKey() }
     } else {
@@ -94,6 +98,7 @@ final class OverlayController {
   /// Esc from anywhere in the panel collapses back to the pill.
   func collapse() {
     guard OverlayState.shared.expanded else { return }
+    VoiceSession.shared.stop()
     withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
       OverlayState.shared.expanded = false
     }

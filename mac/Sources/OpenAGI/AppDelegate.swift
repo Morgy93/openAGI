@@ -34,6 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       ReplayController.shared.start()
       OverlayController.shared.startIfEnabled()
       HotkeyManager.shared.onHotkey = { OverlayController.shared.toggle() }
+      HotkeyManager.shared.onVoicePressed = { OverlayState.shared.beginVoice(.hotkey) }
+      HotkeyManager.shared.onVoiceReleased = { VoiceSession.shared.release(.hotkey) }
       HotkeyManager.shared.register()
 
       // Support and automated verification need a deterministic way to open
@@ -90,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       // extend process lifetime, and the local daemon has already been stopped.
       OverlayController.shared.persistPosition()
       HotkeyManager.shared.unregister()
+      VoiceSession.shared.stop()
     }
   }
 
