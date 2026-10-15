@@ -8,6 +8,7 @@
 
 import crypto from "node:crypto";
 import { threadHealth } from "./classify.js";
+import { registerVoiceTools } from "./voice-tools.js";
 
 const SOURCE = "integration:fleet-supervisor";
 const TOOL_NAMES = ["fleet_status", "fleet_thread", "fleet_scan", "fleet_send_message", "fleet_answer_question", "fleet_screen", "fleet_click", "fleet_app"];
@@ -140,6 +141,8 @@ export function fleetThread(supervisor, args = {}) {
 
 export function registerFleetTools(registry, supervisor) {
   for (const name of TOOL_NAMES) registry.unregister(name);
+  // Walkthrough, focus, diagnose, feedback and self-fix (voice-tools.js).
+  registerVoiceTools(registry, supervisor);
   if (typeof supervisor?.getState !== "function") return;
   registry.register({ name: "fleet_status", source: SOURCE, sideEffects: false,
     description: "Read the coding-agent fleet the supervisor watches (Codex, Claude, Conductor threads and Antigravity conversations): mode, last scan, counts, the owner's open questions, and up to 60 threads ordered red (stuck on the owner or an outage), yellow (needs a push), green (moving or done), gray (out of scope). Uses the last scan; does not scan, send, or answer anything.",

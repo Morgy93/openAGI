@@ -3,7 +3,7 @@
 import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -122,6 +122,13 @@ export class RemoteFleetSupervisor {
     const body = await this.request('POST', '/fleet/api/click', { threadKey, label, ...(stateId ? { stateId } : {}) });
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
   }
+  // Feedback and self-fix requests live with the fleet, on the computer.
+  async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
+  async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async queueFix(input) { return (await this.request('POST', '/fleet/api/fixes', input)).fix; }
+  async fixes() { return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
+  async reviseFix(id, instructions) { return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }
+  async stopFix(id) { return (await this.request('POST', `/fleet/api/fixes/${id}/stop`)).stopped ?? []; }
   // A thread the computer's last scan does not have is null, not an outage.
   async threadDetail(threadKey) {
     try {

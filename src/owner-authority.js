@@ -1,12 +1,14 @@
 // Proof that a turn is the authenticated owner's, and what that owner asked
 // for. A principal is minted only by transport code right after its auth
 // passed (hosted-interface /message, a paired phone, a G2 tap) and travels in
-// handleMessage options, never in a body. The brand lives in a module-private
+// handleMessage options, never in a body. The voice relay mints one only
+// after token auth and the owner's own gesture (hotkey, mic button, G2 tap),
+// never on a wake word. The brand lives in a module-private
 // WeakSet, so no JSON value, model argument, tool result or journal replay can
 // ever pass isOwnerPrincipal.
 
 const PRINCIPALS = new WeakSet();
-const VIAS = new Set(["owner", "overlay", "phone", "g2"]);
+const VIAS = new Set(["owner", "overlay", "phone", "g2", "voice"]);
 
 // OPENAGI_OWNER_AUTHORITY=off restores queue-everything approvals.
 export function ownerAuthorityEnabled(env = process.env) {

@@ -922,6 +922,15 @@ export class FleetSupervisor {
     return this.store.dismissQuestion(id);
   }
 
+  // The owner's feedback and the self-fix requests it leads to: stored here,
+  // where the runner will work them (voice tools and /fleet/api call these).
+  recordFeedback(input) { return this.store.recordFeedback(input); }
+  feedback(options) { return this.store.feedback(options); }
+  queueFix(input) { return this.store.queueFix(input); }
+  fixes(options) { return this.store.fixes(options); }
+  reviseFix(id, instructions) { return this.store.reviseFix(id, instructions); }
+  stopFix(id) { return this.store.stopFix(id); }
+
   // The owner reopens a question the review closed (a wrong call): same
   // record, and its outreach copy comes back. Pinned, so the review keeps
   // it until its ask changes.

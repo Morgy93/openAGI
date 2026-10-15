@@ -286,11 +286,13 @@ export class ToolRegistry {
   // the spoken code instead only when the turn read untrusted text and the
   // owner's own words do not name this kind of action (an injected "click
   // Approve" must not ride on "what's the latest?"), or the tool insists.
+  // A voice turn always asks: the model heard the words, so it reads the
+  // action back and only the owner's own transcript ("yes 42") runs it.
   async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
     const tainted = turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
-    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context);
+    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || owner.via === "voice";
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({

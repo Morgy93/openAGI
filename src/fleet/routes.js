@@ -181,6 +181,36 @@ export function createFleetRoute({ supervisor } = {}) {
         const result = await supervisor.appAction(parts[1], parts[2], { ...sendOptions, expectRunning });
         return ok({ result, state: state() });
       }
+      // The owner's feedback (voice or typed): GET lists it, POST records one.
+      if (parts.length === 1 && parts[0] === "feedback") {
+        if (typeof supervisor.recordFeedback !== "function") return fail(503, "Feedback is not available.");
+        if (method === "GET") return ok({ feedback: await supervisor.feedback({ limit: 100 }) });
+        if (method !== "POST") return fail(405, "Use GET or POST.");
+        const body = await readObject(readBody);
+        if (!body) return fail(400, "Send a JSON object: { utterance, intent, target?, source? }.");
+        try {
+          return ok({ feedback: await supervisor.recordFeedback(body) });
+        } catch (error) {
+          return fail(400, String(error?.message ?? "Bad feedback.").slice(0, 200));
+        }
+      }
+      // Self-fix requests: stored until the runner exists. GET lists them,
+      // POST queues one; stop and revise act on one ("all" stops every one).
+      if (parts[0] === "fixes" && (parts.length === 1 || (parts.length === 3 && ["stop", "revise"].includes(parts[2])))) {
+        if (typeof supervisor.queueFix !== "function") return fail(503, "Self-fix is not available.");
+        if (parts.length === 1 && method === "GET") return ok({ fixes: await supervisor.fixes() });
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = (await readObject(readBody)) ?? {};
+        try {
+          if (parts.length === 1) return ok({ fix: await supervisor.queueFix(body) });
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad fix id.");
+          if (parts[2] === "stop") return ok({ stopped: await supervisor.stopFix(parts[1]) });
+          const fix = await supervisor.reviseFix(parts[1], body.instructions);
+          return fix ? ok({ fix }) : fail(404, "No fix with that id.");
+        } catch (error) {
+          return fail(400, String(error?.message ?? "Bad fix request.").slice(0, 200));
+        }
+      }
       // One thread, expanded: its detail (GET), or the owner's Push now,
       // Mute or Unmute of it (POST).
       if (parts[0] === "threads" && (parts.length === 2 || parts.length === 3)) {

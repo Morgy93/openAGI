@@ -21,6 +21,10 @@ test("only a minted principal passes; copies, JSON and replays never do", () => 
   for (const value of [null, undefined, "owner", true, 1, []]) assert.equal(isOwnerPrincipal(value), false);
   assert.equal(authorityRecord({ kind: "owner", via: "phone" }), null);
   assert.throws(() => ownerPrincipal("telegram"), /unknown owner transport/);
+  // The voice relay mints its own, after token auth and a gesture.
+  const voice = ownerPrincipal("voice", "phone-1");
+  assert.equal(isOwnerPrincipal(voice), true);
+  assert.deepEqual(authorityRecord(voice), { kind: "owner", via: "voice", nodeId: "phone-1" });
 });
 
 test("the kill switch turns every principal off", () => {

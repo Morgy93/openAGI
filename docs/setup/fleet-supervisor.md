@@ -488,6 +488,50 @@ stops sending the same note to every thread.
   child env plus `CODEX_LB_API_KEY` from `~/.codex/codex-lb.env`.
 - Every verdict shows in **Doing** (`Judge: send`, `wait`, `ask-owner`).
 
+## Voice
+
+On main, `OPENAGI_VOICE=1` opens `WSS /nodes/voice`. Each device opens it on
+the owner's gesture (hotkey, mic button, G2 tap; never a wake word) with the
+subprotocols `openagi-voice` and its token: the owner token on the Mac, the
+paired phone token, or the G2 token. Main holds one `gpt-realtime-2.1` session
+per device, runs the fleet tools as the owner, and writes both sides into the
+shared Supervisor thread. Every action that changes something is read back
+with a code; only the owner's own words ("yes 42") run it, heard in the input
+transcript, never in the model's reply. Voice approvals require the spoken
+code; a bare yes does not approve a pending action. Sessions close after 2 idle minutes
+and at 55 minutes.
+
+| Var | Default | Means |
+|---|---|---|
+| `OPENAGI_VOICE` | off | `1` opens the voice relay on main |
+| `OPENAGI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model (mini models are refused) |
+| `OPENAGI_VOICE_DAILY_USD` | `5` | Daily voice spend cap; the ledger channel is `voice` |
+
+The cap includes conservative reservations for audio and pending responses.
+Reservations are saved before work reaches OpenAI and settled when usage is
+reported, so concurrent devices and reconnects share the same remaining
+budget. An interrupted response whose usage never arrives keeps its reserve
+until the next UTC day. The displayed daily total includes those holds and
+can exceed reported usage. A reply reserves room for up to 1,024 output
+tokens and 8,000 conversation tokens plus instructions/tools, so voice may
+stop before the exact dollar ceiling when there is too little room for a
+whole reply. Failed budget writes stop voice.
+
+Frames: binary PCM16 mono (24 kHz; G2 16 kHz, resampled on main). JSON
+control: `start {gesture, mode?, focus?}`, `commit` (push-to-talk release),
+`barge {playedMs}`, `playback {itemId, playedMs}`, `context {focus}`, `mode {handsFree}`, `stop`.
+The device sends `playback` only after playing audio, using the `itemId` and
+full `audioMs` from `reply.done`. Audio readbacks need this acknowledgement
+before a later spoken approval is eligible; provider completion is insufficient.
+A barge invalidates the interrupted readback.
+`node scripts/voice-smoke.mjs` checks the live API with the key in
+`~/.openagi/.env`.
+
+Voice adds `fleet_walkthrough`, `voice_focus`, `fleet_diagnose` (counts for
+now), `feedback_record` and `self_fix_list/start/revise/stop`. Self-fix
+requests are stored on the coding Mac (`/fleet/api/fixes`); the runner that
+works them ships later.
+
 ## One supervisor shared by main, Android and G2
 
 Run the scanner on the coding Mac with `OPENAGI_FLEET_SUPERVISOR=1` and
