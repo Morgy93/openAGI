@@ -4,7 +4,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
 import { attachVoiceRelay } from "./voice/relay.js";
-import { createVoiceSessionFactory } from "./voice/broker.js";
+import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { g2ConnectPage } from "./g2-connect-page.js";
@@ -1793,7 +1793,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             || Object.keys(body).some(k => !fields[body.op].includes(k))) return sendG2NodeJson(res, 400, { error: "unsupported_experience_fields" });
           if (body.op === "capabilities") return sendG2NodeJson(res, 200, {
             protocol: 1, recovery: true, history: true, mainRole: readNodeConfig(dataDir)?.remote ? "node" : "main",
-            speech: channels.g2.status(), recoveryHours: 24,
+            speech: channels.g2.status(), recoveryHours: 24, voice: voiceEnabled(),
             computer: "Requires a connected computer and explicit approval on main.",
             coding: "Only sessions shared by connected coding hosts are accessible; listing does not grant control."
           });

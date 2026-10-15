@@ -307,6 +307,15 @@ export class VoiceSession {
     return true;
   }
 
+  // A cancelled hold discards only the uncommitted turn.
+  cancel() {
+    if (this.closed || this.handsFree) return;
+    this.appendedBytes = 0;
+    this.audioBytes = 0;
+    this.spend.release(this.audioReservation);
+    this.sendInput({ type: "input_audio_buffer.clear" });
+  }
+
   // Push-to-talk release: the owner's turn ends here.
   commit() {
     if (this.closed || this.handsFree) return;
@@ -625,6 +634,7 @@ export class VoiceSession {
     this.responding = false;
     // Keep the audio item until the device reports playback or barges.
     if (response.usage) this.meter(response.usage, this.model, this.responseReservation);
+    else if (this.responseReservation) this.spend.release(this.responseReservation);
     this.responseReservation = null;
     if (this.closed) return;
     const said = (response.output ?? []).flatMap((item) => (item?.type === "message" ? item.content ?? [] : []))
@@ -794,6 +804,9 @@ export class VoiceSession {
     if (this.closed) return;
     this.closed = true;
     this.spend.release(this.audioReservation);
+    // A reply cut off by the close never reaches response.done, so free its hold here.
+    if (this.responseReservation) this.spend.release(this.responseReservation);
+    this.responseReservation = null;
     for (const id of this.pendingCommits) this.settleAudio(id);
     for (const turn of this.turns.values()) this.settleAudio(turn.reservationId);
     this.toolAbort?.abort();

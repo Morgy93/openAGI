@@ -271,7 +271,8 @@ test("due tasks outside the first page and email drafts retain their categories"
 });
 
 test("supervisor questions carry their choices and Supervisor mode keeps only them", (t) => {
-  const { call, outreach, tasks, now } = fixture(t);
+  const { call, outreach, tasks, now, runtime } = fixture(t);
+  runtime.fleetSupervisor = { getState: () => ({ questions: [{ id: "fq_other", threadKey: "codex:wrong" }, { id: "fq_1", threadKey: "codex:one" }] }) };
   const at = new Date(now()).toISOString();
   outreach.push(
     { id: "o-fleet", status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: "fq_1" }, title: "#7 ready. Merge?", summary: "CI green", needsDecision: true, actions: ["merged", "later", "dismiss"] },
@@ -284,6 +285,12 @@ test("supervisor questions carry their choices and Supervisor mode keeps only th
   assert.deepEqual(fleet.options, ["merged", "later"]);
   assert.equal(fleet.action, "answer-fleet");
   assert.equal(fleet.supervisor, true);
+  assert.equal(fleet.questionId, "fq_1");
+  assert.equal(fleet.threadKey, "codex:one");
+  runtime.fleetSupervisor = { getState: () => ({ questions: [{ id: "fq_1", threadKey: null, threadKeys: ["codex:one", "codex:two"] }] }) };
+  assert.equal(call({ op: "feed" }).items.find(i => i.id === "o-fleet").threadKey, undefined);
+  runtime.fleetSupervisor = { getState: () => ({ questions: [] }) };
+  assert.equal(call({ op: "feed" }).items.find(i => i.id === "o-fleet").threadKey, undefined);
   assert.ok(all.some(i => i.id === "o-mail") && all.some(i => i.id.startsWith("due:")));
   // Supervisor mode: only supervisor items, even with approvals deselected.
   call({ op: "configure", settings: { supervisorOnly: true, categories: ["email"] } });
