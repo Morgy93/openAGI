@@ -1,7 +1,7 @@
 import type { OpenAGIApiClient } from './api-client'
 import { OpenAGIApiError } from './config'
 
-export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[] }
+export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[]; questionId?: string; threadKey?: string }
 // The supervisor's glanceable status: counts by colour, red then yellow threads.
 export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }
 export type InboxOperation = 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'delete-memory'

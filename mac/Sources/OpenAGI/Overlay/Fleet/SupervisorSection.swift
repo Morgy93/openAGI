@@ -18,6 +18,7 @@ struct SupervisorSection: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
+      VoiceButton()
       // One row: the tab already names the section and counts the questions.
       HStack(spacing: 6) {
         // One line, so the minute ticking over never changes the panel's height.
@@ -89,7 +90,7 @@ struct SupervisorSection: View {
 
   private func row(_ question: FleetQuestion) -> some View {
     let busy = fleet.inFlight.contains(question.id) || fleet.stillSending.contains(question.id)
-    let selected = overlay.fleetContext?.entityRef?.id == question.id
+    let selected = overlay.fleetContext?.entityRef?.id == question.id || overlay.voiceFocus.questionId == question.id
     let options = question.tappableOptions
     let open = fleet.expandedQuestions.contains(question.id)
     // A risky ask (release, deploy, delete, merge) is read in full before

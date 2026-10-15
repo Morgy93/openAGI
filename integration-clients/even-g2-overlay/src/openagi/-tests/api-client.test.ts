@@ -7,6 +7,30 @@ function jsonResponse(value: unknown, status = 200): Response {
 
 describe('OpenAGIApiClient', () => {
   const config = { origin: 'https://openagi.example.com', allowedOrigins: ['https://openagi.example.com'] }
+  it('pins voice to the selected HTTPS main with 16k PTT and the scoped G2 token outside the URL', () => {
+    const token = 'g'.repeat(43)
+    const api = new OpenAGIApiClient(config, () => ({ nodeToken: token }))
+    expect(api.voiceRelay()).toEqual({ url: 'wss://openagi.example.com/nodes/voice?rate=16000&mode=ptt', token })
+    expect(api.voiceRelay().url).not.toContain(token)
+    const blocked = new OpenAGIApiClient(config, () => ({ nodeToken: token }), globalThis.fetch, () => 'https://other.example.com')
+    expect(() => blocked.voiceRelay()).toThrow('not allowed')
+    const insecure = new OpenAGIApiClient({ ...config, allowedOrigins: [] }, () => ({ nodeToken: token }), globalThis.fetch, () => 'http://main.example.com')
+    expect(() => insecure.voiceRelay()).toThrow('HTTPS')
+    expect(() => new OpenAGIApiClient(config, () => null).voiceRelay()).toThrow()
+  })
+  it('reads the hub voice switch from G2 capabilities, null when main does not say', async () => {
+    let body: unknown = { protocol: 1, voice: false }
+    const bodies: unknown[] = []
+    const fetchImpl = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(typeof init?.body === 'string' ? init.body : '{}'))
+      return Promise.resolve(jsonResponse(body))
+    }) as unknown as typeof fetch
+    const api = new OpenAGIApiClient(config, () => ({ nodeId: crypto.randomUUID(), nodeToken: 'g'.repeat(43) }), fetchImpl)
+    expect(await api.hubVoiceEnabled()).toBe(false)
+    expect(bodies[0]).toEqual({ op: 'capabilities' })
+    body = { protocol: 1, voice: true }; expect(await api.hubVoiceEnabled()).toBe(true)
+    body = { protocol: 1 }; expect(await api.hubVoiceEnabled()).toBeNull()
+  })
   it('pins the speech relay to the selected HTTPS main and keeps the token out of its URL', () => {
     const api = new OpenAGIApiClient(config, () => ({ nodeToken: 't'.repeat(43) }))
     const relay = api.speechRelay('nova-3', 'Peri')
