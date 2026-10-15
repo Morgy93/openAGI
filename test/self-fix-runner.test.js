@@ -220,8 +220,63 @@ test("async capability shutdown waits for a child ignoring SIGTERM and cleans th
   await node.stop();
   assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
   assert.equal(node.runner.active, null);
-  assert.equal(node.runner.store.fix(fix.id).state, "abandoned");
+  assert.equal(node.runner.store.fix(fix.id).state, "failed");
   assert.equal(fs.existsSync(path.join(root, ".active-lock")), false);
+});
+
+test("shutdown interrupts only the active run; stop all keeps review-ready fixes", async (t) => {
+  let block = false, entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const { runner } = fixture(t, {}, { codingWait: (options) => {
+    if (block) { entered(); return new Promise((_resolve, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true })); }
+    options.onLine(JSON.stringify({ type: "thread.started", thread_id: "fixer-session" }));
+    options.onLine(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 10 } }));
+    return { stdout: "" };
+  } });
+  const node = createSelfFixCapability({ dataDir: runner.dataDir, home: runner.home, env: {}, config: runner.config, deps: runner.deps, store: runner.store });
+  t.after(() => node.stop());
+  const ready = node.runner.enqueue(FIX); await node.runner.idle();
+  assert.equal(node.runner.store.fix(ready.id).state, "owner-ask");
+  block = true;
+  const active = node.runner.enqueue({ ...FIX, title: "Active", area: "voice" }); await started;
+  const queued = node.runner.enqueue({ ...FIX, title: "Queued", area: "judge" });
+  await node.stop();
+  assert.equal(node.runner.store.fix(active.id).state, "failed");
+  assert.equal(node.runner.store.fix(queued.id).state, "queued");
+  assert.equal(node.runner.store.fix(ready.id).state, "owner-ask");
+  assert.equal(node.runner.active, null); assert.equal(node.runner.jobs.size, 0);
+  assert.ok(node.runner.store.openQuestions().some((question) => question.dedupeKey === "self-fix:" + ready.id));
+  // Observe mode stops queued work but keeps the open PR; stopping it by id still works.
+  assert.deepEqual(node.runner.stop("all").map((fix) => fix.id), [queued.id]);
+  assert.equal(node.runner.store.fix(ready.id).state, "owner-ask");
+  assert.deepEqual(node.runner.stop(ready.id).map((fix) => fix.id), [ready.id]);
+});
+
+test("node_modules link is ignored, so guard passes and owner-close cleanup removes the worktree", async (t) => {
+  let root;
+  const git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  const fixtureRun = fixture(t, {}, { prState: "MERGED", onRun: (bin, args, options) => {
+    if (bin !== "git") return;
+    if (args[0] === "worktree" && args[1] === "add" && args[2] === "-b") git(args, options.cwd);
+    if (args[0] === "status" || (args[0] === "worktree" && args[1] === "remove" && args[2].startsWith(path.join(root, "fix_")))) return { stdout: git(args, options.cwd) };
+  } });
+  root = fixtureRun.root;
+  const { runner } = fixtureRun;
+  const repo = path.join(root, "_repo");
+  git(["init", "-q"], repo); git(["config", "user.name", "Fixture"], repo); git(["config", "user.email", "fixture@example.invalid"], repo);
+  fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules/\n");
+  fs.mkdirSync(path.join(repo, "test")); fs.writeFileSync(path.join(repo, "test/fixture.test.js"), "");
+  git(["add", ".gitignore", "test/fixture.test.js"], repo); git(["commit", "-qm", "base"], repo);
+  git(["update-ref", "refs/remotes/origin/main", "HEAD"], repo);
+  const fix = runner.enqueue(FIX); await runner.idle();
+  const { worktree, state } = runner.store.fix(fix.id);
+  assert.equal(state, "owner-ask", runner.store.fix(fix.id).error);
+  assert.ok(fs.lstatSync(path.join(worktree, "node_modules")).isSymbolicLink());
+  assert.equal(git(["status", "--porcelain"], worktree), "");
+  await runner.reconcile();
+  assert.equal(runner.store.fix(fix.id).state, "done");
+  assert.equal(fs.existsSync(worktree), false);
+  assert.ok(fs.existsSync(path.join(repo, "node_modules")));
 });
 
 function hubFixture(t) {

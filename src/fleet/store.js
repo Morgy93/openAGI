@@ -869,10 +869,10 @@ export class FleetStore {
     return structuredClone(fix);
   }
 
-  // "all" stops every fix not already stopped. Returns the fixes it stopped.
+  // "all" stops every fix not already stopped, except open PRs awaiting the owner. Returns the fixes it stopped.
   stopFix(id) {
     const at = iso(this.now());
-    const stopped = this.state.fixes.filter((fix) => (id === "all" || fix.id === id) && !["abandoned", "done", "failed"].includes(fix.state));
+    const stopped = this.state.fixes.filter((fix) => (id === "all" ? fix.state !== "owner-ask" : fix.id === id) && !["abandoned", "done", "failed"].includes(fix.state));
     for (const fix of stopped) Object.assign(fix, { state: "abandoned", stoppedAt: at, updatedAt: at });
     if (stopped.length) this._save();
     return stopped.map((fix) => structuredClone(fix));

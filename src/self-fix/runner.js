@@ -104,7 +104,7 @@ export class SelfFixRunner {
     return fix;
   }
   kick() {
-    if (this.active || this.settings.mode === "off" || /^(0|off)$/i.test(this.env.OPENAGI_FLEET_SELF_FIX ?? "")) return;
+    if (this.closing || this.active || this.settings.mode === "off" || /^(0|off)$/i.test(this.env.OPENAGI_FLEET_SELF_FIX ?? "")) return;
     const fix = this.store.fixes().reverse().find((item) => item.state === "queued");
     if (!fix) return;
     const controller = new AbortController();
@@ -250,6 +250,11 @@ export class SelfFixRunner {
         const baseHead = (await run("git", ["rev-parse", "origin/main"], { cwd: this.repo })).stdout.trim();
         const dependencies = this.env.OPENAGI_SELF_FIX_NODE_MODULES || path.join(this.repo, "node_modules");
         if (!fs.existsSync(dependencies)) throw new Error("Prepare dependencies in the dedicated clone, or set OPENAGI_SELF_FIX_NODE_MODULES to an existing compatible cache. The runner never installs dependencies.");
+        // .gitignore's node_modules/ skips only directories, not this link; every worktree reads the clone's exclude file.
+        const exclude = path.join(this.repo, ".git", "info", "exclude");
+        let excluded = "";
+        try { excluded = fs.readFileSync(exclude, "utf8"); } catch { /* created below */ }
+        if (!excluded.split(/\r?\n/).includes("/node_modules")) { fs.mkdirSync(path.dirname(exclude), { recursive: true }); fs.appendFileSync(exclude, "\n/node_modules\n"); }
         if (!fs.existsSync(path.join(worktree, "node_modules"))) fs.symlinkSync(fs.realpathSync(dependencies), path.join(worktree, "node_modules"), "dir");
         this.store.updateFix(id, { branch, worktree, baseHead, brief, prompt });
       }
@@ -414,5 +419,10 @@ export function createSelfFixCapability(options) {
       else if (command.operation === "list") { runner.kick(); if (!runner.active) await runner.reconcile(); }
       else throw new Error("Unsupported self-fix operation.");
       return runner.snapshot();
-    }, async stop() { runner.stop("all"); await runner.idle(); } };
+    }, async stop() {
+      // Shutdown interrupts only the active run; queued and review-ready fixes survive a restart.
+      runner.closing = true;
+      runner.active?.controller.abort(new Error("Runner interrupted; retained worktree requires owner inspection."));
+      await runner.idle();
+    } };
 }
