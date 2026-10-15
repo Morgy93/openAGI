@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { compareReplay, replayPair } from "../scripts/fleet-replay.mjs";
 
 const sample = (questions, sent = 0) => ({ rows: [], questions: [], sent: [], metrics: { questions }, playbooks: { classify: { questions, sent } } });
@@ -51,4 +52,19 @@ test("base versus fix compares different revisions over the same frozen inputs",
   assert.equal(replayPair({ baseDir: "/base", fixDir: "/fix", dataDir, metric: { name: "questions", direction: "down" }, run }).passed, true);
   assert.deepEqual(reads, ['{"questions":[]}', '{"questions":[]}']);
   assert.equal(fs.readFileSync(path.join(dataDir, "fleet/state.json"), "utf8"), '{"questions":[]}');
+});
+
+test("replay CLI reports only aggregates, never fleet rows, questions or planned sends", (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-replay-cli-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dataDir, "fleet"));
+  fs.writeFileSync(path.join(dataDir, "fleet/state.json"), JSON.stringify({ snapshot: { at: "2026-10-13T12:00:00Z", threads: [] } }));
+  const repo = fileURLToPath(new URL("..", import.meta.url));
+  const result = spawnSync(process.execPath, [path.join(repo, "scripts/fleet-replay.mjs"), repo, repo, dataDir, "questions", "down"], { encoding: "utf8", timeout: 180000 });
+  assert.equal(result.status, 1, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(report).sort(), ["metric", "metrics", "passed", "regressions"]);
+  assert.equal(report.passed, false);
+  assert.deepEqual(report.metrics.base, report.metrics.fix);
+  assert.equal(typeof report.metrics.base.questions, "number");
 });

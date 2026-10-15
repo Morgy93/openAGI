@@ -91,7 +91,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const [baseDir, fixDir, dataDir, name, direction = "down"] = process.argv.slice(2);
     if (!baseDir || !fixDir || !dataDir || !name) throw new Error("Usage: fleet-replay.mjs BASE FIX DATA_DIR METRIC [up|down]");
     const result = replayPair({ baseDir, fixDir, dataDir, metric: { name, direction } });
-    console.log(JSON.stringify(result));
+    // Only aggregates leave the replay; rows, questions and planned sends hold private conversation text.
+    console.log(JSON.stringify({ passed: result.passed, metric: result.metric, regressions: result.regressions, metrics: { base: result.base.metrics, fix: result.fix.metrics } }));
     if (!result.passed) process.exitCode = 1;
   }
 }
