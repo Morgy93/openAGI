@@ -383,6 +383,24 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetMutationResult.self, from: data)
     }
 
+    // MARK: - Supervisor push (docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md)
+
+    // Hands this phone's relay pass and push key to its own daemon, over the
+    // tailnet. The daemon replaces this node's earlier record. Keys sorted so
+    // a test can assert the body byte for byte.
+    public func registerPush(pass: String, key: String, env: String) async throws {
+        var request = try authorizedRequest(path: "/mobile/push", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["pass": pass, "key": key, "env": env],
+                                                      options: [.sortedKeys])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        _ = try await perform(request)
+    }
+
+    public func unregisterPush() async throws {
+        let request = try authorizedRequest(path: "/mobile/push", method: "DELETE")
+        _ = try await perform(request)
+    }
+
     // `GET /events` -- the long-lived broadcast connection (mobile/PROTOCOL.md
     // §7). Reconnect-with-backoff is the caller's job (see
     // `EventStreamController`): this returns one connection's worth of
