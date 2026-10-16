@@ -12,6 +12,10 @@ enum SupervisorAnswerOutcome: Equatable {
     // keeps the question open.
     case undelivered(String)
     case failed
+    // The request may have reached the daemon before it was cut off (time ran
+    // out, the connection dropped): the agent may still get the answer, so
+    // the owner is told to check rather than to send it again.
+    case unknown
 
     private static let delivered: Set<String> = ["sent", "dry-run", "done"]
 
@@ -19,12 +23,19 @@ enum SupervisorAnswerOutcome: Equatable {
         if let error {
             switch error as? DaemonError {
             case .notFound?, .conflict?: return .done
-            default: return .failed
+            case let .transport(underlying)? where mayHaveArrived(underlying): return .unknown
+            default: return error is CancellationError ? .unknown : .failed
             }
         }
         guard let status = delivery?.status, !delivered.contains(status) else { return .done }
         let detail = delivery?.detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return .undelivered(detail.isEmpty ? "The agent could not be reached" : detail)
+    }
+
+    private static func mayHaveArrived(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        guard let code = (error as? URLError)?.code else { return false }
+        return [.cancelled, .timedOut, .networkConnectionLost].contains(code)
     }
 }
 
@@ -51,8 +62,8 @@ enum SupervisorAnswerSender {
         }
 
         // A background action gets roughly 30 seconds; relaying an answer can
-        // take longer. When time runs out the request is cancelled and counts
-        // as not sent, so the owner is told rather than left guessing.
+        // take longer. When time runs out the request is cancelled, but the
+        // daemon may still deliver it, so the owner is told to check.
         let work = Task { () -> SupervisorAnswerOutcome in
             do {
                 switch action {
@@ -81,6 +92,9 @@ enum SupervisorAnswerSender {
         case .failed:
             await postNotSent(title: "Not sent", questionID: questionID, replacing: notificationID,
                               body: "Couldn't send your answer. " + notSentBody)
+        case .unknown:
+            await postNotSent(title: "May not have sent", questionID: questionID, replacing: notificationID,
+                              body: "Your answer may still reach the agent. Open Supervisor to check before answering again.")
         }
         backgroundTask.end()
     }

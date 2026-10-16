@@ -23,15 +23,30 @@ import UserNotifications
 final class PushRegistrar {
     static let shared = PushRegistrar()
 
-    // Development-signed builds get sandbox tokens; TestFlight and App Store
-    // builds (Release) get production ones. The relay must call the matching
-    // APNs host or every send fails with BadDeviceToken.
-    static var env: String {
-        #if DEBUG
-        return "sandbox"
-        #else
-        return "production"
-        #endif
+    // The relay must call the APNs host matching the device token or every
+    // send fails with BadDeviceToken. Which one the token is for comes from
+    // aps-environment in the signing profile, not the build configuration.
+    static let env = environment(profile: Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
+        .flatMap { try? Data(contentsOf: $0) })
+
+    // App Store builds carry no profile and are production. A profile is a
+    // signed blob around a plist; only the plist is read.
+    nonisolated static func environment(profile: Data?) -> String {
+        guard let profile else {
+            #if targetEnvironment(simulator)
+            return "sandbox"
+            #else
+            return "production"
+            #endif
+        }
+        guard let start = profile.range(of: Data("<?xml".utf8)),
+              let end = profile.range(of: Data("</plist>".utf8), in: start.lowerBound..<profile.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(from: profile[start.lowerBound..<end.upperBound],
+                                                                      format: nil) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any],
+              let aps = entitlements["aps-environment"] as? String
+        else { return "sandbox" }
+        return aps == "production" ? "production" : "sandbox"
     }
 
     private enum Keys {
@@ -199,7 +214,12 @@ final class PushRegistrar {
             if let older = stored?.retire, older != replacing { try? await relay.unregister(pass: older) }
             current = .init(pass: fresh, signature: signature, mintedAt: Date(), retire: replacing)
             // Saved before the daemon step, so a failed POST retries with it.
-            PushPassStore.save(current)
+            // Not durable means the next run mints yet another channel, so the
+            // fresh one is retired and nothing is posted.
+            guard PushPassStore.save(current) else {
+                try? await relay.unregister(pass: fresh)
+                return
+            }
             minted = true
         }
 
@@ -207,6 +227,9 @@ final class PushRegistrar {
         let alerts = Self.alertsAllowed(await Self.notificationAuthorization())
         guard stillCurrent(), let key = try? PushKeyStore.loadOrCreate() else { return }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+        // Activities on the lock screen now belong to the pass being retired;
+        // taken before the daemon learns the new pass and can start another.
+        let oldActivityIDs = current.retire == nil ? [] : Set(Activity<SupervisorActivityAttributes>.activities.map(\.id))
         // A failure here is retried on the next sync with the same pass.
         guard let result = try? await client.registerPush(pass: current.pass, key: key.base64URLEncodedString(),
                                                          env: Self.env, activities: startToken != nil, alerts: alerts),
@@ -214,6 +237,9 @@ final class PushRegistrar {
         else { return }
 
         if let retire = current.retire {
+            // The daemon starts afresh on the new pass and the old channel is
+            // about to go, so nothing else could end these.
+            if !oldActivityIDs.isEmpty { await Self.endActivities(ids: oldActivityIDs) }
             try? await relay.unregister(pass: retire)
             guard stillCurrent() else { return }
             current.retire = nil
@@ -352,17 +378,20 @@ enum PushPassStore {
         return try? JSONDecoder().decode(Stored.self, from: data)
     }
 
-    static func save(_ stored: Stored) {
-        guard let data = try? JSONEncoder().encode(stored) else { return }
+    // Updated in place, so a failed write never loses the pass already stored.
+    @discardableResult
+    static func save(_ stored: Stored) -> Bool {
+        guard let data = try? JSONEncoder().encode(stored) else { return false }
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(query as CFDictionary)
+        let updated = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        guard updated == errSecItemNotFound else { return updated == errSecSuccess }
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(query as CFDictionary, nil)
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
     }
 
     static func clear() {

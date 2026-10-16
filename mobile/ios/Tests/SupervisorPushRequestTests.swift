@@ -7,6 +7,22 @@ import XCTest
 // result is judged, and the two registration calls (relay, then daemon).
 // Uses DaemonClientTests' StubProtocol, so nothing leaves the process.
 final class SupervisorPushRequestTests: XCTestCase {
+    func testPushEnvironmentComesFromTheSigningProfile() {
+        func profile(_ aps: String?) -> Data {
+            let entitlements = aps.map { "<key>aps-environment</key><string>\($0)</string>" } ?? ""
+            let plist = #"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>"#
+                + "<key>Entitlements</key><dict>\(entitlements)</dict></dict></plist>"
+            // Wrapped like the CMS signature around a real profile.
+            return Data([0x30, 0x82, 0x00, 0xff]) + Data(plist.utf8) + Data([0xa0, 0x00, 0x31])
+        }
+        XCTAssertEqual(PushRegistrar.environment(profile: profile("development")), "sandbox")
+        XCTAssertEqual(PushRegistrar.environment(profile: profile("production")), "production")
+        XCTAssertEqual(PushRegistrar.environment(profile: profile(nil)), "sandbox")
+        XCTAssertEqual(PushRegistrar.environment(profile: Data("garbage".utf8)), "sandbox")
+        // No profile: an App Store build (the simulator has no real tokens).
+        XCTAssertEqual(PushRegistrar.environment(profile: nil), "sandbox", "tests run on the simulator")
+    }
+
     override func tearDown() {
         StubProtocol.handler = nil
         StubProtocol.failure = nil
@@ -104,6 +120,12 @@ final class SupervisorPushRequestTests: XCTestCase {
         StubProtocol.failure = URLError(.notConnectedToInternet)
         let offline = await send(.answer(questionId: "q", answer: "Approve"))
         XCTAssertEqual(offline, .failed)
+        StubProtocol.failure = URLError(.timedOut)
+        let timedOut = await send(.answer(questionId: "q", answer: "Approve"))
+        XCTAssertEqual(timedOut, .unknown)
+        StubProtocol.failure = URLError(.cancelled)
+        let cancelled = await send(.answer(questionId: "q", answer: "Approve"))
+        XCTAssertEqual(cancelled, .unknown)
         StubProtocol.failure = nil
 
         respond(200, #"{"delivery":{"status":"blocked","detail":"Agent is busy"}}"#)
