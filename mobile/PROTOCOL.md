@@ -213,6 +213,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/mobile/summary` | §4 |
+| POST | `/mobile/push` | iOS push registration, §7.1 |
+| DELETE | `/mobile/push` | remove it, §7.1 |
 | GET | `/tasks` | list, with `?queue=&bucket=&status=&limit=` |
 | POST | `/tasks` | create a task |
 | GET | `/tasks/:id` | one task |
@@ -643,9 +645,38 @@ notification/badge on `pending-action` and `clarification-created`; and
 consider `task-reminder` a candidate for a local push notification.
 
 `GET /events` is only practical while the app is foregrounded/backgrounded
-with an active connection (no APNs/FCM push bridge exists in this phase) —
-polling `GET /mobile/summary` on the heartbeat cadence below is the
-foreground-independent fallback for widgets.
+with an active connection. With the app closed, iOS gets the supervisor's
+Live Activity and question alerts over the encrypted push relay (§7.1);
+there is no FCM bridge, and polling `GET /mobile/summary` on the heartbeat
+cadence below stays the fallback for widgets.
+
+### 7.1 Push registration (`POST /mobile/push`, iOS)
+
+```
+POST /mobile/push
+Content-Type: application/json
+Authorization: Bearer <nodeToken>
+X-OpenAGI-Node-ID: <nodeId>
+
+{"pass": "p1.<...>", "key": "<base64url, 32 bytes, no padding>", "env": "sandbox"}
+```
+
+- `pass`: what the relay's `POST /v1/register` returned. Must start with
+  `p1.`, at most 2000 chars. Opaque to the daemon.
+- `key`: the phone's envelope key, base64url without padding, exactly 32
+  bytes. Never sent to the relay.
+- `env`: `sandbox` or `production`.
+
+Response `{"ok": true}`; a bad body is `400 {"error": "..."}`. Only a paired
+phone's own credential may call it (the owner token gets `403`). The daemon
+keeps one record per phone in `<dataDir>/nodes/push.json` (0600), replacing
+the prior one; a new record starts a fresh Live Activity on the next change.
+`DELETE /mobile/push` (no body) removes it, and so does revoking the phone
+(§9). Envelope format, plaintexts and relay API:
+`docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md`. The daemon
+sends only when it runs the fleet supervisor and `OPENAGI_PUSH` is not `0`;
+`OPENAGI_PUSH_RELAY` overrides the relay URL (default
+`https://push.openagi.sh`).
 
 ## 8. Heartbeat
 
