@@ -953,6 +953,8 @@ export class FleetSupervisor {
     this._suggestionManager ??= new SuggestionManager({ store: this.store, config: this.config,
       queueFix: (input) => this.queueFix(input), now: () => this.now(), notify: (q, options) => this.notifier.notifyQuestion(q, options),
       respondSuggestion: (id, choice, options) => this.respondSuggestion(id, choice, options),
+      // Behind an OPENAGI_FLEET_NODE main no coding node is reachable from here: ask instead.
+      canAutoFix: () => Boolean(this.selfFixHub.nodeId && this.runtime?.nodeCapabilities?.dispatch),
       models: this.deps.diagnoseModels ?? createDiagnoseModels({ config: this.config, run: this.deps.runCommand, now: () => this.now() }) });
     return this._suggestionManager;
   }

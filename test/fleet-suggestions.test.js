@@ -183,9 +183,10 @@ test("auto acceptance after a lock clears resolves the existing outreach card on
   const runtime = { outreach: {
     append: (item) => { items.push(item); return { id: `out-${items.length}` }; },
     resolve: (...args) => resolved.push(args)
-  } };
+  }, nodeCapabilities: { dispatch: async () => { throw new Error("Coding node offline"); } } };
   const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.config, runtime, deps: { now: f.now } });
   supervisor._store = f.store;
+  supervisor.selfFixHub.nodeId = "coder";
   f.store.state.fixLocks = { policy: "busy" };
   await supervisor.suggestionManager.publish([f.candidate()]);
   const question = f.store.openQuestions()[0];
@@ -203,6 +204,53 @@ test("auto acceptance after a lock clears resolves the existing outreach card on
   assert.deepEqual(resolved, [["out-1", "Fix it", { status: "acted" }]]);
   await supervisor.suggestionManager.refresh();
   assert.equal(resolved.length, 1);
+});
+
+test("auto mode asks instead when this computer cannot reach a coding node", async (t) => {
+  const f = fixture(t, "auto");
+  const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.config, deps: { now: f.now } });
+  supervisor._store = f.store;
+  await supervisor.suggestionManager.publish([f.candidate()]);
+  assert.equal(f.store.fixes().length, 0);
+  assert.equal(f.store.suggestions()[0].status, "open");
+  assert.equal(f.store.openQuestions()[0].kind, "suggestion");
+});
+
+test("an answer given while the push is in flight is kept", async (t) => {
+  const f = fixture(t);
+  f.manager.notify = async (q) => { await f.manager.respond(q.meta.suggestionId, "Never"); return { pushed: true }; };
+  await f.manager.publish([f.candidate()]);
+  const [s] = f.store.suggestions();
+  assert.equal(s.status, "never");
+  assert.ok(s.pushedAt);
+});
+
+test("behind an OPENAGI_FLEET_NODE main, Fix it queues in the main's hub", async (t) => {
+  const f = fixture(t);
+  const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.config, deps: { now: f.now, diagnoseModels: f.manager.models } });
+  supervisor._store = f.store; supervisor._suggestionManager = f.manager;
+  await f.manager.publish([f.candidate(0), f.candidate(1)]);
+  const capability = createFleetCapability(supervisor);
+  const hubDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-suggestions-hub-"));
+  t.after(() => fs.rmSync(hubDir, { recursive: true, force: true }));
+  const remote = new RemoteFleetSupervisor({ nodeId: "test", dataDir: hubDir, runtime: { nodeCapabilities: { dispatch: async (_node, cap, operation, payload) => {
+    if (cap !== "fleet-supervisor") throw new Error("Coding node offline");
+    return capability.invoke(operation, payload);
+  } } } });
+  await remote.refresh();
+  const [first, second] = f.store.suggestions();
+  const card = remote.getState().questions.find((q) => q.meta?.suggestionId === first.id);
+  const answered = await remote.answerQuestion(card.id, "Fix it");
+  assert.deepEqual(answered.fix.evidence.suggestionIds, [first.id]);
+  assert.equal(f.store.fixes().length, 0, "the computer only links the fix");
+  assert.equal(f.store.suggestions().find((s) => s.id === first.id).fixId, answered.fix.id);
+  assert.equal(f.store.question(card.id).status, "answered");
+  assert.deepEqual(remote.getState().fixes.map((x) => x.id), [answered.fix.id]);
+  await assert.rejects(remote.respondSuggestion(second.id, "Fix it"), /already holds/);
+  await remote.stopFix(answered.fix.id);
+  const { fix } = await remote.respondSuggestion(second.id, "Fix it");
+  assert.equal(f.store.suggestions().find((s) => s.id === second.id).fixId, fix.id);
+  assert.deepEqual(remote.getState().fixes.map((x) => x.id).sort(), [answered.fix.id, fix.id].sort());
 });
 
 test("an owner Fix it stays manual even in auto mode", async (t) => {

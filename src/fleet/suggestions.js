@@ -25,6 +25,19 @@ export function autoGate(suggestion, { mode, fixes = [], areaLocks = {}, now }) 
   return fixes.filter((f) => localDay(f.createdAt) === localDay(now)).length < 3;
 }
 
+// The same checks and fix request wherever the fix is queued: here, or in an
+// OPENAGI_FLEET_NODE main's own self-fix hub (remote.js).
+export function assertFixAllowed(store, area, now) {
+  const fixes = store.fixes();
+  if (fixes.some((f) => ACTIVE_FIX.has(f.state)) || store.state.fixLocks?.[area]) throw new Error("A fix already holds the area or global lock.");
+  if (fixes.filter((f) => localDay(f.createdAt) === localDay(now)).length >= 3) throw new Error("The daily self-fix cap is reached.");
+}
+
+export function suggestionFix(suggestion, { auto = false } = {}) {
+  return { title: clean(suggestion.proposedFix, 100), problem: suggestion.rootCause, area: suggestion.area,
+    acceptance: suggestion.acceptance, evidence: { ...suggestion.evidence, suggestionIds: [suggestion.id] }, ...(auto ? { auto: true, confidence: suggestion.confidence } : {}) };
+}
+
 export function diagnoseDue(schedule = {}, now, quietHours) {
   const date = new Date(now);
   return {
@@ -85,8 +98,8 @@ export function createDiagnoseModels({ config, run, env, now } = {}) {
 }
 
 export class SuggestionManager {
-  constructor({ store, config, queueFix, notify, respondSuggestion, now = Date.now, models }) {
-    Object.assign(this, { store, config, queueFix, notify, respondSuggestion, now, models });
+  constructor({ store, config, queueFix, notify, respondSuggestion, canAutoFix = () => true, now = Date.now, models }) {
+    Object.assign(this, { store, config, queueFix, notify, respondSuggestion, canAutoFix, now, models });
   }
 
   get mode() { return this.config.selfFix?.mode ?? "propose"; }
@@ -124,17 +137,17 @@ export class SuggestionManager {
     await this.refresh();
   }
 
-  async startFix(suggestion, { auto = false } = {}) {
-    const fixes = this.store.fixes();
-    if (fixes.some((f) => ACTIVE_FIX.has(f.state)) || this.store.state.fixLocks?.[suggestion.area]) throw new Error("A fix already holds the area or global lock.");
-    if (fixes.filter((f) => localDay(f.createdAt) === localDay(this.now())).length >= 3) throw new Error("The daily self-fix cap is reached.");
-    const fix = await this.queueFix({ title: clean(suggestion.proposedFix, 100), problem: suggestion.rootCause, area: suggestion.area,
-      acceptance: suggestion.acceptance, evidence: { ...suggestion.evidence, suggestionIds: [suggestion.id] }, ...(auto ? { auto: true, confidence: suggestion.confidence } : {}) });
-    this.store.saveSuggestion({ ...suggestion, status: "fix-queued", fixId: fix.id, updatedAt: new Date(this.now()).toISOString() });
+  // fixId: an OPENAGI_FLEET_NODE main already queued the fix in its own hub.
+  async startFix(suggestion, { auto = false, fixId = null } = {}) {
+    if (fixId && !/^fix_[a-f0-9]{16}$/.test(fixId)) throw new Error("Invalid fix id.");
+    if (!fixId) assertFixAllowed(this.store, suggestion.area, this.now());
+    const fix = fixId ? { id: fixId } : await this.queueFix(suggestionFix(suggestion, { auto }));
+    const current = this.store.suggestions().find((v) => v.id === suggestion.id) ?? suggestion;
+    this.store.saveSuggestion({ ...current, status: "fix-queued", fixId: fix.id, updatedAt: new Date(this.now()).toISOString() });
     return fix;
   }
 
-  async respond(id, choice, { auto = false } = {}) {
+  async respond(id, choice, { auto = false, fixId = null } = {}) {
     const suggestion = this.store.suggestions().find((s) => s.id === id);
     if (!suggestion) return null;
     const picked = String(choice ?? "").toLowerCase();
@@ -143,7 +156,7 @@ export class SuggestionManager {
     let fix = null;
     if (picked === "fix it") {
       if (this.mode === "off") throw new Error("Self-fix is off.");
-      fix = await this.startFix(suggestion, { auto });
+      fix = await this.startFix(suggestion, { auto, fixId });
     } else {
       this.store.saveSuggestion({ ...suggestion, status: picked === "never" ? "never" : "snoozed",
         snoozedUntil: picked === "not now" ? new Date(this.now() + 7 * DAY_MS).toISOString() : null, updatedAt: new Date(this.now()).toISOString() });
@@ -160,7 +173,7 @@ export class SuggestionManager {
         s = this.store.saveSuggestion({ ...s, status: "open", updatedAt: new Date(now).toISOString() });
       }
       if (s.status !== "open") continue;
-      if (autoGate(s, { mode: this.mode, fixes: this.store.fixes(), areaLocks: this.store.state.fixLocks, now })) {
+      if (autoGate(s, { mode: this.mode, fixes: this.store.fixes(), areaLocks: this.store.state.fixLocks, now }) && this.canAutoFix()) {
         if (this.respondSuggestion) await this.respondSuggestion(s.id, "Fix it", { auto: true });
         else await this.respond(s.id, "Fix it", { auto: true });
         continue;
@@ -172,7 +185,8 @@ export class SuggestionManager {
         && !isQuietHour(new Date(now), this.config.limits?.quietHours)
         && this.store.pushesSince(60 * 60_000, now) < (this.config.limits?.pushPerHour ?? 3);
       const result = await this.notify?.(question, { allowPush });
-      if (result?.pushed) this.store.saveSuggestion({ ...s, pushedAt: new Date(now).toISOString() });
+      // The owner may have answered while the push was in flight: patch the current record.
+      if (result?.pushed) this.store.saveSuggestion({ ...(this.store.suggestions().find((v) => v.id === s.id) ?? s), pushedAt: new Date(now).toISOString() });
     }
   }
 }

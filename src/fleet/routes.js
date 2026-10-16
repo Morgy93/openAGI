@@ -108,7 +108,7 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         const body = await readObject(readBody);
         try {
-          const result = await supervisor.respondSuggestion(parts[1], body?.choice);
+          const result = await supervisor.respondSuggestion(parts[1], body?.choice, typeof body?.fixId === "string" ? { fixId: body.fixId } : undefined);
           return result ? ok(result) : fail(404, "No suggestion with that id.");
         } catch { return fail(409, "Suggestion could not be applied. Check its choice, self-fix mode, locks and daily cap."); }
       }
