@@ -50,7 +50,9 @@ final class HotkeyManager {
     if status != noErr { NSLog("OpenAGI: hotkey registration failed (\(status)) — tray-only") }
     registerVoiceShortcut()
     defaultsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-      Task { @MainActor in self?.registerVoiceShortcut() }
+      // Swift 5.10 (the release runner) rejects the weak var inside the Task.
+      guard let self else { return }
+      Task { @MainActor in self.registerVoiceShortcut() }
     }
   }
 
