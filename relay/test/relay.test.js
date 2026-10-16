@@ -301,12 +301,13 @@ test("activity-update broadcasts on the channel with priority 5 by default", asy
   const r = await send({ pass, type: "activity-update", sealed: SEALED, staleAt });
   assert.deepEqual(r.json, { ok: true, apnsId: "bcast-1" });
   const c = calls[0];
-  assert.equal(c.url, `https://api.sandbox.push.apple.com/4/broadcasts/apps/${BUNDLE}`);
+  assert.equal(c.url, `https://api-broadcast.sandbox.push.apple.com/4/broadcasts/apps/${BUNDLE}`);
   const h = c.init.headers;
   assert.equal(h["apns-channel-id"], CHANNEL);
   assert.equal(h["apns-push-type"], "liveactivity");
   assert.equal(h["apns-priority"], "5");
   assert.equal(h["apns-topic"], undefined, "broadcast carries the bundle id in the path");
+  assert.equal(h["apns-expiration"], String(Math.floor(nowMs / 1000) + 8 * 60 * 60));
   await verifyJwt(h.authorization);
   assert.deepEqual(c.body, {
     aps: { timestamp: Math.floor(nowMs / 1000), event: "update", "content-state": { sealed: SEALED }, "stale-date": staleAt },
@@ -329,7 +330,7 @@ test("activity-end broadcasts with event end and dismissal-date", async () => {
   const r = await send({ pass, type: "activity-end", sealed: SEALED, dismissAt });
   assert.equal(r.json.ok, true);
   const c = calls[0];
-  assert.equal(c.url, `https://api.push.apple.com/4/broadcasts/apps/${BUNDLE}`);
+  assert.equal(c.url, `https://api-broadcast.push.apple.com/4/broadcasts/apps/${BUNDLE}`);
   assert.equal(c.init.headers["apns-channel-id"], CHANNEL);
   assert.equal(c.init.headers["apns-priority"], "5");
   assert.deepEqual(c.body, {
@@ -392,6 +393,27 @@ test("bad, tampered, foreign and wrong-AAD passes are rejected", async () => {
     key,
     enc.encode(JSON.stringify({ d: DEVICE, s: START, ch: CHANNEL, env: "sandbox", iat: 1 })),
   );
+  // Same bytes, different spelling: the final character's unused padding
+  // bits changed. Ciphertext length is chosen so those bits exist.
+  let aliasCt;
+  for (let pad = ""; !aliasCt || aliasCt.byteLength % 3 === 0; pad += "x") {
+    aliasCt = await subtle.encrypt(
+      { name: "AES-GCM", iv: nonce, additionalData: enc.encode("openagi-relay-pass:v1") },
+      key,
+      enc.encode(JSON.stringify({ d: DEVICE, env: "sandbox", iat: Math.floor(nowMs / 1000), pad })),
+    );
+  }
+  const aliasSeg = b64url(new Uint8Array(aliasCt));
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const last = aliasSeg.at(-1);
+  const twin = [...alphabet].find(
+    (ch) => ch !== last && Buffer.from(aliasSeg.slice(0, -1) + ch, "base64url").equals(Buffer.from(aliasSeg, "base64url")),
+  );
+  assert.ok(twin, "ciphertext length leaves padding bits");
+  const canonical = `p1.${b64url(nonce)}.${aliasSeg}`;
+  assert.equal((await send({ pass: canonical, type: "alert", sealed: SEALED })).json.ok, true);
+  calls = [];
+  const alias = `p1.${b64url(nonce)}.${aliasSeg.slice(0, -1)}${twin}`;
   // Valid seal, invalid contents.
   const badShape = await sealPass(makeEnv(), { d: DEVICE, s: START, ch: CHANNEL, env: "staging", iat: 1 });
 
@@ -406,6 +428,7 @@ test("bad, tampered, foreign and wrong-AAD passes are rejected", async () => {
     `p1.${b64url(new Uint8Array(8))}.${c}`,
     badShape,
     "p1." + "A".repeat(2100) + ".AAAA",
+    alias,
   ]) {
     const r = await send({ pass: p, type: "alert", sealed: SEALED });
     assert.deepEqual([r.status, r.json], [400, { ok: false, error: "bad_pass" }], String(p).slice(0, 20));

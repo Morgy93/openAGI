@@ -10,6 +10,9 @@ const MAX_PASS = 2000;
 const MAX_COLLAPSE_ID_BYTES = 64;
 const JWT_TTL_MS = 50 * 60 * 1000;
 const PASS_TTL_S = 30 * 24 * 60 * 60;
+// A Live Activity lives at most 8 hours; a broadcast held longer has nothing
+// left to update.
+const BROADCAST_TTL_S = 8 * 60 * 60;
 const MIN_KV_TTL_S = 60;
 const PASS_AAD = "openagi-relay-pass:v1";
 const DEFAULT_BUNDLE_ID = "sh.openagi.OpenAGI";
@@ -100,6 +103,11 @@ function bundleId(env) {
 
 function apnsHost(apnsEnv) {
   return apnsEnv === "production" ? "https://api.push.apple.com" : "https://api.sandbox.push.apple.com";
+}
+
+// Channel broadcasts have their own APNs service, separate from device pushes.
+function broadcastHost(apnsEnv) {
+  return apnsEnv === "production" ? "https://api-broadcast.push.apple.com" : "https://api-broadcast.sandbox.push.apple.com";
 }
 
 function manageHost(apnsEnv) {
@@ -196,6 +204,9 @@ export async function openPass(env, pass) {
   try {
     const nonce = b64urlDecode(m[1]);
     const ct = b64urlDecode(m[2]);
+    // Revocation and rate limits key on the pass string, so only the one
+    // canonical spelling of these bytes is accepted (no padding-bit aliases).
+    if (b64urlEncode(nonce) !== m[1] || b64urlEncode(ct) !== m[2]) throw new Error("noncanonical");
     if (nonce.length !== 12 || ct.length < 17) throw new Error("bad sizes");
     plain = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: nonce, additionalData: enc.encode(PASS_AAD), tagLength: 128 },
@@ -412,10 +423,12 @@ function buildRequest(env, p, s, nowSec, jwt) {
   if (s.staleAt !== undefined) aps["stale-date"] = s.staleAt;
   if (s.dismissAt !== undefined) aps["dismissal-date"] = s.dismissAt;
   return {
-    url: `${apnsHost(p.env)}/4/broadcasts/apps/${bid}`,
+    url: `${broadcastHost(p.env)}/4/broadcasts/apps/${bid}`,
     headers: {
       ...base,
       "apns-channel-id": p.ch,
+      // Required on broadcasts; the channel stores the most recent message.
+      "apns-expiration": String(nowSec + BROADCAST_TTL_S),
       "apns-push-type": "liveactivity",
       "apns-priority": String(s.priority || 5),
     },
