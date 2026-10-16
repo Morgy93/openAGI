@@ -197,10 +197,23 @@ test("auto acceptance after a lock clears resolves the existing outreach card on
   assert.equal(f.store.fixes().length, 1);
   assert.equal(f.store.suggestions()[0].status, "fix-queued");
   assert.equal(f.store.suggestions()[0].fixId, f.store.fixes()[0].id, "the hub queue is awaited, so the suggestion links its fix");
+  assert.equal(f.store.fixes()[0].auto, true, "an auto-accepted fix keeps its automatic provenance");
+  assert.equal(f.store.fixes()[0].confidence, explanation.confidence);
   assert.equal(f.store.openQuestions().length, 0);
   assert.deepEqual(resolved, [["out-1", "Fix it", { status: "acted" }]]);
   await supervisor.suggestionManager.refresh();
   assert.equal(resolved.length, 1);
+});
+
+test("an owner Fix it stays manual even in auto mode", async (t) => {
+  const f = fixture(t, "auto");
+  const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.config, deps: { now: f.now } });
+  supervisor._store = f.store;
+  await supervisor.suggestionManager.publish([f.candidate(0, { confidence: 0.5 })]);
+  assert.equal(f.store.fixes().length, 0, "below the auto gate, the owner decides");
+  const { fix } = await supervisor.respondSuggestion(f.store.suggestions()[0].id, "Fix it");
+  assert.equal(fix.auto, undefined);
+  assert.equal(f.store.suggestions()[0].fixId, fix.id);
 });
 
 test("suggestion responses work through question, routes, remote capability and phone allowlist", async (t) => {

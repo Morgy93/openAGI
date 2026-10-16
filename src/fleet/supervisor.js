@@ -952,14 +952,14 @@ export class FleetSupervisor {
   get suggestionManager() {
     this._suggestionManager ??= new SuggestionManager({ store: this.store, config: this.config,
       queueFix: (input) => this.queueFix(input), now: () => this.now(), notify: (q, options) => this.notifier.notifyQuestion(q, options),
-      respondSuggestion: (id, choice) => this.respondSuggestion(id, choice),
+      respondSuggestion: (id, choice, options) => this.respondSuggestion(id, choice, options),
       models: this.deps.diagnoseModels ?? createDiagnoseModels({ config: this.config, run: this.deps.runCommand, now: () => this.now() }) });
     return this._suggestionManager;
   }
 
-  async respondSuggestion(id, choice) {
+  async respondSuggestion(id, choice, options) {
     const questions = this.store.openQuestions().filter((q) => q.kind === "suggestion" && q.meta?.suggestionId === id);
-    const result = await this.suggestionManager.respond(id, choice);
+    const result = await this.suggestionManager.respond(id, choice, options);
     if (result) for (const q of questions) this.resolveOutreach(q, choice, "acted");
     return result;
   }

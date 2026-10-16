@@ -72,6 +72,16 @@ test("repeats, judge waits/failures, flicker, titles, escalation and spend thres
   assert.equal(diagnose({ now: NOW, actions: rows.map((r, i) => ({ ...r, progressMark: String(i) })) }).metrics.repeats.length, 0);
 });
 
+test("unsent escalation plans are not failed attempts", () => {
+  const rows = ["planned", "proposed", "stale", "dry-run"].map((status, i) => ({ id: `e${i}`, kind: "escalate-manager", at: at(), status }));
+  const report = diagnose({ now: NOW, actions: rows });
+  assert.equal(report.metrics.escalation.attempts, 0);
+  assert.ok(!report.anomalies.some((a) => a.metric === "escalation-success"));
+  const tried = diagnose({ now: NOW, actions: [...rows, { id: "ef", kind: "escalate-manager", at: at(), status: "failed" }] });
+  assert.equal(tried.metrics.escalation.attempts, 1);
+  assert.ok(tried.anomalies.some((a) => a.metric === "escalation-success"));
+});
+
 test("07:30 daily diagnosis checks the complete local day and its prior seven spend days", async (t) => {
   const dataDir = temp(t);
   const now = new Date(2026, 9, 14, 7, 31).getTime();

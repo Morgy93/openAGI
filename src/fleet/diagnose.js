@@ -117,7 +117,8 @@ export function diagnose({ actions = [], questions = [], state = {}, feedback = 
   metrics.review = { failures: reviews.length, modelLimitFailures: limits.length };
   if (reviews.length >= 5) add("review-failures", "review", reviews.length, reviews, { days: 1 });
   if (limits.length) add("review-model-limits", "review", limits.length, limits, { days: 1 });
-  const escalations = recent.filter((a) => a.kind === "escalate-manager");
+  // Observe/propose plans and unsent (stale, dry-run) records never tried a delivery.
+  const escalations = recent.filter((a) => a.kind === "escalate-manager" && !["planned", "proposed", "stale", "dry-run"].includes(a.status));
   const succeeded = escalations.filter((a) => ["sent", "escalated", "done"].includes(a.status));
   metrics.escalation = { attempts: escalations.length, succeeded: succeeded.length, successRate: ratio(succeeded.length, escalations.length) };
   if (escalations.length && succeeded.length / escalations.length < 0.5) add("escalation-success", "policy", escalations.length - succeeded.length, escalations.filter((a) => !succeeded.includes(a)));

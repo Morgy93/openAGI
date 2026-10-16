@@ -124,17 +124,17 @@ export class SuggestionManager {
     await this.refresh();
   }
 
-  async startFix(suggestion) {
+  async startFix(suggestion, { auto = false } = {}) {
     const fixes = this.store.fixes();
     if (fixes.some((f) => ACTIVE_FIX.has(f.state)) || this.store.state.fixLocks?.[suggestion.area]) throw new Error("A fix already holds the area or global lock.");
     if (fixes.filter((f) => localDay(f.createdAt) === localDay(this.now())).length >= 3) throw new Error("The daily self-fix cap is reached.");
     const fix = await this.queueFix({ title: clean(suggestion.proposedFix, 100), problem: suggestion.rootCause, area: suggestion.area,
-      acceptance: suggestion.acceptance, evidence: { ...suggestion.evidence, suggestionIds: [suggestion.id] } });
+      acceptance: suggestion.acceptance, evidence: { ...suggestion.evidence, suggestionIds: [suggestion.id] }, ...(auto ? { auto: true, confidence: suggestion.confidence } : {}) });
     this.store.saveSuggestion({ ...suggestion, status: "fix-queued", fixId: fix.id, updatedAt: new Date(this.now()).toISOString() });
     return fix;
   }
 
-  async respond(id, choice) {
+  async respond(id, choice, { auto = false } = {}) {
     const suggestion = this.store.suggestions().find((s) => s.id === id);
     if (!suggestion) return null;
     const picked = String(choice ?? "").toLowerCase();
@@ -143,7 +143,7 @@ export class SuggestionManager {
     let fix = null;
     if (picked === "fix it") {
       if (this.mode === "off") throw new Error("Self-fix is off.");
-      fix = await this.startFix(suggestion);
+      fix = await this.startFix(suggestion, { auto });
     } else {
       this.store.saveSuggestion({ ...suggestion, status: picked === "never" ? "never" : "snoozed",
         snoozedUntil: picked === "not now" ? new Date(this.now() + 7 * DAY_MS).toISOString() : null, updatedAt: new Date(this.now()).toISOString() });
@@ -161,8 +161,8 @@ export class SuggestionManager {
       }
       if (s.status !== "open") continue;
       if (autoGate(s, { mode: this.mode, fixes: this.store.fixes(), areaLocks: this.store.state.fixLocks, now })) {
-        if (this.respondSuggestion) await this.respondSuggestion(s.id, "Fix it");
-        else await this.respond(s.id, "Fix it");
+        if (this.respondSuggestion) await this.respondSuggestion(s.id, "Fix it", { auto: true });
+        else await this.respond(s.id, "Fix it", { auto: true });
         continue;
       }
       const question = this.store.upsertQuestion({ kind: "suggestion", dedupeKey: `suggestion:${s.id}`, title: clean(s.proposedFix, 100),
