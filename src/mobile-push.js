@@ -268,7 +268,7 @@ export class MobilePush {
     const t = this.timing;
     if (registration.activities === false || registration.noLiveActivity) {
       this.live.delete(nodeId);
-      this.store.setActivity(nodeId, null);
+      this.store.setActivity(nodeId, registration.pass, null);
       return null;
     }
     let live = this.live.get(nodeId) ?? null;
@@ -296,7 +296,7 @@ export class MobilePush {
       const result = await this.sendActivity(registration, "activity-start", activity, { staleAt: this.epoch(now + t.staleAfterMs) });
       if (result !== "ok") return null;
       this.live.set(nodeId, { pass: registration.pass, startedAt: now, lastHash: hash, lastSentAt: now, lastYou: activity.counts.you, idleSince: null });
-      this.store.setActivity(nodeId, { startedAt: new Date(now).toISOString() });
+      this.store.setActivity(nodeId, registration.pass, { startedAt: new Date(now).toISOString() });
       return now + t.restartAfterMs;
     }
 
@@ -304,7 +304,7 @@ export class MobilePush {
       const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now) });
       if (ended !== "ok") return null;
       this.live.delete(nodeId);
-      this.store.setActivity(nodeId, null);
+      this.store.setActivity(nodeId, registration.pass, null);
       return this.syncActivity(registration, activity, now);
     }
 
@@ -314,7 +314,7 @@ export class MobilePush {
         const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now + t.dismissAfterMs) });
         if (ended === "ok") {
           this.live.delete(nodeId);
-          this.store.setActivity(nodeId, null);
+          this.store.setActivity(nodeId, registration.pass, null);
         }
         return null;
       }
@@ -375,8 +375,14 @@ export class MobilePush {
     let json = null;
     try { json = await response.json(); } catch { /* not JSON */ }
     if (json?.gone === true) {
-      this.dropGone(registration.nodeId);
-      return "gone";
+      // Only the device token going means the phone is gone. A gone Live
+      // Activity channel or start token leaves its alerts working.
+      if (body.type === "alert") {
+        this.dropGone(registration.nodeId);
+        return "gone";
+      }
+      this.alertsOnly(registration);
+      return "error";
     }
     if (response.ok && json?.ok === true) {
       this.reported.clear();
@@ -384,15 +390,19 @@ export class MobilePush {
     }
     // The pass was registered without a push-to-start token: alerts only.
     if (response.status === 400 && json?.error === "no_live_activity") {
-      this.live.delete(registration.nodeId);
-      try { this.store.markNoLiveActivity(registration.nodeId); } catch (error) {
-        this.report(`could not record no_live_activity: ${error?.message ?? error}`);
-      }
+      this.alertsOnly(registration);
       return "error";
     }
     const code = typeof json?.error === "string" ? json.error.slice(0, 80) : `HTTP ${response.status}`;
     this.report(`relay refused ${body.type}: ${code}`);
     return "error";
+  }
+
+  alertsOnly(registration) {
+    this.live.delete(registration.nodeId);
+    try { this.store.markNoLiveActivity(registration.nodeId, registration.pass); } catch (error) {
+      this.report(`could not record an alerts-only pass: ${error?.message ?? error}`);
+    }
   }
 
   dropGone(nodeId) {

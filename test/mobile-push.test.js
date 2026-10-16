@@ -440,3 +440,31 @@ test("a relay no_live_activity makes that pass alerts-only until a new pass", as
   await h.push.flush();
   assert.deepEqual(h.types(), ["activity-start", "alert", "activity-start"]);
 });
+
+test("a gone Live Activity channel makes the pass alerts-only; only an alert's gone deletes", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  h.setReply((body) => (body.type.startsWith("activity-") ? { ok: false, gone: true, __status: 410 } : { ok: true }));
+  await h.push.flush();
+  const record = h.store.get(NODE);
+  assert.ok(record, "the registration is kept");
+  assert.equal(record.noLiveActivity, true);
+  assert.equal(record.activity, null);
+  h.state.questions = [question("fq1")];
+  h.state.snapshot.threads.push(thread("codex:b", "you"));
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "alert"]);
+});
+
+test("a start answered after the phone re-registered does not attach to the new pass", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  h.setReply((body) => {
+    if (body.type === "activity-start" && body.pass === "p1.pass-one") h.store.put(NODE, { pass: "p1.pass-two", key: h.key, env: "sandbox" });
+    return { ok: true };
+  });
+  await h.push.flush();
+  assert.equal(h.store.get(NODE).pass, "p1.pass-two");
+  assert.equal(h.store.get(NODE).activity, null);
+  await h.push.flush();
+  assert.deepEqual(h.sent.map((s) => `${s.type} ${s.pass}`), ["activity-start p1.pass-one", "activity-start p1.pass-two"]);
+  assert.deepEqual(h.store.get(NODE).activity, { startedAt: new Date(T0).toISOString() });
+});

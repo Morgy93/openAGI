@@ -89,17 +89,21 @@ export class MobilePushStore {
     return copy(record);
   }
 
-  setActivity(nodeId, activity) {
+  /// Written only while the record still holds `pass`: a relay reply for an
+  /// old pass must not attach its activity to the phone's new registration.
+  setActivity(nodeId, pass, activity) {
     const record = this.records.get(nodeId);
-    if (!record || (record.activity?.startedAt ?? null) === (activity?.startedAt ?? null)) return;
+    if (!record || record.pass !== pass) return;
+    if ((record.activity?.startedAt ?? null) === (activity?.startedAt ?? null)) return;
     record.activity = activity ? { startedAt: activity.startedAt } : null;
     this.save();
   }
 
-  /// The relay has no Live Activity channel for this pass: alerts only.
-  markNoLiveActivity(nodeId) {
+  /// The relay has no (or no longer a) Live Activity channel for this pass:
+  /// alerts only, until the phone registers a new pass.
+  markNoLiveActivity(nodeId, pass) {
     const record = this.records.get(nodeId);
-    if (!record || (record.noLiveActivity && !record.activity)) return;
+    if (!record || record.pass !== pass || (record.noLiveActivity && !record.activity)) return;
     record.noLiveActivity = true;
     record.activity = null;
     this.save();
