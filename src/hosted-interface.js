@@ -4,7 +4,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
 import { attachVoiceRelay } from "./voice/relay.js";
-import { createVoiceSessionFactory } from "./voice/broker.js";
+import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { g2ConnectPage } from "./g2-connect-page.js";
@@ -72,6 +72,7 @@ import {
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 import { executeApprovedAction } from "./approval-executor.js";
+import { createSelfFixCapability } from "./self-fix/runner.js";
 import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
 import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
@@ -673,9 +674,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
     };
   };
+  let selfFixNode = null;
+  const selfFixProvider = {
+    health: async () => ({ capability: { id: "self-fix", ready: true, operations: ["start", "list", "revise", "stop", "close"], detail: "Isolated repair runner; owner merges" } }),
+    invoke: (operation, payload) => {
+      selfFixNode ??= createSelfFixCapability({ dataDir });
+      return selfFixNode.execute({ capability: "self-fix", operation, payload });
+    }
+  };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
-    if (codingNodeEnabledHere()) providers.set(CODING_CAPABILITY, codingNodeProvider());
+    if (codingNodeEnabledHere()) {
+      providers.set(CODING_CAPABILITY, codingNodeProvider());
+      if (process.platform === "darwin") providers.set("self-fix", selfFixProvider);
+    }
     if (process.env.OPENAGI_FLEET_SUPERVISOR === "1" && !process.env.OPENAGI_FLEET_NODE && runtime.fleetSupervisor) {
       providers.set("fleet-supervisor", createFleetCapability(runtime.fleetSupervisor));
     }
@@ -1781,7 +1793,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             || Object.keys(body).some(k => !fields[body.op].includes(k))) return sendG2NodeJson(res, 400, { error: "unsupported_experience_fields" });
           if (body.op === "capabilities") return sendG2NodeJson(res, 200, {
             protocol: 1, recovery: true, history: true, mainRole: readNodeConfig(dataDir)?.remote ? "node" : "main",
-            speech: channels.g2.status(), recoveryHours: 24,
+            speech: channels.g2.status(), recoveryHours: 24, voice: voiceEnabled(),
             computer: "Requires a connected computer and explicit approval on main.",
             coding: "Only sessions shared by connected coding hosts are accessible; listing does not grant control."
           });
@@ -3569,6 +3581,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         channels?.stop?.();
         runtime.codingSupervisor?.stop();
         codingNode?.stop?.();
+        selfFixNode?.stop?.();
         runtime.fleetSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();

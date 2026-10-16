@@ -22,6 +22,7 @@ function fakeSession() {
     appendOk: true,
     appendAudio(pcm) { session.audio.push(pcm); return session.appendOk; },
     commit() { calls.push(["commit"]); },
+    cancel() { calls.push(["cancel"]); },
     barge(options) { calls.push(["barge", options]); },
     playback(options) { calls.push(["playback", options]); },
     setFocus(focus) { calls.push(["focus", focus]); },
@@ -160,11 +161,12 @@ test("push-to-talk controls reach the session: commit, barge with played ms, con
   assert.deepEqual(session.params.focus, { view: "supervisor" });
   client.ws.send(Buffer.alloc(4800));
   client.send({ type: "commit" });
+  client.send({ type: "cancel" });
   client.send({ type: "barge", playedMs: 320 });
   client.send({ type: "context", focus: { threadKey: "codex:t1" } });
   client.send({ type: "mode", handsFree: true });
-  await until(() => session.calls.length >= 4);
-  assert.deepEqual(session.calls, [["commit"], ["barge", { playedMs: 320 }], ["focus", { threadKey: "codex:t1" }], ["handsFree", true]]);
+  await until(() => session.calls.length >= 5);
+  assert.deepEqual(session.calls, [["commit"], ["cancel"], ["barge", { playedMs: 320 }], ["focus", { threadKey: "codex:t1" }], ["handsFree", true]]);
   assert.equal(session.audio[0].length, 4800);
   // The broker's events and audio reach the device.
   session.io.send({ type: "reply.delta", text: "On it." });

@@ -144,7 +144,7 @@ test("Fix it uses the same queueFix path, is idempotent and links feedback", asy
   await f.manager.publish([f.candidate(0, { evidence: { actionIds: ["a1"], feedbackIds: [feedback.id] } })]);
   const s = f.store.suggestions()[0];
   assert.equal(f.store.feedback()[0].status, "triaged");
-  const result = f.manager.respond(s.id, "Fix it");
+  const result = await f.manager.respond(s.id, "Fix it");
   assert.equal(result.fix.state, "queued");
   assert.deepEqual(result.fix.evidence.suggestionIds, [s.id]);
   assert.equal(f.store.feedback()[0].status, "fix-queued");
@@ -186,16 +186,17 @@ test("auto acceptance after a lock clears resolves the existing outreach card on
   } };
   const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.config, runtime, deps: { now: f.now } });
   supervisor._store = f.store;
-  f.store.state.areaLocks = { policy: "busy" };
+  f.store.state.fixLocks = { policy: "busy" };
   await supervisor.suggestionManager.publish([f.candidate()]);
   const question = f.store.openQuestions()[0];
   assert.equal(question.outreachId, "out-1");
   assert.equal(items.length, 1);
   assert.equal(f.store.fixes().length, 0);
-  f.store.state.areaLocks = {};
+  f.store.state.fixLocks = {};
   await supervisor.suggestionManager.refresh();
   assert.equal(f.store.fixes().length, 1);
   assert.equal(f.store.suggestions()[0].status, "fix-queued");
+  assert.equal(f.store.suggestions()[0].fixId, f.store.fixes()[0].id, "the hub queue is awaited, so the suggestion links its fix");
   assert.equal(f.store.openQuestions().length, 0);
   assert.deepEqual(resolved, [["out-1", "Fix it", { status: "acted" }]]);
   await supervisor.suggestionManager.refresh();

@@ -370,7 +370,7 @@ test("walkthrough counts suggestions once without crowding out ordinary question
   assert.deepEqual(suggestions.items.map((item) => item.id), [suggestion.id]);
 });
 
-test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix stubs", async () => {
+test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix tools", async () => {
   const questions = [{ id: "fq_1", title: "Merge PR 42?", options: ["Yes", "No"], threadKey: "codex:t1", prRef: "acme/app#42" }];
   const threads = [
     row({ key: "codex:red", workspace: "amman", state: "needs-human", health: "red", reason: "Waiting on you" }),
@@ -403,7 +403,7 @@ test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix s
 
   const list = (await tools.invoke("self_fix_list", { status: "queued" })).result;
   assert.deepEqual(list.fixes.map((fix) => fix.id), ["fix_1"]);
-  assert.match(list.runner, /not built yet/);
+  assert.match(list.runner, /coding node/);
   // No queueFix on this supervisor: no start tool; and never a merge tool.
   assert.equal(tools.has("self_fix_start"), false);
   assert.ok(!tools.list().some((tool) => /merge|release|deploy/.test(tool.name)));

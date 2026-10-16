@@ -16,7 +16,7 @@ const TERMINAL = new Set(["merged", "declined"]);
 // Where a fix may land; one fix at a time per area once the runner exists.
 export const FIX_AREAS = Object.freeze(["policy", "classify", "ui-delivery", "judge", "review", "sources", "page", "voice", "self-fix"]);
 // queued until the runner (P3) picks a request up; stop marks it abandoned.
-export const FIX_STATES = Object.freeze(["queued", "abandoned"]);
+export const FIX_STATES = Object.freeze(["queued", "preflight", "brief", "worktree", "coding", "tests", "guard", "pr", "awaiting-review", "fixing-findings", "replay", "owner-ask", "done", "failed", "abandoned"]);
 // What the owner is looking at: the on-screen focus a voice client sends.
 export const TARGET_FIELDS = Object.freeze(["view", "threadKey", "questionId", "actionId", "prRef", "fixId", "suggestionId"]);
 

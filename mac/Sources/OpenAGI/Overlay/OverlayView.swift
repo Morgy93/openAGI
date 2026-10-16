@@ -8,6 +8,7 @@ struct OverlayView: View {
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var briefEditor = BriefEditorState.shared
   @ObservedObject var fleet = FleetConsumer.shared
+  @ObservedObject var voice = VoiceSession.shared
   @FocusState private var fieldFocused: Bool
   @State private var pillHovered = false
   // Per-item reply text for the targeted chat field, keyed by outreach id.
@@ -26,7 +27,16 @@ struct OverlayView: View {
   // a single chain of sixteen generic .onChange overloads. Opaque helper
   // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    fleetDetailWatchers(watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))))))
+    voiceWatchers(fleetDetailWatchers(watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody))))))))))
+  }
+
+  private func voiceWatchers<V: View>(_ content: V) -> some View {
+    content
+      .onChange(of: voice.phase) { _, _ in onContentChange() }
+      .onChange(of: voice.transcript) { _, _ in onContentChange() }
+      .onChange(of: voice.reply) { _, _ in onContentChange() }
+      .onChange(of: voice.error) { _, _ in onContentChange() }
+      .onChange(of: voice.notice) { _, _ in onContentChange() }
   }
 
   private var panelBody: some View {

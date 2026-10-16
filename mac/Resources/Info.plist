@@ -34,6 +34,8 @@
   <string>Licensed under the PolyForm Noncommercial License 1.0.0. Commercial use requires a separate license.</string>
 
   <!-- Capture permission usage strings. macOS shows these when prompting. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>OpenAGI sends your speech to your paired hub when you use the voice mic button or hold-to-talk hotkey.</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>OpenAGI uses AppleEvents to read window titles for ambient activity tracking. No keystrokes are captured.</string>
   <key>NSAccessibilityUsageDescription</key>

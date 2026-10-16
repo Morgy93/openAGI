@@ -4,7 +4,6 @@ import { OpenAGIStore, type OpenAGIState } from '../store'
 import type { LiveSpeech, SpeechCallbacks } from '../live-speech'
 import { SpeechStreamError } from '../live-speech'
 import type { OpenAGIApiClient } from '../api-client'
-import { OpenAGIApiError } from '../config'
 
 type Consent = { id: string; grantedAt: number; until: number | null }
 // A main that keeps one persistent grant per G2, like src/g2-proactive.js.
@@ -106,134 +105,19 @@ it('Talk: swipe down reads the shared agent conversation and opens an answer', a
   } finally { await f.app.systemExit() }
 })
 
-it('Supervisor: status page tap talks to the supervisor thread; an older main says so without a resend draft', async () => {
+it('buffered speech: a recording that reaches 30 seconds is kept and finished, not lost', async () => {
   vi.useFakeTimers()
   const f = await fixture({ autoSend: true })
   try {
-    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    const status = { mode: 'auto', lastTickAt: null, needsYou: 0, counts: { red: 0, yellow: 0, green: 2, gray: 0 }, threads: [] }
-    vi.spyOn(f.app.proactive, 'fleetStatus').mockResolvedValue(status)
-    await f.app.configureHomeMode('supervisor')
-    expect(f.renderer.speaker).toHaveBeenLastCalledWith('Supervisor')
-    // No questions: tap shows status; tap on status starts talking to the supervisor.
-    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.renderer.fleetStatus).toHaveBeenCalledWith(expect.stringContaining('2 green'), 0, 1)
-    await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.audio.start).toHaveBeenCalledOnce()
-    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
-    f.api.askText.mockRejectedValueOnce(new OpenAGIApiError('threads_unsupported', 400, 'Update OpenAGI on your main to talk to the supervisor from the glasses. Nothing was sent.'))
-    await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
-    await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.renderer.message).toHaveBeenLastCalledWith('Could not ask agent', expect.stringContaining('Update OpenAGI'))
-    expect(f.phone.draft).not.toHaveBeenCalledWith(expect.anything(), 'delivery')
-  } finally { await f.app.systemExit(); vi.useRealTimers() }
-})
-
-it('Supervisor home: press and hold talks to the supervisor, letting go sends without a review', async () => {
-  vi.useFakeTimers()
-  // Review is on (autoSend false): push-to-talk still sends on release.
-  const f = await fixture({ autoSend: false })
-  try {
-    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    await f.app.configureHomeMode('supervisor')
-    expect(f.app.holdStart()).toBe(true)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(f.audio.start).toHaveBeenCalledOnce()
-    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
-    expect(f.renderer.review).not.toHaveBeenCalled()
-    // Outside Supervisor home a hold stays a plain tap.
-    await f.app.configureHomeMode('talk')
-    expect(f.app.holdStart()).toBe(false)
-  } finally { await f.app.systemExit(); vi.useRealTimers() }
-})
-
-it('Supervisor home: letting go before the microphone opened still sends once it has', async () => {
-  vi.useFakeTimers()
-  const f = await fixture({ autoSend: false })
-  try {
-    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    await f.app.configureHomeMode('supervisor')
-    let opened!: () => void
-    f.audio.start.mockImplementationOnce(() => new Promise<void>((resolve) => { opened = resolve }))
-    expect(f.app.holdStart()).toBe(true)
-    await vi.advanceTimersByTimeAsync(1)
-    f.app.holdRelease()
-    expect(f.api.askText).not.toHaveBeenCalled()
-    opened(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
-  } finally { await f.app.systemExit(); vi.useRealTimers() }
-})
-
-it('Supervisor home: leaving the glasses mid-hold sends nothing and the next tap follows the review setting', async () => {
-  vi.useFakeTimers()
-  const f = await fixture({ autoSend: false })
-  try {
-    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    const status = { mode: 'auto', lastTickAt: null, needsYou: 0, counts: { red: 0, yellow: 0, green: 1, gray: 0 }, threads: [] }
-    vi.spyOn(f.app.proactive, 'fleetStatus').mockResolvedValue(status)
-    await f.app.configureHomeMode('supervisor')
-    expect(f.app.holdStart()).toBe(true)
-    await vi.advanceTimersByTimeAsync(1)
-    f.app.setForeground(false); await vi.advanceTimersByTimeAsync(1)
-    f.app.setForeground(true); await vi.advanceTimersByTimeAsync(600)
-    expect(f.api.askText).not.toHaveBeenCalled()
-    // Status page, then a tapped recording: it goes to review, not straight out.
-    f.app.tap(); await vi.advanceTimersByTimeAsync(600)
-    f.app.tap(); await vi.advanceTimersByTimeAsync(600)
-    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.api.askText).not.toHaveBeenCalled()
-    expect(f.phone.draft).toHaveBeenLastCalledWith('What time is it?', undefined)
-  } finally { await f.app.systemExit(); vi.useRealTimers() }
-})
-
-it('Supervisor home: a hold past the 30-second live limit sends what was said and says why', async () => {
-  vi.useFakeTimers()
-  const f = await fixture({ autoSend: false })
-  try {
-    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    await f.app.configureHomeMode('supervisor')
-    expect(f.app.holdStart()).toBe(true)
-    await vi.advanceTimersByTimeAsync(30_001)
-    expect(f.phone.set).toHaveBeenCalledWith('30-second limit', expect.stringContaining('sending what you said'))
-    expect(f.api.askText).toHaveBeenCalledOnce()
-    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
-    expect(f.api.askText).toHaveBeenCalledOnce()
-  } finally { await f.app.systemExit(); vi.useRealTimers() }
-})
-
-it('Supervisor home: a release just after the 30-second limit still sends, with review on', async () => {
-  vi.useFakeTimers()
-  const f = await fixture({ autoSend: false })
-  try {
-    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    await f.app.configureHomeMode('supervisor')
-    let finish!: (text: string) => void
-    f.speech.finish.mockImplementationOnce(() => new Promise<string>((resolve) => { finish = resolve }))
-    expect(f.app.holdStart()).toBe(true)
-    await vi.advanceTimersByTimeAsync(30_001)
-    // Released while the limit's finish is still waiting on the transcript.
-    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
-    finish('Resume my sessions'); await vi.advanceTimersByTimeAsync(1)
-    expect(f.api.askText).toHaveBeenLastCalledWith('Resume my sessions', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
-  } finally { await f.app.systemExit(); vi.useRealTimers() }
-})
-
-it('buffered speech: a recording that reaches 30 seconds is kept and finished, not lost', async () => {
-  vi.useFakeTimers()
-  const f = await fixture({ autoSend: false })
-  try {
     await f.store.update({ speechModel: 'openai-buffered' })
     vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
-    await f.app.configureHomeMode('supervisor')
     f.api.ask.mockResolvedValue({ question: 'Resume my sessions', reply: 'On it', sessionId: 's' })
-    expect(f.app.holdStart()).toBe(true)
+    await f.app.startAsk()
     await vi.advanceTimersByTimeAsync(1)
     // 16 kHz, 16-bit mono: 32,000 bytes a second; 31 seconds of frames.
     for (let i = 0; i < 31; i += 1) f.receive(new Uint8Array(32_000))
     await vi.advanceTimersByTimeAsync(1)
-    expect(f.phone.set).toHaveBeenCalledWith('30-second limit', expect.stringContaining('sending what you said'))
+    expect(f.phone.set).toHaveBeenCalledWith('30-second limit', 'Recording stopped at 30 seconds.')
     expect(f.api.ask).toHaveBeenCalledOnce()
     expect(f.renderer.message).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('30 second limit'))
   } finally { await f.app.systemExit(); vi.useRealTimers() }
@@ -689,8 +573,8 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
     await f.app.configureHomeMode('supervisor')
     expect(configure).toHaveBeenCalledWith({ supervisorOnly: true })
     expect(f.store.snapshot().homeMode).toBe('supervisor')
-    // Tap at home: only supervisor items, not a new question.
-    await tap()
+    // Swipe up: only supervisor items.
+    f.app.scrollUp()
     expect(f.renderer.inboxList).toHaveBeenLastCalledWith('#7 ready. Merge?', 1, 1)
     expect(f.api.askText).not.toHaveBeenCalled()
     await tap(); await tap()

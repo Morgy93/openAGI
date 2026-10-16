@@ -136,6 +136,14 @@ final class AppState: ObservableObject {
     return Self.readEnvFile()["OPENAGI_AUTH_TOKEN"]
   }
 
+  func voiceConnection() throws -> VoiceConnection {
+    let captureURL = captureRemoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !captureURL.isEmpty {
+      return try VoiceConnection(base: captureURL, token: captureRemoteToken)
+    }
+    return try VoiceConnection(base: outreachRemoteURL.trimmingCharacters(in: .whitespacesAndNewlines), token: outreachToken)
+  }
+
   static func readEnvFile() -> [String: String] {
     let path = dataDir().appendingPathComponent(".env")
     guard let text = try? String(contentsOf: path, encoding: .utf8) else { return [:] }
