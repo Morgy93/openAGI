@@ -218,3 +218,26 @@ Relay URL: `OPENAGI_PUSH_RELAY` env, default `https://push.openagi.sh`.
   deploy; if blocked, channel creation moves to a tiny second endpoint.
 - Lock-screen view decrypting via keychain: covered by the fixture test, but
   only a device run proves the extension can read the item while locked.
+
+## Amendments after review (2026-10-15)
+
+- Channel-management ports: sandbox `:2195`, production `:2196`.
+- `POST /v1/register`: `startToken` is optional. Without it no channel is
+  created and the pass has no `s`/`ch`; `activity-*` sends with such a pass
+  return 400 `{ error: "no_live_activity" }`. Alerts work with the device
+  token alone.
+- `POST /v1/unregister` `{ pass }`: deletes the pass's channel if any
+  (`DELETE /1/apps/<bundleId>/channels` with `apns-channel-id`), returns
+  `{ ok: true }` even if the channel is already gone.
+- `POST /mobile/push` takes optional `activities: boolean` (default `true`).
+  `false` → the daemon never sends `activity-*` for that node.
+- The daemon persists per-node activity state (`activity: { startedAt }` or
+  null) in `push.json`, so a restart sends `activity-update`, not a second
+  `activity-start`. Re-POSTing the same `pass` keeps that state and the
+  notified ids; a different `pass` resets activity state only.
+- The phone re-POSTs `/mobile/push` (stored pass) on every foreground and
+  background refresh, persists the pass as soon as the relay returns it
+  (daemon-step retries reuse it), calls `/v1/unregister` with the old pass
+  when it re-registers or forgets pairing, and ends all but the newest
+  `SupervisorActivityAttributes` activity whenever `Activity.activityUpdates`
+  yields.
