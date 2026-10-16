@@ -241,3 +241,25 @@ Relay URL: `OPENAGI_PUSH_RELAY` env, default `https://push.openagi.sh`.
   when it re-registers or forgets pairing, and ends all but the newest
   `SupervisorActivityAttributes` activity whenever `Activity.activityUpdates`
   yields.
+
+## Amendments, round 2 (2026-10-16)
+
+- Pass lifetime: pass plaintext adds `exp` = `iat` + 30 days (seconds). The
+  relay rejects an expired pass with 400 `pass_expired`.
+- Revocation: with an optional KV binding `REVOKED`, `/v1/unregister` stores
+  `sha256(pass)` (TTL = remaining life); every send/unregister with a
+  revoked pass gets 400 `pass_revoked`. Without the binding, `exp` bounds it.
+- `wrangler.toml` ships the `SEND_LIMITER` and `REGISTER_LIMITER` bindings
+  enabled.
+- Daemon: a relay 400 `bad_pass` | `pass_expired` | `pass_revoked` marks the
+  record `renew: true` (persisted) and stops sends with it.
+  `POST /mobile/push` returns `{ ok: true, renew }`, where `renew` is true when
+  the stored record for that same pass is marked. A new pass clears it.
+- `POST /mobile/push` takes optional `alerts: boolean` (default `true`): the
+  phone's notification permission. With `false` the daemon sends no alerts
+  and does not mark questions notified.
+- Daemon: gone deletions only remove the record if it still holds the pass
+  the send used. A pass that leaves open questions unsent (over the cap of 5)
+  schedules a follow-up pass 30 s later.
+- Phone: mints a new pass (re-register, then unregister the old one) when
+  the daemon answers `renew: true` or the stored pass is older than 7 days.
