@@ -1688,9 +1688,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         const checked = validatePushRegistration(await readJsonLimited(req, 4 * 1024).catch(() => null));
         if (!checked.ok) return sendJson(res, 400, { error: checked.error });
-        mobilePushStore.put(requestNodeId, checked.value);
+        const record = mobilePushStore.put(requestNodeId, checked.value);
         mobilePush?.registrationChanged(requestNodeId);
-        return sendJson(res, 200, { ok: true });
+        // renew: the relay refused this same pass; the phone should mint a new one.
+        return sendJson(res, 200, { ok: true, renew: record.renew === true });
       }
       if (method === "GET" && pathname === "/brief/today") {
         const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);

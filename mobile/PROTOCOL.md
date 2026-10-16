@@ -670,8 +670,15 @@ X-OpenAGI-Node-ID: <nodeId>
   the daemon never sends a Live Activity start, update or end for this phone.
   A relay `400 no_live_activity` (a pass registered without a push-to-start
   token) has the same effect for that pass.
+- `alerts` (optional boolean, default `true`): the phone's notification
+  permission. `false` means no alerts are sent and no question is marked
+  alerted, so turning it back on (re-POST, same pass is fine) alerts the
+  questions still open.
 
-Response `{"ok": true}`; a bad body is `400 {"error": "..."}`. Only a paired
+Response `{"ok": true, "renew": false}`; a bad body is `400 {"error": "..."}`.
+`renew: true` means the relay refused this same pass (`bad_pass`,
+`pass_expired` or `pass_revoked`) and the daemon sends nothing with it: mint
+a new pass and POST that (a new pass clears it). Only a paired
 phone's own credential may call it (the owner token gets `403`). The daemon
 keeps one record per phone in `<dataDir>/nodes/push.json` (0600), replacing
 the prior one. Re-POST it on every foreground and background refresh:

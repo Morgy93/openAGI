@@ -29,9 +29,11 @@ async function boot(t) {
   });
   runtime.integrations = new IntegrationRegistry();
   const relayed = [];
+  let relayReply = () => ({ status: 200, body: { ok: true, apnsId: "a" } });
   const pushFetch = async (url, init) => {
     relayed.push({ url, ...JSON.parse(init.body) });
-    return { ok: true, status: 200, json: async () => ({ ok: true, apnsId: "a" }) };
+    const { status, body } = relayReply();
+    return { ok: status < 300, status, json: async () => body };
   };
   const app = createHostedInterface(runtime, { dataDir, host: "127.0.0.1", port: 0, authToken: OWNER, tickerMs: 0, nodeControlEnabled: false, pushFetch });
   t.after(async () => {
@@ -67,7 +69,7 @@ async function boot(t) {
   };
   const pushFile = path.join(dataDir, "nodes", "push.json");
   const records = () => (fs.existsSync(pushFile) ? JSON.parse(fs.readFileSync(pushFile, "utf8")).registrations : []);
-  return { url, pair, records, pushFile, relayed, runtime };
+  return { url, pair, records, pushFile, relayed, runtime, setRelayReply: (fn) => { relayReply = fn; } };
 }
 
 test("the push routes are on the phone allowlist, other methods are not", () => {
@@ -83,7 +85,7 @@ test("a paired phone stores, replaces and deletes its own registration (0600)", 
   const phone = await pair();
   const res = await phone.call("/mobile/push", { method: "POST", body: REGISTRATION });
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { ok: true });
+  assert.deepEqual(await res.json(), { ok: true, renew: false });
   assert.equal(fs.statSync(pushFile).mode & 0o777, 0o600);
   let saved = records();
   assert.equal(saved.length, 1);
@@ -104,6 +106,9 @@ test("a paired phone stores, replaces and deletes its own registration (0600)", 
   const alertsOnly = await phone.call("/mobile/push", { method: "POST", body: { ...REGISTRATION, pass: "p1.second", env: "production", activities: false } });
   assert.equal(alertsOnly.status, 200);
   assert.equal(records()[0].activities, false);
+  assert.equal(records()[0].alerts, true);
+  await phone.call("/mobile/push", { method: "POST", body: { ...REGISTRATION, pass: "p1.second", env: "production", activities: false, alerts: false } });
+  assert.equal(records()[0].alerts, false);
 
   const other = await pair();
   await other.call("/mobile/push", { method: "POST", body: REGISTRATION });
@@ -127,6 +132,7 @@ test("bad bodies are refused with 400 and nothing is stored", async (t) => {
     { ...REGISTRATION, key: undefined },
     { ...REGISTRATION, env: "staging" },
     { ...REGISTRATION, activities: "no" },
+    { ...REGISTRATION, alerts: 1 },
     [],
     "not json"
   ];
@@ -190,4 +196,19 @@ test("a registration with an active fleet starts a sealed Live Activity at the r
   const activity = JSON.parse(openPushEnvelope(KEY, "activity", relayed[0].sealed));
   assert.deepEqual(activity.counts, { you: 0, working: 1, waiting: 0 });
   assert.equal(activity.rows[0].title, "Fix login");
+});
+
+test("a pass the relay refused is answered renew: true until the phone brings a new one", async (t) => {
+  const { pair, relayed, records, setRelayReply } = await boot(t);
+  setRelayReply(() => ({ status: 400, body: { ok: false, error: "pass_expired" } }));
+  const phone = await pair();
+  await phone.call("/mobile/push", { method: "POST", body: REGISTRATION });
+  for (let i = 0; i < 40 && !records()[0]?.renew; i += 1) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(relayed.length, 1);
+  assert.equal(records()[0].renew, true);
+  const again = await phone.call("/mobile/push", { method: "POST", body: REGISTRATION });
+  assert.deepEqual(await again.json(), { ok: true, renew: true });
+  const fresh = await phone.call("/mobile/push", { method: "POST", body: { ...REGISTRATION, pass: "p1.renewed" } });
+  assert.deepEqual(await fresh.json(), { ok: true, renew: false });
+  assert.equal(records()[0].renew, false);
 });

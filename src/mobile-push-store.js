@@ -13,7 +13,10 @@ import { decodePushKey } from "./mobile-push-envelope.js";
 // `activity` ({ startedAt } or null) is the Live Activity this daemon started
 // on the phone, persisted for the same reason: after a restart the next change
 // updates it instead of starting a second one. `activities: false` means the
-// phone takes alerts only (no Live Activity token, or the relay said so).
+// phone takes alerts only (no Live Activity token, or the relay said so);
+// `alerts: false` that its notification permission is off. `renew: true`
+// means the relay refused the pass itself, so nothing is sent with it until
+// the phone posts a new one (POST /mobile/push answers it renew: true).
 export const PUSH_PASS_MAX = 2000;
 export const PUSH_ENVS = Object.freeze(["sandbox", "production"]);
 
@@ -24,14 +27,15 @@ const NOTIFIED_MAX = 200;
 /// { ok: false, error }, never throws.
 export function validatePushRegistration(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "body must be an object" };
-  const { pass, key, env, activities } = body;
+  const { pass, key, env, activities, alerts } = body;
   if (typeof pass !== "string" || !pass.startsWith("p1.") || pass.length > PUSH_PASS_MAX) {
     return { ok: false, error: `pass must start with "p1." and be at most ${PUSH_PASS_MAX} chars` };
   }
   if (!decodePushKey(key)) return { ok: false, error: "key must be base64url of exactly 32 bytes" };
   if (!PUSH_ENVS.includes(env)) return { ok: false, error: `env must be one of ${PUSH_ENVS.join(", ")}` };
   if (activities !== undefined && typeof activities !== "boolean") return { ok: false, error: "activities must be a boolean" };
-  return { ok: true, value: { pass, key, env, activities: activities !== false } };
+  if (alerts !== undefined && typeof alerts !== "boolean") return { ok: false, error: "alerts must be a boolean" };
+  return { ok: true, value: { pass, key, env, activities: activities !== false, alerts: alerts !== false } };
 }
 
 const copy = (record) => ({ ...record, notified: [...record.notified], activity: record.activity ? { ...record.activity } : null });
@@ -53,6 +57,8 @@ export class MobilePushStore {
         updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : null,
         notified: Array.isArray(record.notified) ? record.notified.filter((id) => typeof id === "string") : [],
         activities: record.activities !== false,
+        alerts: record.alerts !== false,
+        renew: record.renew === true,
         noLiveActivity: record.noLiveActivity === true,
         activity: Number.isFinite(Date.parse(record.activity?.startedAt ?? "")) ? { startedAt: record.activity.startedAt } : null
       });
@@ -72,7 +78,7 @@ export class MobilePushStore {
   /// the same pass keeps its activity state, a new pass is a new push-to-start
   /// token whose activity is not ours to update. The notified ids carry over
   /// either way: it is the same phone, which already saw those alerts.
-  put(nodeId, { pass, key, env, activities = true }) {
+  put(nodeId, { pass, key, env, activities = true, alerts = true }) {
     const prior = this.records.get(nodeId);
     const samePass = prior?.pass === pass;
     const record = {
@@ -80,7 +86,9 @@ export class MobilePushStore {
       updatedAt: this.now().toISOString(),
       notified: prior?.notified ?? [],
       activities: activities !== false,
-      // The relay's "no_live_activity" belongs to the pass, not the request.
+      alerts: alerts !== false,
+      // The relay's verdicts belong to the pass, not the request.
+      renew: samePass ? prior.renew === true : false,
       noLiveActivity: samePass ? prior.noLiveActivity === true : false,
       activity: samePass ? prior.activity ?? null : null
     };
@@ -105,6 +113,20 @@ export class MobilePushStore {
     const record = this.records.get(nodeId);
     if (!record || record.pass !== pass || (record.noLiveActivity && !record.activity)) return;
     record.noLiveActivity = true;
+    record.activity = null;
+    this.save();
+  }
+
+  /// A gone verdict is for the pass that was sent, not whatever is stored now.
+  removeIfPass(nodeId, pass) {
+    return this.records.get(nodeId)?.pass === pass ? this.remove(nodeId) : false;
+  }
+
+  /// The relay refused the pass itself (bad, expired, revoked).
+  markRenew(nodeId, pass) {
+    const record = this.records.get(nodeId);
+    if (!record || record.pass !== pass || record.renew) return;
+    record.renew = true;
     record.activity = null;
     this.save();
   }

@@ -39,6 +39,10 @@ const ALERTS_PER_PASS = 5;
 // Same filter as Android: "dismiss" is the separate dismissal, and "open
 // thread" asks for the agent's own app, so posting either answers nothing.
 const NON_ACTIONS = new Set(["dismiss", "open thread"]);
+// A backlog over the cap drains on a follow-up pass this long after.
+const ALERT_BACKLOG_MS = 30_000;
+// The relay will not take this pass again; the phone must mint a new one.
+const RENEW_ERRORS = new Set(["bad_pass", "pass_expired", "pass_revoked"]);
 const SEALED_MAX = 3000;
 const SEND_TIMEOUT_MS = 15_000;
 const REPORTED_MAX = 50;
@@ -234,32 +238,43 @@ export class MobilePush {
       ? state.questions.filter((q) => typeof q?.id === "string" && q.id && (q.status ?? "open") === "open")
       : null;
     let wakeAt = null;
+    const wakeBy = (due) => { if (due !== null && (wakeAt === null || due < wakeAt)) wakeAt = due; };
     for (const registration of registrations) {
       if (this.stopped) return;
-      if (await this.sendAlerts(registration, questions)) continue;
-      const due = await this.syncActivity(registration, activity, now);
-      if (due !== null && (wakeAt === null || due < wakeAt)) wakeAt = due;
+      // Waiting for the phone to bring a new pass (POST /mobile/push answers
+      // it renew: true); nothing more is sent with this one.
+      if (registration.renew) {
+        this.live.delete(registration.nodeId);
+        continue;
+      }
+      const alerts = await this.sendAlerts(registration, questions);
+      if (alerts.backlog) wakeBy(now + ALERT_BACKLOG_MS);
+      if (alerts.stop) continue;
+      wakeBy(await this.syncActivity(registration, activity, now));
     }
     this.scheduleWake(wakeAt);
   }
 
-  // Returns true when the registration turned out to be gone.
+  // stop: the registration is gone or needs a new pass. backlog: open
+  // questions are left over the per-pass cap.
   async sendAlerts(registration, questions) {
-    if (!questions) return false;
+    // alerts: false is the phone's notification permission turned off.
+    if (!questions || registration.alerts === false) return { stop: false, backlog: false };
     const open = new Set(questions.map((q) => q.id));
     // Pruned to open ids, so a question that closes and reopens alerts again.
     const notified = registration.notified.filter((id) => open.has(id));
-    const fresh = [...new Map(questions.filter((q) => !notified.includes(q.id)).map((q) => [q.id, q])).values()]
-      .slice(0, ALERTS_PER_PASS);
+    const unsent = [...new Map(questions.filter((q) => !notified.includes(q.id)).map((q) => [q.id, q])).values()];
+    const fresh = unsent.slice(0, ALERTS_PER_PASS);
+    let failed = false;
     for (const question of fresh) {
       const result = await this.send(registration, { type: "alert", sealed: this.sealAlert(registration.key, question), collapseId: question.id });
-      if (result === "gone") return true;
+      if (result === "gone" || result === "renew") return { stop: true, backlog: false };
       // A failed send stays un-notified and is retried on the next change.
-      if (result !== "ok") break;
+      if (result !== "ok") { failed = true; break; }
       notified.push(question.id);
     }
     this.store.setNotified(registration.nodeId, notified);
-    return false;
+    return { stop: false, backlog: !failed && unsent.length > fresh.length };
   }
 
   // Returns when the next pass is due for this registration, or null.
@@ -358,7 +373,7 @@ export class MobilePush {
     return sealed.length > SEALED_MAX ? sealPushEnvelope(key, "alert", { ...plain, options: [] }) : sealed;
   }
 
-  // "ok" | "gone" | "error". Never throws, never logs a body.
+  // "ok" | "gone" | "renew" | "error". Never throws, never logs a body.
   async send(registration, body) {
     let response;
     try {
@@ -378,7 +393,7 @@ export class MobilePush {
       // Only the device token going means the phone is gone. A gone Live
       // Activity channel or start token leaves its alerts working.
       if (body.type === "alert") {
-        this.dropGone(registration.nodeId);
+        this.dropGone(registration);
         return "gone";
       }
       this.alertsOnly(registration);
@@ -389,6 +404,14 @@ export class MobilePush {
       return "ok";
     }
     // The pass was registered without a push-to-start token: alerts only.
+    if (response.status === 400 && RENEW_ERRORS.has(json?.error)) {
+      this.live.delete(registration.nodeId);
+      try { this.store.markRenew(registration.nodeId, registration.pass); } catch (error) {
+        this.report(`could not record a pass to renew: ${error?.message ?? error}`);
+      }
+      this.report(`relay refused ${registration.nodeId}'s pass (${json.error}); waiting for the phone to renew it`);
+      return "renew";
+    }
     if (response.status === 400 && json?.error === "no_live_activity") {
       this.alertsOnly(registration);
       return "error";
@@ -405,14 +428,17 @@ export class MobilePush {
     }
   }
 
-  dropGone(nodeId) {
-    this.live.delete(nodeId);
+  // Only the pass the send used: a phone that re-registered meanwhile keeps
+  // its new registration.
+  dropGone({ nodeId, pass }) {
+    if (this.live.get(nodeId)?.pass === pass) this.live.delete(nodeId);
+    let removed = false;
     try {
-      this.store.remove(nodeId);
+      removed = this.store.removeIfPass(nodeId, pass);
     } catch (error) {
       this.report(`could not remove a gone registration: ${error?.message ?? error}`);
     }
-    this.log(`[openagi] mobile push: ${nodeId}'s push registration is gone at APNs; removed it`);
+    if (removed) this.log(`[openagi] mobile push: ${nodeId}'s push registration is gone at APNs; removed it`);
   }
 
   scheduleWake(at) {

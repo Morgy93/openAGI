@@ -468,3 +468,71 @@ test("a start answered after the phone re-registered does not attach to the new 
   assert.deepEqual(h.sent.map((s) => `${s.type} ${s.pass}`), ["activity-start p1.pass-one", "activity-start p1.pass-two"]);
   assert.deepEqual(h.store.get(NODE).activity, { startedAt: new Date(T0).toISOString() });
 });
+
+test("a refused pass (bad, expired, revoked) is marked renew and nothing more is sent with it", async (t) => {
+  for (const error of ["bad_pass", "pass_expired", "pass_revoked"]) {
+    const h = harness(t, { threads: [thread("codex:a", "working")], questions: [question("fq1"), question("fq2")] });
+    h.setReply(() => ({ ok: false, error, __status: 400 }));
+    await h.push.flush();
+    assert.deepEqual(h.types(), ["alert"], error);
+    assert.equal(new MobilePushStore({ dir: h.dir }).get(NODE).renew, true);
+    await h.push.flush();
+    assert.equal(h.sent.length, 1, "no further sends with that pass");
+
+    h.setReply(() => ({ ok: true }));
+    h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox" });
+    assert.equal(h.store.get(NODE).renew, true, "the same pass stays marked");
+    await h.push.flush();
+    assert.equal(h.sent.length, 1);
+    h.store.put(NODE, { pass: "p1.pass-two", key: h.key, env: "sandbox" });
+    assert.equal(h.store.get(NODE).renew, false);
+    await h.push.flush();
+    assert.deepEqual(h.types(), ["alert", "alert", "alert", "activity-start"]);
+  }
+});
+
+test("alerts: false sends no alerts and marks nothing notified; turning it on alerts", async (t) => {
+  const h = harness(t, { questions: [question("fq1")] });
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox", alerts: false });
+  await h.push.flush();
+  assert.equal(h.sent.length, 0);
+  assert.deepEqual(h.store.get(NODE).notified, []);
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox", alerts: true });
+  await h.push.flush();
+  assert.deepEqual(h.sent.map((s) => s.collapseId), ["fq1"]);
+});
+
+test("a gone for an old pass does not delete the phone's new registration", async (t) => {
+  const h = harness(t, { questions: [question("fq1")] });
+  h.setReply((body) => {
+    if (body.pass === "p1.pass-one") {
+      h.store.put(NODE, { pass: "p1.pass-two", key: h.key, env: "sandbox" });
+      return { ok: false, gone: true, __status: 410 };
+    }
+    return { ok: true };
+  });
+  await h.push.flush();
+  assert.equal(h.store.get(NODE)?.pass, "p1.pass-two");
+  await h.push.flush();
+  assert.deepEqual(h.sent.map((s) => `${s.type} ${s.pass}`), ["alert p1.pass-one", "alert p1.pass-two"]);
+});
+
+test("questions over the per-pass cap go out on a follow-up pass 30 s later", async (t) => {
+  const h = harness(t, { questions: Array.from({ length: 7 }, (_, i) => question(`fq${i}`)) });
+  await h.push.flush();
+  assert.equal(h.sent.length, 5);
+  await h.advance(30 * SEC - 1);
+  assert.equal(h.sent.length, 5);
+  await h.advance(1);
+  assert.deepEqual(h.sent.map((s) => s.collapseId).slice(5), ["fq5", "fq6"]);
+  assert.equal(h.pending.size, 0, "no backlog, no follow-up");
+  h.push.stop();
+});
+
+test("stop clears a pending backlog follow-up", async (t) => {
+  const h = harness(t, { questions: Array.from({ length: 6 }, (_, i) => question(`fq${i}`)) });
+  await h.push.flush();
+  assert.equal(h.pending.size, 1);
+  h.push.stop();
+  assert.equal(h.pending.size, 0);
+});
