@@ -7,8 +7,9 @@ import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
+import { assertFixAllowed, suggestionFix } from './suggestions.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -24,7 +25,11 @@ export function createFleetCapability(supervisor) {
           || !THREAD_ROUTE.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
-      const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
+      const url = new URL(payload.path, 'http://localhost');
+      if (payload.path === '/fleet/api/diagnose') for (const key of ['window', 'area']) {
+        if (typeof payload.body?.[key] === 'string') url.searchParams.set(key, payload.body[key]);
+      }
+      const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
     }
@@ -103,7 +108,15 @@ export class RemoteFleetSupervisor {
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
-  async answerQuestion(id, answer) { if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer); return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
+  async answerQuestion(id, answer) {
+    if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer);
+    const card = this.state.questions.find(q => q.id === id);
+    if (this.selfFixHub && card?.kind === 'suggestion' && answer === 'Fix it' && (card.options ?? []).includes(answer)) {
+      const result = await this.respondSuggestion(card.meta?.suggestionId, answer);
+      return { question: { ...card, status: 'answered', answer }, delivery: null, fix: result?.fix ?? null };
+    }
+    return this.request('POST', `/fleet/api/questions/${id}`, { answer });
+  }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
   async dismissQuestion(id, { replay = false } = {}) {
@@ -140,6 +153,18 @@ export class RemoteFleetSupervisor {
   // Feedback and self-fix requests live with the fleet, on the computer.
   async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
   async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
+  async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }
+  // Fix it queues in this main's hub (where fixes are listed, revised and
+  // stopped); the computer only links the suggestion to that fix id.
+  async respondSuggestion(id, choice) {
+    if (!this.selfFixHub || String(choice ?? '').toLowerCase() !== 'fix it') return this.request('POST', `/fleet/api/suggestions/${id}`, { choice });
+    const { suggestion } = await this.request('GET', `/fleet/api/suggestions/${id}`);
+    if (suggestion.status !== 'open') return { suggestion, fix: null };
+    assertFixAllowed(this.selfFixHub.store, suggestion.area, Date.now());
+    const fix = await this.selfFixHub.queue(suggestionFix(suggestion));
+    return { ...(await this.request('POST', `/fleet/api/suggestions/${id}`, { choice, fixId: fix.id })), fix };
+  }
   async queueFix(input) { if (this.selfFixHub) return this.selfFixHub.queue(input); return (await this.request('POST', '/fleet/api/fixes', input)).fix; }
   async fixes() { if (this.selfFixHub) return this.selfFixHub.store.fixes(); return (await this.request('GET', '/fleet/api/fixes')).fixes ?? []; }
   async reviseFix(id, instructions) { if (this.selfFixHub) return this.selfFixHub.revise(id, instructions); return (await this.request('POST', `/fleet/api/fixes/${id}/revise`, { instructions })).fix; }

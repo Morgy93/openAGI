@@ -73,6 +73,8 @@ const EXACT = new Set([
   // The /fleet supervisor's JSON API only. The /fleet page itself and any
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
+  "GET /fleet/api/diagnose",
+  "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
   "POST /fleet/api/mode",
@@ -84,6 +86,8 @@ const EXACT = new Set([
 ]);
 
 const PATTERNS = [
+  { method: "GET", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
   { method: "GET", re: new RegExp(`^/tasks/${ID}$`) },
   { method: "PATCH", re: new RegExp(`^/tasks/${ID}$`) },
   { method: "DELETE", re: new RegExp(`^/tasks/${ID}$`) },

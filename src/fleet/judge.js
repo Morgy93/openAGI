@@ -576,7 +576,8 @@ export function createLockedCodexExec({ config, run = runCommand, env = process.
 }
 
 // config.judge: { enabled, model, timeoutMs }. run: runCommand-like.
-export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now } = {}) {
+export function createNudgeJudge({ config, run = runCommand, env = process.env, now = Date.now,
+  schema = JUDGE_SCHEMA, promptFor = buildJudgePrompt, validate = validateVerdict } = {}) {
   const settings = config?.judge ?? {};
   const model = String(settings.model ?? "").trim();
   const enabled = Boolean(settings.enabled) && Boolean(model);
@@ -588,8 +589,8 @@ export function createNudgeJudge({ config, run = runCommand, env = process.env, 
   async function judge(input) {
     if (!enabled) throw new Error("judge off");
     const limitMs = Math.min(timeoutMs, Number.isFinite(input?.timeoutMs) ? input.timeoutMs : Infinity);
-    const parsed = await exec({ prompt: buildJudgePrompt(input), schema: JUDGE_SCHEMA, model, timeoutMs: limitMs });
-    return validateVerdict(parsed, limits);
+    const parsed = await exec({ prompt: promptFor(input), schema, model, timeoutMs: limitMs });
+    return validate(parsed, limits);
   }
 
   return { enabled, model, judge };

@@ -3495,9 +3495,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             const heartbeatBuild = resolveBuildInfo({ packageVersion: PACKAGE_VERSION });
             let heartbeatFailStreak = 0;
             const sendHeartbeat = async () => {
+              if (closing) return;
               try {
                 const identity = readOrCreateIdentity(dataDir);
                 const scopedToken = await ensureScopedNodeToken(pairing, identity);
+                if (closing) return;
                 const ctrl = new AbortController();
                 const heartbeatTimeoutMs = Math.max(1_000, Math.min(30_000,
                   Number(options.heartbeatTimeoutMs) || 15_000));

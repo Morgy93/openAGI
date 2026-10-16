@@ -20,6 +20,8 @@ import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, ded
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
+import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
+import { localDay } from "./diagnose.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
@@ -823,6 +825,8 @@ export class FleetSupervisor {
       // So the owner can reopen a wrong close.
       reviewClosed: store.reviewClosed(),
       actions: store.actions(50),
+      suggestions: store.suggestions(),
+      diagnosis: structuredClone(store.state.diagnosis),
       settings: {
         tickMinutes: Math.round(this.config.tickMs / MIN),
         lookbackHours: this.config.lookbackHours,
@@ -915,6 +919,10 @@ export class FleetSupervisor {
   dismissQuestion(id) {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
+    if (question.kind === "suggestion") {
+      this.respondSuggestion(question.meta?.suggestionId, "Not now").catch(() => {});
+      return this.store.question(id);
+    }
     // A storage ask comes back every tick, and a dismissal holds while it is
     // asked: one dismiss would mute it for good. It counts as Later (24 h).
     if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
@@ -938,6 +946,47 @@ export class FleetSupervisor {
   fixes(options) { return this.store.fixes(options); }
   reviseFix(id, instructions) { return this.selfFixHub.revise(id, instructions); }
   stopFix(id) { return this.selfFixHub.stop(id); }
+
+  suggestions() { return this.store.suggestions(); }
+
+  get suggestionManager() {
+    this._suggestionManager ??= new SuggestionManager({ store: this.store, config: this.config,
+      queueFix: (input) => this.queueFix(input), now: () => this.now(), notify: (q, options) => this.notifier.notifyQuestion(q, options),
+      respondSuggestion: (id, choice, options) => this.respondSuggestion(id, choice, options),
+      // Behind an OPENAGI_FLEET_NODE main no coding node is reachable from here: ask instead.
+      canAutoFix: () => Boolean(this.selfFixHub.nodeId && this.runtime?.nodeCapabilities?.dispatch),
+      models: this.deps.diagnoseModels ?? createDiagnoseModels({ config: this.config, run: this.deps.runCommand, now: () => this.now() }) });
+    return this._suggestionManager;
+  }
+
+  async respondSuggestion(id, choice, options) {
+    const questions = this.store.openQuestions().filter((q) => q.kind === "suggestion" && q.meta?.suggestionId === id);
+    const result = await this.suggestionManager.respond(id, choice, options);
+    if (result) for (const q of questions) this.resolveOutreach(q, choice, "acted");
+    return result;
+  }
+
+  diagnose(options = {}) {
+    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(), storageConfig: this.config.storage,
+      state: { ...this.store.state, lastError: this.lastError, lastReview: this.lastReview }, options, models: this.suggestionManager });
+  }
+
+  async diagnoseTick() {
+    const now = this.now();
+    const due = diagnoseDue(this.store.state.diagnosis, now, this.config.limits.quietHours);
+    if (due.hourly) {
+      const report = await this.diagnose({ cheap: true });
+      this.store.saveDiagnosis({ hourlyAt: new Date(now).toISOString(), cheap: report });
+      this.store.rotateActions();
+    }
+    if (due.daily) {
+      // Mark before the call: model outages never turn into a call every tick.
+      this.store.saveDiagnosis({ dailyDay: localDay(now) });
+      const report = await this.diagnose({ window: "7d", completeDay: true });
+      this.store.saveDiagnosis({ full: report });
+      if (this.forceMode !== "observe") await this.suggestionManager.publish(report.suggestions);
+    } else if (due.hourly && this.forceMode !== "observe") await this.suggestionManager.refresh();
+  }
 
   // The owner reopens a question the review closed (a wrong call): same
   // record, and its outreach copy comes back. Pinned, so the review keeps
@@ -1411,6 +1460,10 @@ export class FleetSupervisor {
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
+    if (question.kind === "suggestion") {
+      const result = await this.respondSuggestion(question.meta?.suggestionId, answer);
+      return result ? { question: this.store.question(id), delivery: null, fix: result.fix } : null;
+    }
     // A question card is answered in the app itself. Until the supervisor
     // can click it there, "open thread" is the only answer and it relays
     // nothing; anything else is refused.
@@ -1886,6 +1939,9 @@ export class FleetSupervisor {
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
+    try { await this.diagnoseTick(); } catch (error) {
+      store.saveDiagnosis({ error: clampText(redactSecrets(error?.message), 200) });
+    }
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
     return snapshot;
   }
@@ -2379,6 +2435,7 @@ export class FleetSupervisor {
       const target = targetKey ? byKey.get(targetKey) : null;
       const record = {
         threadKey: decision.threadKey, targetKey, playbook: decision.playbook, route: decision.route,
+        head: items.find((item) => item.thread.key === decision.threadKey)?.pr?.headOid ?? null,
         message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
         ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };

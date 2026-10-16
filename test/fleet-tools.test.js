@@ -352,7 +352,25 @@ test("a send blocked by a card names its buttons and stateId so it can be answer
     /Not delivered \(blocked\): permission prompt visible: answer it first \(fleet_click\), then send again; a card is waiting \("Run npm test\?"\) with buttons "Allow once", "Deny" \(stateId 0123456789abcdef\): fleet_click can answer it/);
 });
 
-test("voice tools: walkthrough order, focus, diagnose counts, self-fix tools", async () => {
+test("walkthrough counts suggestions once without crowding out ordinary questions", async () => {
+  const questions = Array.from({ length: 24 }, (_, i) => ({ id: `q${i}`, title: `Ask ${i}`, kind: "agent-ask" }));
+  const suggestion = { id: "sg_1", status: "open", proposedFix: "Keep asks closed", area: "policy", score: 10 };
+  questions.unshift({ id: "sq_1", kind: "suggestion", title: suggestion.proposedFix, meta: { suggestionId: suggestion.id } });
+  const tools = registry({ ...fakeSupervisor({ questions }), suggestions: async () => [suggestion] });
+  const all = (await tools.invoke("fleet_walkthrough", {})).result;
+  assert.equal(all.total, 25);
+  assert.equal(all.items.length, 25);
+  assert.equal(all.truncated, undefined);
+  assert.deepEqual(all.items.map((item) => item.id), [...questions.slice(1).map((q) => q.id), suggestion.id]);
+  const asks = (await tools.invoke("fleet_walkthrough", { scope: "questions" })).result;
+  assert.equal(asks.total, 24);
+  assert.ok(asks.items.every((item) => item.kind === "question"));
+  const suggestions = (await tools.invoke("fleet_walkthrough", { scope: "suggestions" })).result;
+  assert.equal(suggestions.total, 1);
+  assert.deepEqual(suggestions.items.map((item) => item.id), [suggestion.id]);
+});
+
+test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix tools", async () => {
   const questions = [{ id: "fq_1", title: "Merge PR 42?", options: ["Yes", "No"], threadKey: "codex:t1", prRef: "acme/app#42" }];
   const threads = [
     row({ key: "codex:red", workspace: "amman", state: "needs-human", health: "red", reason: "Waiting on you" }),
@@ -363,6 +381,7 @@ test("voice tools: walkthrough order, focus, diagnose counts, self-fix tools", a
   const supervisor = {
     ...fakeSupervisor({ questions, snapshot: { at: "2026-10-13T20:00:00.000Z", counts: {}, threads, infra: {}, sourceErrors: { claude: "locked" } },
       actions: [{ id: "fa_1", kind: "nudge", status: "sent", at: new Date().toISOString() }] }),
+    diagnose: async (options) => ({ ...options, metrics: { review: { failures: 35 } }, anomalies: [{ metric: "review-failures" }] }),
     fixes: async () => fixes,
     feedback: async () => [{ intent: "change", at: new Date().toISOString() }]
   };
@@ -379,13 +398,8 @@ test("voice tools: walkthrough order, focus, diagnose counts, self-fix tools", a
 
   const diagnose = (await tools.invoke("fleet_diagnose", { window: "7d" })).result;
   assert.equal(diagnose.window, "7d");
-  assert.deepEqual(diagnose.threads, { red: 1, yellow: 0, green: 1, gray: 0 });
-  assert.equal(diagnose.openQuestions, 1);
-  assert.deepEqual(diagnose.recentActions, { "nudge:sent": 1 });
-  assert.deepEqual(diagnose.failedSources, ["claude"]);
-  assert.deepEqual(diagnose.feedback, { change: 1 });
-  assert.deepEqual(diagnose.fixes, { queued: 1, total: 2 });
-  assert.deepEqual(diagnose.anomalies, []);
+  assert.deepEqual(diagnose.metrics, { review: { failures: 35 } });
+  assert.deepEqual(diagnose.anomalies, [{ metric: "review-failures" }]);
 
   const list = (await tools.invoke("self_fix_list", { status: "queued" })).result;
   assert.deepEqual(list.fixes.map((fix) => fix.id), ["fix_1"]);
