@@ -13,6 +13,7 @@ const BUNDLE = "sh.openagi.OpenAGI";
 const DEVICE = "ab".repeat(32);
 const START = "cd".repeat(80);
 const CHANNEL = "dHN0LTE2LWNoYW5uZWw=";
+const THIRTY_DAYS = 30 * 24 * 60 * 60;
 const SEALED = "v1.AAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBB";
 
 function b64url(bytes) {
@@ -135,7 +136,7 @@ test("register creates a channel and returns a pass that round-trips", async () 
   await verifyJwt(c.init.headers.authorization);
 
   const p = await openPassForTest(pass);
-  assert.deepEqual(p, { d: DEVICE, s: START, ch: CHANNEL, env: "sandbox", iat: Math.floor(nowMs / 1000) });
+  assert.deepEqual(p, { d: DEVICE, s: START, ch: CHANNEL, env: "sandbox", iat: Math.floor(nowMs / 1000), exp: Math.floor(nowMs / 1000) + THIRTY_DAYS });
 });
 
 test("register uses the production channel host for env production", async () => {
@@ -407,7 +408,7 @@ test("bad, tampered, foreign and wrong-AAD passes are rejected", async () => {
     "p1." + "A".repeat(2100) + ".AAAA",
   ]) {
     const r = await send({ pass: p, type: "alert", sealed: SEALED });
-    assert.deepEqual([r.status, r.json], [401, { ok: false, error: "bad_pass" }], String(p).slice(0, 20));
+    assert.deepEqual([r.status, r.json], [400, { ok: false, error: "bad_pass" }], String(p).slice(0, 20));
   }
   assert.equal(calls.length, 0);
 });
@@ -506,7 +507,7 @@ test("register without startToken creates no channel and the pass has no s/ch", 
     assert.equal(r.status, 200);
     assert.equal(calls.length, 0, "no channel-management call");
     const p = await openPassForTest(r.json.pass);
-    assert.deepEqual(p, { d: DEVICE, env: "sandbox", iat: Math.floor(nowMs / 1000) });
+    assert.deepEqual(p, { d: DEVICE, env: "sandbox", iat: Math.floor(nowMs / 1000), exp: Math.floor(nowMs / 1000) + THIRTY_DAYS });
   }
   const bad = await call("/v1/register", { deviceToken: DEVICE, startToken: "", env: "sandbox" });
   assert.deepEqual([bad.status, bad.json], [400, { error: "invalid_startToken" }]);
@@ -528,7 +529,7 @@ test("alert-only pass: alerts work, activity-* return 400 no_live_activity", asy
 test("a pass with only one of s/ch is rejected", async () => {
   const half = await sealPass(makeEnv(), { d: DEVICE, s: START, env: "sandbox", iat: 1 });
   const r = await send({ pass: half, type: "alert", sealed: SEALED });
-  assert.deepEqual([r.status, r.json], [401, { ok: false, error: "bad_pass" }]);
+  assert.deepEqual([r.status, r.json], [400, { ok: false, error: "bad_pass" }]);
 });
 
 test("unregister deletes the channel on the right host with apns-channel-id", async () => {
@@ -571,14 +572,121 @@ test("unregister treats an already-gone channel as ok and reports other failures
   assert.deepEqual([r.status, r.json], [502, { ok: false, error: "apns_unreachable" }]);
 });
 
-test("unregister with an alert-only pass is ok without calling APNs; bad pass is 401", async () => {
+test("unregister with an alert-only pass is ok without calling APNs; bad pass is 400", async () => {
   const r0 = await call("/v1/register", { deviceToken: DEVICE, env: "sandbox" });
   calls = [];
   const r = await call("/v1/unregister", { pass: r0.json.pass });
   assert.deepEqual([r.status, r.json], [200, { ok: true }]);
   assert.equal(calls.length, 0);
   const bad = await call("/v1/unregister", { pass: "p1.AAAA.BBBB" });
-  assert.deepEqual([bad.status, bad.json], [401, { ok: false, error: "bad_pass" }]);
+  assert.deepEqual([bad.status, bad.json], [400, { ok: false, error: "bad_pass" }]);
   const get = await call("/v1/unregister", undefined, makeEnv(), { method: "GET" });
   assert.equal(get.status, 405);
+});
+
+// ---------- round 2: pass expiry and revocation ----------
+
+function fakeKv() {
+  const store = new Map();
+  const puts = [];
+  return {
+    store,
+    puts,
+    async get(k) {
+      return store.has(k) ? store.get(k) : null;
+    },
+    async put(k, v, opts) {
+      puts.push({ k, v, opts });
+      store.set(k, v);
+    },
+  };
+}
+
+async function sha256HexForTest(str) {
+  const d = new Uint8Array(await subtle.digest("SHA-256", enc.encode(str)));
+  return Buffer.from(d).toString("hex");
+}
+
+test("pass expires 30 days after iat with 400 pass_expired", async () => {
+  const pass = await register();
+  nowMs += (THIRTY_DAYS - 1) * 1000;
+  assert.equal((await send({ pass, type: "alert", sealed: SEALED })).json.ok, true);
+  nowMs += 1000;
+  for (const path of ["/v1/send", "/v1/unregister"]) {
+    const r = await call(path, { pass, type: "alert", sealed: SEALED });
+    assert.deepEqual([r.status, r.json], [400, { ok: false, error: "pass_expired" }], path);
+  }
+});
+
+test("legacy pass without exp expires at iat + 30 days; non-numeric times are bad_pass", async () => {
+  const iat = Math.floor(nowMs / 1000) - THIRTY_DAYS;
+  const legacy = await sealPass(makeEnv(), { d: DEVICE, env: "sandbox", iat });
+  let r = await send({ pass: legacy, type: "alert", sealed: SEALED });
+  assert.deepEqual([r.status, r.json], [400, { ok: false, error: "pass_expired" }]);
+  const fresh = await sealPass(makeEnv(), { d: DEVICE, env: "sandbox", iat: iat + 10 });
+  assert.equal((await send({ pass: fresh, type: "alert", sealed: SEALED })).json.ok, true);
+  const noTimes = await sealPass(makeEnv(), { d: DEVICE, env: "sandbox" });
+  r = await send({ pass: noTimes, type: "alert", sealed: SEALED });
+  assert.deepEqual([r.status, r.json], [400, { ok: false, error: "bad_pass" }]);
+});
+
+test("unregister revokes the pass in KV with TTL = remaining life", async () => {
+  const kv = fakeKv();
+  const env = makeEnv({ REVOKED: kv });
+  const pass = await register(env);
+  nowMs += 10 * 24 * 60 * 60 * 1000; // 10 days later
+  const r = await call("/v1/unregister", { pass }, env);
+  assert.deepEqual([r.status, r.json], [200, { ok: true }]);
+  assert.equal(kv.puts.length, 1);
+  assert.equal(kv.puts[0].k, `revoked:${await sha256HexForTest(pass)}`);
+  assert.equal(kv.puts[0].k.includes(pass), false);
+  assert.deepEqual(kv.puts[0].opts, { expirationTtl: 20 * 24 * 60 * 60 });
+
+  calls = [];
+  for (const path of ["/v1/send", "/v1/unregister"]) {
+    const x = await call(path, { pass, type: "alert", sealed: SEALED }, env);
+    assert.deepEqual([x.status, x.json], [400, { ok: false, error: "pass_revoked" }], path);
+  }
+  assert.equal(calls.length, 0);
+  // Without the binding, the same pass still works (exp bounds it).
+  assert.equal((await send({ pass, type: "alert", sealed: SEALED })).json.ok, true);
+});
+
+test("revocation TTL is at least 60 s; alert-only passes are revoked too", async () => {
+  const kv = fakeKv();
+  const env = makeEnv({ REVOKED: kv });
+  const r0 = await call("/v1/register", { deviceToken: DEVICE, env: "sandbox" }, env);
+  nowMs += (THIRTY_DAYS - 5) * 1000;
+  const r = await call("/v1/unregister", { pass: r0.json.pass }, env);
+  assert.deepEqual(r.json, { ok: true });
+  assert.deepEqual(kv.puts[0].opts, { expirationTtl: 60 });
+});
+
+test("failed channel delete does not revoke, so it can be retried", async () => {
+  const kv = fakeKv();
+  const env = makeEnv({ REVOKED: kv });
+  const pass = await register(env);
+  responder = () => new Response(JSON.stringify({ reason: "InternalServerError" }), { status: 500 });
+  const r = await call("/v1/unregister", { pass }, env);
+  assert.equal(r.status, 502);
+  assert.equal(kv.puts.length, 0);
+  responder = defaultResponder;
+  assert.deepEqual((await call("/v1/unregister", { pass }, env)).json, { ok: true });
+  assert.equal(kv.puts.length, 1);
+});
+
+test("KV errors fail open", async () => {
+  const pass = await register();
+  const env = makeEnv({
+    REVOKED: {
+      async get() {
+        throw new Error("kv down");
+      },
+      async put() {
+        throw new Error("kv down");
+      },
+    },
+  });
+  assert.equal((await send({ pass, type: "alert", sealed: SEALED }, env)).json.ok, true);
+  assert.deepEqual((await call("/v1/unregister", { pass }, env)).json, { ok: true });
 });

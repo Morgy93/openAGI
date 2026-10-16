@@ -9,6 +9,8 @@ const MAX_SEALED = 3000;
 const MAX_PASS = 2000;
 const MAX_COLLAPSE_ID_BYTES = 64;
 const JWT_TTL_MS = 50 * 60 * 1000;
+const PASS_TTL_S = 30 * 24 * 60 * 60;
+const MIN_KV_TTL_S = 60;
 const PASS_AAD = "openagi-relay-pass:v1";
 const DEFAULT_BUNDLE_ID = "sh.openagi.OpenAGI";
 const GONE_REASONS = new Set(["BadDeviceToken", "Unregistered", "ChannelNotRegistered"]);
@@ -129,7 +131,36 @@ async function rateLimit(binding, key) {
 
 async function sha256Hex(str) {
   const d = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(str)));
-  return Array.from(d.slice(0, 16), (b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---------- revocation (optional KV binding REVOKED) ----------
+
+function revokedKey(passHash) {
+  return `revoked:${passHash}`;
+}
+
+async function assertNotRevoked(env, passHash) {
+  const kv = env.REVOKED;
+  if (!kv || typeof kv.get !== "function") return;
+  let hit = null;
+  try {
+    hit = await kv.get(revokedKey(passHash));
+  } catch {
+    return; // fail open: exp still bounds the pass
+  }
+  if (hit !== null && hit !== undefined) throw new HttpError(400, "pass_revoked");
+}
+
+async function revoke(env, passHash, exp) {
+  const kv = env.REVOKED;
+  if (!kv || typeof kv.put !== "function") return;
+  const ttl = Math.max(MIN_KV_TTL_S, Math.ceil(exp - clock() / 1000));
+  try {
+    await kv.put(revokedKey(passHash), "1", { expirationTtl: ttl });
+  } catch {
+    // best effort; exp bounds the pass
+  }
 }
 
 // ---------- pass sealing ----------
@@ -157,9 +188,9 @@ export async function sealPass(env, payload) {
 }
 
 export async function openPass(env, pass) {
-  if (typeof pass !== "string" || pass.length > MAX_PASS) throw new HttpError(401, "bad_pass");
+  if (typeof pass !== "string" || pass.length > MAX_PASS) throw new HttpError(400, "bad_pass");
   const m = PASS_RE.exec(pass);
-  if (!m) throw new HttpError(401, "bad_pass");
+  if (!m) throw new HttpError(400, "bad_pass");
   const key = await passKey(env);
   let plain;
   try {
@@ -172,13 +203,13 @@ export async function openPass(env, pass) {
       ct,
     );
   } catch {
-    throw new HttpError(401, "bad_pass");
+    throw new HttpError(400, "bad_pass");
   }
   let p;
   try {
     p = JSON.parse(dec.decode(plain));
   } catch {
-    throw new HttpError(401, "bad_pass");
+    throw new HttpError(400, "bad_pass");
   }
   if (
     !isPlainObject(p) ||
@@ -189,8 +220,13 @@ export async function openPass(env, pass) {
     (p.s === undefined) !== (p.ch === undefined) ||
     !ENVS.has(p.env)
   ) {
-    throw new HttpError(401, "bad_pass");
+    throw new HttpError(400, "bad_pass");
   }
+  // Passes minted before exp existed expire 30 days after iat.
+  const exp = typeof p.exp === "number" ? p.exp : typeof p.iat === "number" ? p.iat + PASS_TTL_S : NaN;
+  if (!Number.isFinite(exp)) throw new HttpError(400, "bad_pass");
+  if (clock() / 1000 >= exp) throw new HttpError(400, "pass_expired");
+  p.exp = exp;
   return p;
 }
 
@@ -295,7 +331,8 @@ async function handleRegister(request, env) {
     claims.ch = channelId;
   }
 
-  const pass = await sealPass(env, { ...claims, env: apnsEnv, iat: Math.floor(clock() / 1000) });
+  const iat = Math.floor(clock() / 1000);
+  const pass = await sealPass(env, { ...claims, env: apnsEnv, iat, exp: iat + PASS_TTL_S });
   return json(200, { pass });
 }
 
@@ -389,7 +426,9 @@ function buildRequest(env, p, s, nowSec, jwt) {
 async function handleSend(request, env) {
   const body = await readJsonBody(request);
   const p = await openPass(env, body.pass);
-  if (!(await rateLimit(env.SEND_LIMITER, `send:${await sha256Hex(body.pass)}`))) {
+  const passHash = await sha256Hex(body.pass);
+  await assertNotRevoked(env, passHash);
+  if (!(await rateLimit(env.SEND_LIMITER, `send:${passHash.slice(0, 32)}`))) {
     throw new HttpError(429, "rate_limited");
   }
   const s = validateSend(body);
@@ -412,10 +451,15 @@ async function handleSend(request, env) {
 async function handleUnregister(request, env) {
   const body = await readJsonBody(request);
   const p = await openPass(env, body.pass);
-  if (!(await rateLimit(env.SEND_LIMITER, `send:${await sha256Hex(body.pass)}`))) {
+  const passHash = await sha256Hex(body.pass);
+  await assertNotRevoked(env, passHash);
+  if (!(await rateLimit(env.SEND_LIMITER, `send:${passHash.slice(0, 32)}`))) {
     throw new HttpError(429, "rate_limited");
   }
-  if (!p.ch) return json(200, { ok: true });
+  if (!p.ch) {
+    await revoke(env, passHash, p.exp);
+    return json(200, { ok: true });
+  }
   const jwt = await apnsJwt(env);
   const r = await apnsFetch(
     `${manageHost(p.env)}/1/apps/${bundleId(env)}/channels`,
@@ -426,6 +470,8 @@ async function handleUnregister(request, env) {
   if (r.network) return json(502, { ok: false, error: "apns_unreachable" });
   // Already gone counts as done.
   if (r.ok || r.status === 404 || r.status === 410 || r.reason === "ChannelNotRegistered") {
+    // Revoke only once the channel is gone, so a failed delete can be retried.
+    await revoke(env, passHash, p.exp);
     return json(200, { ok: true });
   }
   return json(502, { ok: false, error: r.reason || `apns_${r.status}` });

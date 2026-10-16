@@ -44,9 +44,10 @@ The Worker never logs request bodies, tokens, or passes.
 ## Limits
 
 - Body at most 8 KB. `sealed` at most 3000 chars. `collapseId` at most 64 bytes.
-- Optional Workers rate-limit bindings `SEND_LIMITER` (keyed by a hash of the
-  pass) and `REGISTER_LIMITER` (keyed by `CF-Connecting-IP`). Without a
-  binding, that limit is skipped. Bindings only support 10 s or 60 s periods,
+- Workers rate-limit bindings `SEND_LIMITER` (keyed by a hash of the pass,
+  shared by send and unregister) and `REGISTER_LIMITER` (keyed by
+  `CF-Connecting-IP`), enabled in `wrangler.toml`. If a binding is missing,
+  that limit is skipped. Bindings only support 10 s or 60 s periods,
   so the spec's hourly budgets are approximated per minute in `wrangler.toml`.
 
 ## Deploy
@@ -62,8 +63,21 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))" \
 npx wrangler deploy
 ```
 
-Then uncomment the `routes` and `[[ratelimits]]` blocks in `wrangler.toml`
-as needed and deploy again. `BUNDLE_ID` defaults to `sh.openagi.OpenAGI`.
+The rate-limit bindings ship enabled. Uncomment the `routes` block (and the
+`REVOKED` KV block, below) in `wrangler.toml` as needed and deploy again. `BUNDLE_ID` defaults to `sh.openagi.OpenAGI`.
+
+## Pass lifetime and revocation
+
+- Each pass carries `exp` = `iat` + 30 days. After that, send and unregister
+  return 400 `pass_expired`. A malformed, tampered, or foreign pass returns
+  400 `bad_pass`.
+- Optional KV binding `REVOKED`: `/v1/unregister` stores `sha256(pass)` (never
+  the pass) with a TTL of the pass's remaining life, minimum 60 s. Later
+  send/unregister calls with that pass return 400 `pass_revoked`. The
+  revocation is written only after the channel is gone, so a failed delete can
+  be retried. KV errors fail open. Without the binding, `exp` bounds the pass.
+- Enable it: `npx wrangler kv namespace create REVOKED`, paste the id into the
+  commented `[[kv_namespaces]]` block in `wrangler.toml`, uncomment it, deploy.
 
 Rotating `PASS_KEY` invalidates every pass. Phones re-register on their next
 foreground or background refresh.
