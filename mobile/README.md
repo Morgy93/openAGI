@@ -155,12 +155,17 @@ daemon; the relay sees ciphertext. Spec:
 
 Setup (owner, once):
 
-1. **Team.** Set `DEVELOPMENT_TEAM` in `mobile/ios/project.yml`, enable
-   Push Notifications, App Groups (`group.sh.openagi.mobile`) and Keychain
-   Sharing on the `sh.openagi.OpenAGI` App ID and its two extensions
-   (`.OpenAGIWidget`, `.OpenAGINotify`), and sign with a real profile
-   (replace `CODE_SIGN_IDENTITY: "-"` for device builds). The default ad-hoc
-   build still runs on Simulator; push just never registers.
+1. **Team.** Set `DEVELOPMENT_TEAM` in `mobile/ios/project.yml` and sign
+   with a real profile (replace `CODE_SIGN_IDENTITY: "-"` for device
+   builds). Bundle and App Group ids are global across Apple teams; if
+   `sh.openagi.OpenAGI` or `group.sh.openagi.mobile` belongs to another
+   team, set `OPENAGI_BUNDLE_ID` and `OPENAGI_APP_GROUP` (the extensions
+   follow the bundle id). On developer.apple.com, enable Push Notifications,
+   **Broadcast Push Notifications** (Live Activity updates use APNs
+   channels; Xcode cannot turn this one on), App Groups and Keychain
+   Sharing on the app's App ID, and App Groups on its two extensions
+   (`.OpenAGIWidget`, `.OpenAGINotify`). The default ad-hoc build still runs
+   on Simulator; push just never registers.
 2. **APNs key.** Create an APNs auth key (.p8) and note its key ID.
 3. **Relay.** Deploy `relay/` and `wrangler secret put` `APNS_KEY_P8`,
    `APNS_KEY_ID`, `APNS_TEAM_ID`, `PASS_KEY`. The app uses
@@ -169,8 +174,12 @@ Setup (owner, once):
    **and** the daemon must set its `OPENAGI_PUSH_RELAY` env to the same URL.
    A pass only opens at the relay that issued it, so a mismatch makes every
    send fail with `bad_pass`.
-   Debug builds register as `sandbox`, Release (TestFlight, App Store) as
-   `production`.
+   The relay's `BUNDLE_ID` (`relay/wrangler.toml`, or
+   `wrangler deploy --var BUNDLE_ID:<id>`) must equal the app's bundle id:
+   it is the APNs topic, and APNs rejects every push for another app.
+   The app registers as `sandbox` or `production` from `aps-environment` in
+   its signing profile (development profiles are sandbox; App Store and
+   TestFlight are production).
 
 Manual device checklist (needs the setup above and a real iPhone):
 
