@@ -1,4 +1,5 @@
 import UIKit
+import UserNotifications
 import XCTest
 @testable import OpenAGI
 
@@ -181,8 +182,9 @@ final class SupervisorPushRequestTests: XCTestCase {
     func testDaemonRegisterAndUnregister() async throws {
         respond(200, #"{"ok":true}"#)
         let client = makeClient()
-        try await client.registerPush(pass: "p1.x.y", key: "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM", env: "production",
-                                      activities: false)
+        let result = try await client.registerPush(pass: "p1.x.y", key: "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM",
+                                                   env: "production", activities: false, alerts: false)
+        XCTAssertEqual(result, PushRegistrationResult(renew: false), "an older daemon sends no renew")
         var request = try XCTUnwrap(StubProtocol.lastRequest)
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.url?.path, "/mobile/push")
@@ -192,10 +194,17 @@ final class SupervisorPushRequestTests: XCTestCase {
         XCTAssertEqual(sent["key"] as? String, "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM")
         XCTAssertEqual(sent["env"] as? String, "production")
         XCTAssertEqual(sent["activities"] as? Bool, false)
-        XCTAssertEqual(sent.count, 4)
+        XCTAssertEqual(sent["alerts"] as? Bool, false)
+        XCTAssertEqual(sent.count, 5)
 
-        try await client.registerPush(pass: "p1.x.y", key: "k", env: "sandbox", activities: true)
-        XCTAssertEqual(try body(of: XCTUnwrap(StubProtocol.lastRequest))["activities"] as? Bool, true)
+        respond(200, #"{"ok":true,"renew":true}"#)
+        let renew = try await client.registerPush(pass: "p1.x.y", key: "k", env: "sandbox", activities: true, alerts: true)
+        XCTAssertEqual(renew, PushRegistrationResult(renew: true))
+        let second = try body(of: XCTUnwrap(StubProtocol.lastRequest))
+        XCTAssertEqual(second["activities"] as? Bool, true)
+        XCTAssertEqual(second["alerts"] as? Bool, true)
+
+        respond(200, #"{"ok":true,"renew":false}"#)
 
         try await client.unregisterPush()
         request = try XCTUnwrap(StubProtocol.lastRequest)
@@ -232,28 +241,54 @@ final class SupervisorPushRequestTests: XCTestCase {
 
     // MARK: - Registration steps
 
+    private let now = Date(timeIntervalSince1970: 1_792_065_600)
+
     func testNothingHappensUnpairedOrWithoutADeviceToken() {
-        let stored = PushPassStore.Stored(pass: "p1.a", signature: "sig")
-        XCTAssertEqual(PushRegistrar.step(paired: false, signature: "sig", stored: stored), .idle)
-        XCTAssertEqual(PushRegistrar.step(paired: true, signature: nil, stored: stored), .idle)
+        let stored = PushPassStore.Stored(pass: "p1.a", signature: "sig", mintedAt: now)
+        XCTAssertEqual(PushRegistrar.step(paired: false, signature: "sig", stored: stored, now: now), .idle)
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: nil, stored: stored, now: now), .idle)
     }
 
     func testFirstRegistrationAsksTheRelay() {
-        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: nil), .register(replacing: nil))
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: nil, now: now), .register(replacing: nil))
     }
 
     // Same tokens: every sync re-posts the stored pass to the daemon (it may
     // have lost the record), and never mints a second relay channel.
     func testUnchangedRegistrationRepostsTheStoredPass() {
-        let stored = PushPassStore.Stored(pass: "p1.a", signature: "sig")
-        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: stored), .post(pass: "p1.a"))
+        let stored = PushPassStore.Stored(pass: "p1.a", signature: "sig", mintedAt: now.addingTimeInterval(-6 * 86_400))
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: stored, now: now), .post(pass: "p1.a"))
     }
 
     // A token changed (rotation, Live Activities turned on or off):
     // re-register and retire the old pass.
     func testChangedTokensReRegisterAndRetireTheOldPass() {
-        let stored = PushPassStore.Stored(pass: "p1.old", signature: "old-sig")
-        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "new-sig", stored: stored), .register(replacing: "p1.old"))
+        let stored = PushPassStore.Stored(pass: "p1.old", signature: "old-sig", mintedAt: now)
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "new-sig", stored: stored, now: now), .register(replacing: "p1.old"))
+    }
+
+    // Re-minted every 7 days (the relay expires passes at 30), and whenever
+    // the stored pass has no mint date: saved by an older build, or marked
+    // after the daemon answered renew.
+    func testOldOrUndatedPassIsReminted() {
+        let weekOld = PushPassStore.Stored(pass: "p1.old", signature: "sig", mintedAt: now.addingTimeInterval(-7 * 86_400))
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: weekOld, now: now), .register(replacing: "p1.old"))
+        let undated = PushPassStore.Stored(pass: "p1.old", signature: "sig")
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: undated, now: now), .register(replacing: "p1.old"))
+    }
+
+    func testDaemonRenewMintsOnlyForAPassNotJustMinted() {
+        XCTAssertTrue(PushRegistrar.shouldRenew(daemonSaysRenew: true, justMinted: false))
+        XCTAssertFalse(PushRegistrar.shouldRenew(daemonSaysRenew: true, justMinted: true))
+        XCTAssertFalse(PushRegistrar.shouldRenew(daemonSaysRenew: false, justMinted: false))
+    }
+
+    func testAlertsFollowNotificationPermission() {
+        XCTAssertTrue(PushRegistrar.alertsAllowed(.authorized))
+        XCTAssertTrue(PushRegistrar.alertsAllowed(.provisional))
+        XCTAssertTrue(PushRegistrar.alertsAllowed(.ephemeral))
+        XCTAssertFalse(PushRegistrar.alertsAllowed(.denied))
+        XCTAssertFalse(PushRegistrar.alertsAllowed(.notDetermined))
     }
 
     func testPassStoreRoundTripsThroughTheKeychain() {
@@ -262,8 +297,8 @@ final class SupervisorPushRequestTests: XCTestCase {
         XCTAssertNil(PushPassStore.load())
         PushPassStore.save(.init(pass: "p1.x", signature: "s1"))
         XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.x", signature: "s1"))
-        PushPassStore.save(.init(pass: "p1.y", signature: "s2"))
-        XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.y", signature: "s2"))
+        PushPassStore.save(.init(pass: "p1.y", signature: "s2", mintedAt: now, retire: "p1.x"))
+        XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.y", signature: "s2", mintedAt: now, retire: "p1.x"))
     }
 
     // forget() bumps the generation and marks the node forgotten; an

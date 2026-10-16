@@ -48,6 +48,22 @@ public struct Enrollment: Codable, Sendable {
     public let nodeToken: String
 }
 
+// `POST /mobile/push`'s answer.
+public struct PushRegistrationResult: Decodable, Sendable, Equatable {
+    public var renew: Bool
+
+    public init(renew: Bool = false) {
+        self.renew = renew
+    }
+
+    private enum CodingKeys: String, CodingKey { case renew }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        renew = (try? c.decodeIfPresent(Bool.self, forKey: .renew)) ?? false
+    }
+}
+
 public actor DaemonClient {
     private let server: URL
     private let nodeID: String
@@ -388,14 +404,19 @@ public actor DaemonClient {
     // Hands this phone's relay pass and push key to its own daemon, over the
     // tailnet. The daemon replaces this node's earlier record (re-posting the
     // same pass keeps its activity state). `activities: false` means this
-    // phone has no push-to-start token, so the daemon sends alerts only.
+    // phone has no push-to-start token; `alerts: false` that notifications
+    // are not allowed. `renew` in the answer means the relay refused this
+    // pass (expired, revoked, unknown) and the phone should mint a new one.
     // Keys sorted so a test can assert the body byte for byte.
-    public func registerPush(pass: String, key: String, env: String, activities: Bool) async throws {
+    public func registerPush(pass: String, key: String, env: String, activities: Bool,
+                             alerts: Bool) async throws -> PushRegistrationResult {
         var request = try authorizedRequest(path: "/mobile/push", method: "POST")
-        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities]
+        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities, "alerts": alerts]
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        _ = try await perform(request)
+        let (data, _) = try await perform(request)
+        // An older daemon answers `{ ok: true }` only: no renew.
+        return (try? JSONDecoder().decode(PushRegistrationResult.self, from: data)) ?? PushRegistrationResult()
     }
 
     public func unregisterPush() async throws {

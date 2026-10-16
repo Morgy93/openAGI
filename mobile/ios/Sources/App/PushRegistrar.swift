@@ -173,12 +173,14 @@ final class PushRegistrar {
         }
         let stored = PushPassStore.load()
 
-        var pass: String
-        switch Self.step(paired: true, signature: signature, stored: stored) {
+        var current: PushPassStore.Stored
+        var minted = false
+        switch Self.step(paired: true, signature: signature, stored: stored, now: Date()) {
         case .idle:
             return
-        case let .post(existing):
-            pass = existing
+        case .post:
+            guard let stored else { return }
+            current = stored
         case let .register(replacing):
             guard let deviceToken, let signature,
                   let fresh = try? await relay.register(deviceToken: deviceToken, startToken: startToken, env: Self.env)
@@ -188,16 +190,38 @@ final class PushRegistrar {
                 try? await relay.unregister(pass: fresh)
                 return
             }
-            pass = fresh
-            PushPassStore.save(.init(pass: fresh, signature: signature))
-            if let replacing { try? await relay.unregister(pass: replacing) }
+            // A pass still waiting to be retired from an earlier mint goes now;
+            // the one being replaced waits until the daemon holds the new one.
+            if let older = stored?.retire, older != replacing { try? await relay.unregister(pass: older) }
+            current = .init(pass: fresh, signature: signature, mintedAt: Date(), retire: replacing)
+            // Saved before the daemon step, so a failed POST retries with it.
+            PushPassStore.save(current)
+            minted = true
         }
 
+        // Re-read every sync: turning notifications on later flips it.
+        let alerts = Self.alertsAllowed(await Self.notificationAuthorization())
         guard stillCurrent(), let key = try? PushKeyStore.loadOrCreate() else { return }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         // A failure here is retried on the next sync with the same pass.
-        try? await client.registerPush(pass: pass, key: key.base64URLEncodedString(), env: Self.env,
-                                       activities: startToken != nil)
+        guard let result = try? await client.registerPush(pass: current.pass, key: key.base64URLEncodedString(),
+                                                         env: Self.env, activities: startToken != nil, alerts: alerts),
+              stillCurrent()
+        else { return }
+
+        if let retire = current.retire {
+            try? await relay.unregister(pass: retire)
+            guard stillCurrent() else { return }
+            current.retire = nil
+            PushPassStore.save(current)
+        }
+        if Self.shouldRenew(daemonSaysRenew: result.renew, justMinted: minted) {
+            // Persisted as "too old", so the next run (now, or after a kill)
+            // mints a fresh pass.
+            current.mintedAt = nil
+            PushPassStore.save(current)
+            syncAgain = true
+        }
     }
 
     // Forget pairing: tell the daemon to stop pushing (best effort; a revoke
@@ -217,7 +241,9 @@ final class PushRegistrar {
         try? await client.unregisterPush()
         if let stored = PushPassStore.load() {
             PushPassStore.clear()
-            try? await PushRelayClient().unregister(pass: stored.pass)
+            let relay = PushRelayClient()
+            try? await relay.unregister(pass: stored.pass)
+            if let retire = stored.retire { try? await relay.unregister(pass: retire) }
         }
         PushKeyStore.clear()
         await Self.endActivities(ids: nil)
@@ -228,11 +254,40 @@ final class PushRegistrar {
 
     // MARK: - Pure decisions (pinned by tests)
 
-    // `signature` is nil until there is a device token.
-    nonisolated static func step(paired: Bool, signature: String?, stored: PushPassStore.Stored?) -> Step {
+    // A pass is re-minted well inside the relay's 30-day expiry.
+    nonisolated static let passMaxAge: TimeInterval = 7 * 24 * 60 * 60
+
+    // `signature` is nil until there is a device token. A pass with no mint
+    // date (saved before dates were kept, or marked for renewal) is too old.
+    nonisolated static func step(paired: Bool, signature: String?, stored: PushPassStore.Stored?, now: Date) -> Step {
         guard paired, let signature else { return .idle }
-        if let stored, stored.signature == signature { return .post(pass: stored.pass) }
-        return .register(replacing: stored?.pass)
+        guard let stored else { return .register(replacing: nil) }
+        guard stored.signature == signature,
+              let mintedAt = stored.mintedAt, now.timeIntervalSince(mintedAt) < passMaxAge
+        else { return .register(replacing: stored.pass) }
+        return .post(pass: stored.pass)
+    }
+
+    // A pass minted this run cannot already be refused; asking again would
+    // loop.
+    nonisolated static func shouldRenew(daemonSaysRenew: Bool, justMinted: Bool) -> Bool {
+        daemonSaysRenew && !justMinted
+    }
+
+    nonisolated static func alertsAllowed(_ status: UNAuthorizationStatus) -> Bool {
+        switch status {
+        case .authorized, .provisional, .ephemeral: return true
+        default: return false
+        }
+    }
+
+    // Completion-handler API: only the Sendable status leaves the callback.
+    nonisolated private static func notificationAuthorization() async -> UNAuthorizationStatus {
+        await withCheckedContinuation { (continuation: CheckedContinuation<UNAuthorizationStatus, Never>) in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                continuation.resume(returning: settings.authorizationStatus)
+            }
+        }
     }
 
     // Whether a sync that started under `started` may take its next step.
@@ -265,6 +320,17 @@ enum PushPassStore {
     struct Stored: Codable, Equatable, Sendable {
         var pass: String
         var signature: String
+        var mintedAt: Date?
+        // The pass this one replaced, unregistered at the relay once the
+        // daemon holds the new one.
+        var retire: String?
+
+        init(pass: String, signature: String, mintedAt: Date? = nil, retire: String? = nil) {
+            self.pass = pass
+            self.signature = signature
+            self.mintedAt = mintedAt
+            self.retire = retire
+        }
     }
 
     private static let service = "sh.openagi.mobile.pushpass"
