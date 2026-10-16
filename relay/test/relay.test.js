@@ -129,7 +129,7 @@ test("register creates a channel and returns a pass that round-trips", async () 
   assert.match(pass, /^p1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
   assert.equal(calls.length, 1);
   const c = calls[0];
-  assert.equal(c.url, `https://api-manage-broadcast.sandbox.push.apple.com:2196/1/apps/${BUNDLE}/channels`);
+  assert.equal(c.url, `https://api-manage-broadcast.sandbox.push.apple.com:2195/1/apps/${BUNDLE}/channels`);
   assert.equal(c.init.method, "POST");
   assert.deepEqual(c.body, { "message-storage-policy": 1, "push-type": "LiveActivity" });
   await verifyJwt(c.init.headers.authorization);
@@ -495,4 +495,90 @@ test("routing: 404 for unknown paths, 405 for wrong methods, health check", asyn
   r = await call("/v1/health", undefined, makeEnv(), { method: "GET" });
   assert.deepEqual([r.status, r.json], [200, { ok: true }]);
   assert.equal(r.res.headers.get("content-type").startsWith("application/json"), true);
+});
+
+// ---------- amendments: optional startToken, unregister ----------
+
+test("register without startToken creates no channel and the pass has no s/ch", async () => {
+  for (const extra of [{}, { startToken: null }]) {
+    calls = [];
+    const r = await call("/v1/register", { deviceToken: DEVICE, env: "sandbox", ...extra });
+    assert.equal(r.status, 200);
+    assert.equal(calls.length, 0, "no channel-management call");
+    const p = await openPassForTest(r.json.pass);
+    assert.deepEqual(p, { d: DEVICE, env: "sandbox", iat: Math.floor(nowMs / 1000) });
+  }
+  const bad = await call("/v1/register", { deviceToken: DEVICE, startToken: "", env: "sandbox" });
+  assert.deepEqual([bad.status, bad.json], [400, { error: "invalid_startToken" }]);
+});
+
+test("alert-only pass: alerts work, activity-* return 400 no_live_activity", async () => {
+  const r0 = await call("/v1/register", { deviceToken: DEVICE, env: "production" });
+  const pass = r0.json.pass;
+  const a = await send({ pass, type: "alert", sealed: SEALED });
+  assert.deepEqual(a.json, { ok: true, apnsId: "apns-123" });
+  assert.equal(calls[0].url, `https://api.push.apple.com/3/device/${DEVICE}`);
+  for (const type of ["activity-start", "activity-update", "activity-end"]) {
+    const r = await send({ pass, type, sealed: SEALED });
+    assert.deepEqual([r.status, r.json], [400, { ok: false, error: "no_live_activity" }]);
+  }
+  assert.equal(calls.length, 1);
+});
+
+test("a pass with only one of s/ch is rejected", async () => {
+  const half = await sealPass(makeEnv(), { d: DEVICE, s: START, env: "sandbox", iat: 1 });
+  const r = await send({ pass: half, type: "alert", sealed: SEALED });
+  assert.deepEqual([r.status, r.json], [401, { ok: false, error: "bad_pass" }]);
+});
+
+test("unregister deletes the channel on the right host with apns-channel-id", async () => {
+  for (const [apnsEnv, host] of [
+    ["sandbox", "https://api-manage-broadcast.sandbox.push.apple.com:2195"],
+    ["production", "https://api-manage-broadcast.push.apple.com:2196"],
+  ]) {
+    const pass = await register(makeEnv(), apnsEnv);
+    calls = [];
+    const r = await call("/v1/unregister", { pass });
+    assert.deepEqual([r.status, r.json], [200, { ok: true }]);
+    assert.equal(calls.length, 1);
+    const c = calls[0];
+    assert.equal(c.url, `${host}/1/apps/${BUNDLE}/channels`);
+    assert.equal(c.init.method, "DELETE");
+    assert.equal(c.init.headers["apns-channel-id"], CHANNEL);
+    assert.equal(c.init.body, undefined);
+    await verifyJwt(c.init.headers.authorization);
+  }
+});
+
+test("unregister treats an already-gone channel as ok and reports other failures", async () => {
+  const pass = await register();
+  for (const [status, body] of [
+    [404, null],
+    [410, null],
+    [400, { reason: "ChannelNotRegistered" }],
+  ]) {
+    responder = () => new Response(body ? JSON.stringify(body) : null, { status });
+    const r = await call("/v1/unregister", { pass });
+    assert.deepEqual([r.status, r.json], [200, { ok: true }], String(status));
+  }
+  responder = () => new Response(JSON.stringify({ reason: "InternalServerError" }), { status: 500 });
+  let r = await call("/v1/unregister", { pass });
+  assert.deepEqual([r.status, r.json], [502, { ok: false, error: "InternalServerError" }]);
+  responder = () => {
+    throw new TypeError("blocked port");
+  };
+  r = await call("/v1/unregister", { pass });
+  assert.deepEqual([r.status, r.json], [502, { ok: false, error: "apns_unreachable" }]);
+});
+
+test("unregister with an alert-only pass is ok without calling APNs; bad pass is 401", async () => {
+  const r0 = await call("/v1/register", { deviceToken: DEVICE, env: "sandbox" });
+  calls = [];
+  const r = await call("/v1/unregister", { pass: r0.json.pass });
+  assert.deepEqual([r.status, r.json], [200, { ok: true }]);
+  assert.equal(calls.length, 0);
+  const bad = await call("/v1/unregister", { pass: "p1.AAAA.BBBB" });
+  assert.deepEqual([bad.status, bad.json], [401, { ok: false, error: "bad_pass" }]);
+  const get = await call("/v1/unregister", undefined, makeEnv(), { method: "GET" });
+  assert.equal(get.status, 405);
 });

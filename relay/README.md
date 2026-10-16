@@ -7,8 +7,10 @@ an OpenAGI daemon to the paired iPhone. Spec:
 
 ## What it does
 
-- `POST /v1/register` `{ deviceToken, startToken, env }` creates one APNs
-  broadcast channel for the phone's Live Activity and returns a `pass`. The
+- `POST /v1/register` `{ deviceToken, startToken?, env }` creates one APNs
+  broadcast channel for the phone's Live Activity and returns a `pass`.
+  Without `startToken` no channel is created: the pass supports alerts only,
+  and `activity-*` sends return 400 `no_live_activity`. The
   pass is an AES-256-GCM blob (`p1.<nonce>.<ct+tag>`, AAD
   `openagi-relay-pass:v1`) sealed with the Worker secret `PASS_KEY`. It holds
   the device token, push-to-start token, channel id, env, and issue time. The
@@ -23,6 +25,8 @@ an OpenAGI daemon to the paired iPhone. Spec:
   - Returns `{ ok: true, apnsId }`, `{ ok: false, gone: true }` (410,
     `BadDeviceToken`, `Unregistered`, `ChannelNotRegistered`), or
     `{ ok: false, error }`.
+- `POST /v1/unregister` `{ pass }` deletes the pass's channel, if any. Returns
+  `{ ok: true }` even when the channel is already gone.
 - `staleAt` / `dismissAt` take epoch seconds or an ISO-8601 string.
 - `GET /v1/health` returns `{ ok: true }`.
 
@@ -64,13 +68,14 @@ as needed and deploy again. `BUNDLE_ID` defaults to `sh.openagi.OpenAGI`.
 Rotating `PASS_KEY` invalidates every pass. Phones re-register on their next
 foreground or background refresh.
 
-## Risk: port 2196
+## Risk: ports 2195 / 2196
 
-Channel creation calls `api-manage-broadcast[.sandbox].push.apple.com:2196`.
-Workers outbound fetch to that non-standard port is unproven. Check it on the
-first deploy with a real register call. If it is blocked, register fails with
-`apns_unreachable`, and channel creation has to move to a small second
-endpoint (any host that can reach port 2196). Sends are unaffected because
+Channel management calls `api-manage-broadcast.sandbox.push.apple.com:2195`
+(sandbox) and `api-manage-broadcast.push.apple.com:2196` (production).
+Workers outbound fetch to those non-standard ports is unproven. Check it on
+the first deploy with a real register call. If it is blocked, register fails
+with `apns_unreachable`, and channel management has to move to a small second
+endpoint (any host that can reach those ports). Sends are unaffected because
 they use port 443.
 
 ## Test

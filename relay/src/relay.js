@@ -103,7 +103,7 @@ function apnsHost(apnsEnv) {
 function manageHost(apnsEnv) {
   return apnsEnv === "production"
     ? "https://api-manage-broadcast.push.apple.com:2196"
-    : "https://api-manage-broadcast.sandbox.push.apple.com:2196";
+    : "https://api-manage-broadcast.sandbox.push.apple.com:2195";
 }
 
 // Accepts epoch seconds (number) or an ISO-8601 string; returns epoch seconds.
@@ -183,9 +183,10 @@ export async function openPass(env, pass) {
   if (
     !isPlainObject(p) ||
     typeof p.d !== "string" ||
-    typeof p.s !== "string" ||
-    typeof p.ch !== "string" ||
-    !p.ch ||
+    !p.d ||
+    (p.s !== undefined && (typeof p.s !== "string" || !p.s)) ||
+    (p.ch !== undefined && (typeof p.ch !== "string" || !p.ch)) ||
+    (p.s === undefined) !== (p.ch === undefined) ||
     !ENVS.has(p.env)
   ) {
     throw new HttpError(401, "bad_pass");
@@ -239,10 +240,12 @@ async function apnsJwt(env) {
   return token;
 }
 
-async function apnsFetch(url, headers, payload) {
+async function apnsFetch(url, headers, payload, method = "POST") {
   let res;
   try {
-    res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    const init = { method, headers };
+    if (payload !== undefined) init.body = JSON.stringify(payload);
+    res = await fetch(url, init);
   } catch {
     return { network: true };
   }
@@ -269,29 +272,30 @@ async function handleRegister(request, env) {
   if (typeof deviceToken !== "string" || !HEX_TOKEN.test(deviceToken) || deviceToken.length % 2) {
     throw new HttpError(400, "invalid_deviceToken");
   }
-  if (typeof startToken !== "string" || !HEX_TOKEN.test(startToken) || startToken.length % 2) {
+  const hasStart = startToken !== undefined && startToken !== null;
+  if (hasStart && (typeof startToken !== "string" || !HEX_TOKEN.test(startToken) || startToken.length % 2)) {
     throw new HttpError(400, "invalid_startToken");
   }
   if (!ENVS.has(apnsEnv)) throw new HttpError(400, "invalid_env");
 
   await passKey(env); // fail before touching APNs if misconfigured
-  const jwt = await apnsJwt(env);
-  const r = await apnsFetch(
-    `${manageHost(apnsEnv)}/1/apps/${bundleId(env)}/channels`,
-    { authorization: `bearer ${jwt}`, "content-type": "application/json" },
-    { "message-storage-policy": 1, "push-type": "LiveActivity" },
-  );
-  if (r.network) throw new HttpError(502, "apns_unreachable");
-  const channelId = r.ok ? r.headers.get("apns-channel-id") : null;
-  if (!channelId) throw new HttpError(502, r.reason ? `channel_${r.reason}` : "channel_create_failed");
+  const claims = { d: deviceToken.toLowerCase() };
+  if (hasStart) {
+    // Live Activity support: one broadcast channel per registration.
+    const jwt = await apnsJwt(env);
+    const r = await apnsFetch(
+      `${manageHost(apnsEnv)}/1/apps/${bundleId(env)}/channels`,
+      { authorization: `bearer ${jwt}`, "content-type": "application/json" },
+      { "message-storage-policy": 1, "push-type": "LiveActivity" },
+    );
+    if (r.network) throw new HttpError(502, "apns_unreachable");
+    const channelId = r.ok ? r.headers.get("apns-channel-id") : null;
+    if (!channelId) throw new HttpError(502, r.reason ? `channel_${r.reason}` : "channel_create_failed");
+    claims.s = startToken.toLowerCase();
+    claims.ch = channelId;
+  }
 
-  const pass = await sealPass(env, {
-    d: deviceToken.toLowerCase(),
-    s: startToken.toLowerCase(),
-    ch: channelId,
-    env: apnsEnv,
-    iat: Math.floor(clock() / 1000),
-  });
+  const pass = await sealPass(env, { ...claims, env: apnsEnv, iat: Math.floor(clock() / 1000) });
   return json(200, { pass });
 }
 
@@ -389,6 +393,7 @@ async function handleSend(request, env) {
     throw new HttpError(429, "rate_limited");
   }
   const s = validateSend(body);
+  if (s.type !== "alert" && !p.ch) throw new HttpError(400, "no_live_activity");
   const jwt = await apnsJwt(env);
   const req = buildRequest(env, p, s, Math.floor(clock() / 1000), jwt);
   const r = await apnsFetch(req.url, req.headers, req.payload);
@@ -404,11 +409,34 @@ async function handleSend(request, env) {
   return json(502, { ok: false, error: r.reason || `apns_${r.status}` });
 }
 
+async function handleUnregister(request, env) {
+  const body = await readJsonBody(request);
+  const p = await openPass(env, body.pass);
+  if (!(await rateLimit(env.SEND_LIMITER, `send:${await sha256Hex(body.pass)}`))) {
+    throw new HttpError(429, "rate_limited");
+  }
+  if (!p.ch) return json(200, { ok: true });
+  const jwt = await apnsJwt(env);
+  const r = await apnsFetch(
+    `${manageHost(p.env)}/1/apps/${bundleId(env)}/channels`,
+    { authorization: `bearer ${jwt}`, "apns-channel-id": p.ch },
+    undefined,
+    "DELETE",
+  );
+  if (r.network) return json(502, { ok: false, error: "apns_unreachable" });
+  // Already gone counts as done.
+  if (r.ok || r.status === 404 || r.status === 410 || r.reason === "ChannelNotRegistered") {
+    return json(200, { ok: true });
+  }
+  return json(502, { ok: false, error: r.reason || `apns_${r.status}` });
+}
+
 export async function handle(request, env = {}) {
   const url = new URL(request.url);
   const routes = {
     "/v1/register": handleRegister,
     "/v1/send": handleSend,
+    "/v1/unregister": handleUnregister,
   };
   try {
     if (url.pathname === "/v1/health" && request.method === "GET") return json(200, { ok: true });
@@ -419,6 +447,6 @@ export async function handle(request, env = {}) {
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500;
     const code = e instanceof HttpError ? e.code : "internal";
-    return url.pathname === "/v1/send" ? json(status, { ok: false, error: code }) : json(status, { error: code });
+    return url.pathname === "/v1/send" || url.pathname === "/v1/unregister" ? json(status, { ok: false, error: code }) : json(status, { error: code });
   }
 }
