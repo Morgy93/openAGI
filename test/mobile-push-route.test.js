@@ -100,6 +100,11 @@ test("a paired phone stores, replaces and deletes its own registration (0600)", 
   assert.equal(saved[0].pass, "p1.second");
   assert.equal(saved[0].env, "production");
 
+  assert.equal(saved[0].activities, true);
+  const alertsOnly = await phone.call("/mobile/push", { method: "POST", body: { ...REGISTRATION, pass: "p1.second", env: "production", activities: false } });
+  assert.equal(alertsOnly.status, 200);
+  assert.equal(records()[0].activities, false);
+
   const other = await pair();
   await other.call("/mobile/push", { method: "POST", body: REGISTRATION });
   assert.equal(records().length, 2);
@@ -121,6 +126,7 @@ test("bad bodies are refused with 400 and nothing is stored", async (t) => {
     { ...REGISTRATION, key: crypto.randomBytes(32).toString("base64") },
     { ...REGISTRATION, key: undefined },
     { ...REGISTRATION, env: "staging" },
+    { ...REGISTRATION, activities: "no" },
     [],
     "not json"
   ];

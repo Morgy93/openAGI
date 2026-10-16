@@ -666,11 +666,20 @@ X-OpenAGI-Node-ID: <nodeId>
 - `key`: the phone's envelope key, base64url without padding, exactly 32
   bytes. Never sent to the relay.
 - `env`: `sandbox` or `production`.
+- `activities` (optional boolean, default `true`): `false` means alerts only;
+  the daemon never sends a Live Activity start, update or end for this phone.
+  A relay `400 no_live_activity` (a pass registered without a push-to-start
+  token) has the same effect for that pass.
 
 Response `{"ok": true}`; a bad body is `400 {"error": "..."}`. Only a paired
 phone's own credential may call it (the owner token gets `403`). The daemon
 keeps one record per phone in `<dataDir>/nodes/push.json` (0600), replacing
-the prior one; a new record starts a fresh Live Activity on the next change.
+the prior one. Re-POST it on every foreground and background refresh:
+re-POSTing the same `pass` keeps the daemon's record of the Live Activity it
+started and the questions already alerted; a different `pass` resets the
+activity only (the next change starts a new one) and still never re-alerts.
+The started activity is persisted, so a daemon restart updates it rather
+than starting a second one.
 `DELETE /mobile/push` (no body) removes it, and so does revoking the phone
 (§9). Envelope format, plaintexts and relay API:
 `docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md`. The daemon

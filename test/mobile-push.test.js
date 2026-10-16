@@ -53,7 +53,16 @@ function harness(t, { threads = [], questions = [] } = {}) {
   push.start();
 
   return {
-    push, store, state, events, sent, logs, key, dir, pending,
+    push, store, state, events, sent, logs, key, dir, pending, fetch,
+    // A fresh process on the same push.json, sharing the relay.
+    restart(at) {
+      now = at;
+      push.stop();
+      const store2 = new MobilePushStore({ dir });
+      const push2 = new MobilePush({ store: store2, supervisor, events, relayUrl: "https://relay.test/", fetch, now: () => now, timers, log: (line) => logs.push(line) });
+      push2.start();
+      return { push: push2, store: store2 };
+    },
     setReply(fn) { reply = fn; },
     get now() { return now; },
     // Move the clock, firing due timers in order and letting each pass finish.
@@ -339,4 +348,95 @@ test("stop drops the listeners and timers", async (t) => {
   h.events.emit("fleet", {});
   assert.equal(h.pending.size, 0);
   assert.equal(h.events.listenerCount("fleet"), 0);
+});
+
+test("a daemon restart updates the activity it started instead of starting a second one", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  await h.push.flush();
+  assert.deepEqual(h.store.get(NODE).activity, { startedAt: new Date(T0).toISOString() });
+
+  const after = h.restart(T0 + 10 * MIN);
+  await after.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "activity-update"]);
+  assert.equal(h.sent[1].priority, undefined);
+  assert.deepEqual(h.open(h.sent[1]).counts, { you: 0, working: 1, waiting: 0 });
+  await after.push.flush();
+  assert.equal(h.sent.length, 2, "unchanged content is not resent");
+});
+
+test("the 7.5 h restart counts from the persisted start, across a daemon restart", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  await h.push.flush();
+  const after = h.restart(T0 + 7.5 * 60 * MIN);
+  await after.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "activity-end", "activity-start"]);
+  assert.deepEqual(after.store.get(NODE).activity, { startedAt: new Date(T0 + 7.5 * 60 * MIN).toISOString() });
+});
+
+test("an idle end clears the persisted activity, so a restart starts afresh", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  await h.push.flush();
+  h.state.snapshot.threads = [];
+  await h.advance(30 * SEC);
+  await h.push.flush();
+  await h.advance(2 * MIN);
+  assert.equal(h.sent.at(-1).type, "activity-end");
+  assert.equal(h.store.get(NODE).activity, null);
+  h.state.snapshot.threads = [thread("codex:a", "working")];
+  const after = h.restart(T0 + 10 * MIN);
+  await after.push.flush();
+  assert.equal(h.sent.at(-1).type, "activity-start");
+});
+
+test("re-POSTing the same pass keeps the activity and notified ids; a new pass resets the activity only", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")], questions: [question("fq1")] });
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["alert", "activity-start"]);
+
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox" });
+  h.push.registrationChanged(NODE);
+  await h.advance(PUSH_TIMING.debounceMs);
+  assert.deepEqual(h.types(), ["alert", "activity-start"], "no second start, no second alert");
+  assert.deepEqual(h.store.get(NODE).activity, { startedAt: new Date(T0).toISOString() });
+  assert.deepEqual(h.store.get(NODE).notified, ["fq1"]);
+
+  h.store.put(NODE, { pass: "p1.pass-two", key: h.key, env: "sandbox" });
+  assert.equal(h.store.get(NODE).activity, null);
+  assert.deepEqual(h.store.get(NODE).notified, ["fq1"]);
+  h.push.registrationChanged(NODE);
+  await h.advance(PUSH_TIMING.debounceMs);
+  assert.deepEqual(h.types(), ["alert", "activity-start", "activity-start"]);
+  assert.equal(h.sent[2].pass, "p1.pass-two");
+});
+
+test("activities: false gets alerts and never an activity send", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "you")], questions: [question("fq1")] });
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox", activities: false });
+  await h.push.flush();
+  await h.advance(8 * 60 * MIN);
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["alert"]);
+  assert.equal(h.store.get(NODE).activity, null);
+});
+
+test("a relay no_live_activity makes that pass alerts-only until a new pass", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  h.setReply((body) => (body.type.startsWith("activity-") ? { ok: false, error: "no_live_activity", __status: 400 } : { ok: true }));
+  await h.push.flush();
+  assert.equal(h.store.get(NODE).noLiveActivity, true);
+  h.state.questions = [question("fq1")];
+  h.state.snapshot.threads.push(thread("codex:b", "you"));
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "alert"]);
+
+  // The phone's routine re-POST of the same pass does not undo it.
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox" });
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "alert"]);
+  assert.equal(new MobilePushStore({ dir: h.dir }).get(NODE).noLiveActivity, true);
+
+  h.setReply(() => ({ ok: true }));
+  h.store.put(NODE, { pass: "p1.pass-two", key: h.key, env: "sandbox" });
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "alert", "activity-start"]);
 });

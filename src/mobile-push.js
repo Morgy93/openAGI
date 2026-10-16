@@ -135,7 +135,8 @@ export class MobilePush {
     this.timing = timing;
     this.log = log;
     // nodeId -> { pass, startedAt, lastHash, lastSentAt, lastYou, idleSince }.
-    // Memory only: after a restart the next change starts a fresh activity.
+    // Only startedAt is persisted (push.json); after a restart the rest is
+    // rebuilt from it, and the next pass updates rather than starts.
     this.live = new Map();
     this.reported = new Set();
     this.listener = () => this.changed();
@@ -178,10 +179,11 @@ export class MobilePush {
     }
   }
 
-  /// The phone registered again (a rotated token, a reinstall): its old
-  /// activity is not ours to update, so the next change starts a new one.
-  registrationChanged(nodeId) {
-    this.live.delete(nodeId);
+  /// The phone registered again. With a new pass (a rotated token, a
+  /// reinstall) its old activity is not ours to update: syncActivity sees the
+  /// pass differ and the next change starts a new one. The same pass (the
+  /// phone's routine re-POST) keeps the activity as it is.
+  registrationChanged() {
     this.changed();
   }
 
@@ -264,10 +266,27 @@ export class MobilePush {
   async syncActivity(registration, activity, now) {
     const { nodeId } = registration;
     const t = this.timing;
+    if (registration.activities === false || registration.noLiveActivity) {
+      this.live.delete(nodeId);
+      this.store.setActivity(nodeId, null);
+      return null;
+    }
     let live = this.live.get(nodeId) ?? null;
     if (live && live.pass !== registration.pass) {
       this.live.delete(nodeId);
       live = null;
+    }
+    if (!live) {
+      // Read fresh, not from the pass's snapshot: an end earlier in this pass
+      // (the 7.5 h restart) has already cleared it.
+      const saved = this.store.get(nodeId);
+      const startedAt = saved?.pass === registration.pass ? Date.parse(saved.activity?.startedAt ?? "") : NaN;
+      if (Number.isFinite(startedAt)) {
+        // A daemon restart: the phone still shows the activity we started.
+        // What it shows is unknown, so the next pass updates it at once.
+        live = { pass: registration.pass, startedAt, lastHash: null, lastSentAt: -Infinity, lastYou: Infinity, idleSince: null };
+        this.live.set(nodeId, live);
+      }
     }
     const active = activeCount(activity);
     const hash = contentHash(activity);
@@ -277,6 +296,7 @@ export class MobilePush {
       const result = await this.sendActivity(registration, "activity-start", activity, { staleAt: this.epoch(now + t.staleAfterMs) });
       if (result !== "ok") return null;
       this.live.set(nodeId, { pass: registration.pass, startedAt: now, lastHash: hash, lastSentAt: now, lastYou: activity.counts.you, idleSince: null });
+      this.store.setActivity(nodeId, { startedAt: new Date(now).toISOString() });
       return now + t.restartAfterMs;
     }
 
@@ -284,6 +304,7 @@ export class MobilePush {
       const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now) });
       if (ended !== "ok") return null;
       this.live.delete(nodeId);
+      this.store.setActivity(nodeId, null);
       return this.syncActivity(registration, activity, now);
     }
 
@@ -291,7 +312,10 @@ export class MobilePush {
       live.idleSince ??= now;
       if (now - live.idleSince >= t.endAfterIdleMs) {
         const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now + t.dismissAfterMs) });
-        if (ended === "ok") this.live.delete(nodeId);
+        if (ended === "ok") {
+          this.live.delete(nodeId);
+          this.store.setActivity(nodeId, null);
+        }
         return null;
       }
     } else {
@@ -357,6 +381,14 @@ export class MobilePush {
     if (response.ok && json?.ok === true) {
       this.reported.clear();
       return "ok";
+    }
+    // The pass was registered without a push-to-start token: alerts only.
+    if (response.status === 400 && json?.error === "no_live_activity") {
+      this.live.delete(registration.nodeId);
+      try { this.store.markNoLiveActivity(registration.nodeId); } catch (error) {
+        this.report(`could not record no_live_activity: ${error?.message ?? error}`);
+      }
+      return "error";
     }
     const code = typeof json?.error === "string" ? json.error.slice(0, 80) : `HTTP ${response.status}`;
     this.report(`relay refused ${body.type}: ${code}`);
