@@ -185,6 +185,10 @@ Manual device checklist (needs the setup above and a real iPhone):
       closes on the daemon. Tap Dismiss on another; it is dismissed.
 - [ ] Turn the daemon off, tap an answer: a "Not sent" notice replaces the
       alert; tapping it opens the Supervisor tab.
+- [ ] Turn Live Activities off for OpenAGI (Settings), reopen the app:
+      `push.json` shows `activities: false`; alerts still arrive.
+- [ ] Delete `push.json` on the daemon, foreground the app: the record comes
+      back with the same pass (no new relay registration).
 - [ ] Settings → Revoke: the activity ends, alerts clear, `push.json` loses
       the record.
 

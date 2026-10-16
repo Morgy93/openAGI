@@ -386,12 +386,14 @@ public actor DaemonClient {
     // MARK: - Supervisor push (docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md)
 
     // Hands this phone's relay pass and push key to its own daemon, over the
-    // tailnet. The daemon replaces this node's earlier record. Keys sorted so
-    // a test can assert the body byte for byte.
-    public func registerPush(pass: String, key: String, env: String) async throws {
+    // tailnet. The daemon replaces this node's earlier record (re-posting the
+    // same pass keeps its activity state). `activities: false` means this
+    // phone has no push-to-start token, so the daemon sends alerts only.
+    // Keys sorted so a test can assert the body byte for byte.
+    public func registerPush(pass: String, key: String, env: String, activities: Bool) async throws {
         var request = try authorizedRequest(path: "/mobile/push", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["pass": pass, "key": key, "env": env],
-                                                      options: [.sortedKeys])
+        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         _ = try await perform(request)
     }

@@ -137,6 +137,25 @@ final class SupervisorPushRequestTests: XCTestCase {
                        ["deviceToken": "aa01", "startToken": "bb02", "env": "sandbox"])
     }
 
+    func testRelayRegisterWithoutStartTokenOmitsIt() async throws {
+        respond(200, #"{"pass":"p1.alerts.only"}"#)
+        let relay = PushRelayClient(base: URL(string: "https://push.example.com")!, session: stubSession)
+        let pass = try await relay.register(deviceToken: "aa01", startToken: nil, env: "production")
+        XCTAssertEqual(pass, "p1.alerts.only")
+        XCTAssertEqual(try body(of: XCTUnwrap(StubProtocol.lastRequest)) as? [String: String],
+                       ["deviceToken": "aa01", "env": "production"])
+    }
+
+    func testRelayUnregisterSendsThePass() async throws {
+        respond(200, #"{"ok":true}"#)
+        let relay = PushRelayClient(base: URL(string: "https://push.example.com")!, session: stubSession)
+        try await relay.unregister(pass: "p1.old.pass")
+        let request = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.absoluteString, "https://push.example.com/v1/unregister")
+        XCTAssertEqual(try body(of: request) as? [String: String], ["pass": "p1.old.pass"])
+    }
+
     func testRelayErrorsAreTyped() async {
         let relay = PushRelayClient(base: URL(string: "https://push.example.com")!, session: stubSession)
         respond(429, #"{"error":"rate-limited"}"#)
@@ -161,13 +180,21 @@ final class SupervisorPushRequestTests: XCTestCase {
     func testDaemonRegisterAndUnregister() async throws {
         respond(200, #"{"ok":true}"#)
         let client = makeClient()
-        try await client.registerPush(pass: "p1.x.y", key: "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM", env: "production")
+        try await client.registerPush(pass: "p1.x.y", key: "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM", env: "production",
+                                      activities: false)
         var request = try XCTUnwrap(StubProtocol.lastRequest)
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.url?.path, "/mobile/push")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer " + String(repeating: "a", count: 43))
-        XCTAssertEqual(try body(of: request) as? [String: String],
-                       ["pass": "p1.x.y", "key": "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM", "env": "production"])
+        let sent = try body(of: request)
+        XCTAssertEqual(sent["pass"] as? String, "p1.x.y")
+        XCTAssertEqual(sent["key"] as? String, "SMOleUn2o5oqGjAszy9JO7-tK3avgOZmkjI34rcEBsM")
+        XCTAssertEqual(sent["env"] as? String, "production")
+        XCTAssertEqual(sent["activities"] as? Bool, false)
+        XCTAssertEqual(sent.count, 4)
+
+        try await client.registerPush(pass: "p1.x.y", key: "k", env: "sandbox", activities: true)
+        XCTAssertEqual(try body(of: XCTUnwrap(StubProtocol.lastRequest))["activities"] as? Bool, true)
 
         try await client.unregisterPush()
         request = try XCTUnwrap(StubProtocol.lastRequest)
@@ -188,20 +215,66 @@ final class SupervisorPushRequestTests: XCTestCase {
     }
 
     func testRegistrationSignatureChangesWithEveryInput() {
-        let server = URL(string: "http://mac.ts.net:43210")!
         let relay = PushRelayClient.defaultURL
-        let base = PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", nodeID: "n", server: server, relay: relay)
-        XCTAssertEqual(base, PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", nodeID: "n", server: server, relay: relay))
+        let base = PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", relay: relay)
+        XCTAssertEqual(base, PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", relay: relay))
         XCTAssertFalse(base.contains("d\n"), "hashed, not the raw tokens")
         let variants = [
-            PushRegistrar.signature(deviceToken: "d2", startToken: "s", env: "sandbox", nodeID: "n", server: server, relay: relay),
-            PushRegistrar.signature(deviceToken: "d", startToken: "s2", env: "sandbox", nodeID: "n", server: server, relay: relay),
-            PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "production", nodeID: "n", server: server, relay: relay),
-            PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", nodeID: "n2", server: server, relay: relay),
-            PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", nodeID: "n",
-                                    server: URL(string: "http://other.ts.net:43210")!, relay: relay)
+            PushRegistrar.signature(deviceToken: "d2", startToken: "s", env: "sandbox", relay: relay),
+            PushRegistrar.signature(deviceToken: "d", startToken: "s2", env: "sandbox", relay: relay),
+            PushRegistrar.signature(deviceToken: "d", startToken: nil, env: "sandbox", relay: relay),
+            PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "production", relay: relay),
+            PushRegistrar.signature(deviceToken: "d", startToken: "s", env: "sandbox", relay: URL(string: "https://relay.example.com")!)
         ]
         XCTAssertEqual(Set(variants + [base]).count, 6)
+    }
+
+    // MARK: - Registration steps
+
+    func testNothingHappensUnpairedOrWithoutADeviceToken() {
+        let stored = PushPassStore.Stored(pass: "p1.a", signature: "sig")
+        XCTAssertEqual(PushRegistrar.step(paired: false, signature: "sig", stored: stored), .idle)
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: nil, stored: stored), .idle)
+    }
+
+    func testFirstRegistrationAsksTheRelay() {
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: nil), .register(replacing: nil))
+    }
+
+    // Same tokens: every sync re-posts the stored pass to the daemon (it may
+    // have lost the record), and never mints a second relay channel.
+    func testUnchangedRegistrationRepostsTheStoredPass() {
+        let stored = PushPassStore.Stored(pass: "p1.a", signature: "sig")
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "sig", stored: stored), .post(pass: "p1.a"))
+    }
+
+    // A token changed (rotation, Live Activities turned on or off):
+    // re-register and retire the old pass.
+    func testChangedTokensReRegisterAndRetireTheOldPass() {
+        let stored = PushPassStore.Stored(pass: "p1.old", signature: "old-sig")
+        XCTAssertEqual(PushRegistrar.step(paired: true, signature: "new-sig", stored: stored), .register(replacing: "p1.old"))
+    }
+
+    func testPassStoreRoundTripsThroughTheKeychain() {
+        PushPassStore.clear()
+        defer { PushPassStore.clear() }
+        XCTAssertNil(PushPassStore.load())
+        PushPassStore.save(.init(pass: "p1.x", signature: "s1"))
+        XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.x", signature: "s1"))
+        PushPassStore.save(.init(pass: "p1.y", signature: "s2"))
+        XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.y", signature: "s2"))
+    }
+
+    // MARK: - Duplicate Live Activities
+
+    func testOnlyTheNewestActivitySurvives() {
+        XCTAssertEqual(PushRegistrar.activityIDsToEnd(current: [], firstSeen: [:]), [])
+        XCTAssertEqual(PushRegistrar.activityIDsToEnd(current: ["a"], firstSeen: [:]), [])
+        // Never seen start in this process: the system's last one wins.
+        XCTAssertEqual(PushRegistrar.activityIDsToEnd(current: ["a", "b", "c"], firstSeen: [:]), ["a", "b"])
+        // Seen start here: the latest seen wins over system order.
+        XCTAssertEqual(PushRegistrar.activityIDsToEnd(current: ["b", "a", "c"], firstSeen: ["c": 0, "b": 1]), ["a", "c"])
+        XCTAssertEqual(PushRegistrar.activityIDsToEnd(current: ["x", "y"], firstSeen: ["x": 3]), ["y"])
     }
 
     func testHexToken() {
