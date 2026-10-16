@@ -536,3 +536,13 @@ test("stop clears a pending backlog follow-up", async (t) => {
   h.push.stop();
   assert.equal(h.pending.size, 0);
 });
+
+test("over 200 open questions never re-alert an old one", async (t) => {
+  const qs = Array.from({ length: 210 }, (_, i) => question(`fq${i}`));
+  const h = harness(t, { questions: qs });
+  for (let i = 0; i < 45; i++) await h.push.flush();
+  const ids = h.sent.filter((s) => s.type === "alert").map((a) => a.collapseId);
+  assert.equal(ids.length, 210);
+  assert.equal(new Set(ids).size, 210);
+  assert.equal(h.store.get(NODE).notified.length, 210);
+});

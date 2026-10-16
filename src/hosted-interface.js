@@ -341,7 +341,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       })
     : null;
   // A revoked phone must stop receiving pushes; revocation must not fail on it.
-  const forgetMobilePush = (nodeId) => {
+  // endActivity: the phone is not the one forgetting, so it will not end its
+  // own Live Activity.
+  const forgetMobilePush = (nodeId, { endActivity = false } = {}) => {
+    if (endActivity && mobilePush) void mobilePush.endActivity(mobilePushStore.get(nodeId));
     mobilePush?.forget(nodeId);
     try { mobilePushStore.remove(nodeId); } catch (error) {
       console.warn(`[openagi] could not remove ${nodeId}'s push registration: ${error.message}`);
@@ -1139,7 +1142,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         nodeControlBroker.removeNode(nodeId, "node credential was revoked by the main owner");
         nodeRegistry.revoke(nodeId);
-        forgetMobilePush(nodeId);
+        forgetMobilePush(nodeId, { endActivity: true });
         g2Requests?.sweep();
         return sendJson(res, 200, { ok: true, nodeId, revoked: true });
       }

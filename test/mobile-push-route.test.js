@@ -212,3 +212,19 @@ test("a pass the relay refused is answered renew: true until the phone brings a 
   assert.deepEqual(await fresh.json(), { ok: true, renew: false });
   assert.equal(records()[0].renew, false);
 });
+
+test("an owner revoke ends the phone's Live Activity before dropping its registration", async (t) => {
+  const { url, pair, relayed, records } = await boot(t);
+  const phone = await pair();
+  await phone.call("/mobile/push", { method: "POST", body: REGISTRATION });
+  for (let i = 0; i < 40 && !relayed.length; i += 1) await new Promise((r) => setTimeout(r, 100));
+  assert.equal(relayed[0].type, "activity-start");
+  const revoked = await fetch(`${url}/nodes/${encodeURIComponent(phone.nodeId)}/revoke`, {
+    method: "POST", headers: { authorization: `Bearer ${OWNER}` }
+  });
+  assert.equal(revoked.status, 200);
+  for (let i = 0; i < 40 && relayed.length < 2; i += 1) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(relayed[1].type, "activity-end");
+  assert.equal(relayed[1].pass, REGISTRATION.pass);
+  assert.deepEqual(records(), []);
+});

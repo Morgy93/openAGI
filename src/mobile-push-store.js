@@ -21,7 +21,6 @@ export const PUSH_PASS_MAX = 2000;
 export const PUSH_ENVS = Object.freeze(["sandbox", "production"]);
 
 const FILE_VERSION = 1;
-const NOTIFIED_MAX = 200;
 
 /// Check a phone's POST /mobile/push body. Returns { ok: true, value } or
 /// { ok: false, error }, never throws.
@@ -137,10 +136,12 @@ export class MobilePushStore {
     return true;
   }
 
+  /// `ids` are the still-open questions already alerted. All are kept: dropping
+  /// one would alert it again. The caller prunes closed ones, which bounds it.
   setNotified(nodeId, ids) {
     const record = this.records.get(nodeId);
     if (!record) return;
-    const next = [...new Set(ids)].slice(-NOTIFIED_MAX);
+    const next = [...new Set(ids)];
     if (next.length === record.notified.length && next.every((id, i) => id === record.notified[i])) return;
     record.notified = next;
     this.save();

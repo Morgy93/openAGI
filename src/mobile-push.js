@@ -195,6 +195,23 @@ export class MobilePush {
     this.live.delete(nodeId);
   }
 
+  /// The owner revoked the phone, so the phone never ends its own activity.
+  /// Ended here, best effort, before the registration (and with it the only
+  /// way to reach that activity) is dropped. Never rejects.
+  async endActivity(registration) {
+    if (!registration || registration.renew || registration.activities === false || registration.noLiveActivity) return;
+    const live = this.live.get(registration.nodeId);
+    if (live?.pass !== registration.pass && !registration.activity?.startedAt) return;
+    let state = null;
+    try { state = this.supervisor.getState(); } catch { /* end it empty */ }
+    const now = this.now();
+    try {
+      await this.sendActivity(registration, "activity-end", buildActivity(state, new Date(now)), { dismissAt: this.epoch(now) });
+    } catch (error) {
+      this.report(`could not end ${registration.nodeId}'s Live Activity: ${error?.message ?? error}`);
+    }
+  }
+
   /// Run a pass now. Overlapping calls coalesce into one more pass; the
   /// promise never rejects.
   flush() {
