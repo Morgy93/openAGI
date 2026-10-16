@@ -47,6 +47,9 @@ settings:
     CODE_SIGN_IDENTITY: "-"
     CODE_SIGNING_REQUIRED: "YES"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    # App Group ids are global across Apple teams; a team that cannot
+    # register this one overrides it (xcodebuild OPENAGI_APP_GROUP=...).
+    OPENAGI_APP_GROUP: group.sh.openagi.mobile
 targets:
   OpenAGI:
     type: application
@@ -57,6 +60,7 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         UILaunchScreen: {}
         CFBundleURLTypes:
           - CFBundleURLName: sh.openagi.pair
@@ -76,7 +80,7 @@ targets:
     entitlements:
       path: Sources/OpenAGI.entitlements
       properties:
-        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        com.apple.security.application-groups: [$(OPENAGI_APP_GROUP)]
         keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
         # Archive/export rewrites this to "production" from the
         # distribution profile.
@@ -104,12 +108,13 @@ targets:
       path: Widget/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI Today
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:
       path: Widget/OpenAGIWidget.entitlements
       properties:
-        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        com.apple.security.application-groups: [$(OPENAGI_APP_GROUP)]
         keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
   # Notification Service Extension: decrypts a supervisor alert and adds its
   # answer buttons. Shares the keychain group (push key) with the app and
@@ -130,13 +135,14 @@ targets:
       path: Notify/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI Notify
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
     entitlements:
       path: Notify/OpenAGINotify.entitlements
       properties:
-        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        com.apple.security.application-groups: [$(OPENAGI_APP_GROUP)]
         keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
   OpenAGITests:
     type: bundle.unit-test

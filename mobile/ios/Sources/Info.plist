@@ -54,6 +54,8 @@
 	<string>OpenAGI talks to the daemon on your own machine.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+	<key>OpenAGIAppGroup</key>
+	<string>$(OPENAGI_APP_GROUP)</string>
 	<key>OpenAGIPushRelay</key>
 	<string>$(OPENAGI_PUSH_RELAY)</string>
 	<key>UIBackgroundModes</key>
