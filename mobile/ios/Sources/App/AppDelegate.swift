@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                                  defaultActionIdentifier: UNNotificationDefaultActionIdentifier,
                                                  userInfo: response.notification.request.content.userInfo)
         let notificationID = response.notification.request.identifier
-        nonisolated(unsafe) let done = completionHandler
+        let done = UncheckedSendableBox(value: completionHandler)
         Task { @MainActor in
             switch action {
             case .open?:
@@ -46,7 +46,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             case nil:
                 break
             }
-            done()
+            done.value()
         }
     }
 }

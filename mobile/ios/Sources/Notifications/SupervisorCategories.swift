@@ -40,13 +40,32 @@ enum SupervisorCategories {
         return result
     }
 
-    static func register(_ category: UNNotificationCategory, center: UNUserNotificationCenter = .current()) async {
-        let existing = await center.notificationCategories()
-        let inUse = Set(await center.deliveredNotifications().map(\.request.content.categoryIdentifier))
-        center.setNotificationCategories(merged(existing: existing, adding: category, inUse: inUse))
-        // Reading the set back waits for the write to land. Without it, an
-        // extension that hands its content over straight away can have the
-        // alert shown before its category exists, with no buttons.
-        _ = await center.notificationCategories()
+    // Completion-handler APIs rather than async ones, so no non-Sendable
+    // UserNotifications object ever crosses an isolation boundary (Swift 6.1
+    // strict concurrency rejects that). `completion` runs once the write has
+    // landed.
+    static func register(_ category: UNNotificationCategory, center: UNUserNotificationCenter = .current(),
+                         completion: @escaping @Sendable () -> Void = {}) {
+        let box = UncheckedSendableBox(value: (category: category, center: center))
+        center.getNotificationCategories { existing in
+            let existingBox = UncheckedSendableBox(value: existing)
+            box.value.center.getDeliveredNotifications { delivered in
+                let inUse = Set(delivered.map(\.request.content.categoryIdentifier))
+                box.value.center.setNotificationCategories(
+                    merged(existing: existingBox.value, adding: box.value.category, inUse: inUse))
+                // Reading the set back waits for the write to land. Without
+                // it, an extension that hands its content over straight away
+                // can have the alert shown before its category exists, with
+                // no buttons.
+                box.value.center.getNotificationCategories { _ in completion() }
+            }
+        }
     }
+}
+
+// Carries a value that is not Sendable across a closure or task boundary
+// where the code guarantees it is never used from two places at once. Used
+// instead of `nonisolated(unsafe)` captures, which Swift 6.1 rejects.
+struct UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
 }

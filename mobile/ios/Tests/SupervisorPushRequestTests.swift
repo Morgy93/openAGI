@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 @testable import OpenAGI
 
@@ -263,6 +264,47 @@ final class SupervisorPushRequestTests: XCTestCase {
         XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.x", signature: "s1"))
         PushPassStore.save(.init(pass: "p1.y", signature: "s2"))
         XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.y", signature: "s2"))
+    }
+
+    // forget() bumps the generation and marks the node forgotten; an
+    // in-flight sync must stop at its next step.
+    func testSyncStopsOnceForgottenOrRepaired() {
+        XCTAssertTrue(PushRegistrar.isCurrent(started: 3, now: 3, startedNodeID: "n", currentNodeID: "n", forgotten: []))
+        XCTAssertFalse(PushRegistrar.isCurrent(started: 3, now: 4, startedNodeID: "n", currentNodeID: "n", forgotten: []),
+                       "forget ran since the sync started")
+        XCTAssertFalse(PushRegistrar.isCurrent(started: 3, now: 3, startedNodeID: "n", currentNodeID: "n", forgotten: ["n"]),
+                       "node already forgotten, credentials not cleared yet")
+        XCTAssertFalse(PushRegistrar.isCurrent(started: 3, now: 3, startedNodeID: "n", currentNodeID: nil, forgotten: []),
+                       "credentials gone")
+        XCTAssertFalse(PushRegistrar.isCurrent(started: 3, now: 3, startedNodeID: "n", currentNodeID: "m", forgotten: []),
+                       "re-paired to another node")
+    }
+
+    // MARK: - Background assertion
+
+    @MainActor
+    func testBackgroundTaskEndsOnceWhenItExpires() {
+        var expiration: (@MainActor () -> Void)?
+        var ended: [UIBackgroundTaskIdentifier] = []
+        var expired = 0
+        let guardTask = BackgroundTaskGuard(beginTask: { handler in expiration = handler; return UIBackgroundTaskIdentifier(rawValue: 7) },
+                                            endTask: { ended.append($0) })
+        guardTask.begin { expired += 1 }
+        expiration?()
+        guardTask.end()
+        XCTAssertEqual(expired, 1)
+        XCTAssertEqual(ended, [UIBackgroundTaskIdentifier(rawValue: 7)])
+    }
+
+    @MainActor
+    func testBackgroundTaskEndsOnceOnTheNormalPath() {
+        var ended = 0
+        let guardTask = BackgroundTaskGuard(beginTask: { _ in UIBackgroundTaskIdentifier(rawValue: 9) },
+                                            endTask: { _ in ended += 1 })
+        guardTask.begin {}
+        guardTask.end()
+        guardTask.end()
+        XCTAssertEqual(ended, 1)
     }
 
     // MARK: - Duplicate Live Activities

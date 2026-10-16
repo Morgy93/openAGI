@@ -69,7 +69,8 @@ enum SupervisorAnswerSender {
                 return .of(error: error, delivery: nil)
             }
         }
-        let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "supervisor-answer") { work.cancel() }
+        let backgroundTask = BackgroundTaskGuard()
+        backgroundTask.begin { work.cancel() }
         let outcome = await work.value
 
         switch outcome {
@@ -81,7 +82,7 @@ enum SupervisorAnswerSender {
             await postNotSent(title: "Not sent", questionID: questionID, replacing: notificationID,
                               body: "Couldn't send your answer. " + notSentBody)
         }
-        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask.end()
     }
 
     // Same identifier as the alert, so it replaces it (and its buttons)
@@ -96,7 +97,9 @@ enum SupervisorAnswerSender {
         content.categoryIdentifier = SupervisorPushContent.baseCategory
         content.userInfo = [SupervisorPushContent.questionIdKey: questionID]
         let request = UNNotificationRequest(identifier: notificationID, content: content, trigger: nil)
-        try? await UNUserNotificationCenter.current().add(request)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            UNUserNotificationCenter.current().add(request) { _ in continuation.resume() }
+        }
     }
 
     // The daemon cannot take back an alert it already pushed when the
@@ -104,9 +107,14 @@ enum SupervisorAnswerSender {
     static func clearClosedAlerts(client: DaemonClient) async {
         guard let state = try? await client.fleetState() else { return }
         let center = UNUserNotificationCenter.current()
-        let delivered = await center.deliveredNotifications().map { notification in
-            (id: notification.request.identifier,
-             questionID: notification.request.content.userInfo[SupervisorPushContent.questionIdKey] as? String)
+        // Only Sendable strings leave the callback.
+        let delivered = await withCheckedContinuation { (continuation: CheckedContinuation<[(id: String, questionID: String?)], Never>) in
+            center.getDeliveredNotifications { notifications in
+                continuation.resume(returning: notifications.map { notification in
+                    (id: notification.request.identifier,
+                     questionID: notification.request.content.userInfo[SupervisorPushContent.questionIdKey] as? String)
+                })
+            }
         }
         let stale = staleNotificationIDs(delivered: delivered, open: Set(state.questions.map(\.id)))
         if !stale.isEmpty { center.removeDeliveredNotifications(withIdentifiers: stale) }
@@ -118,5 +126,41 @@ enum SupervisorAnswerSender {
             guard let questionID = entry.questionID, !open.contains(questionID) else { return nil }
             return entry.id
         }
+    }
+}
+
+// One background assertion, ended exactly once: by the normal path or by
+// the expiration handler, whichever comes first. Leaving an expired
+// assertion un-ended gets the app killed. `beginTask` / `endTask` are
+// injectable so the once-only rule is testable without UIApplication.
+@MainActor
+final class BackgroundTaskGuard {
+    typealias Begin = (_ expiration: @escaping @MainActor () -> Void) -> UIBackgroundTaskIdentifier
+
+    private let beginTask: Begin
+    private let endTask: (UIBackgroundTaskIdentifier) -> Void
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    init(name: String = "supervisor-answer",
+         beginTask: Begin? = nil,
+         endTask: ((UIBackgroundTaskIdentifier) -> Void)? = nil) {
+        self.beginTask = beginTask ?? { expiration in
+            UIApplication.shared.beginBackgroundTask(withName: name, expirationHandler: expiration)
+        }
+        self.endTask = endTask ?? { UIApplication.shared.endBackgroundTask($0) }
+    }
+
+    func begin(onExpire: @escaping @MainActor () -> Void) {
+        identifier = beginTask { [weak self] in
+            onExpire()
+            self?.end()
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+        let ending = identifier
+        identifier = .invalid
+        endTask(ending)
     }
 }

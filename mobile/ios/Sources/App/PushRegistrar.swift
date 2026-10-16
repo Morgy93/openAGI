@@ -51,8 +51,15 @@ final class PushRegistrar {
     private var activityTask: Task<Void, Never>?
     // Order this process first saw each activity in; the newest one is kept.
     private var activityFirstSeen: [String: Int] = [:]
-    private var syncing = false
+    private var syncTask: Task<Void, Never>?
     private var syncAgain = false
+    // Bumped by forget(). A sync started under an older generation stops at
+    // its next step instead of saving a pass or posting to the daemon.
+    private var generation = 0
+    // Pairings already forgotten. Credentials outlive forget() for a moment
+    // (AppModel still revokes, then clears them); no sync may restart for
+    // them in that window.
+    private var forgottenNodeIDs: Set<String> = []
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -61,11 +68,10 @@ final class PushRegistrar {
     // Called once a pairing exists (RootTabView appears). Safe to call again.
     func start() async {
         guard Credentials.load() != nil else { return }
-        let center = UNUserNotificationCenter.current()
-        await SupervisorCategories.register(SupervisorCategories.base(), center: center)
-        _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
-        // Asked for whatever the answer above: a Live Activity started by push
-        // needs no notification permission.
+        SupervisorCategories.register(SupervisorCategories.base())
+        // Not awaited: whatever the answer, the device token is asked for. A
+        // Live Activity started by push needs no notification permission.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         UIApplication.shared.registerForRemoteNotifications()
         observeStartTokens()
         observeActivities()
@@ -97,9 +103,12 @@ final class PushRegistrar {
     private func observeActivities() {
         guard activityTask == nil else { return }
         endOlderActivities()
-        activityTask = Task { [weak self] in
+        // Detached so the non-Sendable Activity never leaves this task; only
+        // its id hops to the main actor.
+        activityTask = Task.detached { [weak self] in
             for await activity in Activity<SupervisorActivityAttributes>.activityUpdates {
-                self?.noteActivity(id: activity.id)
+                let id = activity.id
+                await self?.noteActivity(id: id)
             }
         }
     }
@@ -114,10 +123,14 @@ final class PushRegistrar {
             .filter { $0.activityState == .active || $0.activityState == .stale }
         let ending = Set(Self.activityIDsToEnd(current: live.map(\.id), firstSeen: activityFirstSeen))
         guard !ending.isEmpty else { return }
-        Task {
-            for activity in Activity<SupervisorActivityAttributes>.activities where ending.contains(activity.id) {
-                await activity.end(nil, dismissalPolicy: .immediate)
-            }
+        Task { await Self.endActivities(ids: ending) }
+    }
+
+    // Nonisolated, so each Activity is fetched and ended in one isolation
+    // domain and never sent across. nil ends every one.
+    nonisolated private static func endActivities(ids: Set<String>?) async {
+        for activity in Activity<SupervisorActivityAttributes>.activities where ids?.contains(activity.id) ?? true {
+            await activity.end(nil, dismissalPolicy: .immediate)
         }
     }
 
@@ -125,17 +138,31 @@ final class PushRegistrar {
     // Overlapping calls fold into one follow-up run instead of racing two
     // relay registrations.
     func sync() async {
-        if syncing { syncAgain = true; return }
-        syncing = true
-        defer { syncing = false }
-        repeat {
-            syncAgain = false
-            await syncOnce()
-        } while syncAgain
+        if let running = syncTask {
+            syncAgain = true
+            await running.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            repeat {
+                self.syncAgain = false
+                await self.syncOnce()
+            } while self.syncAgain && !Task.isCancelled
+        }
+        syncTask = task
+        await task.value
+        syncTask = nil
     }
 
     private func syncOnce() async {
-        let credentials = Credentials.load()
+        let started = generation
+        guard let credentials = Credentials.load(), !forgottenNodeIDs.contains(credentials.nodeID) else { return }
+        // Checked after every await: forget() may have run meanwhile.
+        func stillCurrent() -> Bool {
+            Self.isCurrent(started: started, now: generation, startedNodeID: credentials.nodeID,
+                           currentNodeID: Credentials.load()?.nodeID, forgotten: forgottenNodeIDs)
+        }
         let deviceToken = defaults.string(forKey: Keys.deviceToken)
         // Live Activities switched off in Settings: register as alerts-only
         // rather than hand the relay a token that can start nothing.
@@ -147,7 +174,7 @@ final class PushRegistrar {
         let stored = PushPassStore.load()
 
         var pass: String
-        switch Self.step(paired: credentials != nil, signature: signature, stored: stored) {
+        switch Self.step(paired: true, signature: signature, stored: stored) {
         case .idle:
             return
         case let .post(existing):
@@ -156,12 +183,17 @@ final class PushRegistrar {
             guard let deviceToken, let signature,
                   let fresh = try? await relay.register(deviceToken: deviceToken, startToken: startToken, env: Self.env)
             else { return }
+            guard stillCurrent() else {
+                // Forgotten while the relay answered: retire what it made.
+                try? await relay.unregister(pass: fresh)
+                return
+            }
             pass = fresh
             PushPassStore.save(.init(pass: fresh, signature: signature))
             if let replacing { try? await relay.unregister(pass: replacing) }
         }
 
-        guard let credentials, let key = try? PushKeyStore.loadOrCreate() else { return }
+        guard stillCurrent(), let key = try? PushKeyStore.loadOrCreate() else { return }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         // A failure here is retried on the next sync with the same pass.
         try? await client.registerPush(pass: pass, key: key.base64URLEncodedString(), env: Self.env,
@@ -174,15 +206,21 @@ final class PushRegistrar {
     // for this pairing opens again. Tokens are kept: they belong to the
     // phone, not the pairing.
     func forget(client: DaemonClient) async {
+        generation += 1
+        if let nodeID = Credentials.load()?.nodeID { forgottenNodeIDs.insert(nodeID) }
+        // Cancel and wait out an in-flight sync, so it cannot save a pass or
+        // post to the daemon after the cleanup below.
+        if let running = syncTask {
+            running.cancel()
+            await running.value
+        }
         try? await client.unregisterPush()
         if let stored = PushPassStore.load() {
             PushPassStore.clear()
             try? await PushRelayClient().unregister(pass: stored.pass)
         }
         PushKeyStore.clear()
-        for activity in Activity<SupervisorActivityAttributes>.activities {
-            await activity.end(nil, dismissalPolicy: .immediate)
-        }
+        await Self.endActivities(ids: nil)
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()
         center.removeAllPendingNotificationRequests()
@@ -195,6 +233,12 @@ final class PushRegistrar {
         guard paired, let signature else { return .idle }
         if let stored, stored.signature == signature { return .post(pass: stored.pass) }
         return .register(replacing: stored?.pass)
+    }
+
+    // Whether a sync that started under `started` may take its next step.
+    nonisolated static func isCurrent(started: Int, now: Int, startedNodeID: String,
+                                      currentNodeID: String?, forgotten: Set<String>) -> Bool {
+        started == now && currentNodeID == startedNodeID && !forgotten.contains(startedNodeID)
     }
 
     // Keeps the newest: first seen latest in this process, and among ones

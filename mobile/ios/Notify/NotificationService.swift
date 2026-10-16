@@ -38,13 +38,11 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
         let rewritten = content.copy() as? UNNotificationContent ?? content
         lock.withLock { bestAttempt = rewritten }
 
-        // Neither type is Sendable; both are built here and never touched
-        // again outside the task.
-        nonisolated(unsafe) let category = SupervisorCategories.category(for: alert)
-        nonisolated(unsafe) let delivered = rewritten
-        Task {
-            await SupervisorCategories.register(category)
-            self.finish(with: delivered)
+        // Content is not Sendable; it is built here and only read again by
+        // the one completion below.
+        let delivered = UncheckedSendableBox(value: rewritten)
+        SupervisorCategories.register(SupervisorCategories.category(for: alert)) { [self] in
+            finish(with: delivered.value)
         }
     }
 

@@ -165,7 +165,10 @@ Setup (owner, once):
 3. **Relay.** Deploy `relay/` and `wrangler secret put` `APNS_KEY_P8`,
    `APNS_KEY_ID`, `APNS_TEAM_ID`, `PASS_KEY`. The app uses
    `https://push.openagi.sh`; a self-hosted relay goes in the
-   `OPENAGI_PUSH_RELAY` build setting (Info.plist key `OpenAGIPushRelay`).
+   `OPENAGI_PUSH_RELAY` build setting (Info.plist key `OpenAGIPushRelay`),
+   **and** the daemon must set its `OPENAGI_PUSH_RELAY` env to the same URL.
+   A pass only opens at the relay that issued it, so a mismatch makes every
+   send fail with `bad_pass`.
    Debug builds register as `sandbox`, Release (TestFlight, App Store) as
    `production`.
 
