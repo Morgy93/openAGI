@@ -157,3 +157,34 @@ test('fixture isolates persistent stores and uses offline embeddings', async (t)
   await runtime.vectorStore.upsert('memory', 'fixture-only', 'Synthetic delivery evidence');
   assert.equal((await runtime.vectorStore.search('memory', 'delivery evidence'))[0].id, 'fixture-only');
 });
+
+for (const [kind, body] of [
+  ['object', { material: 'zirconium' }],
+  ['array', [{ material: 'zirconium' }]],
+]) {
+  test(`structured ${kind} evidence retrieves prior context before scrutiny`, (t) => {
+    const runtime = fixture(t);
+    const prior = runtime.memory.remember({ content: 'zirconium', tags: [], source: 'synthetic-evidence' });
+    const unrelated = runtime.memory.remember({ content: 'unrelated', tags: [], source: 'synthetic-evidence' });
+    let evaluatedMemories;
+    runtime.scrutiny.evaluate = ({ memories }) => {
+      evaluatedMemories = memories;
+      return { action: 'observe', score: 0.6, reasons: ['retain useful evidence'], dimensions: {} };
+    };
+    const [output] = runtime.processIntegrationEvent('abi', signal(body));
+    assert.ok(evaluatedMemories.some(({ item }) => item.id === prior.id), 'scrutiny must receive body-matched context');
+    assert.ok(output.customContext.some(({ id }) => id === prior.id));
+    assert.ok(!output.customContext.some(({ id }) => id === unrelated.id));
+    assert.ok(output.memory.content.startsWith(JSON.stringify(body)));
+  });
+}
+
+for (const body of [undefined, null]) {
+  test(`missing ${body} body does not create an artificial recall match`, (t) => {
+    const runtime = fixture(t);
+    runtime.memory.remember({ content: String(body), tags: [], source: 'synthetic-evidence' });
+    const output = runtime.processSignal(signal(body));
+    assert.deepEqual(output.customContext, []);
+    assert.match(output.memory.content, /Project update/);
+  });
+}

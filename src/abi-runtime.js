@@ -605,8 +605,15 @@ export class AbiRuntime {
   }
 
   processSignal(signal, options = {}) {
+    // Use the same evidence for pre-decision recall and subsequent storage.
+    // Accepted JSON bodies must not collapse to "[object Object]" in queries.
+    const body = signal.content != null && typeof signal.content === "object"
+      ? JSON.stringify(signal.content)
+      : signal.content;
     const workflow = this.workflows.select(signal);
-    const memoryHits = this.memory.retrieve(`${signal.summary} ${signal.content} ${signal.tags?.join(" ") ?? ""}`, {
+    const memoryHits = this.memory.retrieve([signal.summary, body, ...(signal.tags ?? [])]
+      .filter((part) => part != null && part !== "")
+      .join(" "), {
       limit: 6,
       scope: options.scope
     });
@@ -650,11 +657,6 @@ export class AbiRuntime {
         score: scrutiny.score
       });
     } else if (!options.ephemeral) {
-      // Integration content may be any JSON value accepted by /ingest.
-      // Serialize structured evidence before comparison and memory hashing.
-      const body = signal.content != null && typeof signal.content === "object"
-        ? JSON.stringify(signal.content)
-        : signal.content;
       memoryItem = this.memory.remember(
         {
           source: signal.source,
