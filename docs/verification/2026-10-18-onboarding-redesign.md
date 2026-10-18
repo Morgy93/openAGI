@@ -34,6 +34,9 @@ Native model availability requires compatible hardware, OS, enabled Apple Intell
   narrow navigation, Escape dismissal, no horizontal overflow and dark appearance.
 - Native Mac and iOS compilation/tests, full runtime regression and packaged
   Windows/Linux smoke checks run on the final PR head in GitHub Actions.
+- CI follow-up: updated legacy navigation assertions, the model-setup handoff
+  smoke check, and the iOS model greeting expectation for availability reporting.
+  All 55 affected JavaScript tests and disposable source startup passed locally.
 
 | Surface | Evidence | Verified state |
 | --- | --- | --- |

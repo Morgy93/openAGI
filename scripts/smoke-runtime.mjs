@@ -43,7 +43,7 @@ try {
     const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)];
     assert.ok(scripts.length);
     for (const [, script] of scripts) new vm.Script(script);
-    assert.match(html, route === "/setup" ? /tab=get-started/ : /function renderGettingStarted/);
+    assert.match(html, route === "/setup" ? /tab=chat&onboarding=1/ : /function renderGettingStarted/);
   }
   console.log("Runtime boot, health, authenticated setup, and guided dashboard passed on " + process.platform + "/" + process.arch);
 } catch (error) {
