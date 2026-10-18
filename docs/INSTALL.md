@@ -110,10 +110,17 @@ below, for example with `v0.0.58`. The volume keeps state across replacements.
 Binding the published port to loopback keeps setup on this computer.
 
 ```sh
+OPENAGI_AUTH_TOKEN="$(openssl rand -hex 32)"
 docker run -d --name openagi --restart unless-stopped \
   -p 127.0.0.1:43210:43210 -v openagi-data:/data \
+  -e OPENAGI_AUTH_TOKEN="$OPENAGI_AUTH_TOKEN" \
   ghcr.io/spshulem/openagi:<version>
 ```
+
+The image requires this token because it listens on all interfaces inside the
+container. Open **http://127.0.0.1:43210/** and enter the generated token at
+the login prompt. Keep it in your password manager; treat it as the dashboard
+password. Configure your model in Settings after signing in.
 
 Docker provides the agent runtime, not native desktop screen access. Configure
 and pair a compatible computer node if you need interactive desktop tools.

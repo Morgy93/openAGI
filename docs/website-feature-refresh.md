@@ -2,9 +2,11 @@
 
 Copy and placement for the public OpenAGI site, audited against main and the
 v0.0.58 release on 2026-10-18. This is an editorial handoff, not a deployed
-website or a release announcement. The public site source was not present in
-this repository or the available Sites projects. The separate local
-`companion-site` is a hardware catalogue.
+website or a release announcement. The canonical site lives in
+[`buildbetter-app/bb-website/openagi`](https://github.com/buildbetter-app/bb-website/tree/main/openagi),
+and Vercel's `buildbetter/openagi` project deploys it from `main` to
+`openagi.sh` and `www.openagi.sh`. It is separate from this application repo.
+The separate local `companion-site` is a hardware catalogue.
 
 ## Hero supporting copy
 

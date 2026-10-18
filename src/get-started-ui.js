@@ -40,9 +40,11 @@ function renderGettingStarted() {
     if (className) node.className = className;
     return node;
   };
-  main.append(el("h2", "Make OpenAGI useful to you"));
-  main.append(el("p", "Pick one thing you want help with. Connect your model, then let the agent walk you through it in chat. You can skip a flow and come back any time.", "muted"));
-  main.append(el("p", progress.size + " of " + GET_STARTED_FLOWS.length + " flows tried in this browser. This is your checklist, not a connection or permission check.", "muted"));
+  const pane = el("div", "", "pane");
+  main.append(pane);
+  pane.append(el("h2", "Make OpenAGI useful to you"));
+  pane.append(el("p", "Pick one thing you want help with. Connect your model, then let the agent walk you through it in chat. You can skip a flow and come back any time.", "muted"));
+  pane.append(el("p", progress.size + " of " + GET_STARTED_FLOWS.length + " flows tried in this browser. This is your checklist, not a connection or permission check.", "muted"));
   const grid = el("div");
   Object.assign(grid.style, { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: "16px" });
   for (const flow of GET_STARTED_FLOWS) {
@@ -77,12 +79,12 @@ function renderGettingStarted() {
     card.append(label);
     grid.append(card);
   }
-  main.append(grid);
+  pane.append(grid);
   const guide = el("a", "Installation, troubleshooting, and first-use guide");
   guide.href = "https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md";
   guide.target = "_blank";
   guide.rel = "noopener noreferrer";
-  main.append(el("p", "Your agent's state is stored on its host. Model providers and connected services may receive the context needed for your requests. Start with non-sensitive examples.", "muted"), guide);
+  pane.append(el("p", "Your agent's state is stored on its host. Model providers and connected services may receive the context needed for your requests. Start with non-sensitive examples.", "muted"), guide);
 }
 
 export const getStartedUi = `const GET_STARTED_FLOWS = ${JSON.stringify(GET_STARTED_FLOWS)};\n`

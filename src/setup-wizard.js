@@ -533,7 +533,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
         '\\n\\n<span class="ok">MCPs registered:</span> ' +
         mcpResults.filter((r) => r.ok).map((r) => r.name ?? r.catalogId).join(", ") +
         (mcpResults.some((r) => !r.ok) ? '\\n<span class="err">Failed:</span> ' + mcpResults.filter((r) => !r.ok).map((r) => r.catalogId + " (" + r.error + ")").join(", ") : "");
-      const target = "/?tab=get-started";
+      const target = checkedMcps.length ? "/?tab=integrations" : "/?tab=get-started";
 
       // Bounce the daemon so existing integrations (Linear/BuildBetter/Sendblue
       // etc) re-read their .env values. The Mac app's DaemonController auto-
