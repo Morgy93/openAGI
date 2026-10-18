@@ -5,8 +5,8 @@
 import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
-  threadKey, toIso
+  SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, isSupervisorOwnPrompt, openReadOnlyDb, prRefKey,
+  redactSecrets, repoFromRemote, threadKey, toIso
 } from "../contracts.js";
 import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
 
@@ -14,6 +14,24 @@ const STATUS_MAP = Object.freeze({ working: "running", waiting: "waiting", idle:
 const TAIL_ROWS = 400;
 const MAX_STALE_MANAGER_ROWS = 10;
 const MIN_REF_PREFIX = 8;
+// The PRs a session created, newest first, at most this many.
+const MAX_PRS_CREATED = 12;
+// A PR's own link, not a comment or file link inside it.
+const PR_URL = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?![\d#/])/;
+// The PRs a session created: its gh pr create calls (its own or a
+// subagent's, local or over ssh) and the results that answer them, which
+// fall out of the tail. Read by LIKE over the session's rows once, then only
+// over rows sent since (the (session_id, sent_at) index): the whole of
+// cape-town (14,571 rows, 22 MB) takes ~35 ms, every session ~1.8 s.
+const PR_CREATE_SQL = `
+  SELECT content, sent_at, rowid AS row_id FROM session_messages
+  WHERE session_id = ? AND sent_at >= ? AND role = 'assistant'
+    AND (content LIKE '%gh pr create%' OR (content LIKE '%"tool_result"%' AND content LIKE '%github.com/%/pull/%'))
+  ORDER BY sent_at, rowid`;
+const CREATED_CACHE_MAX = 1_000;
+const CALLS_KEPT = 200;
+// "<db path>\n<session id>" -> { at, atRows, calls, refs }: what was read.
+const createdCache = new Map();
 
 const SESSIONS_SQL = `
   SELECT s.id, s.status, s.claude_session_id, s.title, s.model, s.updated_at, s.unread_count,
@@ -25,9 +43,25 @@ const SESSIONS_SQL = `
   WHERE COALESCE(s.is_hidden, 0) = 0 AND COALESCE(w.state, '') != 'archived'`;
 
 // (session_id, sent_at) is indexed, so these never scan a whole session.
-const TAIL_SQL = `
-  SELECT role, content, created_at, cancelled_at, sender_session_id, sender_api_key_name
+const tailSql = (turnColumn) => `
+  SELECT role, content, created_at, sent_at, rowid AS row_id, cancelled_at, sender_session_id, sender_api_key_name, ${turnColumn}
   FROM session_messages WHERE session_id = ? ORDER BY sent_at DESC, rowid DESC LIMIT ?`;
+// A turn with hundreds of subagent rows pushes its AskUserQuestion call out
+// of the tail. Both reads stay inside the current turn: "+session_id" keeps
+// the planner on the turn_id index (it would otherwise walk the whole
+// session by sent_at). Only a tool call named AskUserQuestion matches; rows
+// that merely mention it (file reads, greps) escape the quote.
+export const ASK_SQL = `
+  SELECT content, created_at, sent_at, rowid AS row_id FROM session_messages
+  WHERE turn_id = ? AND +session_id = ? AND role = 'assistant' AND content LIKE '%"name":"%AskUserQuestion"%'
+  ORDER BY sent_at DESC, rowid DESC LIMIT 50`;
+export const ASK_CLOSED_SQL = `
+  SELECT content FROM session_messages
+  WHERE turn_id = ? AND +session_id = ? AND role = 'assistant' AND (sent_at > ? OR (sent_at = ? AND rowid > ?))
+    AND (content LIKE ? OR content LIKE '%"subtype":"init"%' OR content LIKE '%"type":"result"%' OR content LIKE '%"type":"error"%')
+  ORDER BY sent_at, rowid LIMIT 50`;
+// An errored session shows no card, whatever its last rows say.
+const CARD_DEAD_STATUSES = new Set(["error"]);
 const TASKS_SQL = `
   SELECT content, created_at FROM session_messages
   WHERE session_id = ? AND sent_at >= ? AND role = 'assistant'
@@ -65,10 +99,20 @@ function eventText(event) {
     .map((block) => block.text).join("\n").trim();
 }
 
+// An answer the agent sent back over a session socket with SendMessage (to
+// a supervisor relay that has already exited) is its reply too: the
+// transcript is where it is read. A message to a subagent is not.
+function sentMessageText(event) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  const call = content.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
+    && typeof block.input?.message === "string");
+  return call ? call.input.message.trim() : "";
+}
+
 function summarizeTail(rowsNewestFirst) {
   const summary = {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
-    pendingAsk: null
+    lastSupervisorAt: null, pendingAsks: new Map(), fullText: "", fullAt: null, firstUserText: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
@@ -77,7 +121,9 @@ function summarizeTail(rowsNewestFirst) {
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
-      if (text && !text.startsWith(SUPERVISOR_PREFIX)) {
+      summary.firstUserText ??= text || null;
+      if (text.startsWith(SUPERVISOR_PREFIX)) summary.lastSupervisorAt = at;
+      else if (text) {
         summary.lastUserText = text;
         summary.lastUserAt = at;
       }
@@ -92,18 +138,31 @@ function summarizeTail(rowsNewestFirst) {
     // AskUserQuestion means the agent moved on without the pick.
     if (event.type === "system" && event.subtype === "init") {
       summary.turnStartedAt = at;
-      summary.pendingAsk = null;
+      summary.pendingAsks.clear();
     }
-    else if (event.type === "assistant" && !event.parent_tool_use_id) {
+    else if (event.type === "assistant" && event.parent_tool_use_id) {
+      // A subagent's card shows to the owner too; its own tool_result closes it.
+      const ask = askUserQuestion(event, at);
+      if (ask) summary.pendingAsks.set(ask.id, { ...ask, subagent: true });
+    }
+    else if (event.type === "assistant") {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
       const ask = askUserQuestion(event, at);
-      if (ask) summary.pendingAsk = ask;
-      const text = eventText(event);
+      if (ask) summary.pendingAsks.set(ask.id, ask);
+      // The answer it relayed beats any preamble text beside it.
+      const text = sentMessageText(event) || eventText(event);
       if (text) {
         summary.lastAgentText = text;
         summary.lastAgentAt = at;
+        // A "<synthetic>" row (a session limit notice) is not the agent's reply.
+        if (event.message?.model !== "<synthetic>") {
+          summary.fullText = text;
+          summary.fullAt = at;
+        }
       }
     } else if (event.type === "result") {
+      // The turn ended: no card of it is open any more.
+      summary.pendingAsks.clear();
       const errors = Array.isArray(event.errors) ? event.errors.join("; ") : "";
       // Limit errors arrive as subtype "success" with is_error set.
       const isError = event.is_error === true || event.is_error === 1;
@@ -111,30 +170,99 @@ function summarizeTail(rowsNewestFirst) {
       if (!isError && !summary.lastAgentText && event.result) {
         summary.lastAgentText = String(event.result);
         summary.lastAgentAt = at;
+        summary.fullText = summary.lastAgentText;
+        summary.fullAt = at;
       }
     } else if (event.type === "error") {
+      // The process died ("exited with code 143"): its card went with it.
+      summary.pendingAsks.clear();
       summary.lastEnd = { isError: true, text: String(event.content ?? ""), at };
-    } else if (event.type === "user" && summary.pendingAsk && answersTool(event, summary.pendingAsk.id)) {
-      summary.pendingAsk = null;
+    } else if (event.type === "user") {
+      for (const id of summary.pendingAsks.keys()) if (answersTool(event, id)) summary.pendingAsks.delete(id);
     }
   }
   return summary;
 }
 
-// Conductor's AskUserQuestion: the turn waits on the owner's pick while the
-// session reads "idle", and the question is in the tool call, not the text.
+// A gh pr create in any string of a tool call's input (a Bash command, an
+// ssh line). Read raw, never as JSON: there a newline is the two characters
+// backslash and n, so a gh pr create after a heredoc body has no word
+// boundary before it (madrid's #7586 went unseen).
+function createsPr(value, depth = 0) {
+  if (typeof value === "string") return /\bgh\s+pr\s+create\b/.test(value);
+  if (!value || typeof value !== "object" || depth > 4) return false;
+  return Object.values(value).some((item) => createsPr(item, depth + 1));
+}
+
+// The PRs this session created, newest first: each gh pr create call's
+// result, when it names one PR (the new one, or the one its branch already
+// has). A PR the chat only viewed, checked, listed, commented on or named
+// is not its own: another agent's PR, a stack base, one it reviewed.
+// readTo: the newest sent_at the tail already read; every row up to it was
+// in this read, so the next one starts there even when none matched.
+function readCreatedPrs(db, sessionId, dbPath, readTo = null) {
+  const key = `${dbPath ?? ""}\n${sessionId}`;
+  const seen = createdCache.get(key) ?? { at: "", atRows: new Set(), calls: [], refs: [] };
+  let rows;
+  try {
+    rows = db.prepare(PR_CREATE_SQL).all(sessionId, seen.at);
+  } catch {
+    // An older schema or a locked read: what was read before stands.
+    return [...seen.refs].reverse();
+  }
+  const calls = new Set(seen.calls);
+  const refs = [...seen.refs];
+  let { at, atRows } = seen;
+  for (const row of rows) {
+    const sentAt = String(row.sent_at ?? "");
+    if (sentAt === at && atRows.has(row.row_id)) continue;
+    if (sentAt !== at) { at = sentAt; atRows = new Set(); }
+    atRows.add(row.row_id);
+    const content = parseEvent(row.content)?.message?.content;
+    for (const block of Array.isArray(content) ? content : []) {
+      if (block?.type === "tool_use" && block.id && createsPr(block.input)) calls.add(block.id);
+      if (block?.type !== "tool_result" || !calls.has(block.tool_use_id)) continue;
+      const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
+      const links = new Set([...text.matchAll(new RegExp(PR_URL.source, "g"))].map((match) => prRefKey(`${match[1]}/${match[2]}`, Number(match[3]))));
+      if (links.size !== 1) continue;
+      const [ref] = links;
+      const index = refs.indexOf(ref);
+      if (index >= 0) refs.splice(index, 1);
+      refs.push(ref);
+    }
+  }
+  const tailAt = String(readTo ?? "");
+  if (tailAt > at) {
+    at = tailAt;
+    atRows = new Set(rows.filter((row) => String(row.sent_at ?? "") === tailAt).map((row) => row.row_id));
+  }
+  createdCache.delete(key);
+  if (createdCache.size >= CREATED_CACHE_MAX) createdCache.delete(createdCache.keys().next().value);
+  createdCache.set(key, { at, atRows, calls: [...calls].slice(-CALLS_KEPT), refs: refs.slice(-MAX_PRS_CREATED) });
+  return refs.slice(-MAX_PRS_CREATED).reverse();
+}
+
+// Conductor's AskUserQuestion: the tool call blocks the turn on the owner's
+// pick, so the session reads "working" the whole time, and the questions are
+// in the call, not the text.
 function askUserQuestion(event, at) {
   const content = Array.isArray(event.message?.content) ? event.message.content : [];
   const call = content.find((block) => block?.type === "tool_use" && /AskUserQuestion$/.test(String(block.name ?? "")));
   const questions = Array.isArray(call?.input?.questions) ? call.input.questions.filter((q) => q && typeof q.question === "string") : [];
   if (!call?.id || !questions.length) return null;
-  // The pick is a widget in Conductor: typed text does not answer it, so the
-  // choices ride in the text and the owner answers in the app.
   const choices = (q) => (Array.isArray(q.options) ? q.options : [])
     .map((option) => (typeof option === "string" ? option : option?.label))
     .filter((option) => typeof option === "string" && option.trim());
-  const text = questions.map((q) => (choices(q).length ? `${q.question.trim()} (${choices(q).join(" / ")})` : q.question.trim())).join(" / ");
-  return { id: String(call.id), at, text, options: [] };
+  // The card is a widget: typed text does not answer it. Every question is
+  // one item, with its full labels; Conductor always offers "Other" too.
+  const items = questions.map((q, index) => ({
+    index, itemId: `${call.id}:${index}`, header: typeof q.header === "string" ? q.header : null, question: q.question.trim(),
+    options: choices(q), multiSelect: q.multiSelect === true, freeText: true, at
+  }));
+  // The first question alone, as before cards (executor and older readers).
+  const first = items[0];
+  const text = first.options.length ? `${first.question} (${first.options.join(" / ")})` : first.question;
+  return { id: String(call.id), at, text, options: [], items };
 }
 
 function answersTool(event, id) {
@@ -142,8 +270,74 @@ function answersTool(event, id) {
   return content.some((block) => block?.type === "tool_result" && String(block.tool_use_id ?? "") === id);
 }
 
-function readRecentMessages(db, sessionId) {
-  return db.prepare(TAIL_SQL).all(sessionId, TAIL_ROWS);
+function readRecentMessages(db, sessionId, turnColumn) {
+  return db.prepare(tailSql(turnColumn)).all(sessionId, TAIL_ROWS);
+}
+
+// A session's opening prompt, which names a supervisor display chat. The
+// tail's earliest prompt is it only while the tail holds the whole session;
+// past that it is read once per session (it never changes), so a long
+// display chat stays excluded.
+const FIRST_PROMPT_SQL = `
+  SELECT content FROM session_messages
+  WHERE session_id = ? AND role = 'user' AND cancelled_at IS NULL AND sender_session_id IS NULL AND sender_api_key_name IS NULL
+  ORDER BY sent_at, rowid LIMIT 1`;
+const FIRST_PROMPTS_KEPT = 2000;
+const firstPrompts = new Map();
+
+function firstPromptOf(db, sessionId, rows, summary, cache, cacheKey) {
+  if (rows.length < TAIL_ROWS) return summary.firstUserText;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
+  const text = String(db.prepare(FIRST_PROMPT_SQL).get(sessionId)?.content ?? "").trim() || null;
+  if (cache.size >= FIRST_PROMPTS_KEPT) cache.delete(cache.keys().next().value);
+  cache.set(cacheKey, text);
+  return text;
+}
+
+// The open AskUserQuestion calls (the agent's or a subagent's) of the
+// current turn when the tail holds no start or end of that turn (the calls
+// fell out of it), oldest first. A later tool_result, init, result or error
+// row closes one, as in summarizeTail.
+function readOlderAsks(db, sessionId, rows) {
+  const turnId = currentTurnId(rows);
+  if (!turnId) return [];
+  const open = [];
+  for (const row of db.prepare(ASK_SQL).all(turnId, sessionId)) {
+    const event = parseEvent(row.content);
+    if (event?.type !== "assistant") continue;
+    const ask = askUserQuestion(event, dbTimeToIso(row.created_at));
+    if (!ask) continue;
+    const later = db.prepare(ASK_CLOSED_SQL).all(turnId, sessionId, row.sent_at, row.sent_at, row.row_id, `%${ask.id}%`);
+    const closed = later.some((other) => {
+      const next = parseEvent(other.content);
+      if (!next) return false;
+      return (next.type === "system" && next.subtype === "init") || next.type === "result" || next.type === "error" || (next.type === "user" && answersTool(next, ask.id));
+    });
+    if (!closed) open.unshift(event.parent_tool_use_id ? { ...ask, subagent: true } : ask);
+  }
+  return open;
+}
+
+// The turn of the newest row that has one. A trailing row with no turn_id
+// (an older build, a queued user row) or an ambient broadcast (system rows
+// such as commands_changed, which land on idle tabs too) does not name it.
+function currentTurnId(rowsNewestFirst) {
+  for (const row of rowsNewestFirst) {
+    if (!row.turn_id || row.cancelled_at) continue;
+    if (row.role !== "user") {
+      const event = parseEvent(row.content);
+      if (event?.type === "system" && event.subtype !== "init") continue;
+    }
+    return row.turn_id;
+  }
+  return null;
+}
+
+// Every open call of the turn as one card (a subagent's beside the agent's).
+function cardOf(asks, limits) {
+  if (!asks.length) return null;
+  const items = asks.flatMap((ask) => ask.items).map((item, index) => cleanCardItem({ ...item, index }, limits));
+  return { app: "conductor", cardId: asks[0].id, at: asks[0].at, count: items.length, items };
 }
 
 // Background tasks = task_started with no matching task_notification.
@@ -206,11 +400,43 @@ function workspaceTabs(rows) {
   return out;
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null }) {
+// A call can only still block on the owner while the process that made it
+// lives: no live peer, or one started after the call, means it died with it.
+function askOutlivedBy(ask, peer) {
+  if (!peer) return false;
+  const since = Date.parse(peer.startedAt ?? "");
+  return !(Number.isFinite(since) && Date.parse(ask.at ?? "") < since);
+}
+
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id", prompts = firstPrompts, dbFile = "" }) {
   const { limits } = config;
-  const summary = summarizeTail(readRecentMessages(db, row.id));
+  const rows = readRecentMessages(db, row.id, turnColumn);
+  const summary = summarizeTail(rows);
+  summary.firstUserText = firstPromptOf(db, row.id, rows, summary, prompts, `${dbFile}\n${row.id}`);
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
+  // An errored session lost its card, so it reads as stopped instead. Only a
+  // turn whose start and end are both outside the tail can hide one.
+  const live = !CARD_DEAD_STATUSES.has(row.status);
+  let asks = live ? [...summary.pendingAsks.values()] : [];
+  if (live && !summary.turnStartedAt && !summary.lastEnd) {
+    // Older calls of the turn join the ones the tail found; a tail card is never dropped.
+    const inTail = new Set(asks.map((ask) => ask.id));
+    asks = [...readOlderAsks(db, row.id, rows).filter((ask) => !inTail.has(ask.id)), ...asks];
+  }
+  // Idle is ambiguous. Older Conductor reports an AskUserQuestion wait as
+  // idle, but a process that died mid-call leaves the same rows (600a2afc).
+  // Only a live process that was already running at the call still holds it.
+  if (row.status === "idle") asks = asks.filter((ask) => askOutlivedBy(ask, peer));
+  // A process that died mid-card leaves its row "working". A peer started
+  // after the call, or none once the turn went silent, means the card died
+  // with it; no peer while rows still arrive is unknown, so the card stays.
+  else if (row.status === "working" && (peer || now - Date.parse(summary.lastAt ?? "") >= limits.silentTurnMs)) {
+    asks = asks.filter((ask) => askOutlivedBy(ask, peer));
+  }
+  const card = cardOf(asks, limits);
+  // The agent's own call first, as before cards (executor and older readers).
+  const pendingAsk = asks.find((ask) => !ask.subagent) ?? asks[0] ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
   const blockedOnOwner = peerBlockedOnOwner(peer);
   const { agentStatus: reported, error, abortReason, abortedAt = null } = blockedOnOwner
@@ -229,7 +455,8 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const title = row.title && row.title !== "Untitled" ? row.title : row.pr_title || row.directory_name || row.id;
   const selfIds = config.selfSessionIds ?? [];
-  const excluded = selfIds.includes(row.id) || (claudeSessionId && selfIds.includes(claudeSessionId)) ? "self"
+  const ownPrompt = isSupervisorOwnPrompt(row.title) || isSupervisorOwnPrompt(summary.firstUserText);
+  const excluded = ownPrompt || selfIds.includes(row.id) || (claudeSessionId && selfIds.includes(claudeSessionId)) ? "self"
     : !row.workspace_path ? "no-repo"
     : stale ? "stale"
     : null;
@@ -251,6 +478,8 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
     lastActivityAt: summary.lastAt ?? dbTimeToIso(row.updated_at),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
+    lastAgentFull: clampTailLines(redactSecrets(summary.fullText), limits.fullTextMax),
+    lastAgentFullAt: summary.fullAt,
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,
@@ -267,10 +496,16 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
       turnStartedAt: summary.turnStartedAt ?? summary.lastUserAt,
       abortReason,
       abortedAt,
+      lastSupervisorAt: summary.lastSupervisorAt,
       blockedOnOwner,
-      pendingQuestion: summary.pendingAsk
-        ? { text: clampText(redactSecrets(summary.pendingAsk.text), limits.bodyMax), options: summary.pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: summary.pendingAsk.at }
+      pendingQuestion: pendingAsk
+        ? { text: clampText(redactSecrets(pendingAsk.text), limits.bodyMax), options: pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pendingAsk.at }
         : null,
+      pendingCard: card,
+      // The PRs the chat created ("owner/repo#n"), newest first. The
+      // workspace branch alone goes stale: cape-town sat on merged #6817
+      // while its subagents opened #7089, #7343 and #7573 from other branches.
+      prCreated: readCreatedPrs(db, row.id, config.paths?.conductorDb, rows[0]?.sent_at ?? null),
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,
@@ -323,12 +558,14 @@ export async function listConductorThreads(config, options = {}) {
       .slice(0, MAX_STALE_MANAGER_ROWS);
     const peers = options.peers ?? readLivePeers(config, { isPidAlive });
     const tabs = workspaceTabs(rows);
+    // Older Conductor builds have no turn_id; the tail then stands alone.
+    const turnColumn = db.prepare("PRAGMA table_info(session_messages)").all().some((column) => column.name === "turn_id") ? "turn_id" : "NULL AS turn_id";
     const threads = [];
     for (const [list, stale] of [[recent, false], [manager, true]]) {
       for (const { row } of list) {
         // A query failure means the source is unknown this tick. Returning a
         // partial catalog would close questions from sessions we failed to read.
-        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null }));
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file }));
       }
     }
     return threads;

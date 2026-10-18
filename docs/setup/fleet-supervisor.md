@@ -1,6 +1,6 @@
 # Fleet supervisor
 
-Watches every recent Codex, Claude Code, and Conductor coding thread on this Mac.
+Watches every recent Codex, Claude Code, Conductor, and Antigravity coding thread on this Mac.
 Judges each PR from GitHub and BuildBot3, not from the agent's "done".
 Nudges stuck threads with your own wording. Asks you only for real decisions.
 
@@ -75,9 +75,13 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_IDLE_DRAIN` | on | `0` turns off the [idle watcher](#while-you-work) |
 | `OPENAGI_FLEET_IDLE_POLL_MS` | `15000` | How often the idle watcher reads idle time while sends wait |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
-| `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
+| `OPENAGI_FLEET_REVIEW_PROVIDER` | `codex` when `~/.codex/config.toml` uses codex-lb, else `claude` | Which model provider runs that review; `claude` pins the old behavior |
+| `OPENAGI_FLEET_REVIEW_MODEL` | `gpt-6-luna` on codex, `claude-sonnet-5` on claude | Model for that review (owner-confirmed); a `claude-*` name picks Claude |
 | `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
+| `OPENAGI_FLEET_JUDGE` | off | `1` turns on the [nudge judge](#judge) (needs a model too) |
+| `OPENAGI_FLEET_JUDGE_MODEL` | unset (judge off) | Model for the judge, run with `codex exec` through codex-lb, e.g. `gpt-6.1-sol` |
 | `OPENAGI_FLEET_STORAGE` | on with the supervisor | `0` turns off the [storage manager](#storage) |
+| `OPENAGI_FLEET_ANTIGRAVITY` | on | `0` stops reading and messaging [Antigravity](#antigravity) conversations |
 | `OPENAGI_FLEET_STORAGE_SD` | `/Volumes/Xtra` | The SD card the storage manager archives to |
 | `OPENAGI_FLEET_STORAGE_LOW_GB` | `100` | Mac free space below this starts safe cleanup and archiving |
 | `OPENAGI_FLEET_STORAGE_TARGET_GB` | `150` | Cleanup stops once the Mac has this much free |
@@ -141,6 +145,38 @@ To keep these files in version control, make `~/.openagi/skills` its own private
 - Deletes files only through the [storage manager](#storage) rules, and asks
   first for anything not clearly regenerable.
 - Agent text is untrusted: shown as plain text, never forwarded to other agents.
+
+## Antigravity
+
+Antigravity conversations show as `antigravity:<conversation id>` threads.
+
+**Read.** `~/.gemini/antigravity/conversation_summaries.db` lists them, and
+`conversations/<id>.db` holds each one's steps (protobuf). Both are the app's
+live SQLite (WAL) files. The supervisor opens one read-only only while the app
+has it open (its `-wal` and `-shm` exist); otherwise it reads an immutable
+snapshot, which creates and locks nothing. It never writes either.
+
+- Subagent conversations (research, self) are skipped; their parent shows.
+- A conversation with no workspace folder is out of scope (no repo).
+- Running: the run status, background commands or subagents (`not_fully_idle`).
+- Waiting on you: a tool step waits for your approval. Answer it in the app.
+
+**Limits.** "Individual quota reached ... Resets in 37m19s" (QUOTA_EXHAUSTED)
+is a usage limit. The reset comes from the error's `quotaResetTimeStamp`. If
+the app is running, the quota it reports wins: quota back means resume now;
+none left means the family's window reset. After reset + 2 min the thread
+gets one resume message, like a Claude or Codex cap.
+
+**Send.** Route `antigravity-send`: `agentapi send-message --title "OpenAGI
+supervisor" <id> <text>`, the app's own API. It finds the running language
+server from `ps` and `lsof` and gives its address and csrf token to that one
+child only; they are never logged. The conversation is read again first: a
+running turn, an open approval, or a message from you since the scan blocks
+the send. Antigravity shows the text as a "OpenAGI supervisor" message block,
+not as your bubble. Nothing is typed, so it works in every delivery mode.
+
+**Open.** Antigravity has no link to one conversation (its `antigravity://`
+scheme only imports from AI Studio). Open the app and pick it in the sidebar.
 
 ## Storage
 
@@ -419,9 +455,82 @@ on; the same outreach item updates in place. The supervisor's own questions
 - It runs in every mode. It only edits the supervisor's own list; it never
   messages a thread.
 
-The default model is `claude-sonnet-5`, confirmed by the owner on 2026-09-29. On
-26 hand-audited questions it agreed with the audit on 20, versus 17 for Haiku 4.5.
-Set `OPENAGI_FLEET_REVIEW_MODEL` to use another model.
+With codex-lb configured the review runs on `gpt-6-luna` through it, tool-free
+like the judge (owner decision 2026-10-13, after Claude usage limits failed 35
+reviews in a day). If that call fails it falls back to `claude-sonnet-5`, which
+is also the default without codex-lb (confirmed 2026-09-29: on 26 hand-audited
+questions it agreed with the audit on 20, versus 17 for Haiku 4.5). Set
+`OPENAGI_FLEET_REVIEW_PROVIDER=claude` to keep the review on Claude, and
+`OPENAGI_FLEET_REVIEW_MODEL` to use another model. Settings show which ran.
+
+## Judge
+
+Off by default. With `OPENAGI_FLEET_JUDGE=1` and `OPENAGI_FLEET_JUDGE_MODEL`
+set, a model reads the chat before each automatic nudge, so the supervisor
+stops sending the same note to every thread.
+
+- Reads: the thread, the PR (CI, failing checks, gates, blockers, open
+  threads), the agent's last full message (newest 6000 chars), the last 3
+  nudges, and the planned nudge.
+- Says one of: **send** one short message naming what is still missing,
+  **wait** (the agent already answered, or waits on CI, a queued run, a
+  reviewer, a limit), or **ask you** (it needs your decision, approval or a
+  credential). Your answer goes to the agent like any agent question.
+- Only in Auto, only for merge-ready, ci-finished, status-check,
+  idle-report, bb3-slow-agent and resume. A resume after a limit reset or an
+  error stays automatic. Your answers and messages are never judged.
+- At most 6 calls per scan, 3 at once. A verdict holds 2 hours while the
+  chat, playbook and PR facts are the same. Cooldowns and the same-message
+  guard still apply to its sends.
+- A failure or timeout (90 s) waits; nothing is sent blind. A scan where
+  every call failed pauses the judge 5 minutes.
+- Runs `codex exec --ephemeral -s read-only` in a temp dir with the fleet's
+  child env plus `CODEX_LB_API_KEY` from `~/.codex/codex-lb.env`.
+- Every verdict shows in **Doing** (`Judge: send`, `wait`, `ask-owner`).
+
+## Voice
+
+On main, `OPENAGI_VOICE=1` opens `WSS /nodes/voice`. Each device opens it on
+the owner's gesture (hotkey, mic button, G2 tap; never a wake word) with the
+subprotocols `openagi-voice` and its token: the owner token on the Mac, the
+paired phone token, or the G2 token. Main holds one `gpt-realtime-2.1` session
+per device, runs the fleet tools as the owner, and writes both sides into the
+shared Supervisor thread. Every action that changes something is read back
+with a code; only the owner's own words ("yes 42") run it, heard in the input
+transcript, never in the model's reply. Voice approvals require the spoken
+code; a bare yes does not approve a pending action. Sessions close after 2 idle minutes
+and at 55 minutes.
+
+| Var | Default | Means |
+|---|---|---|
+| `OPENAGI_VOICE` | off | `1` opens the voice relay on main |
+| `OPENAGI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model (mini models are refused) |
+| `OPENAGI_VOICE_DAILY_USD` | `5` | Daily voice spend cap; the ledger channel is `voice` |
+
+The cap includes conservative reservations for audio and pending responses.
+Reservations are saved before work reaches OpenAI and settled when usage is
+reported, so concurrent devices and reconnects share the same remaining
+budget. An interrupted response whose usage never arrives keeps its reserve
+until the next UTC day. The displayed daily total includes those holds and
+can exceed reported usage. A reply reserves room for up to 1,024 output
+tokens and 8,000 conversation tokens plus instructions/tools, so voice may
+stop before the exact dollar ceiling when there is too little room for a
+whole reply. Failed budget writes stop voice.
+
+Frames: binary PCM16 mono (24 kHz; G2 16 kHz, resampled on main). JSON
+control: `start {gesture, mode?, focus?}`, `commit` (push-to-talk release),
+`barge {playedMs}`, `playback {itemId, playedMs}`, `context {focus}`, `mode {handsFree}`, `stop`.
+The device sends `playback` only after playing audio, using the `itemId` and
+full `audioMs` from `reply.done`. Audio readbacks need this acknowledgement
+before a later spoken approval is eligible; provider completion is insufficient.
+A barge invalidates the interrupted readback.
+`node scripts/voice-smoke.mjs` checks the live API with the key in
+`~/.openagi/.env`.
+
+Voice adds `fleet_walkthrough`, `voice_focus`, `fleet_diagnose` (counts for
+now), `feedback_record` and `self_fix_list/start/revise/stop`. Self-fix
+requests are stored on the coding Mac (`/fleet/api/fixes`); the runner that
+works them ships later.
 
 ## One supervisor shared by main, Android and G2
 
@@ -437,3 +546,53 @@ proactive inbox when Approvals notifications are enabled; this requires the
 backend update, not a glasses firmware update. Answering remains on the phone
 or main dashboard. Offline Macs retain their last snapshot with an unavailable
 status; no successful delivery is inferred from cached data.
+
+### Self-fix runner
+
+The hub keeps repair requests and dispatches them only to
+`OPENAGI_CODING_SUPERVISOR_NODE` through the `self-fix` capability. The Mac's
+outbound coding worker and enrolled Mac daemon advertise that capability.
+An offline Mac leaves requests queued. The agent opens and reviews PRs; the
+owner merges. There is no merge, release, deploy or restart operation.
+
+`OPENAGI_FLEET_SELF_FIX` accepts `off`, `propose` (default) or `auto`.
+Auto requests require confidence at least 0.8 and count toward the three starts
+per UTC day. Explicit owner requests also count. Limits can be lowered with
+`OPENAGI_FLEET_SELF_FIX_DAILY_CAP`, `OPENAGI_FLEET_SELF_FIX_WALL_MS`,
+`OPENAGI_FLEET_SELF_FIX_TOKEN_CAP` and `OPENAGI_FLEET_SELF_FIX_ROUNDS`.
+The hard ceilings are three starts/day, two hours, six million tokens and
+three review repairs, plus one owner revision. Stop all or switching Fleet to
+Observe cancels the process group. Failed and stopped worktrees are retained.
+
+On the Mac, configure Codex's codex-lb provider to use `CODEX_LB_API_KEY` and
+put that key in `~/.codex/codex-lb.env`. The runner uses
+`~/.ccodex/bin/codex`, only gpt-6.1-sol, and Node 22.21.1 from nvm.
+It prepares a dedicated clone under `~/Dev/openagi-fixes/_repo`. Prepare that
+clone's dependencies ahead of time, or set `OPENAGI_SELF_FIX_NODE_MODULES` to
+an existing compatible dependency cache. Worktrees link that cache; the runner
+does not install packages. It never uses the owner's development checkout.
+
+Create a dedicated fine-grained GitHub token: Settings > Developer settings >
+Personal access tokens > Fine-grained tokens > Generate new token. Select
+resource owner Spshulem, only repository openAGI, and repository permissions
+Contents: Read and write, Pull requests: Read and write, Metadata: Read.
+Protect main with required owner review: those write permissions alone do not
+prevent GitHub's merge endpoint. Save the token in
+`~/.openagi/self-fix-gh-token` owned by the Mac user with mode 0600, or supply
+`OPENAGI_SELF_FIX_GH_TOKEN`. No owner gh login is used. Missing or unsafe token
+files fail preflight and raise one deduplicated setup card on the hub.
+
+`GET /fleet/api/fixes` lists runs. `POST /fleet/api/fixes/:id/stop` stops one
+(or use id `all`); `POST /fleet/api/fixes/:id/revise` takes `{instructions}`.
+The owner card has Review PR, Request changes and Close PR. The web Request
+changes button collects instructions and uses the same revision path as the
+voice tool. A completed repair cleans up its own worktree and branch only
+when the owner's merge or closure is observed. Recovery after a runner crash
+fails closed and retains the interrupted worktree for inspection.
+
+Replay copies fleet state, action history and playbooks into temporary data
+directories. Both revisions see the same frozen sources and clock; external
+commands, notifications, pushes and delivery are disabled. A target metric
+must improve and untouched playbooks may not increase questions or sends by
+more than 10%. An unknown metric fails closed. P4's richer diagnostic metrics
+can extend this replay contract later.

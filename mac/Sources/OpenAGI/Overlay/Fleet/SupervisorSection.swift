@@ -18,6 +18,7 @@ struct SupervisorSection: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 8) {
+      VoiceButton()
       // One row: the tab already names the section and counts the questions.
       HStack(spacing: 6) {
         // One line, so the minute ticking over never changes the panel's height.
@@ -65,8 +66,11 @@ struct SupervisorSection: View {
             }
           }
         }
-        .frame(maxHeight: 300)
+        // Taller while a card is opened or a risky ask shows in full.
+        .frame(maxHeight: fleet.expandedQuestions.isEmpty && !fleet.questions.contains(where: \.risky) ? 300 : 420)
       }
+
+      WatchingList()
     }
   }
 
@@ -86,64 +90,78 @@ struct SupervisorSection: View {
 
   private func row(_ question: FleetQuestion) -> some View {
     let busy = fleet.inFlight.contains(question.id) || fleet.stillSending.contains(question.id)
-    let selected = overlay.fleetContext?.entityRef?.id == question.id
+    let selected = overlay.fleetContext?.entityRef?.id == question.id || overlay.voiceFocus.questionId == question.id
     let options = question.tappableOptions
+    let open = fleet.expandedQuestions.contains(question.id)
+    // A risky ask (release, deploy, delete, merge) is read in full before
+    // any button; so is an opened card.
+    let full = question.risky || open
+    let chat = question.openChat ?? question.chats.first
     return VStack(alignment: .leading, spacing: 4) {
+      if question.risky { FleetRiskyLabel() }
       HStack(alignment: .firstTextBaseline, spacing: 6) {
-        Button { overlay.chatAbout(question) } label: {
+        Button { fleet.toggleQuestion(question) } label: {
           Text(question.title)
             .font(.system(size: 12, weight: .semibold))
-            .lineLimit(3)
+            .lineLimit(full ? nil : 3)
             .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: full)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Chat with the supervisor about this question")
-        if let age = FleetConsumer.age(question.createdAt) {
+        .help(open ? "Show less" : "Show the agent's words, the PR and the next step")
+        if let age = FleetConsumer.age(question.askedTime) {
           Text(age).font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize()
+            .help("Asked \(question.askedTime ?? "")")
         }
+      }
+      if let place = Self.placeLine(question) {
+        Text(place).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(2)
       }
       if !question.body.isEmpty {
         // The daemon caps the body at 220 characters: about five lines here.
-        Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(6)
+        Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary)
+          .lineLimit(full ? nil : 6)
+          .fixedSize(horizontal: false, vertical: full)
       }
+      if question.risky && !open, let context = question.displayAskContext {
+        Text(context).font(.system(size: 11)).foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      if open { opened(question) }
       if let note = question.reviewNote {
         Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(2)
       }
-      if question.kind == "agent-ask" && !options.isEmpty {
+      if question.kind == "agent-ask" && !options.isEmpty && !question.answersInThread {
         Text("Your answer goes to the agent.").font(.system(size: 10)).foregroundStyle(.secondary)
       }
-      if question.answersInThread && options.isEmpty {
+      if question.answersInThread {
         // The supervisor can't carry this answer; it would only hand it back.
-        Text("Answer this in the agent's own app, then Scan now.")
-          .font(.system(size: 10)).foregroundStyle(.secondary)
-      } else if question.answersInThread {
-        // Tap a choice here, or type something else in the agent's own app.
-        Text("Or answer in the agent's own app, then Scan now.")
-          .font(.system(size: 10)).foregroundStyle(.tertiary)
+        let app = chat?.appName ?? "the agent's own app"
+        Text(options.isEmpty ? "Answer this in \(app), then Scan now." : "Or answer in \(app), then Scan now.")
+          .font(.system(size: 10)).foregroundStyle(options.isEmpty ? .secondary : .tertiary)
       }
       if !options.isEmpty {
-        ViewThatFits(in: .horizontal) {
-          HStack(spacing: 6) { optionButtons(question, options) }
-          VStack(alignment: .leading, spacing: 4) { optionButtons(question, options) }
-        }
-        .disabled(busy || offline)
+        FleetOptionButtons(question: question, options: options)
+          .disabled(busy || offline)
       }
       if let note = fleet.notes[question.id] {
-        HStack(alignment: .top, spacing: 6) {
-          Text(note.text).font(.system(size: 10))
-            .foregroundStyle(note.isError ? Color.red : Color.secondary)
-            .lineLimit(3)
-          Spacer(minLength: 4)
-          Button { fleet.clearNote(question.id) } label: {
-            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-          }
-          .buttonStyle(.plain)
-          .help("Hide")
-        }
+        FleetNoteRow(note: note) { fleet.clearNote(question.id) }
       }
       HStack(spacing: 8) {
+        if let chat, let title = FleetChatOpener.buttonTitle(chat) {
+          // An answer only the agent's app takes: this is the main button.
+          if question.answersInThread && options.isEmpty {
+            Button(title) { fleet.openChat(chat) }
+              .controlSize(.small).buttonStyle(.borderedProminent)
+              .help(chat.link == nil ? (chat.note ?? chat.label) : "Open \(chat.label)")
+          } else {
+            Button(title) { fleet.openChat(chat) }
+              .buttonStyle(.borderless).font(.system(size: 10))
+              .help(chat.link == nil ? (chat.note ?? chat.label) : "Open \(chat.label)")
+          }
+        }
         Button("Chat") { overlay.chatAbout(question) }
           .buttonStyle(.borderless).font(.system(size: 10))
           .help("Chat with the supervisor about this question")
@@ -161,29 +179,53 @@ struct SupervisorSection: View {
     .contextMenu { rowMenu(question, busy: busy) }
   }
 
-  /// The right-click twin of the row's Chat and Dismiss, as on task rows.
+  /// An opened card: the agent's words the ask came from, every chat a
+  /// grouped question is about, and its thread's PR, wait and next step.
+  @ViewBuilder private func opened(_ question: FleetQuestion) -> some View {
+    if let context = question.displayAskContext {
+      Text("The agent said:").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+      Text(context)
+        .font(.system(size: 11))
+        .lineLimit(question.risky ? nil : 12)
+        .textSelection(.enabled)
+    }
+    if question.chats.count > 1 {
+      ForEach(Array(question.chats.prefix(6).enumerated()), id: \.offset) { _, chat in
+        FleetOpenChatLine(chat: chat, prefix: "·")
+      }
+    } else if let chat = question.openChat ?? question.chats.first, chat.link == nil, let note = chat.note {
+      Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(2)
+    }
+    if let key = question.threadKey, fleet.thread(key) != nil || fleet.details[key] != nil {
+      let hasAgentWords = !(question.askContext ?? "").isEmpty
+      FleetThreadLines(summary: FleetThreadSummary(thread: fleet.thread(key), detail: fleet.details[key]),
+                       showsExcerpt: !hasAgentWords)
+    } else if let key = question.threadKey, fleet.detailLoading.contains(key) {
+      ProgressView().controlSize(.small)
+    }
+  }
+
+  /// "In remote-dev · Remote dev setup (Conductor) · asked 3h ago".
+  static func placeLine(_ question: FleetQuestion, now: Date = Date()) -> String? {
+    var parts: [String] = []
+    if let label = question.chatLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
+      parts.append("In \(label)")
+    }
+    if let at = question.askedTime.flatMap(FleetWatching.parseDate) {
+      parts.append("asked \(FleetThreadSummary.ago(at, now: now))")
+    }
+    guard !parts.isEmpty else { return nil }
+    let line = parts.joined(separator: " · ")
+    return line.prefix(1).uppercased() + line.dropFirst()
+  }
+
+  /// The right-click twin of the row's Open chat, Chat and Dismiss, as on task rows.
   @ViewBuilder private func rowMenu(_ question: FleetQuestion, busy: Bool) -> some View {
+    if let chat = question.openChat ?? question.chats.first, let title = FleetChatOpener.buttonTitle(chat) {
+      Button(title) { fleet.openChat(chat) }
+    }
     Button("Chat about this") { overlay.chatAbout(question) }
     Button("Dismiss") { Task { await fleet.dismiss(question) } }
       .disabled(busy || offline)
-  }
-
-  @ViewBuilder private func optionButtons(_ question: FleetQuestion, _ options: [String]) -> some View {
-    ForEach(Array(options.enumerated()), id: \.offset) { index, option in
-      optionButton(question, option, prominent: index == 0)
-    }
-  }
-
-  /// Shows a capitalized label; the daemon gets the option exactly as offered.
-  @ViewBuilder private func optionButton(_ question: FleetQuestion, _ option: String, prominent: Bool) -> some View {
-    let button = Button { Task { await fleet.answer(question, option: option) } } label: {
-      Text(question.label(for: option)).lineLimit(1)
-    }
-    .controlSize(.small)
-    if prominent {
-      button.buttonStyle(.borderedProminent)
-    } else {
-      button.buttonStyle(.bordered)
-    }
   }
 }

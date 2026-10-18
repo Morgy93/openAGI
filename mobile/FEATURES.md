@@ -113,12 +113,17 @@ coding thread and says which ones need you. This tab is its phone view.
   it is about, and one button per option plus Dismiss. The result shows
   inline: "Sent to the agent.", or "Saved. Couldn't reach the agent: …" when
   the answer was kept but the relay failed. An answer can take up to ~190s.
-- **Threads:** a count line ("3 red · 5 yellow · 12 green"), then every
-  thread sorted red, yellow, green, gray, most recent first within a colour.
-  A row is a health dot plus the colour named in words (colour is never the
-  only signal), the name (workspace, else title), the state in plain words,
-  a one-line reason, a PR chip (`#112 · CI failing`) and the last activity.
-- **Thread detail** (a sheet): repo and branch in mono, health, reason,
+- **Watching** (Android; iOS still shows **Threads** by health): every
+  thread grouped by what the supervisor watches it for, in this order:
+  Waiting on you, Working, Waiting on CI or BuildBot3, Needs a push, Blocked
+  by infra, Quiet (folded until tapped), then Out of scope (folded). A row is
+  the name, the PR short ref (`openAGI#112`, `alert` when CI fails), and how
+  long: "on BuildBot3 full run for 23m" on a waiting row, "for 12m" on the
+  rest, counting up every 30s while on screen. Longest wait first inside a
+  group; Quiet newest first. A daemon without `watch` groups by state.
+- **Thread detail** (a sheet): repo and branch in mono, health, what it
+  is watched for and how long, how long the turn has run, the wait, when the
+  agent last spoke, the last activity, reason,
   blockers, the PR (tap to open it in the browser), the supervisor's next
   step and why, any error, the last agent message in mono, and — in Propose
   mode — each proposed nudge for that thread with a Send button.

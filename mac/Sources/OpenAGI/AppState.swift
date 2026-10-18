@@ -136,6 +136,14 @@ final class AppState: ObservableObject {
     return Self.readEnvFile()["OPENAGI_AUTH_TOKEN"]
   }
 
+  func voiceConnection() throws -> VoiceConnection {
+    let captureURL = captureRemoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !captureURL.isEmpty {
+      return try VoiceConnection(base: captureURL, token: captureRemoteToken)
+    }
+    return try VoiceConnection(base: outreachRemoteURL.trimmingCharacters(in: .whitespacesAndNewlines), token: outreachToken)
+  }
+
   static func readEnvFile() -> [String: String] {
     let path = dataDir().appendingPathComponent(".env")
     guard let text = try? String(contentsOf: path, encoding: .utf8) else { return [:] }
@@ -599,6 +607,7 @@ final class AppState: ObservableObject {
 
   nonisolated static func requestMayStillBeRunning(after error: Error) -> Bool {
     let ns = error as NSError
+    if ns.domain == NSURLErrorDomain, [NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost, NSURLErrorNotConnectedToInternet].contains(ns.code) { return false }
     return ns.domain == NSURLErrorDomain || ns.domain == "OpenAGI.Transport"
   }
 
@@ -759,6 +768,44 @@ final class AppState: ObservableObject {
     throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
       NSLocalizedDescriptionKey: "The connection ended before completion was confirmed."
     ])
+  }
+
+  /// How a Quick Ask whose stream dropped ended, read back from its session.
+  enum OverlayRecovered: Equatable {
+    case answered(String)
+    case failed(String)
+  }
+
+  /// One read of the ask's session after the stream dropped: the reply the
+  /// daemon saved for this request id, if it has finished. Nil: still
+  /// running, or the read failed. GET only, so it can never send twice.
+  func overlayReply(sessionId: String, requestId: String) async -> OverlayRecovered? {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+    guard let id = sessionId.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+    var req = URLRequest(url: Self.buildURL(base: baseURL, path: "/sessions/" + id))
+    req.timeoutInterval = 6
+    if let token = authToken() { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    guard let (data, response) = try? await URLSession.shared.data(for: req),
+          let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+    return Self.overlayReply(in: data, requestId: requestId)
+  }
+
+  /// The last assistant message tagged with this request id. A failed turn
+  /// is saved as one too, with metadata.status "failed".
+  nonisolated static func overlayReply(in data: Data, requestId: String) -> OverlayRecovered? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let messages = object["messages"] as? [[String: Any]] else { return nil }
+    for message in messages.reversed() {
+      guard message["role"] as? String == "assistant",
+            let metadata = message["metadata"] as? [String: Any],
+            metadata["requestId"] as? String == requestId else { continue }
+      let text = (message["content"] as? String) ?? ""
+      if metadata["status"] as? String == "failed" {
+        return .failed(text.isEmpty ? "The agent could not complete that request." : text)
+      }
+      return .answered(text.isEmpty ? "(no reply)" : text)
+    }
+    return nil
   }
 
   /// Open the dashboard's chat tab ON a specific server-side session.

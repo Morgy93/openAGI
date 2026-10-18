@@ -1,5 +1,6 @@
 package sh.openagi.mobile.ui.markdown
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -25,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -44,14 +46,39 @@ import sh.openagi.mobile.ui.theme.OpenAGIType
 
 // Renders agent text as Markdown anywhere the app shows it: chat replies,
 // a thread's last message, supervisor questions. Links open in the browser.
+//
+// onCanvas: the text sits straight on `canvas` (a chat reply has no bubble).
+// In light mode a code block or table there is a `surface` card with an
+// `edge` hairline; the darker `edge` fill used elsewhere reads as a grey
+// smudge on the light canvas.
 @Composable
-fun MarkdownView(text: String, textColor: Color, modifier: Modifier = Modifier, style: TextStyle = OpenAGIType.body) {
+fun MarkdownView(text: String, textColor: Color, modifier: Modifier = Modifier, style: TextStyle = OpenAGIType.body, onCanvas: Boolean = false) {
     val blocks = remember(text) { Markdown.parse(text) }
-    MarkdownBlocksView(blocks, textColor, modifier, style)
+    MarkdownBlocksView(blocks, textColor, modifier, style, onCanvas)
+}
+
+// The fill and optional hairline for a code block or table.
+private data class BlockFrame(val fill: Color, val border: BorderStroke?)
+
+@Composable
+private fun blockFrame(onCanvas: Boolean, defaultFill: Color): BlockFrame {
+    val colors = LocalOpenAGIColors.current
+    val light = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    return if (onCanvas && light) {
+        BlockFrame(MaterialTheme.colorScheme.surface, BorderStroke(1.dp, colors.edge))
+    } else {
+        BlockFrame(defaultFill, null)
+    }
 }
 
 @Composable
-fun MarkdownBlocksView(blocks: List<MarkdownBlock>, textColor: Color, modifier: Modifier = Modifier, style: TextStyle = OpenAGIType.body) {
+fun MarkdownBlocksView(
+    blocks: List<MarkdownBlock>,
+    textColor: Color,
+    modifier: Modifier = Modifier,
+    style: TextStyle = OpenAGIType.body,
+    onCanvas: Boolean = false,
+) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
         blocks.forEach { block ->
@@ -87,8 +114,8 @@ fun MarkdownBlocksView(blocks: List<MarkdownBlock>, textColor: Color, modifier: 
                     Text(renderInline(block.spans, textColor), style = style.copy(fontStyle = FontStyle.Italic), color = muted, modifier = Modifier.weight(1f))
                 }
                 is MarkdownBlock.Rule -> HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = muted.copy(alpha = 0.4f))
-                is MarkdownBlock.Table -> TableView(block, textColor, style)
-                is MarkdownBlock.CodeBlock -> CodeBlockView(block.code)
+                is MarkdownBlock.Table -> TableView(block, textColor, style, onCanvas)
+                is MarkdownBlock.CodeBlock -> CodeBlockView(block.code, onCanvas)
             }
         }
     }
@@ -123,10 +150,11 @@ fun renderInline(spans: List<InlineSpan>, base: Color): AnnotatedString = buildA
 
 // Tables scroll sideways instead of squeezing columns on a phone.
 @Composable
-private fun TableView(table: MarkdownBlock.Table, textColor: Color, style: TextStyle) {
+private fun TableView(table: MarkdownBlock.Table, textColor: Color, style: TextStyle, onCanvas: Boolean) {
     val colors = LocalOpenAGIColors.current
     val columns = maxOf(table.header.size, table.rows.maxOfOrNull { it.size } ?: 0)
-    Surface(color = colors.edge.copy(alpha = 0.35f), shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+    val frame = blockFrame(onCanvas, colors.edge.copy(alpha = 0.35f))
+    Surface(color = frame.fill, border = frame.border, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.horizontalScroll(rememberScrollState()).padding(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             listOf(table.header).plus(table.rows).forEachIndexed { rowIndex, row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -150,10 +178,11 @@ private fun TableView(table: MarkdownBlock.Table, textColor: Color, style: TextS
 // scrolls horizontally rather than wrapping, and is long-press copyable."
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun CodeBlockView(code: String) {
+fun CodeBlockView(code: String, onCanvas: Boolean = false) {
     val colors = LocalOpenAGIColors.current
     val clipboard = LocalClipboardManager.current
-    Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+    val frame = blockFrame(onCanvas, colors.edge)
+    Surface(color = frame.fill, border = frame.border, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
                 .horizontalScroll(rememberScrollState())

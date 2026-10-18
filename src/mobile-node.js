@@ -1,3 +1,5 @@
+import { THREAD_KIND_PATTERN } from "./fleet/contracts.js";
+
 // The phone is a full client, so its credential is broader than the G2
 // wearable's. Breadth is only safe when it is explicit: this module is the
 // single enumerated answer to "what may a phone token do", kept as pure data
@@ -49,9 +51,14 @@ export const MOBILE_NODE_NAME_MAX = 60;
 // A task/action id as minted by createId(): letters, digits, underscore, dash.
 // Deliberately excludes "." and "/" so no id can carry a path segment.
 const ID = "[a-zA-Z0-9_-]{1,120}";
+// A fleet thread key ("conductor:<id>"), its colon raw or percent-encoded.
+const FLEET_THREAD = `(?:${THREAD_KIND_PATTERN})(?::|%3A)[A-Za-z0-9_.-]{1,120}`;
 
 const EXACT = new Set([
   "GET /mobile/summary",
+  // The phone's own push registration (relay pass + envelope key).
+  "POST /mobile/push",
+  "DELETE /mobile/push",
   "GET /tasks",
   "POST /tasks",
   "GET /tasks/clarifications",
@@ -69,16 +76,40 @@ const EXACT = new Set([
   // The /fleet supervisor's JSON API only. The /fleet page itself and any
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
+  "GET /fleet/api/diagnose",
+  "GET /fleet/api/suggestions",
+  "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
   "POST /fleet/api/mode",
   // Shared device threads and the read-only lifelog. Owner decision: paired
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
-  "GET /lifelog/moments"
+  "GET /lifelog/moments",
+  // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+  "GET /settings/models",
+  "POST /settings/models",
+  "POST /settings/models/test",
+  "GET /workspace/persona",
+  "PUT /workspace/persona",
+  "GET /workspace/skills",
+  "GET /workspace/jobs",
+  // The phone's offline copy of this agent, and what it did offline.
+  "GET /mobile/mirror",
+  "POST /mobile/offline-import",
+  // Sign in with ChatGPT on the daemon in this app (phone-only mode).
+  "POST /auth/chatgpt/start",
+  "GET /auth/chatgpt/status",
+  "POST /auth/chatgpt/signout"
 ]);
 
 const PATTERNS = [
+  { method: "GET", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
+  { method: "GET", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },
+  { method: "PUT", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },
+  { method: "DELETE", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },
+  { method: "POST", re: /^\/workspace\/jobs\/[A-Za-z0-9_.:-]{1,120}$/ },
   { method: "GET", re: new RegExp(`^/tasks/${ID}$`) },
   { method: "PATCH", re: new RegExp(`^/tasks/${ID}$`) },
   { method: "DELETE", re: new RegExp(`^/tasks/${ID}$`) },
@@ -87,7 +118,11 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/approve$`) },
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
-  { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) }
+  { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
+  // One fleet thread's detail, and the owner's Push now, Mute and Unmute.
+  { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute)$`) }
 ];
 
 export function isMobileRouteAllowed(method, pathname) {

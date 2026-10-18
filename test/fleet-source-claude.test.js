@@ -55,6 +55,18 @@ function rowsFor(id, cwd, { entrypoint = "cli", branch = "spencer/feature", side
       type: "user", timestamp: at, promptSource: "system", turnOrigin: "task_notification", origin: { kind: "task-notification" },
       message: { role: "user", content: `<task-notification>\n<task-id>${taskId}</task-id>\n<status>completed</status>\n</task-notification>` }
     }),
+    // A Workflow tool report, as written on 2026-09-26: the status says
+    // completed even when every agent failed.
+    workflowReport: (taskId, failures, at, { done = 0 } = {}) => base({
+      type: "user", timestamp: at, promptSource: "system", turnOrigin: "task_notification", origin: { kind: "task-notification" },
+      message: { role: "user", content: [
+        "<task-notification>", `<task-id>${taskId}</task-id>`, "<status>completed</status>",
+        `<summary>Dynamic workflow "Build" completed</summary>`, '<result>{"built":[]}</result>',
+        failures.length ? `<failures>${failures.join("\n")}</failures>` : "",
+        `<usage><agent_count>${failures.length + done}</agent_count><agents_done>${done}</agents_done><agents_error>${failures.length}</agents_error></usage>`,
+        "</task-notification>"
+      ].filter(Boolean).join("\n") }
+    }),
     peer: (text, at) => base({
       type: "user", timestamp: at, promptSource: "system", turnOrigin: "peer",
       origin: { kind: "peer", name: "remote-dev-d4", body: text },
@@ -326,6 +338,7 @@ test("peer, meta, and command rows are not owner text", async (t) => {
   assert.equal(thread.lastUserAt, iso(50 * MIN));
   assert.equal(thread.lastAgentText, "Not yet.");
   assert.equal(thread.meta.turnStartedAt, iso(16 * MIN));
+  assert.equal(thread.meta.lastSupervisorAt, iso(16 * MIN));
 });
 
 test("exclusions: sidechain, relay, tmp, self, too-short, no-repo", async (t) => {
@@ -356,6 +369,41 @@ test("exclusions: sidechain, relay, tmp, self, too-short, no-repo", async (t) =>
   assert.equal(threads["short-1"].excluded, "too-short");
   assert.equal(threads["nobranch-1"].excluded, "no-repo");
   assert.equal(threads["nocwd-1"].excluded, "no-repo");
+});
+
+// The G2 display opens Claude chats in ~/Dev/g2 with this prompt; they are
+// the supervisor's own, whatever their history.
+test("a transcript opened with the supervisor display prompt is the supervisor's own", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const display = rowsFor("display-1", cwd, { branch: "main" });
+  writeTranscript(home, cwd, "display-1", [display.prompt("You are the Agent Supervisor display. Reply with exactly: Claude supervisor connected.", iso(31 * MIN)),
+    display.text("Claude supervisor connected.", iso(30 * MIN)), ...display.history(29 * MIN)], NOW - 20 * MIN);
+  const work = rowsFor("work-1", cwd);
+  writeTranscript(home, cwd, "work-1", [work.prompt("Do you have access to all of my sessions?", iso(31 * MIN)), ...work.history(29 * MIN)], NOW - 20 * MIN);
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.equal(threads["display-1"].excluded, "self");
+  assert.equal(threads["work-1"].excluded, null);
+});
+
+// A long-running display chat: its opening prompt falls out of the bounded
+// tail, and the tail's earliest prompt is an ordinary later one. It is still
+// the supervisor's own, read from the transcript's head once per session.
+test("a display transcript stays excluded once its opening prompt is out of the tail", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const display = rowsFor("display-2", cwd, { branch: "main" });
+  const filler = [];
+  for (let i = 0; i < 40; i += 1) {
+    filler.push(display.prompt(`status ${i} ${"x".repeat(200)}`, iso(60 * MIN - i * 1000)), display.text(`ok ${i} ${"y".repeat(200)}`, iso(60 * MIN - i * 1000 - 500)));
+  }
+  writeTranscript(home, cwd, "display-2", [display.prompt("You are the Agent Supervisor display. Reply with exactly: Claude supervisor connected.", iso(61 * MIN)),
+    display.text("Claude supervisor connected.", iso(61 * MIN - 500)), ...filler, ...display.history(29 * MIN)], NOW - 20 * MIN);
+  const cache = new Map();
+  const read = async () => byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false, tailBytes: 8 * 1024, firstPrompts: cache }))["display-2"];
+  assert.equal((await read()).excluded, "self");
+  assert.match(cache.get("display-2"), /Agent Supervisor display/);
+  assert.equal((await read()).excluded, "self", "the cached opening prompt still excludes it");
 });
 
 test("Conductor-hosted transcripts are flagged", async (t) => {
@@ -404,7 +452,7 @@ test("only the tail is read and agent text is redacted and clamped", async (t) =
   const home = makeHome(t);
   const cwd = "/Users/x/Dev/repo";
   const r = rowsFor("tail-1", cwd);
-  const secret = "sk-ant-abcdefghijklmnopqrstuv";
+  const secret = ["sk", "ant", "api03", "abcdefghijklmnop".repeat(4)].join("-");
   writeTranscript(home, cwd, "tail-1", [
     r.prLink("o/old", 1, iso(80 * MIN)),
     r.prompt("x".repeat(20_000), iso(79 * MIN)),
@@ -593,4 +641,90 @@ test("an untitled thread is titled with its folder", async (t) => {
   const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
   assert.equal(thread.title, "g2");
   assert.equal(thread.lastUserText, "ship the mobile build to the distiller");
+});
+
+test("an answer the agent sent back to a relay with SendMessage is read as its reply", async (t) => {
+  // A supervisor relay exits once it delivers: the agent's SendMessage back
+  // fails (ENOENT /tmp/cc-socks/...), but its words are still its reply.
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/bbapp";
+  const r = rowsFor("relay-1", cwd);
+  const answer = "PR #7317 is ready on our side; main's red Testing CI is the only blocker.";
+  writeTranscript(home, cwd, "relay-1", [
+    ...r.history(60 * MIN),
+    r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)),
+    r.tool("SendMessage", "s1", { to: "uds:/tmp/cc-socks/48713.sock", summary: "status", message: answer }, iso(19 * MIN)),
+    r.result("s1", "{\"success\":false,\"message\":\"ENOENT\"}", iso(19 * MIN))
+  ], NOW - 19 * MIN);
+  const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(thread.lastAgentFull, answer);
+  assert.equal(thread.lastAgentFullAt, iso(19 * MIN));
+  // A preamble in the same message is not the answer it relayed.
+  const mixed = { ...r.tool("SendMessage", "s2", { to: "uds:/tmp/cc-socks/48713.sock", summary: "status", message: answer }, iso(18 * MIN)) };
+  mixed.message = { ...mixed.message, content: [{ type: "text", text: "I'll send the status now." }, ...mixed.message.content] };
+  writeTranscript(home, cwd, "relay-1", [...r.history(60 * MIN), r.peer("[OpenAGI supervisor] Ready to merge?", iso(20 * MIN)), mixed], NOW - 18 * MIN);
+  const [again] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(again.lastAgentFull, answer);
+});
+
+test("a workflow whose agents all hit the session limit makes the stopped session a session limit", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/openAGI";
+  const limit = (name) => `[${name}] failed: You've hit your session limit · resets 2:50am (America/Los_Angeles)`;
+  const write = (id, tail, mtimeAgo = 20 * MIN) => {
+    const r = rowsFor(id, cwd);
+    writeTranscript(home, cwd, id, [...r.history(120 * MIN), ...tail(r)], NOW - mtimeAgo);
+  };
+  // (a) The main agent still answers after the report (another model's cap): idle.
+  write("replied", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
+    r.workflowReport("w1", [limit("build:app"), limit("build:core")], iso(30 * MIN)), r.text("The workflow failed on the session limit.", iso(29 * MIN))]);
+  // (b) The report is the last row: the turn never ran, so it stalls.
+  write("last", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
+    r.workflowReport("w1", [limit("verify")], iso(30 * MIN))]);
+  // (c) The main agent reads the journal, then reports the cap: still limited.
+  write("checked", (r) => [r.prompt("build it", iso(60 * MIN)), r.tool("Workflow", "toolu_w", {}, iso(59 * MIN)),
+    r.workflowReport("w1", [limit("build")], iso(32 * MIN)), r.tool("Bash", "b1", { command: "cat journal.jsonl" }, iso(31 * MIN)),
+    r.result("b1", "failed", iso(30 * MIN)), r.text("Every agent hit the session limit; I will resume after it resets.", iso(29 * MIN))]);
+  // (d) A new workflow after the report moves on.
+  write("relaunched", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("build")], iso(40 * MIN)),
+    r.tool("Workflow", "toolu_w2", {}, iso(39 * MIN)), r.result("toolu_w2", "launched", iso(38 * MIN)), r.text("Relaunched; the session limit had reset.", iso(37 * MIN))]);
+  // One agent finished, or a failure that is not a limit: nothing to wait for.
+  write("partial", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(30 * MIN), { done: 1 }), r.text("Partly done.", iso(29 * MIN))]);
+  write("mixed", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a"), "[b] failed: tests are red"], iso(30 * MIN)), r.text("One broke.", iso(29 * MIN))]);
+  // A later clean report, or a new prompt, clears it.
+  write("cleared", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(40 * MIN)),
+    r.workflowReport("w2", [], iso(30 * MIN), { done: 2 }), r.text("All built.", iso(29 * MIN))]);
+  write("resumed", (r) => [r.prompt("build it", iso(60 * MIN)), r.workflowReport("w1", [limit("a")], iso(40 * MIN)),
+    r.prompt("[OpenAGI supervisor] The limit reset; resume.", iso(32 * MIN), { promptSource: "system" }), r.text("Resumed and finished.", iso(29 * MIN))]);
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  for (const id of ["replied", "last", "checked"]) {
+    const error = threads[id].error;
+    assert.equal(error?.kind, "session-limit", id);
+    assert.ok(Date.parse(error.resetAt) > Date.parse(iso(30 * MIN)), `${id}: reset after the report`);
+    assert.match(error.text, /hit your session limit/);
+  }
+  assert.equal(threads.replied.agentStatus, "idle");
+  assert.equal(threads.last.agentStatus, "stalled");
+  for (const id of ["partial", "mixed", "cleared", "resumed", "relaunched"]) assert.equal(threads[id].error, null, id);
+});
+
+
+test("peer and system resumes and real work clear stale workflow limits", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/work/app";
+  const failure = "[build] failed: You've hit your session limit · resets 2:50am (America/Los_Angeles)";
+  const tails = {
+    peer: (r) => [r.peer("[OpenAGI supervisor] Continue after reset.", iso(20 * MIN)), r.text("Finished.", iso(19 * MIN))],
+    system: (r) => [r.prompt("System wrapper\n[OpenAGI supervisor] Continue.", iso(20 * MIN), { promptSource: "system", turnOrigin: "system" }), r.text("Finished.", iso(19 * MIN))],
+    worked: (r) => [r.tool("Bash", "b1", { command: "echo done" }, iso(20 * MIN)), r.result("b1", "done", iso(19 * MIN)), r.text("Pushed the PR.", iso(18 * MIN))],
+    finished: (r) => [r.text("Completed inline and pushed the PR.", iso(20 * MIN))]
+  };
+  for (const [id, tail] of Object.entries(tails)) {
+    const r = rowsFor(id, cwd);
+    writeTranscript(home, cwd, id, [...r.history(120 * MIN), r.workflowReport("w1", [failure], iso(30 * MIN)), ...tail(r)], NOW - 18 * MIN);
+  }
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  for (const id of Object.keys(tails)) assert.equal(threads[id].error, null, id);
+  assert.equal(threads.peer.meta.lastSupervisorAt, iso(20 * MIN));
+  assert.equal(threads.system.meta.lastSupervisorAt, iso(20 * MIN));
 });

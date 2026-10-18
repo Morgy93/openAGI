@@ -2,7 +2,8 @@
 // interface's shared authentication/Origin gate. Never touches res: returns
 // { status, body }, or null for paths it does not own.
 
-import { MODES } from "./contracts.js";
+import { MODES, THREAD_KEY_PATTERN } from "./contracts.js";
+import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 
 const PREFIX = "/fleet/api/";
@@ -10,9 +11,18 @@ const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const ANSWER_MAX = 200;
 const SEND_MAX = 2000;
 const LABEL_MAX = 80;
-const THREAD_KEY = /^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/;
+const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
+const THREAD_ACTIONS = new Set(["push", "mute", "unmute"]);
+const MUTE_HOURS_MAX = 7 * 24;
+
+// A thread key from the path: "conductor:<id>", its colon raw or %3A.
+function pathThreadKey(segment) {
+  let key;
+  try { key = decodeURIComponent(segment); } catch { return null; }
+  return THREAD_KEY.test(key) ? key : null;
+}
 
 const ok = (body) => ({ status: 200, body });
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
@@ -55,6 +65,10 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!open) return fail(404, "No open question with that id.");
     const options = Array.isArray(open.options) ? open.options : [];
     if (answer !== "dismiss" && !options.includes(answer)) return fail(400, "Pick one of the question's options.");
+    if (open.kind === "self-fix" && answer === "Request changes" && typeof body.instructions === "string") {
+      const fix = await supervisor.reviseFix(open.meta?.fixId, body.instructions);
+      return fix ? ok({ question: (state().questions ?? []).find((q) => q.id === id) ?? null, fix, delivery: { status: "sent", detail: "Changes sent to fixer." }, state: state() }) : fail(404, "No fix with that id.");
+    }
     const result = await supervisor.answerQuestion(id, answer, sendOptions);
     if (!result) return fail(409, "Question already closed.");
     return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
@@ -75,6 +89,29 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!supervisor) return fail(503, "Fleet supervisor is not available.");
     const parts = pathname.slice(PREFIX.length).split("/");
     try {
+      if (parts.length === 1 && parts[0] === "diagnose") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.diagnose !== "function") return fail(503, "Diagnose is not available.");
+        const window = url?.searchParams?.get("window") ?? "24h";
+        const area = url?.searchParams?.get("area") ?? null;
+        if (!["24h", "7d"].includes(window) || (area && !FIX_AREAS.includes(area))) return fail(400, "Bad diagnose window or area.");
+        return ok(await supervisor.diagnose({ window, area }));
+      }
+      if (parts[0] === "suggestions" && (parts.length === 1 || parts.length === 2)) {
+        if (typeof supervisor.suggestions !== "function") return fail(503, "Suggestions are not available.");
+        if (parts.length === 1) return method === "GET" ? ok({ suggestions: await supervisor.suggestions() }) : fail(405, "Use GET.");
+        if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad suggestion id.");
+        if (method === "GET") {
+          const suggestion = (await supervisor.suggestions()).find((s) => s.id === parts[1]);
+          return suggestion ? ok({ suggestion }) : fail(404, "No suggestion with that id.");
+        }
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        try {
+          const result = await supervisor.respondSuggestion(parts[1], body?.choice, typeof body?.fixId === "string" ? { fixId: body.fixId } : undefined);
+          return result ? ok(result) : fail(404, "No suggestion with that id.");
+        } catch { return fail(409, "Suggestion could not be applied. Check its choice, self-fix mode, locks and daily cap."); }
+      }
       if (parts.length === 1 && parts[0] === "state") {
         if (method !== "GET") return fail(405, "Use GET.");
         await supervisor.refresh?.();
@@ -123,7 +160,7 @@ export function createFleetRoute({ supervisor } = {}) {
         if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
-        const result = await supervisor.sendOwnerMessage(threadKey, message, sendOptions);
+        const result = await supervisor.sendOwnerMessage(threadKey, message, body?.queue === true ? { ...sendOptions, queue: true } : sendOptions);
         return ok({ delivery: result?.delivery ?? null, state: state() });
       }
       // One thread's screen: its permission card, whether a turn runs, the
@@ -171,6 +208,62 @@ export function createFleetRoute({ supervisor } = {}) {
         if (typeof supervisor.appAction !== "function") return fail(503, "App control is not available.");
         const result = await supervisor.appAction(parts[1], parts[2], { ...sendOptions, expectRunning });
         return ok({ result, state: state() });
+      }
+      // The owner's feedback (voice or typed): GET lists it, POST records one.
+      if (parts.length === 1 && parts[0] === "feedback") {
+        if (typeof supervisor.recordFeedback !== "function") return fail(503, "Feedback is not available.");
+        if (method === "GET") return ok({ feedback: await supervisor.feedback({ limit: 100 }) });
+        if (method !== "POST") return fail(405, "Use GET or POST.");
+        const body = await readObject(readBody);
+        if (!body) return fail(400, "Send a JSON object: { utterance, intent, target?, source? }.");
+        try {
+          return ok({ feedback: await supervisor.recordFeedback(body) });
+        } catch (error) {
+          return fail(400, String(error?.message ?? "Bad feedback.").slice(0, 200));
+        }
+      }
+      // Self-fix runs: GET lists them,
+      // POST queues one; stop and revise act on one ("all" stops every one).
+      if (parts[0] === "fixes" && (parts.length === 1 || (parts.length === 3 && ["stop", "revise"].includes(parts[2])))) {
+        if (typeof supervisor.queueFix !== "function") return fail(503, "Self-fix is not available.");
+        if (parts.length === 1 && method === "GET") return ok({ fixes: await supervisor.fixes() });
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = (await readObject(readBody)) ?? {};
+        try {
+          if (parts.length === 1) return ok({ fix: await supervisor.queueFix(body) });
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad fix id.");
+          if (parts[2] === "stop") return ok({ stopped: await supervisor.stopFix(parts[1]) });
+          const fix = await supervisor.reviseFix(parts[1], body.instructions);
+          return fix ? ok({ fix }) : fail(404, "No fix with that id.");
+        } catch (error) {
+          return fail(400, String(error?.message ?? "Bad fix request.").slice(0, 200));
+        }
+      }
+      // One thread, expanded: its detail (GET), or the owner's Push now,
+      // Mute or Unmute of it (POST).
+      if (parts[0] === "threads" && (parts.length === 2 || parts.length === 3)) {
+        const threadKey = pathThreadKey(parts[1]);
+        if (!threadKey) return fail(400, "Pass a thread key from the fleet state.");
+        if (parts.length === 2) {
+          if (method !== "GET") return fail(405, "Use GET.");
+          if (typeof supervisor.threadDetail !== "function") return fail(503, "Thread details are not available.");
+          const thread = await supervisor.threadDetail(threadKey);
+          return thread ? ok({ thread }) : fail(404, "No thread with that key in the last scan.");
+        }
+        if (!THREAD_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (parts[2] === "push") {
+          if (typeof supervisor.pushNow !== "function") return fail(503, "Push now is not available.");
+          const result = await supervisor.pushNow(threadKey, sendOptions);
+          return ok({ delivery: result?.delivery ?? null, action: result?.action ?? null, state: state() });
+        }
+        if (typeof supervisor.muteThread !== "function") return fail(503, "Muting is not available.");
+        if (parts[2] === "unmute") return ok({ muted: (await supervisor.unmuteThread(threadKey))?.until ?? null, state: state() });
+        const body = (await readObject(readBody)) ?? {};
+        const hours = body.hours === undefined ? undefined : Number(body.hours);
+        if (hours !== undefined && !(Number.isInteger(hours) && hours >= 1 && hours <= MUTE_HOURS_MAX)) return fail(400, `hours must be a whole number from 1 to ${MUTE_HOURS_MAX}.`);
+        const muted = await supervisor.muteThread(threadKey, hours === undefined ? {} : { hours });
+        return ok({ muted: muted?.until ?? null, state: state() });
       }
       if (parts.length === 3 && parts[0] === "actions" && parts[2] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");

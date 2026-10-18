@@ -8,6 +8,7 @@ struct OverlayView: View {
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var briefEditor = BriefEditorState.shared
   @ObservedObject var fleet = FleetConsumer.shared
+  @ObservedObject var voice = VoiceSession.shared
   @FocusState private var fieldFocused: Bool
   @State private var pillHovered = false
   // Per-item reply text for the targeted chat field, keyed by outreach id.
@@ -19,12 +20,23 @@ struct OverlayView: View {
   var onCollapse: () -> Void = {}
   var onExpand: () -> Void = {}
   var onContentChange: () -> Void = {}
+  var onDragBegan: () -> Void = {}
+  var onDragEnded: (NSPoint) -> Void = { _ in }
 
   // Keep the resize watcher chains short: the release compiler times out on
   // a single chain of sixteen generic .onChange overloads. Opaque helper
   // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))))
+    voiceWatchers(fleetDetailWatchers(watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody))))))))))
+  }
+
+  private func voiceWatchers<V: View>(_ content: V) -> some View {
+    content
+      .onChange(of: voice.phase) { _, _ in onContentChange() }
+      .onChange(of: voice.transcript) { _, _ in onContentChange() }
+      .onChange(of: voice.reply) { _, _ in onContentChange() }
+      .onChange(of: voice.error) { _, _ in onContentChange() }
+      .onChange(of: voice.notice) { _, _ in onContentChange() }
   }
 
   private var panelBody: some View {
@@ -61,6 +73,9 @@ struct OverlayView: View {
     .onChange(of: state.answer) { _, _ in onContentChange() }
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
     .onChange(of: state.progressStage) { _, _ in onContentChange() }
+    // The "connection lost" banner's text and buttons change as it checks
+    // back on its own, then it goes.
+    .onChange(of: state.detachedPhase) { _, _ in onContentChange() }
   }
 
   private func composerWatchers<V: View>(_ content: V) -> some View {
@@ -160,6 +175,26 @@ struct OverlayView: View {
     .onChange(of: fleet.stillSending) { _, _ in onContentChange() }
   }
 
+  // The Supervisor tab's Watching list: the scan's threads add, remove and
+  // regroup rows, and opening Quiet adds its rows.
+  private func watchingWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: fleet.threads) { _, _ in onContentChange() }
+    .onChange(of: fleet.openWatchGroups) { _, _ in onContentChange() }
+  }
+
+  // An opened Watching row or question card: its detail lands, its Push now
+  // or Mute runs and leaves a note, each a height change.
+  private func fleetDetailWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: fleet.expandedThread) { _, _ in onContentChange() }
+    .onChange(of: fleet.expandedQuestions) { _, _ in onContentChange() }
+    .onChange(of: fleet.details) { _, _ in onContentChange() }
+    .onChange(of: fleet.detailLoading) { _, _ in onContentChange() }
+    .onChange(of: fleet.threadInFlight) { _, _ in onContentChange() }
+    .onChange(of: fleet.threadNotes) { _, _ in onContentChange() }
+  }
+
   /// Outreach rows for "Needs you". Supervisor questions also arrive as
   /// outreach; the ones the Supervisor tab lists are not listed twice. Another
   /// node's questions (no local copy) stay here.
@@ -182,34 +217,49 @@ struct OverlayView: View {
     return state.briefContext == nil ? "Ask about what you're looking at…" : "Ask about this item…"
   }
 
+  // The pill is drawn by SwiftUI but handled by OverlayDragView on top: a
+  // SwiftUI Button here took the mouse-down, so the pill could never be
+  // dragged. The handle clicks (expand), drags, hovers, and is the VoiceOver
+  // button. It covers the whole 44pt panel and sits outside scaleEffect, so
+  // the hover scale never changes the hit area.
   private var pill: some View {
-    Button(action: {
-      withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = true }
-      onExpand()
-    }) {
-      ZStack {
-        Circle().fill(Color.accentColor).frame(width: 18, height: 18)
-        if pillBadgeCount > 0 {
-          Text("\(pillBadgeCount)")
-            .font(.system(size: 9, weight: .bold)).foregroundColor(.white)
-        }
+    ZStack {
+      Circle().fill(Color.accentColor).frame(width: 18, height: 18)
+      if pillBadgeCount > 0 {
+        Text("\(pillBadgeCount)")
+          .font(.system(size: 9, weight: .bold)).foregroundColor(.white)
       }
-      .padding(9)
-      .contentShape(Circle())
     }
-    .buttonStyle(.plain)
+    .padding(9)
     .background(.ultraThinMaterial, in: Circle())
     .overlay(Circle().strokeBorder(.white.opacity(pillHovered ? 0.25 : 0.1), lineWidth: 1))
     .scaleEffect(pillHovered ? 1.08 : 1.0)
     .animation(.easeOut(duration: 0.12), value: pillHovered)
-    .onHover { pillHovered = $0 }
-    .help("Quick Ask (⌥Space)")
+    .allowsHitTesting(false)
+    .accessibilityHidden(true)
+    .frame(width: 44, height: 44)
+    .overlay {
+      OverlayDragHandle(
+        onClick: expandPill,
+        onHover: { pillHovered = $0 },
+        onDragBegan: onDragBegan,
+        onDragEnded: onDragEnded,
+        toolTip: "Quick Ask (⌥Space) · drag to move",
+        accessibilityButtonLabel: pillBadgeCount > 0 ? "Quick Ask, \(pillBadgeCount) waiting" : "Quick Ask")
+    }
+  }
+
+  private func expandPill() {
+    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = true }
+    onExpand()
   }
 
   private var expandedPanel: some View {
     VStack(alignment: .leading, spacing: 8) {
       HStack {
+        // Not hit-testable, so a press on the title reaches the drag handle.
         Text("Ask OpenAGI").font(.caption).foregroundStyle(.secondary)
+          .allowsHitTesting(false)
         if fleet.available {
           Picker("View", selection: Binding(get: { state.tab }, set: { state.selectTab($0) })) {
             Text("Tasks").tag(OverlayTab.tasks)
@@ -231,6 +281,11 @@ struct OverlayView: View {
         }
         .buttonStyle(.plain)
         .help("Collapse (Esc)")
+      }
+      // Drag the panel by its header. As a background, the Picker and the
+      // close button stay on top and keep their clicks.
+      .background {
+        OverlayDragHandle(onDragBegan: onDragBegan, onDragEnded: onDragEnded, toolTip: "Drag to move")
       }
       if app.status == .down {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
@@ -278,9 +333,16 @@ struct OverlayView: View {
           .frame(maxHeight: 220)
         }
       } else if state.isDetached {
+        // Checks back once on its own, then clears itself (OverlayState
+        // recoverDetached): it never sits at the top of the panel.
         VStack(alignment: .leading, spacing: 5) {
-          Text("Connection lost before completion was confirmed. Open the main app to see whether the request is still running.")
-            .font(.caption).foregroundStyle(.secondary).lineLimit(4)
+          HStack(spacing: 6) {
+            if state.detachedPhase == .checking { ProgressView().controlSize(.small) }
+            Text(state.detachedPhase == .stillRunning
+                 ? "Still running. The answer will be in the main app."
+                 : "Connection lost. Checking whether it finished…")
+              .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+          }
           HStack {
             Button("Open in main app") {
               app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)

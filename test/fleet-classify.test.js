@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, classifyThread, mergeThreads, prReadiness, threadHealth
+  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, WATCH_GROUPS, blockedOnSection, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf
 } from "../src/fleet/classify.js";
-import { DEFAULTS, STATES } from "../src/fleet/contracts.js";
+import { DEFAULTS, STATES, clampTail, clampTailLines } from "../src/fleet/contracts.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -66,6 +66,26 @@ test("mergeThreads keeps the Conductor error and status when it has its own", ()
   const [m] = mergeThreads({ claude: [claude], conductor: [conductor] });
   assert.equal(m.agentStatus, "waiting");
   assert.equal(m.error.kind, "overloaded");
+});
+
+test("mergeThreads folds the Claude report when the Conductor tail kept only a synthetic notice", () => {
+  // The Conductor tail's last text is a limit notice: an excerpt, no real report.
+  const conductor = makeThread({ claudeSessionId: "c1", lastAgentText: "You've hit your session limit", lastAgentFull: "", lastAgentFullAt: null, lastAgentAt: ago(2 * MIN) });
+  const report = "Pushed abc1234.\n\nBlocked on:\n- your call on the schema change";
+  const claude = makeThread({
+    key: "claude:c1", kind: "claude", id: "c1", claudeSessionId: "c1", lastAgentText: report, lastAgentFull: report,
+    lastAgentFullAt: ago(10 * MIN), lastAgentAt: ago(10 * MIN)
+  });
+  const [m] = mergeThreads({ claude: [claude], conductor: [conductor] });
+  assert.equal(m.lastAgentText, "You've hit your session limit");
+  assert.equal(m.lastAgentAt, ago(2 * MIN));
+  assert.equal(m.lastAgentFull, report);
+  assert.equal(m.lastAgentFullAt, ago(10 * MIN));
+  // A real Conductor report is kept.
+  const own = makeThread({ claudeSessionId: "c1", lastAgentText: "Done.", lastAgentFull: "Done.", lastAgentFullAt: ago(MIN) });
+  const [kept] = mergeThreads({ claude: [claude], conductor: [own] });
+  assert.equal(kept.lastAgentFull, "Done.");
+  assert.equal(kept.lastAgentFullAt, ago(MIN));
 });
 
 test("prReadiness reports exact blocker strings", () => {
@@ -263,6 +283,17 @@ test("classifyThread: a PR merged or closed after the ask settles it; an ask mad
   assert.equal(classify(ask(null), { pr: merged(ago(10 * MIN)) }).state, "needs-human");
   assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ state: "MERGED" }) }).state, "needs-human");
   assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ mergedAt: null, closedAt: null }) }).state, "needs-human");
+});
+
+test("classifyThread: a report's Blocked-on list is settled against the report's own time", () => {
+  const merged = makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
+  const report = "Shipped the fix.\n\n**Blocked on:**\n- **Your decision** on cutting the production release";
+  // The report, the merge, then a synthetic limit notice that moved lastAgentAt.
+  const thread = makeThread({ lastAgentText: "You've hit your session limit", lastAgentAt: ago(5 * MIN), lastAgentFull: report, lastAgentFullAt: ago(30 * MIN) });
+  assert.notEqual(classify(thread, { pr: merged }).state, "needs-human");
+  // A report written after the merge still asks.
+  const later = makeThread({ lastAgentText: report, lastAgentAt: ago(5 * MIN), lastAgentFull: report, lastAgentFullAt: ago(5 * MIN) });
+  assert.equal(classify(later, { pr: merged }).state, "needs-human");
 });
 
 test("classifyThread: a structured Codex ask is settled by a later merge, not an earlier one", () => {
@@ -502,4 +533,180 @@ test("a turn that stopped mid-work is stopped, whatever its PR or last words say
   // Still running, or asking the owner: not stopped.
   assert.equal(classify(makeThread({ agentStatus: "running" })).state, "running");
   assert.equal(classify({ ...dead, meta: { pendingQuestion: { text: "Pick a price?", options: ["$1", "$2"], at: ago(20 * MIN) } } }).state, "needs-human");
+});
+
+// The real 18:17 report from Conductor session d1dbe71a (2,198 chars).
+const D1DBE71A_REPORT = [
+  "**Not ready to merge.**",
+  "",
+  "- **PR:** https://github.com/buildbetter-app/remote-dev-setup/pull/1",
+  "- **Head:** `1bfd2c83`",
+  "- **BuildBot3 run:** none. This repo has no BuildBot3 verification.",
+  "",
+  "**Correction:** my earlier \"0 open, ready\" was wrong. I had only counted the first 100 of 402 threads. There were 50 unresolved, including 12 P1 and 1 Cursor MEDIUM security finding.",
+  "",
+  "**Open ≥6/10: 2.** Both need your call.",
+  "- **CPU lanes:** `bb-verify` fixes the lane count when a run starts, but the sweep can shrink its CPU share later. Fixing it means pinning lanes to a per-slot share, or having the sweep resize lanes.",
+  "- **Cache write default:** PR runs write to the shared cache by default, which is a documented trade-off. Making cross-repository (fork) PRs read-only needs a fork check in `pr_head_and_base`.",
+  "",
+  "38 threads remain unresolved, 36 of them P2. I replied on both open P1s.",
+  "",
+  "**Resolved: 12 of 13 P1s plus the security one.**",
+  "- **Fixed in code:**",
+  "  - `bb-ci-remote` now runs the full lane.",
+  "  - `lb-usage-shim` now returns 403 to anyone but loopback and the allow list, and it won't start without one.",
+  "- **Already fixed in code:** five (ticket start ticks, pool lock, base-branch check, `bb-edge` exclusion, SSH login errors).",
+  "- **Deliberate:** two `bb3-watch` \"go down\" fallbacks, because falling back would bill the ChatGPT login.",
+  "- **Bounded:** one memory-reservation race, three 32 GiB slots on about 249 GiB.",
+  "",
+  "**Blocked on:**",
+  "- **Your decision** on the two P1s above.",
+  "- **Checks on the new head:** the Cursor router and Security checks are still running. Codex has not reviewed `1bfd2c83`.",
+  "- **Another session editing this worktree:** about 20 files have uncommitted edits that aren't mine, including `bb3-doctor`, `bb3-heal`, `bb-quick` and `server.py`. That session needs to push or hand off, or we'll conflict.",
+  "- **Deploying the shim:** the shim fix takes effect after `ci-local/install.sh --box` on BuildBot3."
+].join("\n");
+
+// The supervisor's own read gaps on that PR.
+const gappyPr = () => makePr({ unresolvedThreads: 0, threadsTruncated: true, codexReview: { reviewedHead: false, sha: "bbbbbbb" } });
+
+test("a markdown Blocked-on list naming the owner's decision asks the owner, read from the whole report", () => {
+  const thread = makeThread({ lastAgentText: clampTail(D1DBE71A_REPORT, DEFAULTS.excerptMax), lastAgentFull: clampTailLines(D1DBE71A_REPORT, DEFAULTS.fullTextMax) });
+  const result = classify(thread, { pr: gappyPr() });
+  assert.equal(result.state, "needs-human");
+  assert.equal(result.infraKind, null);
+  assert.equal(result.ask.blocked, true);
+  assert.equal(result.ask.text, "Your decision on the two P1s above");
+  // Never a "later" that would be relayed to the agent as the answer.
+  assert.deepEqual(result.ask.options, ["open thread"]);
+  // The whole report as the short text too: "bb3-watch" names a tool, not a down box.
+  assert.equal(classify(makeThread({ lastAgentText: D1DBE71A_REPORT }), { pr: gappyPr() }).state, "needs-human");
+  const section = blockedOnSection(D1DBE71A_REPORT);
+  assert.deepEqual(section.items.map((item) => item.tag), ["owner", "passive", "other", "other"]);
+});
+
+test("the same generic blocker over other choices is a new ask key", () => {
+  const report = (p1s) => ["Not ready.", "", "**Open: 2.** Both need your call.", ...p1s.map((p1) => `- ${p1}`), "", "**Blocked on:**", "- **Your decision** on the two P1s above."].join("\n");
+  const keyOf = (text) => classify(makeThread({ lastAgentText: text })).ask.key;
+  const first = keyOf(report(["P1: migration drops the audit table", "P1: token logged in plaintext"]));
+  assert.equal(keyOf(report(["P1: migration drops the audit table", "P1: token logged in plaintext"])), first);
+  assert.notEqual(keyOf(report(["P1: cache key collides across forks", "P1: retry loop never backs off"])), first);
+  // Other sub-bullet choices under the same owner item are a new ask too.
+  const own = (choices) => `**Blocked on:**\n- Your call on the release:\n${choices.map((choice) => `  - ${choice}`).join("\n")}`;
+  assert.notEqual(keyOf(own(["Merge now", "Keep it open"])), keyOf(own(["Revert it", "Hold until Monday"])));
+});
+
+test("the short Blocked-on form asks; nothing, CI, or a third party's approval does not", () => {
+  const ask = classify(makeThread({ lastAgentText: "**Blocked on:**\n- **Your decision** on the two P1s\n- checks on new head are running" }));
+  assert.equal(ask.state, "needs-human");
+  // A merge call on an open PR is the ready flow's; without a PR it asks.
+  assert.equal(classify(makeThread({ lastAgentText: "Pushed. **Blocked on:** your merge decision." })).state, "ready-needs-human");
+  assert.equal(classify(makeThread({ lastAgentText: "Pushed. **Blocked on:** your merge decision.", prRefs: [] }), { pr: null }).state, "needs-human");
+  assert.equal(classify(makeThread({ lastAgentText: "Blocked on: approval from you." })).state, "needs-human");
+  for (const text of ["Done.\n\nBlocked on: nothing", "**Blocked on:** none.", "**Blocked on:** CI", "Blocked on: required reviewer approval from Adam/Nikhil"]) {
+    const result = classify(makeThread({ lastAgentText: text }), { pr: makePr({ reviewDecision: "REVIEW_REQUIRED", mergeState: "BLOCKED" }) });
+    assert.notEqual(result.state, "needs-human", text);
+  }
+  assert.equal(blockedOnSection("Blocked on: nothing").items.length, 0);
+  assert.equal(blockedOnSection("Blocked on: required reviewer approval from Adam/Nikhil").items[0].tag, "other");
+  assert.equal(blockedOnSection("Not blocked."), null);
+});
+
+test("the latest Blocked-on section wins over an earlier quoted one", () => {
+  const text = "Earlier I wrote:\n\n> **Blocked on:**\n> - **Your decision** on the cache default\n\nYou picked shared writes; that is pushed.\n\n**Blocked on:** nothing";
+  assert.equal(blockedOnSection(text).items.length, 0);
+  assert.notEqual(classify(makeThread({ lastAgentText: text })).state, "needs-human");
+  const reopened = "> Blocked on: nothing\n\nA new question came up.\n\nBlocked on:\n- your decision on the cache default";
+  assert.equal(blockedOnSection(reopened).owner.length, 1);
+  assert.equal(classify(makeThread({ lastAgentText: reopened })).state, "needs-human");
+});
+
+test("an owner Blocked-on item offers the agent's own sub-bullets, then open thread", () => {
+  const text = "Ready except one thing.\n\n### Blocked on\n\n- **Your call** on cache writes:\n  - keep shared writes\n  - make fork PRs read-only\n- CI running\n\nI'll wait.";
+  const result = classify(makeThread({ lastAgentText: text }));
+  assert.equal(result.state, "needs-human");
+  assert.deepEqual(result.ask.options, ["keep shared writes", "make fork PRs read-only", "open thread"]);
+  // Once the owner replied, the old report asks nothing.
+  assert.notEqual(classify(makeThread({ lastAgentText: text, lastUserText: "keep them", lastUserAt: ago(5 * MIN) })).state, "needs-human");
+});
+
+test("a card of acknowledgements hides the tail's structured question too", () => {
+  // ZeroShot 01a12c44: five "Okay"/"Continue" items, and the tail carries the call.
+  const acks = { app: "codex", cardId: "turn-a", count: 2, items: [
+    { index: 0, itemId: "call_ok:0", header: null, question: "I will use the existing native QA build.", options: ["Okay"], multiSelect: false, freeText: true, at: ago(5 * MIN) },
+    { index: 1, itemId: "call_go:0", header: null, question: "I have enough authorization.", options: ["Continue"], multiSelect: false, freeText: true, at: ago(4 * MIN) }
+  ] };
+  const thread = makeThread({ kind: "codex", key: "codex:t1", id: "t1", meta: { pendingCard: acks, pendingQuestion: { text: "I will use the existing native QA build.", options: ["Okay"], at: ago(5 * MIN) } } });
+  assert.notEqual(classify(thread).state, "needs-human");
+});
+
+test("an owner Blocked-on item beats a CI wait the agent wrote, and a merge after it settles it", () => {
+  const text = "CI is still running on the new head.\n\nBlocked on:\n- your decision on the cache default";
+  assert.equal(classify(makeThread({ lastAgentText: text })).state, "needs-human");
+  // Asked 30 min ago; the PR merged 5 min ago.
+  const merged = makePr({ state: "MERGED", mergedAt: ago(5 * MIN), closedAt: ago(5 * MIN) });
+  assert.notEqual(classify(makeThread({ lastAgentText: "Blocked on:\n- your merge decision" }), { pr: merged }).state, "needs-human");
+  assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: merged }).state, "needs-human");
+});
+
+test("watchOf: the owner's view of what each thread is watched for, and since when", () => {
+  const classify = (thread, pr = makePr()) => classifyThread(thread, { pr, now: NOW, config });
+  // A full BuildBot3 run the agent waits on: waiting, on that run, since the task started.
+  const full = { id: "t1", description: "bb-verify --full --pr 6522", kind: "local_bash", startedAt: ago(25 * MIN) };
+  const waiting = makeThread({ agentStatus: "waiting", openTasks: [full], meta: { turnStartedAt: ago(40 * MIN) } });
+  const w = watchOf(waiting, classify(waiting, makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } })), { now: NOW });
+  assert.equal(w.group, "waiting");
+  assert.equal(w.waitingOn, "BuildBot3 full run");
+  assert.equal(w.since, ago(25 * MIN));
+  assert.equal(w.waitSince, ago(25 * MIN));
+  assert.equal(w.runningSince, ago(40 * MIN));
+  // Mid-turn: working since the turn began.
+  const running = makeThread({ agentStatus: "running", lastActivityAt: ago(1 * MIN), meta: { turnStartedAt: ago(12 * MIN) } });
+  const r = watchOf(running, classify(running), { now: NOW });
+  assert.equal(r.group, "working");
+  assert.equal(r.since, ago(12 * MIN));
+  // A question to the owner outranks the state: waiting on you, since it was asked.
+  const asked = watchOf(running, classify(running), { now: NOW, askedAt: ago(7 * MIN) });
+  assert.equal(asked.group, "you");
+  assert.equal(asked.waitingOn, "your answer");
+  assert.equal(asked.since, ago(7 * MIN));
+  // An owner ask still held for review (no visible question) is not blamed on the owner.
+  assert.equal(watchOf(makeThread(), { state: "needs-human" }, { now: NOW }).group, "push");
+  assert.equal(watchOf(makeThread(), { state: "needs-human" }, { now: NOW, askedAt: ago(3 * MIN) }).group, "you");
+  // Out of scope is not watched; every group is a known one.
+  assert.equal(watchOf(makeThread(), { state: "excluded" }, { now: NOW }), null);
+  for (const state of STATES) {
+    const watch = watchOf(makeThread(), { state }, { now: NOW });
+    if (watch) assert.ok(WATCH_GROUPS.includes(watch.group), state);
+  }
+});
+
+test("liveWatch: Waiting on you only while a question the owner can see is open", () => {
+  // Asked while CI ran: back to waiting on CI, on its own clock, once answered.
+  const asked = watchOf(makeThread({ agentStatus: "idle" }), { state: "waiting-ci", wait: { source: "ci", ageMs: 20 * MIN } }, { now: NOW, askedAt: ago(5 * MIN) });
+  assert.equal(asked.group, "you");
+  assert.deepEqual(asked.otherwise, { group: "waiting", waitingOn: "CI" });
+  const answered = liveWatch(asked, { state: "waiting-ci", askedAt: null, closedAt: ago(1 * MIN) });
+  assert.equal(answered.group, "waiting");
+  assert.equal(answered.waitingOn, "CI");
+  assert.equal(answered.since, ago(20 * MIN));
+  assert.equal(answered.otherwise, undefined);
+  // A needs-human row whose question was dismissed: the supervisor's to push, from the dismissal.
+  const ask = watchOf(makeThread(), { state: "needs-human" }, { now: NOW, askedAt: ago(8 * 60 * MIN) });
+  const dismissed = liveWatch(ask, { state: "needs-human", askedAt: null, closedAt: ago(2 * MIN) });
+  assert.equal(dismissed.group, "push");
+  assert.equal(dismissed.since, ago(2 * MIN));
+  assert.equal(dismissed.waitingOn, null);
+  // A snapshot from before otherwise falls back by state.
+  const { otherwise: _drop, ...legacy } = ask;
+  assert.equal(liveWatch(legacy, { state: "needs-human" }).group, "push");
+  // A question opened since the scan puts the row in, timed by it.
+  const quiet = watchOf(makeThread(), { state: "idle-no-pr" }, { now: NOW });
+  const now = liveWatch(quiet, { state: "idle-no-pr", askedAt: ago(1 * MIN) });
+  assert.equal(now.group, "you");
+  assert.equal(now.since, ago(1 * MIN));
+  assert.equal(now.otherwise.group, "quiet");
+  assert.equal(liveWatch(now, { state: "idle-no-pr" }).group, "quiet");
+  // Nothing open and not "you": unchanged; out of scope stays null.
+  assert.equal(liveWatch(quiet, { state: "idle-no-pr" }), quiet);
+  assert.equal(liveWatch(null, { askedAt: ago(1 * MIN) }), null);
 });

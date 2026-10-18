@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { MESSAGE_PREFIX, backgroundRouteFor, buildRelayPrompt, createExecutor, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { CODEX_APP_HOLDS, MESSAGE_PREFIX, RELAY_REPLY_NOTE, backgroundRouteFor, buildRelayPrompt, createExecutor, isCodexIdentityBlock, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
 import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
@@ -184,7 +184,10 @@ test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) 
   assert.equal(call.cwd, config.paths.relayCwd);
   assert.ok(fs.statSync(config.paths.relayCwd).isDirectory());
   assert.equal(call.timeoutMs, 180_000);
-  const expectedPrompt = buildRelayPrompt("cairo-1f", `${MESSAGE_PREFIX}CI finished on abc1234: green.`);
+  // The relay exits once it delivers: the agent is told to answer in its own
+  // chat (dakar's three replies went to a closed /tmp/cc-socks socket).
+  const expectedPrompt = buildRelayPrompt("cairo-1f", `${MESSAGE_PREFIX}CI finished on abc1234: green.\n${RELAY_REPLY_NOTE}`);
+  assert.match(RELAY_REPLY_NOTE, /^Answer in your own chat\b.*not with SendMessage/);
   assert.deepEqual(call.args, [
     "-p", expectedPrompt,
     "--tools", "SendMessage",
@@ -195,7 +198,7 @@ test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) 
   ]);
   assert.match(expectedPrompt, /^Use the SendMessage tool to send a message to the peer named "cairo-1f"\./);
   assert.match(expectedPrompt, /Then reply with only the word DONE\.\n\n--- message starts ---\n\[OpenAGI supervisor\] CI finished/);
-  assert.match(expectedPrompt, /\n--- message ends ---$/);
+  assert.match(expectedPrompt, /green\.\nAnswer in your own chat[^\n]*\n--- message ends ---$/);
   assert.equal(call.env?.CODEX_LB_API_KEY, undefined);
   assert.deepEqual(executor.inFlight(), []);
   const action = store.action(result.actionId);
@@ -379,6 +382,50 @@ test("spawnWithTail settles after a timeout even if SIGTERM is ignored or a desc
   const grandchild = Number(held.tail.trim().split("\n")[0]);
   t.after(() => { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } });
   assert.ok(grandchild > 0);
+});
+
+test("a background resume still running at the ceiling stays in flight, journaled as left running", async (t) => {
+  const { home, cwd, config, store } = setup(t);
+  let options = null;
+  const run = (cmd, args, opts = {}) => { options = opts; return Promise.resolve({ code: null, timedOut: false, detached: true, error: null, tail: "working" }); };
+  const executor = createExecutor({ config, run, store, logDir: path.join(home, "fleet", "logs") });
+  const sent = await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec", playbook: "resume" });
+  assert.equal(options.detach, true);
+  assert.equal(await sent.done, true);
+  await executor.whenIdle();
+  assert.deepEqual(executor.inFlight(), ["codex:t1"], "no second send starts beside the running turn");
+  const running = store.action(sent.actionId);
+  assert.equal(running.running, true);
+  assert.match(running.detail, /left running, not killed/);
+  options.onExit({ code: 0, timedOut: false, error: null, tail: "working\nPushed the fix." });
+  assert.equal(store.action(sent.actionId).status, "done");
+  assert.equal(store.action(sent.actionId).detail, "Pushed the fix.");
+  assert.deepEqual(executor.inFlight(), []);
+});
+
+// A codex exec or claude resume that never exits (a stalled network read,
+// a prompt nobody sees) held its thread "in flight" until the supervisor
+// restarted: every resume, CI-done ping and owner answer was refused.
+test("a detached turn that never exits stops holding its thread after a second ceiling", async (t) => {
+  const { home, cwd, config, store } = setup(t);
+  const runs = [];
+  const run = (cmd, args, opts = {}) => { runs.push(opts); return Promise.resolve({ code: null, timedOut: false, detached: true, error: null, tail: "working" }); };
+  const executor = createExecutor({ config, run, store, logDir: path.join(home, "fleet", "logs"), detachedReleaseMs: 30 });
+  const sent = await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec", playbook: "resume" });
+  await executor.whenIdle();
+  assert.deepEqual(executor.inFlight(), ["codex:t1"]);
+  assert.match((await executor.deliver({ thread: codexThread(cwd), message: "CI done", route: "codex-exec" })).detail, /^in flight/);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(executor.inFlight(), [], "released, never killed");
+  assert.equal(store.action(sent.actionId).running, true);
+  assert.match(store.action(sent.actionId).detail, /no longer holds the thread/);
+  const next = await executor.deliver({ thread: codexThread(cwd), message: "CI done", route: "codex-exec" });
+  assert.equal(next.status, "sent");
+  await executor.whenIdle();
+  // The old turn ending later leaves the newer send in flight.
+  runs[0].onExit({ code: 0, timedOut: false, error: null, tail: "done" });
+  assert.equal(store.action(sent.actionId).status, "done");
+  assert.deepEqual(executor.inFlight(), ["codex:t1"]);
 });
 
 test("a background send reports later whether it reached the agent", async (t) => {
@@ -686,6 +733,72 @@ test("no background route unless allowed, safe and the block was only the owner'
   await stale.executor.whenIdle();
 });
 
+// A Codex app send that cannot prove which thread is open (a title two
+// threads share, or the app still on another thread after the id link) may
+// go by codex exec, which reaches the thread by its id, when no app holds
+// the thread's writer lock.
+test("a Codex send the app cannot verify goes by codex exec when no app holds the thread", async (t) => {
+  withoutLbKey(t);
+  const thread = (cwd, extra = {}) => codexThread(cwd, { id: "01a0df66-b269-7540-81f5-592808f2e1f1", title: "Fix uploads", agentStatus: "idle", ...extra });
+  for (const detail of [
+    "could not verify thread: \"fix uploads\" is not the open thread",
+    "ambiguous: two threads share this title",
+    "ambiguous: two threads share this title; a thread with that title is already open"
+  ]) {
+    const { cwd, calls, store, executor } = fallbackSetup(t, { results: [{ status: "blocked", detail }] });
+    const result = await executor.deliver({ thread: thread(cwd), message: "BuildBot3 full run failed", route: "computer-use", playbook: "merge-ready" });
+    assert.equal(result.status, "sent", detail);
+    assert.equal(result.route, "codex-exec", detail);
+    assert.deepEqual(calls.at(-1).args.slice(0, 3), ["exec", "resume", "01a0df66-b269-7540-81f5-592808f2e1f1"], detail);
+    await executor.whenIdle();
+    assert.equal(store.action(result.actionId).fallbackFrom, detail);
+  }
+  // A running turn, a send left unconfirmed in the composer, or a Conductor
+  // chat (its page names the session by id) gets no exec.
+  for (const [label, extra, results] of [
+    ["turn running", { agentStatus: "running" }, [{ status: "blocked", detail: "could not verify thread: another thread is open" }]],
+    ["unconfirmed", {}, [{ status: "blocked", detail: "could not verify thread: another thread is open", unconfirmed: true }]]
+  ]) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results });
+    const result = await executor.deliver({ thread: thread(cwd, extra), message: "continue", route: "computer-use" });
+    assert.equal(result.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+  assert.equal(isCodexIdentityBlock({ kind: "conductor" }, { status: "blocked", detail: "could not verify thread: another session is open" }), false);
+  assert.equal(isCodexIdentityBlock({ kind: "codex" }, { status: "blocked", detail: "composer not found" }), false);
+});
+
+// codex:019fe344 (#5557), as it is: the approved BuildBot3-failure ping was
+// blocked ("on top of pr #5544, ..." is not the open thread) while the Codex
+// app-server (pid 17768) held the writer lock of this thread and of all 77
+// threads it had loaded. Opening a thread by its link loads it, so codex
+// exec can never take over here: the block stands, says why, and policy
+// asks the owner.
+test("019fe344: a Codex send the app cannot verify, on a thread the app holds, stays blocked and says why", async (t) => {
+  withoutLbKey(t);
+  const id = "019fe344-eb70-7da2-9186-62c55dbd61d2";
+  const detail = "could not verify thread: \"on top of pr #5544, i want to build a mo\" is not the open thread";
+  const thread = (cwd, extra = {}) => codexThread(cwd, { id, key: `codex:${id}`, title: "On top of PR #5544, I want to build a mock chat experience that we can pace on h", agentStatus: "idle", ...extra });
+  // The scan read the lock.
+  const scanned = fallbackSetup(t, { results: [{ status: "blocked", detail }] });
+  const blocked = await scanned.executor.deliver({ thread: thread(scanned.cwd, { writerLocked: true }), message: "BuildBot3 full run failed", route: "computer-use", playbook: "merge-ready" });
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.detail, `${detail}; ${CODEX_APP_HOLDS}`);
+  assert.equal(scanned.calls.length, 0, "no codex exec");
+  // The lock taken after the scan (the id link loaded the thread): read
+  // again at send time, held by a live process.
+  const lsofOut = [];
+  const lsof = fallbackSetup(t, { results: [{ status: "blocked", detail }], relay: lsofOut });
+  const lockFile = path.join(lsof.home, ".codex", "thread-writer-locks", `${id}.lock`);
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, "");
+  lsofOut.push({ code: 0, stdout: `p${process.pid}\nccodex\nf70\nn${lockFile}\n` });
+  const held = await lsof.executor.deliver({ thread: thread(lsof.cwd), message: "BuildBot3 full run failed", route: "computer-use", playbook: "merge-ready" });
+  assert.equal(held.status, "blocked");
+  assert.equal(held.detail, `${detail}; ${CODEX_APP_HOLDS}`);
+  assert.deepEqual(lsof.calls.map((call) => call.args[0]), ["-F"], "only the lock read ran");
+});
+
 test("a Conductor chat goes by peer relay to its live peer only when that peer is idle now", async (t) => {
   const tab = (cwd) => conductorUiThread(cwd, { claudeSessionId: "cs1", live: { peerName: "old-1", pid: 5, status: "idle" } });
   const atConductor = () => [{ status: "blocked", detail: "owner using Conductor" }];
@@ -753,4 +866,275 @@ test("a remote send near its deadline takes no background route", async (t) => {
   assert.equal(result.status, "blocked");
   assert.equal(result.detail, "owner using Codex");
   assert.equal(calls.length, 0);
+});
+
+test("a Conductor chat waiting on background tasks is sent to now (⌘↩) unless the caller queues", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const waiting = conductorUiThread(cwd, { agentStatus: "waiting", openTasks: [{ id: "b1", description: "bb-verify --full" }] });
+  await executor.deliver({ thread: waiting, message: "status?", route: "computer-use", playbook: "status-check" });
+  assert.equal(requests.at(-1).busy, true);
+  assert.equal(requests.at(-1).sendNow, true);
+  await executor.deliver({ thread: waiting, message: "after your tasks", route: "computer-use", playbook: "owner-message", queue: true });
+  assert.equal(requests.at(-1).sendNow, false);
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "idle", route: "computer-use" });
+  assert.equal(requests.at(-1).busy, false);
+  assert.equal(requests.at(-1).sendNow, false);
+});
+
+test("a Codex thread hosted in a busy Conductor chat is sent to now too; a queued send never falls back to a relay", async (t) => {
+  const base = setup(t);
+  const host = conductorUiThread(base.cwd, { agentStatus: "waiting", openTasks: [{ id: "b1" }] });
+  const hosted = { key: "codex:h1", kind: "codex", id: "h1", cwd: base.cwd, archived: false, writerLocked: false, agentStatus: "idle",
+    meta: { originator: "codex_sdk_ts", conductorHost: { workspaceId: "w-madrid", sessionId: "s1", workspace: "madrid", title: "Fix billing" } } };
+  const requests = [];
+  const ui = { async deliver(request) { requests.push(request); return { status: "sent", detail: "typed into Conductor" }; } };
+  const executor = createExecutor({ config: { ...base.config, delivery: "computer-use" }, run: base.run, store: base.store, ui, uiLock: createUiLock(), knownThreads: () => [host, hosted] });
+  await executor.deliver({ thread: hosted, message: "status?", route: "computer-use" });
+  assert.equal(requests.at(-1).sendNow, true, "busy is the Conductor chat it lands in");
+  // Owner at the Mac, background routes on, asked to queue: it waits, no relay.
+  const peers = new Map([["cs1", { peerName: "p-1", pid: 6, status: "idle", waitingFor: null }]]);
+  const blocked = createExecutor({ config: { ...base.config, delivery: "computer-use", backgroundRoutes: ["peer-relay"] }, run: base.run, store: base.store,
+    ui: { deliver: async () => ({ status: "blocked", detail: "owner using Conductor" }) }, uiLock: createUiLock(), readLivePeers: () => peers, refreshThread: async () => tab });
+  const tab = conductorUiThread(base.cwd, { claudeSessionId: "cs1", agentStatus: "waiting", live: { peerName: "p-1", pid: 6, status: "idle" } });
+  const result = await blocked.deliver({ thread: tab, message: "after your tasks", route: "computer-use", queue: true });
+  assert.equal(result.status, "blocked");
+  assert.equal(base.calls.length, 0, "no relay ran");
+});
+
+test("send now or queue is read at send time; a queued Conductor send goes by the app or not at all", async (t) => {
+  const { cwd, base } = (() => { const b = setup(t); return { cwd: b.cwd, base: b }; })();
+  const requests = [];
+  const ui = { async deliver(request) { requests.push(request); return { status: "sent", detail: "typed into Conductor" }; } };
+  const stale = conductorUiThread(cwd, { agentStatus: "idle", openTasks: [] });
+  const executor = createExecutor({ config: { ...base.config, delivery: "computer-use" }, run: base.run, store: base.store, ui, uiLock: createUiLock(),
+    refreshThread: async () => ({ ...stale, agentStatus: "waiting", openTasks: [{ id: "b9" }] }) });
+  await executor.deliver({ thread: stale, message: "status?", route: "computer-use" });
+  assert.equal(requests.at(-1).sendNow, true, "a task started after the scan");
+  const cli = createExecutor({ config: base.config, run: base.run, store: base.store, ui, uiLock: createUiLock() });
+  const relay = await cli.deliver({ thread: conductorUiThread(cwd, { live: { peerName: "p", pid: 1, status: "idle" } }), message: "later", route: "peer-relay", queue: true });
+  assert.equal(relay.status, "blocked");
+  assert.match(relay.detail, /queue needs the Conductor app/);
+  assert.equal(base.calls.length, 0);
+});
+
+test("queue is Conductor's: a Codex thread asked to queue still falls back while the owner is at the Mac", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, executor } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use", queue: true });
+  assert.equal(result.route, "codex-exec");
+  assert.equal(calls.length, 1);
+  await executor.whenIdle();
+});
+
+test("spawnWithTail with detach leaves a turn running past the ceiling and reports its end later", async () => {
+  // Codex 019fe344: the codex-exec route hit its 2 h ceiling at 21:08Z and
+  // killed a live turn. A detached child is never killed.
+  let exited = null;
+  const ended = new Promise((resolve) => { exited = resolve; });
+  const script = "process.stdout.write('working\\n'); setTimeout(() => process.stdout.write('pushed the fix\\n'), 400)";
+  const result = await spawnWithTail(process.execPath, ["-e", script], { timeoutMs: 100, killGraceMs: 50, detach: true, onExit: exited });
+  assert.equal(result.detached, true);
+  assert.equal(result.timedOut, false);
+  const late = await ended;
+  assert.equal(late.code, 0, "the turn ran to its end");
+  assert.match(late.tail, /pushed the fix/);
+});
+
+function antigravitySetup(t, { results = [], fresh = undefined, server = undefined, delivery = undefined, backgroundRoutes = undefined, refresh = null, binary = "shim" } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-ag-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const agentapi = path.join(home, "agentapi");
+  const antigravityLs = path.join(home, "language_server");
+  if (binary === "shim") fs.writeFileSync(agentapi, "#!/bin/sh\nexec /Applications/Antigravity.app/Contents/Resources/bin/language_server agentapi \"$@\"\n");
+  if (["shim", "bundled"].includes(binary)) fs.writeFileSync(antigravityLs, "fixture");
+  const config = resolveFleetConfig({}, { home, bins: { agentapi, antigravityLs }, ...(delivery ? { delivery } : {}), ...(backgroundRoutes ? { backgroundRoutes } : {}) });
+  const store = new FleetStore({ dir: path.join(home, "fleet") });
+  const calls = [];
+  const run = (cmd, args, options = {}) => {
+    calls.push({ cmd, args, env: options.env, timeoutMs: options.timeoutMs });
+    return Promise.resolve({ code: 0, stdout: "", stderr: "", timedOut: false, error: null, ...(results.shift() ?? {}) });
+  };
+  const ls = server === undefined ? { pid: 9, address: "127.0.0.1:50489" } : server;
+  if (ls) Object.defineProperty(ls, "csrfToken", { value: "csrf-secret-77", enumerable: false });
+  const refreshed = [];
+  const executor = createExecutor({
+    config, run, store,
+    refreshThread: async (thread) => { refreshed.push(thread.key); return refresh ? refresh(thread) : fresh === undefined ? thread : fresh; },
+    findLanguageServer: async () => ls
+  });
+  return { home, config, store, calls, executor, refreshed };
+}
+
+function antigravityThread(extra = {}) {
+  return {
+    key: "antigravity:e8b9db19", kind: "antigravity", id: "e8b9db19", cwd: null, archived: false, writerLocked: false, live: null,
+    agentStatus: "error", lastUserAt: "2026-10-14T06:11:16.121Z", meta: { projectId: "proj-1" }, ...extra
+  };
+}
+
+test("Antigravity delivery falls back to bundled agentapi and blocks missing or relative binaries", async (t) => {
+  const bundled = antigravitySetup(t, { binary: "bundled" });
+  assert.equal((await bundled.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" })).status, "sent");
+  assert.equal(bundled.calls[0].cmd, bundled.config.bins.antigravityLs);
+  assert.deepEqual(bundled.calls[0].args.slice(0, 2), ["agentapi", "send-message"]);
+  for (const relative of [false, true]) {
+    const missing = antigravitySetup(t, { binary: "missing" });
+    if (relative) Object.assign(missing.config.bins, { agentapi: "agentapi", antigravityLs: "language_server" });
+    const result = await missing.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+    assert.equal(result.status, "blocked");
+    assert.match(result.detail, /delivery unavailable.*\/Applications.*~\/Applications/);
+    assert.equal(missing.calls.length, 0);
+  }
+});
+
+test("Antigravity cancels stale resumes and proposed nudges after agent activity", async (t) => {
+  const scanned = antigravityThread({ lastAgentAt: "2026-10-14T06:00:00.000Z", lastActivityAt: "2026-10-14T06:10:00.000Z", meta: { stepCount: 10 } });
+  for (const playbook of ["resume", "nudge"]) {
+    for (const change of [
+      { lastAgentAt: "2026-10-14T06:20:00.000Z" },
+      { lastActivityAt: "2026-10-14T06:20:00.000Z" },
+      { meta: { stepCount: 11 } }
+    ]) {
+      const setup = antigravitySetup(t, { fresh: { ...scanned, agentStatus: "idle", ...change } });
+      const result = await setup.executor.deliver({ thread: scanned, message: "continue", route: "antigravity-send", playbook });
+      assert.equal(result.status, "blocked");
+      assert.match(result.detail, /agent replied or did new work/);
+      assert.equal(setup.calls.length, 0);
+    }
+  }
+});
+
+test("Antigravity resumes only while the original error still stands", async (t) => {
+  const thread = antigravityThread({ error: { kind: "usage-limit", text: "quota spent" } });
+  for (const error of [null, { kind: "network", text: "offline" }, { kind: "usage-limit", text: "different limit" }, thread.error]) {
+    const setup = antigravitySetup(t, { fresh: { ...thread, error } });
+    const result = await setup.executor.deliver({ thread, message: "continue", route: "antigravity-send", playbook: "resume" });
+    assert.equal(result.status, error === thread.error ? "sent" : "blocked");
+    if (error !== thread.error) assert.match(result.detail, /original error no longer stands/);
+    assert.equal(setup.calls.length, error === thread.error ? 1 : 0);
+  }
+});
+
+test("antigravity-send runs agentapi send-message with the server address and token in the child env only", async (t) => {
+  const { calls, config, store, executor, refreshed } = antigravitySetup(t, { results: [{ stdout: '{"response":{"sendMessage":{"recipientId":"e8b9db19"}}}\n' }] });
+  const result = await executor.deliver({ thread: antigravityThread(), message: "The quota reset; continue.", route: "antigravity-send", playbook: "resume" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "antigravity-send");
+  assert.deepEqual(refreshed, ["antigravity:e8b9db19"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, config.bins.agentapi);
+  assert.deepEqual(calls[0].args, ["send-message", "--title", "OpenAGI supervisor", "e8b9db19", `${MESSAGE_PREFIX}The quota reset; continue.`]);
+  assert.equal(calls[0].env.ANTIGRAVITY_LS_ADDRESS, "127.0.0.1:50489");
+  assert.equal(calls[0].env.ANTIGRAVITY_CSRF_TOKEN, "csrf-secret-77");
+  assert.equal(calls[0].env.ANTIGRAVITY_PROJECT_ID, "proj-1");
+  assert.equal(process.env.ANTIGRAVITY_CSRF_TOKEN, undefined);
+  const action = store.action(result.actionId);
+  assert.equal(action.status, "sent");
+  assert.equal(action.route, "antigravity-send");
+  const everything = JSON.stringify(result) + JSON.stringify(store.actions()) + fs.readFileSync(path.join(store.dir, "state.json"), "utf8");
+  assert.doesNotMatch(everything, /csrf-secret-77/);
+  assert.deepEqual(executor.inFlight(), []);
+});
+
+test("antigravity-send re-reads the conversation and leaves a busy one alone", async (t) => {
+  const cases = [
+    [{ agentStatus: "running" }, /turn running/],
+    [{ agentStatus: "waiting", meta: { blockedOnOwner: true } }, /approval in Antigravity/],
+    [{ agentStatus: "idle", lastUserAt: "2026-10-14T07:00:00.000Z" }, /owner wrote/],
+    [null, /read the conversation again/]
+  ];
+  for (const [change, reason] of cases) {
+    const fresh = change ? antigravityThread(change) : null;
+    const { calls, executor } = antigravitySetup(t, { fresh });
+    const result = await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+    assert.equal(result.status, "blocked", String(reason));
+    assert.match(result.detail, reason);
+    assert.equal(calls.length, 0);
+  }
+  // The scan's own reading is checked before anything is read again.
+  const { calls, executor, refreshed } = antigravitySetup(t);
+  assert.match((await executor.deliver({ thread: antigravityThread({ agentStatus: "running" }), message: "x", route: "antigravity-send" })).detail, /turn running/);
+  assert.match((await executor.deliver({ thread: { ...antigravityThread(), kind: "claude" }, message: "x", route: "antigravity-send" })).detail, /needs an Antigravity conversation/);
+  assert.deepEqual([calls.length, refreshed.length], [0, 0]);
+});
+
+test("antigravity-send without a running app, or with agentapi failing, says why", async (t) => {
+  const off = antigravitySetup(t, { server: null });
+  const blocked = await off.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+  assert.equal(blocked.status, "blocked");
+  assert.match(blocked.detail, /Antigravity is not running/);
+  assert.equal(off.calls.length, 0);
+  const failing = antigravitySetup(t, { results: [{ code: 0, stdout: '{"error":"ANTIGRAVITY_LS_ADDRESS is not set"}' }] });
+  const failed = await failing.executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.detail, /agentapi failed: ANTIGRAVITY_LS_ADDRESS is not set/);
+});
+
+test("antigravity-send works on a computer-use-only Mac and dry-runs without running", async (t) => {
+  const { calls, executor } = antigravitySetup(t, { delivery: "computer-use", backgroundRoutes: ["antigravity-send"], results: [{ stdout: '{"response":{"sendMessage":{}}}' }] });
+  const dry = await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send", dryRun: true });
+  assert.equal(dry.status, "dry-run");
+  assert.match(dry.detail, /agentapi send-message e8b9db19/);
+  assert.equal(calls.length, 0);
+  assert.equal((await executor.deliver({ thread: antigravityThread(), message: "continue", route: "antigravity-send" })).status, "sent");
+});
+
+
+test("Antigravity reserves the thread before refreshing and releases every blocked send", async (t) => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const setup = antigravitySetup(t, { refresh: async (thread) => { await gate; return thread; } });
+  const request = { thread: antigravityThread(), message: "resume", route: "antigravity-send" };
+  const first = setup.executor.deliver(request);
+  assert.deepEqual(setup.executor.inFlight(), [request.thread.key]);
+  const second = await setup.executor.deliver(request);
+  assert.match(second.detail, /in flight/);
+  release();
+  assert.equal((await first).status, "sent");
+  assert.equal(setup.calls.length, 1);
+  assert.deepEqual(setup.executor.inFlight(), []);
+  const blocked = antigravitySetup(t, { fresh: null });
+  await blocked.executor.deliver(request);
+  assert.deepEqual(blocked.executor.inFlight(), []);
+});
+
+test("Antigravity busy metadata blocks both scan and fresh delivery regardless of displayed status", async (t) => {
+  for (const meta of [{ runStatus: "CASCADE_RUN_STATUS_RUNNING" }, { runStatus: "BUSY" }, { notFullyIdle: true }]) {
+    const thread = antigravityThread({ agentStatus: "stalled", meta });
+    const scan = antigravitySetup(t);
+    assert.match((await scan.executor.deliver({ thread, message: "resume", route: "antigravity-send" })).detail, /turn running/);
+    const fresh = antigravitySetup(t, { fresh: thread });
+    assert.match((await fresh.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).detail, /turn running/);
+    assert.equal(scan.calls.length + fresh.calls.length, 0);
+  }
+});
+
+test("Antigravity requires an explicit background allowance in computer-use modes", async (t) => {
+  for (const delivery of ["computer-use", "computer-use-first"]) {
+    const setup = antigravitySetup(t, { delivery });
+    assert.match((await setup.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).detail, /background delivery is not allowed/);
+    assert.equal(setup.calls.length, 0);
+  }
+});
+
+test("agentapi timeout stays unconfirmed across retries and executor restart", async (t) => {
+  const setup = antigravitySetup(t, { results: [{ timedOut: true }] });
+  const request = { thread: antigravityThread(), message: "resume", route: "antigravity-send" };
+  const first = await setup.executor.deliver(request);
+  assert.equal(first.status, "blocked");
+  assert.equal(first.unconfirmed, true);
+  assert.equal(setup.store.action(first.actionId).unconfirmed, true);
+  assert.match((await setup.executor.deliver(request)).detail, /unconfirmed/);
+  const restarted = createExecutor({ config: setup.config, store: setup.store, run: () => { throw new Error("must not send again"); }, refreshThread: async () => request.thread });
+  assert.match((await restarted.deliver(request)).detail, /unconfirmed/);
+  assert.equal(setup.calls.length, 1);
+  const confirmed = createExecutor({ config: setup.config, store: setup.store, run: () => { throw new Error("must not send again"); }, refreshThread: async () => ({ ...request.thread, meta: { lastSupervisorAt: new Date(Date.now() + 1000).toISOString() } }) });
+  assert.equal((await confirmed.deliver(request)).status, "sent");
+});
+
+test("agentapi accepts exit zero without depending on one JSON success shape", async (t) => {
+  for (const stdout of ["", "Message delivered", '{"ok":true}']) {
+    const setup = antigravitySetup(t, { results: [{ stdout }] });
+    assert.equal((await setup.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).status, "sent");
+  }
 });

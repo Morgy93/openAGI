@@ -141,7 +141,8 @@ function boot({ search = "", state = sampleState(), confirmResult = true } = {})
   const fetch = async (path, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : undefined;
     requests.push({ path, method: init.method ?? "GET", body });
-    const next = responses.shift();
+    const pending = responses.shift();
+    const next = pending ? await pending : null;
     if (next) return { ok: next.status < 400, status: next.status, json: async () => next.body };
     return { ok: true, status: 200, json: async () => currentState };
   };
@@ -402,4 +403,315 @@ test("Oldest run skips queued runs and uses policy's slow limits", async () => {
   pill = await oldestPill([full(2, 40 * 60, false), quick, null]);
   assert.match(pill.text, /#5$/, "an older full run under its limit does not hide a slow quick run");
   assert.equal(pill.tone, "warn");
+});
+
+test("Watching groups threads by what the supervisor waits on, longest first, with how long", async () => {
+  const at = (min) => new Date(Date.now() - min * 60_000).toISOString();
+  const base = sampleState();
+  const row = (key, title, watch, extra = {}) => ({
+    key, kind: "conductor", title, workspace: null, repo: "o/r", branch: "b", agentStatus: "waiting", state: "waiting-ci", reason: "waiting",
+    blockers: [], pr: { ref: "o/r#1", url: "https://github.com/o/r/pull/1", state: "OPEN", ci: null }, lastActivityAt: at(1), lastAgentText: "",
+    live: false, route: null, decision: null, watch, ...extra
+  });
+  const threads = [
+    row("conductor:w1", "Short wait", { group: "waiting", since: at(5), waitingOn: "BuildBot3 full run", waitSince: at(5), runningSince: at(9) }),
+    row("conductor:w2", "Long wait", { group: "waiting", since: at(42), waitingOn: "BuildBot3 full run", waitSince: at(42), runningSince: at(50) }),
+    row("conductor:r1", "Busy", { group: "working", since: at(12), waitingOn: null, waitSince: null, runningSince: at(12) }, { agentStatus: "running", state: "running" }),
+    row("claude:x", "Out", null, { state: "excluded" })
+  ];
+  const page = boot({ state: { ...base, snapshot: { ...base.snapshot, threads } } });
+  await settle();
+  const fleet = page.el("fleetList");
+  const text = fleet.textContent;
+  assert.ok(text.includes("Waiting on CI or BuildBot3"));
+  assert.ok(text.includes("Working"));
+  assert.ok(text.includes("on BuildBot3 full run for 42m"));
+  assert.ok(text.includes("for 12m"));
+  assert.ok(text.indexOf("Working") < text.indexOf("Waiting on CI or BuildBot3"), "groups in watch order");
+  assert.ok(text.indexOf("Long wait") < text.indexOf("Short wait"), "longest wait first");
+  assert.ok(text.includes("Turn running"));
+});
+
+// ─── open chat, row detail and row actions ────────────────────────────────
+
+function watchState() {
+  const at = (min) => new Date(Date.now() - min * 60_000).toISOString();
+  const base = sampleState();
+  const row = (key, title, watch, extra = {}) => ({
+    key, kind: "conductor", title, workspace: "remote-dev", repo: "o/r", branch: "b", agentStatus: "idle", state: "pr-not-ready", reason: "waiting",
+    blockers: [], pr: { ref: "o/r#7", url: "https://github.com/o/r/pull/7", state: "OPEN", ci: null }, lastActivityAt: at(1), lastAgentText: "",
+    live: false, route: "computer-use", decision: null, watch, muted: null, lastOwnerAt: null,
+    openChat: { app: "conductor", url: "conductor://workspace?id=w1&session=s1", label: "remote-dev · Codex LB Transcript open (Conductor)", note: null },
+    ...extra
+  });
+  const threads = [
+    row("conductor:d1", "Capacity fix", { group: "you", since: at(90), waitingOn: "your answer", waitSince: null, runningSince: null }),
+    row("conductor:p1", "Stalled PR", { group: "push", since: at(30), waitingOn: null, waitSince: null, runningSince: null }, {
+      decision: { action: "wait", reason: "owner is driving this thread" },
+      pushPreview: { action: "nudge", playbook: "merge-ready", reason: "idle 30m with CI green", message: "CI is green. Merge when ready." }
+    }),
+    row("conductor:p2", "No plan", { group: "push", since: at(20), waitingOn: null, waitSince: null, runningSince: null }, {
+      decision: { action: "wait", playbook: null, reason: "cooldown after the last nudge", notBefore: null, message: null }
+    }),
+    row("claude:t1", "Terminal", { group: "working", since: at(4), waitingOn: null, waitSince: null, runningSince: at(4) }, {
+      kind: "claude", openChat: { app: "claude", url: null, label: "openAGI · Claude Code terminal", note: "No link opens a terminal session." }
+    }),
+    row("conductor:m1", "Muted one", { group: "push", since: at(50), waitingOn: null, waitSince: null, runningSince: null }, {
+      muted: new Date(Date.now() + 3600_000).toISOString(), openChat: { app: "conductor", url: "javascript:alert(1)", label: "x", note: null }
+    })
+  ];
+  const ask = {
+    id: "fq_cap", kind: "agent-ask", threadKey: "conductor:d1", title: "Which BuildBot3 capacity fix should be applied?", body: "Pick one.",
+    options: ["Add a slot", "Raise the timeout"], status: "open", createdAt: at(10), askedAt: at(180),
+    chatLabel: "remote-dev · Codex LB Transcript open (Conductor)", answerIn: "here", risky: false,
+    openChat: { app: "conductor", url: "conductor://workspace?id=w1&session=s1", label: "remote-dev · Codex LB Transcript open (Conductor)", note: null }
+  };
+  return { ...base, questions: [ask], actions: [], snapshot: { ...base.snapshot, threads } };
+}
+
+function rowOf(page, title) {
+  return findAll(page.el("fleetList"), (e) => e.tagName === "DETAILS" && e.className.includes("thread") && e.textContent.includes(title))[0];
+}
+
+async function expand(row) {
+  row.open = true;
+  for (const fn of row.listeners.toggle ?? []) await fn({});
+  await settle();
+}
+
+test("question cards say which chat, when the agent asked, and link straight to it", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const needs = page.el("needsList");
+  assert.ok(needs.textContent.includes("in remote-dev · Codex LB Transcript open (Conductor)"));
+  assert.ok(needs.textContent.includes("asked 3h ago"), "the agent's ask time, not when the card was made");
+  const open = findAll(needs, (e) => e.tagName === "A" && e.textContent === "Open chat");
+  assert.equal(open.length, 1);
+  assert.equal(open[0].href, "conductor://workspace?id=w1&session=s1");
+});
+
+test("a question answered only in the agent's app leads with Open chat and says so", async () => {
+  const state = watchState();
+  state.questions = [{ ...state.questions[0], kind: "agent-card", answerIn: "agent app", options: ["opened"],
+    openChat: { app: "codex", url: "codex://threads/01a13388", label: "amex · Codex", note: null } }];
+  const page = boot({ state });
+  await settle();
+  const opts = findAll(page.el("needsList"), (e) => e.className === "opts")[0];
+  assert.equal(opts.children[0].tagName, "A", "the way to the app comes first");
+  assert.equal(opts.children[0].href, "codex://threads/01a13388");
+  assert.ok(opts.children[0].className.includes("primary"));
+  assert.ok(page.el("needsList").textContent.includes("Answer this in Codex. Nothing is sent from here."));
+});
+
+test("a risky ask shows all its words before any button, with no highlighted default", async () => {
+  const state = watchState();
+  const long = "Release 0.0.56 to production. ".repeat(40) + "THE END";
+  state.questions = [{ ...state.questions[0], title: "docs #43: cut production release?", risky: true, askContext: long, options: ["Release", "Hold"] }];
+  const page = boot({ state });
+  await settle();
+  const card = findAll(page.el("needsList"), (e) => e.tagName === "ARTICLE")[0];
+  const order = card.all();
+  const warn = order.findIndex((e) => e.className === "risk");
+  const quote = order.findIndex((e) => e.tagName === "BLOCKQUOTE");
+  const firstButton = order.findIndex((e) => e.tagName === "BUTTON");
+  assert.ok(warn >= 0 && warn < quote && quote < firstButton, "warning, then the full text, then the buttons");
+  assert.equal(order[quote].className, "quote", "not clamped");
+  assert.ok(order[quote].textContent.endsWith("THE END"));
+  assert.ok(findAll(card, (e) => e.tagName === "BUTTON").every((b) => !b.className.includes("primary")));
+});
+
+test("Watching rows link to their chat; a chat no link opens names itself and why", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const cap = rowOf(page, "Capacity fix");
+  const summary = cap.children[0];
+  const link = findAll(summary, (e) => e.tagName === "A" && e.textContent === "Open chat")[0];
+  assert.equal(link.href, "conductor://workspace?id=w1&session=s1");
+  assert.ok(summary.textContent.includes("remote-dev · Codex LB Transcript open (Conductor)"));
+  const term = rowOf(page, "Terminal");
+  assert.equal(findAll(term, (e) => e.tagName === "A" && e.textContent === "Open chat").length, 0);
+  assert.ok(term.textContent.includes("openAGI · Claude Code terminal"));
+  assert.ok(term.textContent.includes("No link opens a terminal session."));
+  const muted = rowOf(page, "Muted one");
+  assert.equal(findAll(muted, (e) => e.tagName === "A" && /^javascript:/.test(e.href)).length, 0, "only conductor:// and codex:// links");
+});
+
+test("expanding a row loads its detail: last message, PR with CI, owner's last word, next step", async () => {
+  const state = watchState();
+  const thread = state.snapshot.threads.find((row) => row.key === "conductor:p1");
+  for (const field of ["pr", "decision", "lastOwnerAt"]) delete thread[field];
+  const page = boot({ state });
+  await settle();
+  const row = rowOf(page, "Stalled PR");
+  page.responses.push({ status: 200, body: { thread: {
+    key: "conductor:p1", agentStatus: "idle", lastAgentMessage: { text: "Done. Waiting for review <b>x</b>", at: new Date(Date.now() - 25 * 60_000).toISOString() },
+    lastOwnerAt: new Date(Date.now() - 2 * 3600_000).toISOString(),
+    pr: { ref: "o/r#7", url: "https://github.com/o/r/pull/7", state: "OPEN", title: "Fix LB", ci: { state: "FAILURE", failing: ["unit"], pending: ["e2e"] }, unresolvedThreads: 1, mergeState: "BLOCKED" },
+    watch: { group: "push", since: new Date(Date.now() - 30 * 60_000).toISOString(), waitingOn: null },
+    decision: { action: "nudge", playbook: "merge-ready", reason: "idle 30m with CI green", notBefore: null, message: "CI is green. Merge when ready." },
+    openChat: { app: "conductor", url: "conductor://workspace?id=w1&session=s1", label: "remote-dev · Remote dev setup (Conductor)", note: null },
+    scannedAt: new Date().toISOString()
+  } } });
+  await expand(row);
+  const get = page.requests.find((r) => r.path.startsWith("/fleet/api/threads/"));
+  assert.equal(get.path, "/fleet/api/threads/conductor%3Ap1");
+  assert.equal(get.method, "GET");
+  const text = rowOf(page, "Stalled PR").textContent;
+  assert.ok(text.includes("Done. Waiting for review <b>x</b>"), "last message as plain text");
+  assert.ok(text.includes("Agent last spoke25m ago"));
+  assert.ok(text.includes("You last wrote2h ago"));
+  assert.ok(text.includes("CI FAILURE, failing: unit, pending: e2e"));
+  assert.ok(text.includes("Fix LB"));
+  assert.ok(text.includes("Nextnudge (merge-ready)"));
+  assert.ok(text.includes("Whyidle 30m with CI green"));
+  assert.ok(text.includes("Waits onNeeds a push, for 30m"));
+});
+
+test("a row whose detail is gone says so instead of failing", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  page.responses.push({ status: 404, body: { error: "not found" } });
+  await expand(rowOf(page, "Stalled PR"));
+  assert.ok(rowOf(page, "Stalled PR").textContent.includes("not in the last scan; scan again"));
+});
+
+test("Push now shows the planned words first, posts the push and reports a refusal", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const row = rowOf(page, "Stalled PR");
+  const order = row.all();
+  const quote = order.findIndex((e) => e.tagName === "BLOCKQUOTE" && e.textContent === "CI is green. Merge when ready.");
+  const push = order.findIndex((e) => e.tagName === "BUTTON" && e.textContent === "Push now");
+  assert.ok(quote >= 0 && quote < push, "the words come before the button");
+  page.responses.push({ status: 200, body: { delivery: { status: "blocked", route: "computer-use", detail: "waits on your answer first: Pick one" }, action: null, state: watchState() } });
+  await order[push].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/threads/conductor%3Ap1/push");
+  assert.deepEqual(post.body, {});
+  assert.equal(page.el("status").textContent, "Not pushed: waits on your answer first: Pick one");
+  assert.ok(page.el("status").className.includes("err"));
+});
+
+test("Push now appears only with a planned nudge; otherwise the row says why", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const none = rowOf(page, "No plan");
+  assert.equal(findAll(none, (e) => e.tagName === "BUTTON" && e.textContent === "Push now").length, 0);
+  assert.ok(none.textContent.includes("No nudge planned yet: cooldown after the last nudge"));
+  const you = rowOf(page, "Capacity fix");
+  assert.equal(findAll(you, (e) => e.tagName === "BUTTON" && e.textContent === "Push now").length, 0, "never over your open question");
+  const muted = rowOf(page, "Muted one");
+  assert.equal(findAll(muted, (e) => e.tagName === "BUTTON" && e.textContent === "Push now").length, 0);
+});
+
+test("Mute posts 24 hours; a muted row offers Unmute", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const until = new Date(Date.now() + 24 * 3600_000).toISOString();
+  page.responses.push({ status: 200, body: { muted: until, state: watchState() } });
+  const mute = findAll(rowOf(page, "Stalled PR"), (e) => e.tagName === "BUTTON" && e.textContent === "Mute 24h")[0];
+  await mute.click();
+  await settle();
+  let post = page.requests.filter((r) => r.method === "POST").at(-1);
+  assert.equal(post.path, "/fleet/api/threads/conductor%3Ap1/mute");
+  assert.deepEqual(post.body, { hours: 24 });
+  assert.ok(page.el("status").textContent.startsWith("Muted until"));
+  const muted = rowOf(page, "Muted one");
+  assert.ok(muted.textContent.includes("muted"));
+  page.responses.push({ status: 200, body: { muted: null, state: watchState() } });
+  await findAll(muted, (e) => e.tagName === "BUTTON" && e.textContent === "Unmute")[0].click();
+  await settle();
+  post = page.requests.filter((r) => r.method === "POST").at(-1);
+  assert.equal(post.path, "/fleet/api/threads/conductor%3Am1/unmute");
+});
+
+test("a Waiting on you row carries its question's options and Dismiss", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const row = rowOf(page, "Capacity fix");
+  const labels = findAll(row, (e) => e.tagName === "BUTTON").map((b) => b.textContent);
+  assert.deepEqual(labels.slice(0, 3), ["Add a slot", "Raise the timeout", "Dismiss"]);
+  assert.ok(row.textContent.includes("asked 3h ago in remote-dev · Codex LB Transcript open (Conductor)"));
+  page.responses.push({ status: 200, body: { question: { id: "fq_cap", status: "answered" }, delivery: { status: "sent" }, state: watchState() } });
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Raise the timeout")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_cap");
+  assert.deepEqual(post.body, { answer: "Raise the timeout" });
+});
+
+test("open thread is a chat link, never an answer button", async () => {
+  const state = watchState();
+  state.questions[0].options = ["A", "open thread", "B"];
+  const page = boot({ state });
+  await settle();
+  const buttons = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON");
+  assert.deepEqual(buttons.map((b) => b.textContent), ["A", "B", "Dismiss"]);
+});
+
+test("Push now stays disabled through polling during a send", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  let release;
+  page.responses.push(new Promise((resolve) => { release = resolve; }));
+  const push = () => findAll(rowOf(page, "Stalled PR"), (e) => e.tagName === "BUTTON" && e.textContent === "Push now")[0];
+  const send = push().click();
+  await settle();
+  await page.timers.find((timer) => timer.ms === 30_000).fn();
+  await settle();
+  assert.equal(push().disabled, true);
+  await push().click();
+  assert.equal(page.requests.filter((r) => r.method === "POST").length, 1);
+  release({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
+  await send;
+});
+
+test("a refreshed row wins over cached detail after dismissing its question", async () => {
+  const state = watchState();
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: { thread: {
+    key: "conductor:d1", watch: { group: "you", waitingOn: "your answer" },
+    pr: { ref: "o/r#99", title: "Stale PR" }, decision: { action: "ask-owner", reason: "Stale decision" },
+    muted: new Date(Date.now() + 3600_000).toISOString(),
+    lastAgentMessage: { text: "Longer agent message" }
+  } } });
+  await expand(rowOf(page, "Capacity fix"));
+  const fresh = structuredClone(state);
+  fresh.questions = [];
+  const thread = fresh.snapshot.threads[0];
+  thread.watch = { group: "push", waitingOn: "ready to continue" };
+  thread.pr = { ref: "o/r#8", title: "Current PR" };
+  thread.decision = { action: "wait", reason: "Current decision" };
+  page.responses.push({ status: 200, body: { state: fresh } });
+  await findAll(rowOf(page, "Capacity fix"), (e) => e.tagName === "BUTTON" && e.textContent === "Dismiss")[0].click();
+  await settle();
+  let text = rowOf(page, "Capacity fix").textContent;
+  assert.ok(text.includes("ready to continue"));
+  assert.ok(text.includes("Current PR"));
+  assert.ok(text.includes("Current decision"));
+  assert.ok(text.includes("Longer agent message"));
+  assert.doesNotMatch(text, /your answer|Stale PR|Stale decision|Muted until/);
+  assert.equal(page.requests.filter((r) => r.path.startsWith("/fleet/api/threads/")).length, 1, "detail remains cached");
+  thread.pr = null;
+  thread.decision = null;
+  page.setState(fresh);
+  await page.el("scan").click();
+  await settle();
+  text = rowOf(page, "Capacity fix").textContent;
+  assert.doesNotMatch(text, /Stale PR|Stale decision|Current PR|Current decision/);
+});
+
+
+test("Antigravity thread details show how to open the conversation as plain text", async () => {
+  const state = sampleState();
+  const thread = state.snapshot.threads[0];
+  thread.kind = "antigravity";
+  const note = "Open Antigravity and pick it in the sidebar. <img src=x>";
+  thread.openChat = { note };
+  const page = boot({ state });
+  await settle();
+  assert.ok(page.el("fleetList").textContent.includes(note));
+  assert.equal(findAll(page.el("fleetList"), (e) => e.tagName === "IMG").length, 0);
 });

@@ -12,12 +12,19 @@ enum OverlayTab: Equatable {
 final class OverlayState: ObservableObject {
   static let shared = OverlayState()
 
-  @Published var expanded = false
+  @Published var expanded = false {
+    didSet { if !expanded { voiceSession.stop() } }
+  }
+  private let voiceSession: VoiceSession
+  private let isEnabled: @MainActor () -> Bool
   @Published var question = ""
   @Published var answer: String = ""
   @Published var isLoading = false
   @Published var progressStage: String? = nil
   @Published var isDetached = false
+  /// What the "connection lost" banner says while the overlay finds out on
+  /// its own how a dropped ask ended. Changes the banner's height.
+  @Published private(set) var detachedPhase: DetachedPhase = .none
   @Published var error: String? = nil
   @Published var contextNote: String? = nil
   @Published private(set) var briefContext: BriefChatContext? = nil
@@ -27,12 +34,57 @@ final class OverlayState: ObservableObject {
   @Published private(set) var fleetContext: BriefChatContext? = nil
   /// Counter rather than Bool so selecting the same row twice still focuses.
   @Published private(set) var composerFocusRequest: UInt = 0
+  @Published private(set) var voiceFocus = VoiceFocus()
+
+  init(voiceSession: VoiceSession? = nil,
+       isEnabled: @escaping @MainActor () -> Bool = { OverlayController.isEnabled }) {
+    self.voiceSession = voiceSession ?? .shared
+    self.isEnabled = isEnabled
+  }
+
+  func beginVoice(_ source: VoicePTT.Source) {
+    guard isEnabled() else { return }
+    guard !isLoading, !isDetached else {
+      error = "Wait for the current question to finish before starting voice."
+      return
+    }
+    selectTab(.supervisor)
+    expanded = true
+    OverlayController.shared.show()
+    voiceSession.press(source, focus: voiceFocus)
+  }
+
+  func selectVoiceContext(_ focus: VoiceFocus) {
+    voiceFocus = focus
+    voiceSession.updateFocus(focus)
+  }
+
+  func pruneVoiceContext(openIDs: Set<String>, threadKeys: Set<String>) {
+    if let id = voiceFocus.questionId, !openIDs.contains(id) {
+      selectVoiceContext(VoiceFocus())
+    } else if let key = voiceFocus.threadKey, !threadKeys.contains(key), voiceFocus.questionId == nil {
+      selectVoiceContext(VoiceFocus())
+    }
+  }
+
+  enum DetachedPhase: Equatable {
+    case none
+    /// Reading the session back once to see whether the reply landed.
+    case checking
+    /// Not finished yet: the answer will be in the main app. Clears itself.
+    case stillRunning
+  }
+
+  /// The one read-back after a dropped stream, then the banner's own clear.
+  private var detachedRecovery: Task<Void, Never>?
+  static let detachedCheckDelay: TimeInterval = 4
+  static let detachedClearDelay: TimeInterval = 12
 
   func chatAbout(_ item: BriefItem) {
     briefContext = BriefChatContext(item: item)
     answer = ""
     error = nil
-    isDetached = false
+    endDetached()
     contextNote = nil
     composerFocusRequest &+= 1
   }
@@ -59,7 +111,10 @@ final class OverlayState: ObservableObject {
     // mid-request would show it under the other tab.
     guard tab != newTab, !isLoading, !isDetached else { return }
     tab = newTab
-    if newTab == .tasks { FleetConsumer.shared.supervisorTabLeft() }
+    if newTab == .tasks {
+      voiceSession.stop()
+      FleetConsumer.shared.supervisorTabLeft()
+    }
     answer = ""
     error = nil
     contextNote = nil
@@ -69,15 +124,19 @@ final class OverlayState: ObservableObject {
   func chatAbout(_ question: FleetQuestion) {
     tab = .supervisor
     fleetContext = BriefChatContext(question: question)
+    selectVoiceContext(.question(question))
     answer = ""
     error = nil
-    isDetached = false
+    endDetached()
     contextNote = nil
     composerFocusRequest &+= 1
   }
 
   func clearActiveContext() {
-    if tab == .supervisor { fleetContext = nil } else { briefContext = nil }
+    if tab == .supervisor {
+      fleetContext = nil
+      selectVoiceContext(VoiceFocus())
+    } else { briefContext = nil }
     composerFocusRequest &+= 1
   }
 
@@ -95,13 +154,52 @@ final class OverlayState: ObservableObject {
     contextNote = nil
     question = ""
     progressStage = nil
+    endDetached()
+  }
+
+  private func endDetached() {
+    detachedRecovery?.cancel()
+    detachedRecovery = nil
     isDetached = false
+    detachedPhase = .none
+  }
+
+  /// The stream dropped, but the daemon may still finish the turn. Read the
+  /// session back once, after a short wait: a saved reply replaces the
+  /// banner; otherwise it says the answer will be in the main app and goes
+  /// away on its own. Never re-sends the ask.
+  private func recoverDetached(sessionId: String, requestId: String) {
+    detachedRecovery?.cancel()
+    detachedPhase = .checking
+    detachedRecovery = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(OverlayState.detachedCheckDelay * 1_000_000_000))
+      guard let self, !Task.isCancelled, self.isDetached else { return }
+      let found = await AppState.shared.overlayReply(sessionId: sessionId, requestId: requestId)
+      guard !Task.isCancelled, self.isDetached else { return }
+      switch found {
+      case let .answered(text):
+        self.answer = text
+        self.progressStage = nil
+        self.endDetached()
+      case let .failed(text):
+        self.error = text
+        self.progressStage = nil
+        self.endDetached()
+      case nil:
+        self.detachedPhase = .stillRunning
+        try? await Task.sleep(nanoseconds: UInt64(OverlayState.detachedClearDelay * 1_000_000_000))
+        guard !Task.isCancelled, self.isDetached else { return }
+        self.progressStage = nil
+        self.endDetached()
+      }
+    }
   }
 
   func ask() async {
     let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !q.isEmpty, !isLoading, !isDetached else { return }
-    isLoading = true; error = nil; isDetached = false; answer = ""; progressStage = "queued"
+    endDetached()
+    isLoading = true; error = nil; answer = ""; progressStage = "queued"
     let supervisor = tab == .supervisor
     let sessionId = supervisor ? AppState.overlaySupervisorSessionId : AppState.overlayTasksSessionId
     let requestId = AppState.shared.beginOverlayAsk(sessionId: sessionId)
@@ -140,6 +238,7 @@ final class OverlayState: ObservableObject {
       if AppState.requestMayStillBeRunning(after: error) {
         isDetached = true
         progressStage = "disconnected"
+        recoverDetached(sessionId: AppState.shared.lastAskSessionId ?? sessionId, requestId: requestId)
       } else {
         self.error = error.localizedDescription
       }

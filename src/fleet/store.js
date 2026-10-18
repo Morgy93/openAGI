@@ -4,20 +4,29 @@
 // Methods never throw on disk errors; the last one is kept in lastWriteError.
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
-import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "../file-utils.js";
+import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
+import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
+import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
 
+// A question lives this long from when it was first put to the owner, asked
+// again or not; then it expires, and the same ask stays quiet as long again.
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
 // A question the supervisor closed and that is asked again this soon was a
 // blip: the same record comes back instead of a new one.
 const REOPEN_MS = 60 * 60 * 1000;
 const PUSH_KEEP_MS = 24 * 60 * 60 * 1000;
 const NUDGES_KEPT = 20;
+const FACTS_KEPT = 8;
 const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
 const INFRA_BLOCKED_KEPT = 200;
+const FEEDBACK_KEPT = 500;
+const FIXES_KEPT = 100;
+const SELF_SESSIONS_KEPT = 50;
 // The owner closed these; the same ask stays quiet for a TTL.
 const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 // A review close is the model's guess, so it holds only this long; then the
@@ -25,6 +34,8 @@ const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 const REVIEW_HOLD_MS = 6 * 60 * 60 * 1000;
 // The agent message an ask came from, for the review.
 const ASK_CONTEXT_MAX = 600;
+// An agent's own question: one it wrote, or an item of its question card.
+const AGENT_KINDS = new Set(["agent-ask", "agent-card"]);
 
 // Only a delivered nudge spends the no-progress budget. A failed send still
 // starts the cooldown so a broken route is not retried every tick; dry-runs,
@@ -57,7 +68,14 @@ function emptyState() {
     pushes: [],
     muted: {},
     appRestarts: {},
-    restartedAt: {}
+    restartedAt: {},
+    feedback: [],
+    fixes: [],
+    suggestions: [],
+    diagnosis: {},
+    fixLocks: {},
+    fixCommands: {},
+    selfSessions: []
   };
 }
 
@@ -109,7 +127,7 @@ function isReviewClosed(question) {
 // ("later", "keep going", "opened", "retry") leave the condition to the
 // owner, so the ask returns a TTL after the answer.
 function holdsWhileAsked(question) {
-  return question.status === "dismissed" || question.kind === "agent-ask" || isReviewClosed(question);
+  return question.status === "dismissed" || AGENT_KINDS.has(question.kind) || isReviewClosed(question);
 }
 
 // A group the review closed that now covers another thread is a new ask.
@@ -126,6 +144,12 @@ function keepReviewWording(question, fields) {
   const same = question.askedAs.title === fields.title && JSON.stringify(question.askedAs.options ?? []) === JSON.stringify(fields.options);
   if (same) Object.assign(fields, { title: question.title, options: question.options });
   else fields.askedAs = null;
+}
+
+// When the question was put to the owner (a reopen by the owner, or an
+// answer handed back, puts it again): its expiry runs from here.
+function liveSinceMs(question) {
+  return toMs(question.liveSince ?? question.createdAt, 0);
 }
 
 // Start of an owner close's TTL.
@@ -225,7 +249,10 @@ export class FleetStore {
       playbook: entry.playbook ?? null,
       route: entry.route ?? null,
       status,
-      messageHash: entry.messageHash ?? null
+      messageHash: entry.messageHash ?? null,
+      // When the send started, and the facts the nudge was about.
+      ...(entry.sentAt ? { sentAt: iso(toMs(entry.sentAt, toMs(at, this.now()))) } : {}),
+      ...(entry.factsKey ? { factsKey: String(entry.factsKey), facts: (Array.isArray(entry.facts) ? entry.facts : []).slice(0, FACTS_KEPT).map((item) => clampText(item, 80)) } : {})
     });
     if (ledger.nudges.length > NUDGES_KEPT) ledger.nudges.splice(0, ledger.nudges.length - NUDGES_KEPT);
     if (progressMark !== undefined && markKey(progressMark) !== markKey(ledger.lastProgressMark)) {
@@ -254,32 +281,46 @@ export class FleetStore {
 
   // meta: small facts the supervisor acts on when the owner answers (a
   // permission card's stateId, an app and the chats running in it).
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null } = {}) {
+  // baseKey: an owner close of that ask holds this one too (a card item
+  // asked once more under a new key).
+  // askedHead: the PR head the ask was made at (a move past it settles it).
+  // An agent's own ask (agent-ask) also carries mergeAsk (it asks to merge,
+  // so it holds until answered or merged) and askedBy ("judge" when the
+  // judge raised it, which reads the chat only before a nudge).
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null, card = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
     // while the ask stays open.
     const origin = { askContext: clampTail(redactSecrets(askContext), ASK_CONTEXT_MAX) || null, agentAskedAt: agentAskedAt ?? null };
     const fields = {
+      ...(card ? { card: clampText(redactSecrets(card), this.limits.cardBodyMax) } : {}),
       threadKey: threadKey ?? null,
       prRef: prRef ?? null,
       title: clampText(redactSecrets(title), this.limits.titleMax) || "(untitled)",
-      body: clampText(redactSecrets(body), this.limits.bodyMax),
+      // A card item's body is its whole question and its choices.
+      body: clampText(redactSecrets(body), kind === "agent-card" ? this.limits.cardBodyMax : this.limits.bodyMax),
       options: normalizeOptions(options),
       playbook: playbook ?? null,
       kind: kind ?? null,
       // Grouped questions ("5 threads capped") cover several threads.
       threadKeys: Array.isArray(threadKeys) && threadKeys.length ? threadKeys.slice(0, 50) : null,
-      ...(questionMeta(meta) ? { meta: questionMeta(meta) } : {})
+      ...(questionMeta(meta) ? { meta: questionMeta(meta) } : {}),
+      ...(kind === "agent-ask" ? { mergeAsk: Boolean(mergeAsk), askedBy: askedBy ?? null } : {})
     };
+    const head = typeof askedHead === "string" && askedHead ? askedHead : null;
     const key = String(dedupeKey ?? "").trim() || `${fields.threadKey ?? "fleet"}:${fields.title}`;
+    if (!this.state.questions.some((q) => q.status === "open" && q.dedupeKey === key)) this._adoptLegacyAsk(key, fields, origin);
     const existing = this.state.questions.find((q) => q.status === "open" && q.dedupeKey === key);
     if (existing) {
-      // Still asked, so it has not expired. Not saved on its own: the next
-      // write (at least the tick's snapshot) carries it.
+      // Not saved on its own: the next write (at least the tick's snapshot)
+      // carries it.
       // scanAskedAt: only a scan asking it sets this (a reopen does not).
-      Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS) });
+      // Asking again does not push its expiry back (liveSinceMs).
+      Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now) });
       if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
+      // Asked again at a new head: the ask stands at that head.
+      if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
@@ -293,18 +334,30 @@ export class FleetStore {
     // A delivery-failure answer holds on each thread's failure streak (see
     // ackUndelivered), so the group question itself never holds: a thread
     // that starts failing later is asked about, one already answered is not.
-    const closed = fields.kind === "deliver" ? null : this._ownerClosed(key, now, fields);
+    const closed = fields.kind === "deliver" ? null : this._ownerClosed(key, now, fields) ?? (baseKey ? this._ownerClosed(String(baseKey), now, fields) : null);
     if (closed) {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
     }
+    // It expired while still asked: quiet for a TTL, then asked anew.
+    const expired = this._expiredHold(key, now, fields);
+    if (expired) {
+      expired.lastAskedAt = iso(now);
+      return { ...expired, suppressed: true };
+    }
+    // The agent asks again in a newer message while its last ask is still
+    // open: one question per agent, so the open one takes the new ask in
+    // place (same id, same outreach copy, no second push).
+    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now);
+    if (superseded) return superseded;
     // Same record, same outreach copy, no second push.
     const resolved = this._recentlyResolved(key, now);
     if (resolved) {
       keepReviewWording(resolved, fields);
       Object.assign(resolved, fields, origin.askContext ? origin : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
-        lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+        reopenHistory: [...(resolved.reopenHistory ?? []), iso(now)].filter((at) => now - Date.parse(at) <= 7 * DAY_MS),
+        lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(liveSinceMs(resolved) + QUESTION_TTL_MS)
       });
       this._save();
       return { ...resolved, reopened: true };
@@ -314,6 +367,7 @@ export class FleetStore {
       dedupeKey: key,
       ...fields,
       ...(origin.askContext ? origin : {}),
+      ...(head ? { askedHead: head } : {}),
       status: "open",
       answer: null,
       createdAt: iso(now),
@@ -390,9 +444,10 @@ export class FleetStore {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
     if (question.status === "answered" && (answer === null || question.answer === answer)) {
-      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()) });
-      // Put back as a fresh ask, so it does not expire on the next read.
-      if (asked) Object.assign(question, { lastAskedAt: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
+      // Put back with a fresh day, so an answer that failed near the end of
+      // the old one does not expire on the next read.
+      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()), liveSince: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
+      if (asked) question.lastAskedAt = iso(this.now());
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
     this._save();
@@ -456,7 +511,7 @@ export class FleetStore {
     if (this.state.questions.some((q) => q.status === "open" && q.dedupeKey === question.dedupeKey)) return null;
     Object.assign(question, {
       status: "open", answeredAt: null, resolvedBy: null, resolveReason: null, duplicateOf: null, pinned: true,
-      reopenedAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+      reopenedAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
     });
     this._save();
     return { ...question };
@@ -552,6 +607,52 @@ export class FleetStore {
 
   actions(limit = 50) {
     return this.state.actions.slice(-Math.max(0, limit)).reverse().map((a) => ({ ...a }));
+  }
+
+  actionHistory() {
+    let rows = [];
+    try {
+      rows = fs.readFileSync(this.journalPath, "utf8").split(/\r?\n/).flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+    return foldActions([...this.state.actions, ...rows]).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  }
+
+  // Keep complete folded records, newest first in priority, in a bounded log.
+  rotateActions() {
+    try {
+      if (fs.statSync(this.journalPath).size <= ACTION_LOG_MAX) return false;
+      const folded = this.actionHistory().sort((a, b) => Date.parse(a.updatedAt ?? a.at) - Date.parse(b.updatedAt ?? b.at));
+      const tail = [];
+      let bytes = 0;
+      for (const action of folded.reverse()) {
+        const line = JSON.stringify({ op: "record", ...action }) + "\n";
+        const size = Buffer.byteLength(line);
+        if (bytes + size > ACTION_LOG_MAX * 0.8) break;
+        tail.push(line); bytes += size;
+      }
+      writeTextAtomic(this.journalPath, tail.reverse().join(""));
+      return true;
+    } catch (error) {
+      if (error.code !== "ENOENT") this.lastWriteError = error?.message ?? String(error);
+      return false;
+    }
+  }
+
+  suggestions() { return structuredClone(this.state.suggestions); }
+
+  saveSuggestion(record) {
+    const at = this.state.suggestions.findIndex((s) => s.id === record.id);
+    if (at < 0) this.state.suggestions.push(structuredClone(record));
+    else this.state.suggestions[at] = structuredClone(record);
+    this._save();
+    return structuredClone(record);
+  }
+
+  saveDiagnosis(patch) {
+    Object.assign(this.state.diagnosis, patch);
+    this._save();
   }
 
   // ─── infra escalations and outages ──────────────────────────────────────
@@ -670,12 +771,19 @@ export class FleetStore {
   // ─── owner overrides ────────────────────────────────────────────────────
 
   // A counted send that failed in the background gives its attempt back.
-  undoAttempt(key) {
+  // sent: that send's entry ({ at, messageHash }), else the newest one. Its
+  // words never reached the agent, so it is failed whatever the budget says:
+  // a "sent" hash would refuse the next identical nudge as a repeat.
+  undoAttempt(key, sent = null) {
     const ledger = this.state.ledger[key];
-    if (!ledger || !(ledger.attemptsWithoutProgress > 0)) return null;
-    ledger.attemptsWithoutProgress -= 1;
-    const last = ledger.nudges.at(-1);
-    if (last?.status === "sent") last.status = "failed";
+    if (!ledger) return null;
+    const entry = sent
+      ? ledger.nudges.findLast((nudge) => nudge.status === "sent" && nudge.at === sent.at && nudge.messageHash === (sent.messageHash ?? null))
+      : ledger.nudges.at(-1);
+    const failed = entry?.status === "sent";
+    if (failed) entry.status = "failed";
+    if (!failed && !(ledger.attemptsWithoutProgress > 0)) return null;
+    if (ledger.attemptsWithoutProgress > 0) ledger.attemptsWithoutProgress -= 1;
     this._save();
     return structuredClone(ledger);
   }
@@ -685,6 +793,8 @@ export class FleetStore {
     const ledger = this.state.ledger[key];
     if (!ledger) return null;
     ledger.attemptsWithoutProgress = 0;
+    // Lifts the policy's hold on an answered nudge (resolveNudge).
+    ledger.keepGoingAt = iso(this.now());
     this._save();
     return structuredClone(ledger);
   }
@@ -706,6 +816,155 @@ export class FleetStore {
     return new Set(Object.keys(this.state.muted).filter((key) => this.mutedUntil(key)));
   }
 
+  // ─── owner feedback and self-fix requests ───────────────────────────────
+
+  // Throws on bad input (the caller's words go back to the owner); a disk
+  // error is kept in lastWriteError like every other write.
+  recordFeedback(input) {
+    const record = normalizeFeedback(input, { now: this.now() });
+    this.state.feedback.push(record);
+    if (this.state.feedback.length > FEEDBACK_KEPT) this.state.feedback.splice(0, this.state.feedback.length - FEEDBACK_KEPT);
+    this._save();
+    return { ...record };
+  }
+
+  // Newest first.
+  feedback({ status = null, limit = 50 } = {}) {
+    return this.state.feedback.filter((record) => !status || record.status === status)
+      .slice(-Math.max(0, limit)).reverse().map((record) => structuredClone(record));
+  }
+
+  updateFeedback(id, patch) {
+    const record = this.state.feedback.find((item) => item.id === id);
+    if (!record) return null;
+    Object.assign(record, feedbackPatch(record, patch));
+    this._save();
+    return structuredClone(record);
+  }
+
+  // Feedback cited by a repair moves to fix-queued.
+  queueFix(input) {
+    const fix = normalizeFixRequest(input, { now: this.now() });
+    this.state.fixes.push(fix);
+    if (this.state.fixes.length > FIXES_KEPT) this.state.fixes.splice(0, this.state.fixes.length - FIXES_KEPT);
+    for (const id of fix.evidence.feedbackIds) {
+      const record = this.state.feedback.find((item) => item.id === id);
+      if (record && ["new", "triaged"].includes(record.status)) Object.assign(record, { status: "fix-queued", fixId: fix.id });
+    }
+    this._save();
+    return structuredClone(fix);
+  }
+
+  importFix(input) {
+    if (!input?.id) return this.queueFix(input);
+    if (!/^fix_[a-f0-9]{16}$/.test(input.id)) throw new Error("Invalid fix id.");
+    const existing = this.fix(input.id);
+    if (existing) return existing;
+    const fix = normalizeFixRequest(input, { now: this.now() });
+    fix.id = input.id;
+    this.state.fixes.push(fix);
+    this._save();
+    return structuredClone(fix);
+  }
+
+  updateFix(id, patch) {
+    const fix = this.state.fixes.find((item) => item.id === id);
+    if (!fix) return null;
+    const next = structuredClone(patch);
+    delete next.id;
+    Object.assign(fix, next, { updatedAt: iso(this.now()) });
+    for (const feedbackId of fix.evidence.feedbackIds) {
+      const record = this.state.feedback.find((item) => item.id === feedbackId);
+      const status = fix.outcome ?? (fix.prUrl ? "pr-open" : null);
+      if (record && status && !["merged", "declined"].includes(record.status)) Object.assign(record, { status });
+    }
+    this._save();
+    return structuredClone(fix);
+  }
+
+  fixCommands() { return structuredClone(this.state.fixCommands); }
+
+  queueFixCommand(key, command) {
+    this.state.fixCommands[key] = structuredClone(command);
+    this._save();
+  }
+
+  clearFixCommand(key) { delete this.state.fixCommands[key]; this._save(); }
+
+  acquireFixLock(id, area) {
+    if (Object.values(this.state.fixLocks).some((owner) => owner !== id)) return false;
+    this.state.fixLocks[area] = id;
+    this._save();
+    return !this.lastWriteError;
+  }
+
+  releaseFixLock(id) {
+    for (const [area, owner] of Object.entries(this.state.fixLocks)) if (owner === id) delete this.state.fixLocks[area];
+    this._save();
+  }
+
+  fixes({ state = null } = {}) {
+    return this.state.fixes.filter((fix) => !state || fix.state === state).slice().reverse().map((fix) => structuredClone(fix));
+  }
+
+  fix(id) {
+    const fix = this.state.fixes.find((item) => item.id === id);
+    return fix ? structuredClone(fix) : null;
+  }
+
+  reviseFix(id, instructions) {
+    const fix = this.state.fixes.find((item) => item.id === id);
+    if (!fix) return null;
+    Object.assign(fix, fixRevision(fix, instructions, { now: this.now() }));
+    this._save();
+    return structuredClone(fix);
+  }
+
+  // "all" stops every fix not already stopped, except open PRs awaiting the owner. Returns the fixes it stopped.
+  stopFix(id) {
+    const at = iso(this.now());
+    const stopped = this.state.fixes.filter((fix) => (id === "all" ? fix.state !== "owner-ask" : fix.id === id) && !["abandoned", "done", "failed"].includes(fix.state));
+    for (const fix of stopped) Object.assign(fix, { state: "abandoned", stoppedAt: at, updatedAt: at });
+    if (stopped.length) this._save();
+    return stopped.map((fix) => structuredClone(fix));
+  }
+
+  // Codex session ids of the supervisor's own fixers, so it never nudges them.
+  selfSessions() {
+    return this.state.selfSessions.map((session) => session.id);
+  }
+
+  addSelfSession(id, fixId = null) {
+    if (typeof id !== "string" || !id.trim() || this.state.selfSessions.some((session) => session.id === id)) return false;
+    this.state.selfSessions.push({ id: id.slice(0, 200), fixId: typeof fixId === "string" ? fixId.slice(0, 80) : null, at: iso(this.now()) });
+    if (this.state.selfSessions.length > SELF_SESSIONS_KEPT) this.state.selfSessions.splice(0, this.state.selfSessions.length - SELF_SESSIONS_KEPT);
+    this._save();
+    return true;
+  }
+
+  // The owner's Unmute: the thread is watched and nudged again.
+  unmute(key) {
+    if (!key || !Object.hasOwn(this.state.muted, key)) return false;
+    delete this.state.muted[key];
+    this._save();
+    return true;
+  }
+
+  // thread key -> when its latest closed question closed (answered,
+  // dismissed, resolved or expired), for the group its row falls back to.
+  closedAtByThread() {
+    const out = new Map();
+    for (const question of this.state.questions) {
+      if (question.status === "open") continue;
+      const at = question.answeredAt ?? question.expiredAt ?? null;
+      if (!Number.isFinite(toMs(at, NaN))) continue;
+      for (const key of [question.threadKey, ...(question.threadKeys ?? [])].filter(Boolean)) {
+        if (!out.has(key) || toMs(out.get(key), 0) < toMs(at, 0)) out.set(key, at);
+      }
+    }
+    return out;
+  }
+
   // ─── internals ──────────────────────────────────────────────────────────
 
   _findQuestion(id) {
@@ -724,6 +983,99 @@ export class FleetStore {
       if (!latest || heldSinceMs(question) > heldSinceMs(latest)) latest = question;
     }
     return latest;
+  }
+
+  // The latest expiry of this ask, while it still holds the ask back.
+  _expiredHold(key, now, fields = {}) {
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.dedupeKey !== key || question.status !== "expired" || widens(question, fields)) continue;
+      const expiredAt = toMs(question.expiredAt ?? question.updatedAt, null);
+      if (expiredAt === null || now - expiredAt >= QUESTION_TTL_MS) continue;
+      if (!latest || expiredAt > toMs(latest.expiredAt ?? latest.updatedAt, 0)) latest = question;
+    }
+    return latest;
+  }
+
+  // An open agent ask on the same thread from an older agent message takes
+  // this newer ask in place. Its review and wording start over. The same
+  // question restated (both ask to merge, or the same words, about the same
+  // PR) keeps its push and its expiry; a different one is put to the owner
+  // anew, with its own day and push (milan: a new decision 23 h into an old
+  // ask would expire an hour later, never pushed, then stay quiet a day).
+  _supersedeAgentAsk(key, fields, origin, head, now) {
+    if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
+    const askedAt = toMs(origin.agentAskedAt, null);
+    if (askedAt === null) return null;
+    const older = this.state.questions.find((q) => q.status === "open" && q.kind === "agent-ask" && q.threadKey === fields.threadKey
+      && toMs(q.agentAskedAt, null) !== null && toMs(q.agentAskedAt, 0) < askedAt);
+    if (!older) return null;
+    const norm = (text) => String(text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+    // A merge ask about another PR is a new question, whatever its words.
+    const samePr = !older.prRef || !fields.prRef || older.prRef === fields.prRef;
+    // Titles are generic per topic ("wants a prod step. OK?" for every prod
+    // approval), so only the ask itself counts: the same body, or both merge
+    // asks about the same PR. The title decides only when neither has a body.
+    const body = norm(fields.body);
+    const restated = samePr && ((older.mergeAsk && fields.mergeAsk)
+      || (body ? norm(older.body) === body : !norm(older.body) && norm(older.title) === norm(fields.title)));
+    Object.assign(older, fields, origin, {
+      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
+      supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
+      ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
+    });
+    this._save();
+    return { ...older, superseded: true };
+  }
+
+  // Judge asks a build before 2026-10-12 saved under the judge's own key
+  // (judge:<thread>:<hash>, no askedBy) take the key a scan now gives the
+  // same ask (keyFor: policy's agentAskKey, on the agent message it came
+  // from) and say the judge asked them. Else an answer kept for typing is
+  // dropped as superseded on the first scan: the judge does not read a
+  // thread whose answer waits, so nothing asks that key again.
+  migrateJudgeAskKeys(keyFor) {
+    const openKeys = new Set(this.state.questions.filter((q) => q.status === "open").map((q) => q.dedupeKey));
+    let changed = false;
+    for (const question of this.state.questions) {
+      const key = String(question.dedupeKey ?? "");
+      if (question.kind !== "agent-ask" || !question.threadKey || !key.startsWith(`judge:${question.threadKey}:`)) continue;
+      if (!question.askedBy) {
+        question.askedBy = "judge";
+        changed = true;
+      }
+      if (!Number.isFinite(Date.parse(question.agentAskedAt ?? ""))) continue;
+      const next = keyFor(question.threadKey, { at: question.agentAskedAt });
+      // Never a second open question under one key.
+      if (!next || (question.status === "open" && openKeys.has(next))) continue;
+      if (question.status === "open") openKeys.add(next);
+      question.dedupeKey = next;
+      changed = true;
+    }
+    if (changed) this._save();
+    return changed;
+  }
+
+  // An agent ask a build before 2026-10-12 saved under its wording's key
+  // (ask:<thread>:<text hash>) is the same ask as one asked now about the
+  // same agent message: it takes the new key, whatever its status, so an
+  // open one is not asked twice, an answered or dismissed one holds, and an
+  // answer kept for typing is not dropped as superseded. Records saved since
+  // carry mergeAsk; a structured ask's key (its own id) never changed.
+  _adoptLegacyAsk(key, fields, origin) {
+    if (fields.kind !== "agent-ask" || !fields.threadKey) return;
+    const askedAt = toMs(origin.agentAskedAt, null);
+    if (askedAt === null) return;
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.kind !== "agent-ask" || question.threadKey !== fields.threadKey || Object.hasOwn(question, "mergeAsk")) continue;
+      if (question.dedupeKey === key || !String(question.dedupeKey ?? "").startsWith(`ask:${fields.threadKey}:`)) continue;
+      if (toMs(question.agentAskedAt, null) !== askedAt) continue;
+      if (!latest || toMs(question.updatedAt, 0) > toMs(latest.updatedAt, 0)) latest = question;
+    }
+    if (!latest) return;
+    latest.dedupeKey = key;
+    this._save();
   }
 
   _recentlyResolved(key, now) {
@@ -752,14 +1104,15 @@ export class FleetStore {
     return { ...question };
   }
 
-  // Only a TTL with no ask expires a question; one still asked every tick
-  // keeps its id.
+  // A question expires a TTL after it was put to the owner, still asked or
+  // not: an ask nobody answered in a day leaves the list (see _expiredHold).
   _expireQuestions(now) {
     let changed = false;
     for (const question of this.state.questions) {
       if (question.status !== "open") continue;
-      if (now - lastAskMs(question) < QUESTION_TTL_MS) continue;
+      if (now - liveSinceMs(question) < QUESTION_TTL_MS) continue;
       question.status = "expired";
+      question.expiredAt = iso(now);
       question.updatedAt = iso(now);
       if (question.outreachId) this.expired.push({ ...question });
       changed = true;
@@ -803,7 +1156,14 @@ export class FleetStore {
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
       muted: isObject(raw.muted) ? raw.muted : {},
       appRestarts: isObject(raw.appRestarts) ? raw.appRestarts : {},
-      restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {}
+      restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {},
+      feedback: Array.isArray(raw.feedback) ? raw.feedback.filter(isObject) : [],
+      fixCommands: isObject(raw.fixCommands) ? raw.fixCommands : {},
+      fixLocks: isObject(raw.fixLocks) ? raw.fixLocks : {},
+      fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
+      suggestions: Array.isArray(raw.suggestions) ? raw.suggestions.filter(isObject) : [],
+      diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
+      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
     };
   }
 
@@ -819,6 +1179,7 @@ export class FleetStore {
   _journal(entry) {
     try {
       appendJsonLine(this.journalPath, entry);
+      this.rotateActions();
     } catch (error) {
       this.lastWriteError = error?.message ?? String(error);
     }

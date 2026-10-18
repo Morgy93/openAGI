@@ -9,3 +9,5 @@ Structured JSON bodies (objects and arrays) are serialized before memory compari
 The same serialized body is used for pre-decision memory retrieval, so facts found only in object fields or arrays can bring prior context into scrutiny and propagation decisions. Missing bodies are omitted from retrieval queries rather than introducing literal `undefined` or `null` terms.
 
 Signal memory writes use the same caller scope as pre-decision retrieval. Specialist turns retain evidence in their own specialist scope, preventing peer recall and cross-specialist exact deduplication; unscoped integration events retain the existing shared `main` default. Shared main context remains available to specialists. This applies to future writes only: previously shared rows are not automatically moved or deleted. Explicit legacy-principle promotion remains a separate condensation path.
+
+Unscoped signal processing resolves to `main` for both retrieval and storage. Integration ingestion therefore cannot pull specialist-only evidence into scrutiny, propagation, or returned context. Isolated-context turns continue to bypass memory retrieval and writes entirely.

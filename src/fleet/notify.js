@@ -123,7 +123,7 @@ export function createNotifier({
     return { pushed: true, skipped: null };
   };
 
-  async function notifyQuestion(question) {
+  async function notifyQuestion(question, { allowPush = true } = {}) {
     if (!question?.id) return { outreachId: null, pushed: false, skipped: "no-question" };
     // The stored copy knows what earlier ticks already sent.
     const latest = store?.question?.(question.id) ?? question;
@@ -131,7 +131,7 @@ export function createNotifier({
     const at = current();
     const outreachId = latest.outreachId ?? postOutreach(latest);
     if (outreachId) refreshOutreach(outreachId, latest);
-    const result = await push(latest, at);
+    const result = allowPush ? await push(latest, at) : skip("suggestion-cap");
     if (store && ((outreachId && outreachId !== latest.outreachId) || result.pushed)) {
       store.markQuestionNotified?.(latest.id, { outreachId, pushedAt: result.pushed ? at.toISOString() : undefined });
     }

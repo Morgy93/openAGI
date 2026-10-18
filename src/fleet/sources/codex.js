@@ -5,8 +5,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
+  CARD_DROP_MS, CARD_EXCLUSIONS, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  CONDUCTOR_CODEX_ORIGINATOR, isSupervisorOwnPrompt, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
 import { asksOwner } from "../classify.js";
 import { classifyCodexErrorCode } from "../errors.js";
@@ -15,6 +15,7 @@ import { identityToken } from "../ui-delivery.js";
 const HOUR = 3_600_000;
 const TAIL_BYTES = 1024 * 1024;
 const AUTOMATION_SOURCES = new Set(["guardian_review", "subagent", "automation"]);
+const NEVER_ASKS = new Set(["guardian_review", "subagent"]);
 const HEARTBEAT_PATTERN = /<heartbeat>|<automation_id>/;
 // Scheduled sweeps (usage-reset checks, chat watchdogs) run as codex exec;
 // their status tables quote other chats' asks.
@@ -111,23 +112,54 @@ function isCiphertext(value) {
   return value.length >= 200 || (/[+=]/.test(value) && !value.includes("/"));
 }
 
-function readUserInput(summary, raw, at) {
+// Who wrote a user message: a reply from a question card, the supervisor
+// (Desktop may wrap its text), a heartbeat automation, injected context, or
+// the owner.
+function userInputKind(raw) {
+  const text = String(raw ?? "");
+  if (parseCardReply(text)) return "reply";
+  if (text.trimStart().startsWith(SUPERVISOR_PREFIX)) return "supervisor";
+  if (HEARTBEAT_PATTERN.test(text)) return "heartbeat";
+  const cleaned = cleanCodexUserText(text);
+  if (cleaned.startsWith(SUPERVISOR_PREFIX)) return "supervisor";
+  return cleaned ? "owner" : "context";
+}
+
+function readUserInput(summary, raw, at, turnId = null) {
   const text = String(raw ?? "");
   if (!text.trim()) return;
-  summary.pendingQuestion = null;
-  if (text.trimStart().startsWith(SUPERVISOR_PREFIX)) {
+  const kind = userInputKind(text);
+  // The supervisor's own words never answer an ask.
+  if (kind === "supervisor") {
     summary.lastSupervisorAt = at;
     return;
   }
-  if (HEARTBEAT_PATTERN.test(text)) {
+  if (kind === "reply") {
+    // It closes the items it names, and the items of their card asked
+    // before it. It is still the owner at work.
+    const ids = new Set(parseCardReply(text));
+    summary.cardReplies.push({ ids, order: summary.rows });
+    if (summary.pendingQuestion && ids.has(`${summary.pendingQuestion.callId}:0`)) summary.pendingQuestion = null;
+    summary.lastUser = { text: "Answered a question card.", at };
+    return;
+  }
+  summary.pendingQuestion = null;
+  if (kind === "heartbeat") {
     summary.lastInputHeartbeat = true;
     return;
   }
   summary.lastInputHeartbeat = false;
+  if (kind === "context") return;
+  // The owner typed a new turn instead of answering: asks of earlier turns
+  // are closed (a steer inside the ask's own turn leaves them open).
+  // Older rollouts carry no turn id on the message: one typed after the
+  // last turn ended starts the next turn, whatever turn the tail last saw.
+  const turn = turnId ?? (summary.turnEnded ? null : summary.turnId);
+  summary.cardAsks = summary.cardAsks.filter((ask) => turn && ask.turnId === turn);
   // Links inside the browser/IDE wrappers are ambient context, not the owner's words.
   const cleaned = cleanCodexUserText(text);
   addPrRefs(summary, cleaned, at, "owner");
-  if (cleaned) summary.lastUser = { text: cleaned, at };
+  summary.lastUser = { text: cleaned, at };
 }
 
 // fallback: the agent's last words, shown when the title is ciphertext.
@@ -151,10 +183,13 @@ function questionTitle(args, fallback) {
   }
 }
 
-function readItem(summary, item, at) {
+function readItem(summary, item, at, turnId = null) {
   if (!item || typeof item !== "object") return;
-  if (item.type === "AgentMessage") setAgent(summary, contentText(item.content, ["Text", "text"]), at);
-  else if (item.type === "UserMessage") readUserInput(summary, contentText(item.content, ["text", "Text"]), at);
+  // An async card's item repeats the ask; it is not the agent's last words
+  // (a card ending "- Continue" must not read as an in-scope ask).
+  if (item.type === "AgentMessage" && item.delivery === "async") addCardAsk(summary, item.id, item, at, turnId);
+  else if (item.type === "AgentMessage") setAgent(summary, contentText(item.content, ["Text", "text"]), at);
+  else if (item.type === "UserMessage") readUserInput(summary, contentText(item.content, ["text", "Text"]), at, turnId);
   else if (item.type === "McpToolCall" && item.tool === "attach_artifact") addPrRefs(summary, item.arguments?.url, at, "attachment");
 }
 
@@ -163,24 +198,31 @@ function readEvent(summary, payload, at) {
     case "task_started":
       summary.lifecycle = { type: "task_started", payload, at };
       summary.turnStartedAt = toIso(payload.started_at) ?? at;
+      summary.turnId = payload.turn_id ?? payload.turn_attribution?.turn_id ?? null;
+      summary.turnEnded = false;
       break;
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
+      summary.turnEnded = true;
       setAgent(summary, payload.last_agent_message, at);
       settleSealedAsk(summary);
       break;
     case "turn_aborted":
     case "error":
       summary.lifecycle = { type: payload.type, payload, at };
+      if (payload.type === "turn_aborted") summary.turnEnded = true;
       break;
     case "agent_message":
-      setAgent(summary, payload.message, at);
+      // Older rollouts write the async card as this event: it is the card,
+      // not the agent's last words (its call row carries the ask).
+      if (payload.delivery === "async") addCardAsk(summary, payload.call_id ?? payload.id, payload, at, payload.turn_id ?? null);
+      else setAgent(summary, payload.message, at);
       break;
     case "user_message":
       readUserInput(summary, payload.message, at);
       break;
     case "item_completed":
-      readItem(summary, payload.item, at);
+      readItem(summary, payload.item, at, payload.turn_id ?? null);
       break;
     default:
       break;
@@ -197,7 +239,8 @@ function readResponseItem(summary, payload, at) {
     if (name === "request_user_input_async") {
       // The ask time lets a PR merged after it close the question.
       const asked = questionTitle(payload.arguments, summary.lastAgent?.text);
-      if (asked) summary.pendingQuestion = { ...asked, at };
+      if (asked) summary.pendingQuestion = { ...asked, at, callId: payload.call_id ?? null };
+      addCardAsk(summary, payload.call_id, parseArgs(payload.arguments), at, payload.internal_chat_message_metadata_passthrough?.turn_id ?? null);
     } else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
@@ -206,12 +249,14 @@ function readResponseItem(summary, payload, at) {
 
 export function parseRolloutTail(text) {
   const summary = {
-    events: 0, lifecycle: null, turnStartedAt: null, lastAgent: null, lastUser: null,
-    lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null
+    events: 0, lifecycle: null, turnStartedAt: null, turnId: null, turnEnded: false, lastAgent: null, lastUser: null,
+    lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null,
+    cardAsks: [], cardReplies: [], rows: 0
   };
   for (const row of parseJsonLines(text)) {
     const payload = row?.payload;
     if (!payload || typeof payload !== "object") continue;
+    summary.rows += 1;
     const at = toIso(row.timestamp);
     if (row.type === "event_msg") {
       summary.events += 1;
@@ -223,7 +268,189 @@ export function parseRolloutTail(text) {
       if (at) summary.lastTurnAt = at;
     }
   }
+  const { pendingQuestion } = summary;
+  if (pendingQuestion) delete pendingQuestion.callId;
   return summary;
+}
+
+// ---------- question cards ----------
+
+// The tagged list the Codex app sends when the owner answers card items:
+// <send_user_message_question_reply>[{"questionItemId":
+// "[\"request_user_input_async\",\"call_x\",0]", ...}]</send_user_message_question_reply>.
+// Item ids ("call_x:0"), or null when the text is not one: the app only
+// counts a message that is the tagged list and nothing else.
+const REPLY_PATTERN = /^\s*<send_user_message_question_reply>([\s\S]*)<\/send_user_message_question_reply>\s*$/;
+
+export function parseCardReply(text) {
+  const match = REPLY_PATTERN.exec(String(text ?? ""));
+  if (!match) return null;
+  let list;
+  try { list = JSON.parse(match[1]); } catch { return []; }
+  const ids = [];
+  for (const entry of Array.isArray(list) ? list : []) {
+    try {
+      const [kind, callId, index] = JSON.parse(entry?.questionItemId);
+      if (kind === "request_user_input_async" && callId) ids.push(`${callId}:${Number(index) || 0}`);
+    } catch { /* not an item id */ }
+  }
+  return ids;
+}
+
+function parseArgs(args) {
+  try {
+    return typeof args === "string" ? JSON.parse(args) : args ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// The function call and the card item carry the same ask; the first one counts.
+function addCardAsk(summary, callId, payload, at, turnId) {
+  if (!callId || summary.cardAsks.some((ask) => ask.callId === callId)) return;
+  summary.cardAsks.push({ callId: String(callId), turnId: turnId ?? summary.turnId ?? null, payload, at, order: summary.rows });
+}
+
+// One ask's items. A call with no questions asks its own text, free text only.
+function askItems(ask) {
+  const questions = Array.isArray(ask.payload?.questions) && ask.payload.questions.length ? ask.payload.questions : [{ title: ask.payload?.text }];
+  return questions.map((question, index) => {
+    const raw = String(question?.title ?? question?.question ?? "").trim();
+    const options = (Array.isArray(question?.options) ? question.options : [])
+      .map((option) => (typeof option === "string" ? option : option?.label))
+      .filter((option) => typeof option === "string" && option.trim());
+    return {
+      itemId: `${ask.callId}:${index}`, header: null, question: raw && !isCiphertext(raw) ? raw : SEALED_QUESTION,
+      options, multiSelect: false, freeText: true, at: ask.at
+    };
+  });
+}
+
+// The open card: every still-open ask turn's items no reply closed (a
+// supervisor turn between two asks closes neither). Its id is the newest
+// ask turn, so one card keeps one id while the agent adds to it. The app
+// sends one reply per Send: an item it skips (Skip is local only) was asked
+// before that reply, so a reply naming any item of a turn closes every item
+// of that turn asked before it. order: the row's place (rollout ordinal or tail row).
+function buildCard(asks, replies, limits) {
+  if (!asks.length) return null;
+  const turnId = asks.at(-1).turnId;
+  const all = asks.flatMap((ask) => askItems(ask).map((item) => ({ ...item, order: ask.order, turnId: ask.turnId }))).map((item, index) => ({ ...item, index }));
+  const closed = new Set();
+  for (const reply of replies) {
+    const turns = new Set(all.filter((item) => reply.ids.has(item.itemId)).map((item) => item.turnId));
+    if (!turns.size) continue;
+    for (const item of all) if (reply.ids.has(item.itemId) || (turns.has(item.turnId) && item.order < reply.order)) closed.add(item.itemId);
+  }
+  const items = all.filter((item) => !closed.has(item.itemId));
+  if (!items.length) return null;
+  return {
+    app: "codex", cardId: String(turnId ?? asks.find((ask) => ask.turnId === turnId).callId), at: items[0].at, count: all.length,
+    items: items.map((item) => cleanCardItem(item, limits))
+  };
+}
+
+const HISTORY_TABLES = {
+  thread_items: ["thread_id", "turn_id", "item_id", "rollout_ordinal", "created_at_ms", "item_json", "item_type"],
+  thread_turns: ["thread_id", "turn_id", "rollout_ordinal"],
+  thread_history_projection_state: ["thread_id", "next_rollout_byte_offset"]
+};
+const CARD_USER_ROWS = 60;
+const CARD_ASK_ROWS = 60;
+// At most this many items back from the newest are scanned for asks: a
+// card item past CARD_DROP_MS is dropped anyway.
+const CARD_SCAN_ROWS = 4000;
+// A projection this close to the rollout's size is caught up; one further
+// behind (or past the end) leaves the newest asks and replies to the tail.
+const PROJECTION_SLACK_BYTES = 64 * 1024;
+// Pages past the in-scope stop scanned for open cards, down to the lookback.
+const CARD_SCAN_PAGES = 20;
+const UNINDEXED_CARD_ROWS = /request_user_input_async|"delivery":"async"|"type":"user_message"|"type":"UserMessage"/;
+// A continuation segment (<id>_<segment id>.jsonl) is indexed under the
+// segment's id; the thread's own projection stopped with the older file.
+const SEGMENT_PATTERN = /_([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/i;
+
+// Codex Desktop's own index of every thread item (thread_history_1.sqlite).
+// It holds every card and reply however big the rollout grows. Null when it
+// is missing, unreadable, or not the shape this reader knows.
+export async function openThreadHistory(codexHome) {
+  const db = await openReadOnlyDb(path.join(codexHome, "thread_history_1.sqlite"));
+  if (!db) return null;
+  try {
+    for (const [table, columns] of Object.entries(HISTORY_TABLES)) {
+      const present = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+      if (!columns.every((name) => present.has(name))) throw new Error(`thread history: no ${table}`);
+    }
+    return {
+      db,
+      projection: db.prepare("SELECT next_rollout_byte_offset AS offset, next_rollout_ordinal AS ordinal FROM thread_history_projection_state WHERE thread_id = ?"),
+      users: db.prepare(`SELECT turn_id, rollout_ordinal, item_json FROM thread_items
+        WHERE thread_id = ? AND item_type = 'userMessage' ORDER BY rollout_ordinal DESC LIMIT ${CARD_USER_ROWS}`),
+      // Every user row the ask scan covers, when the newest ones hold no owner turn.
+      usersFrom: db.prepare(`SELECT turn_id, rollout_ordinal, item_json FROM thread_items
+        WHERE thread_id = ? AND item_type = 'userMessage' AND rollout_ordinal >= ? AND created_at_ms >= ? ORDER BY rollout_ordinal DESC`),
+      turnStart: db.prepare("SELECT rollout_ordinal FROM thread_turns WHERE thread_id = ? AND turn_id = ?"),
+      // created_at_ms is checked first: it sits before the large item_json.
+      asks: db.prepare(`SELECT turn_id, item_id, item_json, rollout_ordinal, created_at_ms FROM thread_items
+        WHERE thread_id = ? AND rollout_ordinal >= ? AND created_at_ms >= ? AND item_type = 'agentMessage' AND item_json LIKE '%"delivery":"async"%'
+        ORDER BY rollout_ordinal DESC LIMIT ${CARD_ASK_ROWS}`)
+    };
+  } catch {
+    try { db.close(); } catch { /* already closed */ }
+    return null;
+  }
+}
+
+function itemText(json) {
+  const item = parseArgs(json);
+  return contentText(item?.content, ["text", "Text"]);
+}
+
+// A thread's open card from the history index, null when none, or undefined
+// when the index cannot say (no projection of the rollout file, or one not
+// caught up with it): the rollout tail decides then. Only rows from the
+// owner's newest typed turn on, and from the last two days, are read.
+export function readHistoryCard(history, id, { bytes = null, rolloutPath = null, limits = null, now = Date.now() } = {}) {
+  try {
+    const indexed = SEGMENT_PATTERN.exec(String(rolloutPath ?? ""))?.[1] ?? id;
+    const state = history.projection.get(indexed);
+    if (!state || (Number.isFinite(bytes) && Math.abs(bytes - Number(state.offset)) > PROJECTION_SLACK_BYTES)) return undefined;
+    // Rows the projection has not reached yet that add an ask, answer one,
+    // or start an owner turn leave the card to the tail.
+    const lag = Number.isFinite(bytes) ? bytes - Number(state.offset) : 0;
+    if (lag > 0 && UNINDEXED_CARD_ROWS.test(readTail(rolloutPath, lag + 1))) return undefined;
+    const bound = (Number(state.ordinal) || 0) - CARD_SCAN_ROWS;
+    const cutoff = now - CARD_DROP_MS;
+    let replies = [];
+    let owner = null;
+    const readUsers = (rows) => {
+      replies = [];
+      owner = null;
+      for (const row of rows) {
+        const text = itemText(row.item_json);
+        const kind = userInputKind(text);
+        if (kind === "reply") replies.push({ ids: new Set(parseCardReply(text)), order: Number(row.rollout_ordinal) });
+        else if (kind === "owner" && !owner) owner = row;
+      }
+    };
+    const users = history.users.all(indexed);
+    readUsers(users);
+    // The newest rows are all supervisor, heartbeat, context or reply rows:
+    // none closes an ask, so the whole bounded scan is read for the owner's
+    // turn and the replies instead of treating the oldest of them as one.
+    if (!owner && users.length >= CARD_USER_ROWS) readUsers(history.usersFrom.all(indexed, Math.max(0, bound), cutoff));
+    const ownerFrom = owner ? Number(history.turnStart.get(indexed, owner.turn_id)?.rollout_ordinal ?? owner.rollout_ordinal) : 0;
+    const from = Math.max(ownerFrom, bound);
+    const asks = [];
+    for (const row of history.asks.all(indexed, from, cutoff)) {
+      const item = parseArgs(row.item_json);
+      if (item?.delivery !== "async") continue;
+      asks.unshift({ callId: String(row.item_id), turnId: row.turn_id, payload: item, at: toIso(Number(row.created_at_ms)), order: Number(row.rollout_ordinal) });
+    }
+    return buildCard(asks, replies, limits);
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------- thread assembly ----------
@@ -245,6 +472,8 @@ function metadataExclusion(row, config) {
   const head = String(row.first_user_head ?? "");
   if (HEARTBEAT_PATTERN.test(head) || CHAT_CHECKER_PATTERN.test(head)) return "automation";
   if ((config.selfSessionIds ?? []).includes(String(row.id))) return "self";
+  // The supervisor's own display thread, named by its opening prompt.
+  if (isSupervisorOwnPrompt(head) || isSupervisorOwnPrompt(row.title)) return "self";
   return null;
 }
 
@@ -294,12 +523,14 @@ function applyRollout(thread, row, context) {
   const { config, now, tailBytes } = context;
   const limits = config.limits;
   let mtimeMs = null;
+  let size = null;
   try {
-    mtimeMs = fs.statSync(row.rollout_path).mtimeMs;
+    ({ mtimeMs, size } = fs.statSync(row.rollout_path));
   } catch {
     return [];
   }
   const summary = parseRolloutTail(readTail(row.rollout_path, tailBytes));
+  thread.meta.pendingCard = readCard(row, context, size, summary);
   const updatedMs = Date.parse(thread.lastActivityAt ?? "");
   // Settings writes bump the file and catalog times without a turn, so
   // those are only a fallback when the tail holds no turn row.
@@ -309,6 +540,8 @@ function applyRollout(thread, row, context) {
   if (summary.lastAgent) {
     thread.lastAgentText = clampTail(redactSecrets(summary.lastAgent.text), limits.excerptMax);
     thread.lastAgentTail = clampTail(redactSecrets(summary.lastAgent.text), limits.reviewTailMax);
+    thread.lastAgentFull = clampTailLines(redactSecrets(summary.lastAgent.text), limits.fullTextMax);
+    thread.lastAgentFullAt = summary.lastAgent.at;
     thread.lastAgentAt = summary.lastAgent.at;
   }
   if (summary.lastUser) {
@@ -336,6 +569,29 @@ function applyRollout(thread, row, context) {
     thread.meta.heartbeat = true;
   }
   return summary.prRefs;
+}
+
+// The thread's open question card: from the history index when it covers
+// this thread, else from the rollout tail (parsed here when not given).
+function readCard(row, context, size = undefined, summary = null) {
+  const limits = context.config.limits;
+  let bytes = size;
+  if (bytes === undefined) {
+    try { bytes = fs.statSync(row.rollout_path).size; } catch { bytes = null; }
+  }
+  const indexed = context.history
+    ? readHistoryCard(context.history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits, now: context.now })
+    : undefined;
+  if (indexed !== undefined) return indexed;
+  if (bytes === null) return null;
+  let tail = summary;
+  if (!tail) {
+    // Most excluded threads never ask: skip the parse when the tail holds no card.
+    const text = readTail(row.rollout_path, context.tailBytes);
+    if (!text.includes("request_user_input_async") && !text.includes('"delivery":"async"')) return null;
+    tail = parseRolloutTail(text);
+  }
+  return buildCard(tail.cardAsks, tail.cardReplies, limits);
 }
 
 // The newest attachment is the thread's PR: a long thread moves on from the
@@ -430,6 +686,8 @@ function buildThread(row, context) {
     lastActivityAt: toIso(updatedMs),
     lastAgentText: "",
     lastAgentTail: "",
+    lastAgentFull: "",
+    lastAgentFullAt: null,
     lastAgentAt: null,
     lastUserText: "",
     lastUserAt: null,
@@ -455,11 +713,16 @@ function buildThread(row, context) {
       abortedAt: null,
       lastSupervisorAt: null,
       pendingQuestion: null,
+      pendingCard: null,
       heartbeat: false
     }
   };
-  // Excluded-by-metadata threads (mostly guardian reviews) skip the tail read.
-  const rolloutRefs = thread.excluded ? [] : applyRollout(thread, row, context);
+  // Excluded-by-metadata threads (mostly guardian reviews) skip the tail
+  // read. Automation threads still get their question cards read: those wait
+  // on the owner like any other. Guardian reviews and subagents never ask.
+  const skipped = thread.excluded;
+  const rolloutRefs = skipped ? [] : applyRollout(thread, row, context);
+  if (skipped === "automation" && !NEVER_ASKS.has(row.thread_source) && !sourceIsSubagent(row.source)) thread.meta.pendingCard = readCard(row, context);
   thread.prRefs = orderPrRefs([...(attachments.get(id) ?? []), ...rolloutRefs], thread.branch);
   if (!thread.repo && thread.prRefs.length > 0) thread.repo = parsePrRef(thread.prRefs[0])?.repo ?? null;
   if (!thread.excluded) thread.excluded = scopeExclusion(thread);
@@ -554,11 +817,46 @@ export async function readWriterLocks(config, ids, { run, isPidAlive }) {
   return locked;
 }
 
+// Any thread with an open card (in scope, automation, or no-repo) is kept
+// past the cap: it must not drop a question the owner has not seen.
 function capThreads(threads, max) {
+  const carded = (thread) => (!thread.excluded || CARD_EXCLUSIONS.has(thread.excluded)) && thread.meta?.pendingCard?.items?.length > 0;
   const inScope = threads.filter((thread) => !thread.excluded).slice(0, max);
   const room = Math.max(0, max - inScope.length);
-  const keep = new Set([...inScope, ...threads.filter((thread) => thread.excluded).slice(0, room)]);
+  const rest = threads.filter((thread) => thread.excluded && !carded(thread)).slice(0, room);
+  const keep = new Set([...inScope, ...threads.filter(carded), ...rest]);
   return threads.filter((thread) => keep.has(thread));
+}
+
+// Threads past the paging stop with an open card, paged to the lookback
+// boundary (at most CARD_SCAN_PAGES pages): from the history index, or the
+// bounded rollout tail when the index is missing or cannot say for a row.
+// Every row whose card the index settled (read, or one that never asks)
+// joins cardScanned.
+function readCardedRows(db, history, after, { config, now, cutoff, pageSize, tailBytes, cardScanned }) {
+  const carded = [];
+  for (let page = 0; after && page < CARD_SCAN_PAGES; page += 1) {
+    const rows = readThreadRows(db, cutoff, pageSize, after);
+    carded.push(...rows.filter((row) => {
+      const key = threadKey("codex", String(row.id));
+      if (Number(row.archived) === 1 || NEVER_ASKS.has(row.thread_source) || sourceIsSubagent(row.source)) {
+        cardScanned?.add(key);
+        return false;
+      }
+      let bytes = null;
+      try { bytes = fs.statSync(row.rollout_path).size; } catch { return false; }
+      // A history index that does not cover the rollout (undefined) leaves
+      // the card unknown: the tail may still show one.
+      const indexed = history ? readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits: config.limits, now }) : undefined;
+      if (indexed !== undefined) cardScanned?.add(key);
+      const card = indexed !== undefined ? indexed : readCard(row, { config, now, history: null, tailBytes }, bytes);
+      return card?.items?.length > 0;
+    }));
+    after = rows.length < pageSize ? null : rows.at(-1);
+  }
+  const attachments = readPrAttachments(db, carded.map((row) => String(row.id)));
+  return carded.map((row) => buildThread(row, { config, now, attachments, history, tailBytes }))
+    .filter((thread) => Date.parse(thread.lastActivityAt ?? "") >= cutoff);
 }
 
 export async function listCodexThreads(config, options = {}) {
@@ -575,24 +873,40 @@ export async function listCodexThreads(config, options = {}) {
   const cutoff = now - config.lookbackHours * HOUR;
   const pageSize = limits.maxThreads * 5;
   const built = [];
+  // options.cardScanned (a Set): the keys of threads whose open card this
+  // scan settled. One missing from the capped result has no card open.
+  const cardScanned = options.cardScanned instanceof Set ? options.cardScanned : null;
+  // A history index that will not open leaves every card to the tails.
+  const history = options.history === undefined ? await openThreadHistory(config.paths.codexHome) : options.history;
   try {
     // Guardian reviews, automation, and settings-only rows fill pages too,
     // so read on until maxThreads in-scope threads are found or the
     // lookback window runs out; no fixed row cap hides an older real thread.
-    for (let after = null, inScope = 0; inScope < limits.maxThreads;) {
+    let unread = null;
+    for (let after = null, inScope = 0; ;) {
       const rows = readThreadRows(db, cutoff, pageSize, after);
       const attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
-      const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
+      const context = { config, now, attachments, history, tailBytes: options.tailBytes ?? TAIL_BYTES };
       for (const row of rows) {
         const thread = buildThread(row, context);
         // The catalog query lets settings-only writes through; the last turn decides.
         if (Date.parse(thread.lastActivityAt ?? "") < cutoff) continue;
         built.push(thread);
+        cardScanned?.add(thread.key);
         if (!thread.excluded) inScope += 1;
       }
       if (rows.length < pageSize) break;
       after = rows.at(-1);
+      // Stopped by the cap with rows left: those are scanned for cards below.
+      if (inScope >= limits.maxThreads) {
+        unread = after;
+        break;
+      }
     }
+    // capThreads keeps any thread with an open card, so the older rows the
+    // loop stopped before are checked for one too, page by page to the
+    // lookback: in the history index, else in the bounded rollout tail.
+    if (unread) built.push(...readCardedRows(db, history, unread, { config, now, cutoff, pageSize, tailBytes: options.tailBytes ?? TAIL_BYTES, cardScanned }));
     // A failed title scan marks nothing shared; identity checks still see
     // every thread the supervisor retained.
     let shared = { names: new Set(), labels: new Map() };
@@ -606,6 +920,7 @@ export async function listCodexThreads(config, options = {}) {
     }
   } finally {
     try { db.close(); } catch { /* already closed */ }
+    if (options.history === undefined) try { history?.db.close(); } catch { /* already closed */ }
   }
   const threads = capThreads(built, limits.maxThreads);
   const locked = await readWriterLocks(config, threads.map((thread) => thread.id), { run, isPidAlive });

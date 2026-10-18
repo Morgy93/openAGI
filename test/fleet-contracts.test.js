@@ -3,10 +3,39 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
-  ROUTES, UI_APPS, clampTail, clampText, isPidAlive, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
-  repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
+  linkUiHosts, openChatFor, KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  ANTIGRAVITY_LS, defaultBinaries, openImmutableDb, isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
+
+test("Antigravity binaries resolve the app shim and both app install locations without PATH", () => {
+  const home = "/home/fixture";
+  const shim = path.join(home, ".gemini", "antigravity", "bin", "agentapi");
+  const userApp = path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server");
+  const both = defaultBinaries(home, (file) => [shim, ANTIGRAVITY_LS, userApp].includes(file));
+  assert.equal(both.agentapi, shim);
+  assert.equal(both.antigravityLs, ANTIGRAVITY_LS);
+  const bundled = defaultBinaries(home, (file) => file === userApp);
+  assert.equal(bundled.agentapi, null);
+  assert.equal(bundled.antigravityLs, userApp);
+  assert.equal(defaultBinaries(home, () => false).agentapi, null);
+});
+
+test("immutable SQLite reads preserve special path characters and create no sidecars", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-contracts-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "space #question?percent%.db");
+  const setup = new DatabaseSync(file);
+  setup.exec("PRAGMA journal_mode=WAL; CREATE TABLE fixture (value); INSERT INTO fixture VALUES (42)");
+  setup.close();
+  const db = await openImmutableDb(file);
+  assert.ok(db);
+  try { assert.equal(db.prepare("SELECT value FROM fixture").get().value, 42); }
+  finally { db.close(); }
+  assert.equal(fs.existsSync(file + "-wal"), false);
+  assert.equal(fs.existsSync(file + "-shm"), false);
+});
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
   const config = resolveFleetConfig({}, { home: "/home/fixture" });
@@ -25,6 +54,14 @@ test("resolveFleetConfig reads env and lets overrides win", () => {
   assert.equal(config.push, "buzzkit");
   assert.deepEqual(config.selfSessionIds, ["self-1"]);
   assert.equal(resolveFleetConfig({ OPENAGI_FLEET_MODE: "yolo" }, { home: "/h" }).mode, "observe");
+});
+
+test("the supervisor's own sessions: configured ids and the display prompt", () => {
+  const env = { CLAUDE_CODE_SESSION_ID: "self-1", OPENAGI_FLEET_SELF_SESSION_IDS: "01a0df66-b269-7540-81f5-592808f2e1f1, 01a1316f-4fc1-7072-8c53-d96ce5fb8085" };
+  assert.deepEqual(resolveFleetConfig(env, { home: "/h" }).selfSessionIds, ["self-1", "01a0df66-b269-7540-81f5-592808f2e1f1", "01a1316f-4fc1-7072-8c53-d96ce5fb8085"]);
+  assert.equal(isSupervisorOwnPrompt("You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring C…"), true);
+  assert.equal(isSupervisorOwnPrompt("Explain how the Agent Supervisor display works"), false);
+  assert.equal(isSupervisorOwnPrompt(null), false);
 });
 
 test("text helpers clamp, redact, and parse refs", () => {
@@ -169,4 +206,80 @@ test("background routes are off unless listed, and never include claude-resume; 
   assert.deepEqual(set.backgroundRoutes, ["codex-exec"]);
   assert.deepEqual(set.idleDrain, { enabled: false, pollMs: 5000 });
   assert.deepEqual(resolveFleetConfig({}, { home: "/home/fixture", backgroundRoutes: ["claude-resume", "peer-relay"] }).backgroundRoutes, ["peer-relay"]);
+});
+
+test("a card item that says it needs nothing, or only acknowledges, asks nothing", () => {
+  const item = (question, options = []) => ({ question, options });
+  // 019fe344: a card with no choices that says it needs nothing.
+  assert.equal(isAckItem(item("I'm recovering the staged candidate; no input is needed from you right now.")), true);
+  assert.equal(isAckItem(item("Nothing is needed from you.")), true);
+  assert.equal(isAckItem(item("I will use the native build.", ["Okay"])), true);
+  assert.equal(isAckItem(item("I will use the native build.", ["Continue (Recommended)"])), true);
+  assert.equal(isAckItem(item("I will use the native build.", ["Okay (recommended)"])), true);
+  assert.equal(isAckItem(item("Ship it?", ["Ship it (Recommended)"])), false);
+  assert.equal(isAckItem(item("Please sign back into ZeroShot Staging.")), false);
+  assert.equal(isAckItem(item("No input needed? Pick a region.", ["us-east-1", "eu-west-1"])), false);
+  assert.deepEqual(liveCardItems({ app: "codex", items: [item("no action needed"), { ...item("Sign in?"), at: null }] }).map((entry) => entry.question), ["Sign in?"]);
+});
+
+test("openChatFor: the link that opens exactly that chat, or a label that says where it is", () => {
+  // Two chats in one workspace named remote-dev: the tab title tells them apart.
+  const conductor = (session, tab) => ({
+    key: `conductor:${session}`, kind: "conductor", id: session, title: tab, workspace: "remote-dev", cwd: "/ws/remote-dev",
+    meta: { conductorWorkspaceId: "w1", conductorSessionId: session, conductorSessionTitle: tab, conductorWorkspaceSessions: 2 }
+  });
+  const a = openChatFor(conductor("d1dbe71a", "Codex LB Transcript open"));
+  const b = openChatFor(conductor("0056f770", "Remote dev setup"));
+  assert.deepEqual(a, { app: "conductor", url: "conductor://workspace?id=w1&session=d1dbe71a", label: "remote-dev · Codex LB Transcript open (Conductor)", note: null });
+  assert.equal(b.label, "remote-dev · Remote dev setup (Conductor)");
+  assert.notEqual(a.url, b.url);
+  // A tab titled like its workspace is not named twice.
+  assert.equal(openChatFor(conductor("s9", "Remote-Dev")).label, "remote-dev (Conductor)");
+  // Codex: the thread's id link, the one computer-use sends use.
+  const codex = { key: "codex:019f", kind: "codex", id: "019f", title: "Download Amex Statements", cwd: "/w/bb", meta: {} };
+  assert.deepEqual(openChatFor(codex), { app: "codex", url: "codex://threads/019f", label: "Download Amex Statements (Codex)", note: null });
+  assert.equal(openChatFor({ ...codex, archived: true }).url, null);
+  assert.match(openChatFor({ ...codex, archived: true }).note, /unarchive/);
+  // A Codex thread Conductor runs opens through its Conductor tab.
+  const hosted = { ...codex, key: "codex:c1", id: "c1", meta: { originator: "codex_sdk_ts" } };
+  const host = { ...conductor("s2", "Ship it"), claudeSessionId: "c1" };
+  const [linked] = linkUiHosts([hosted, host]);
+  assert.equal(openChatFor(linked).url, "conductor://workspace?id=w1&session=s2");
+  assert.equal(openChatFor(linked).app, "conductor");
+  // With no Conductor tab showing it: no guessed link, its app named.
+  assert.equal(openChatFor(hosted).url, null);
+  assert.equal(openChatFor(hosted).app, "conductor");
+  const named = openChatFor({ ...hosted, cwd: "/work/remote-dev" });
+  assert.match(named.label, /remote-dev/);
+  assert.match(named.note, /remote-dev/);
+  // A Claude Code terminal session: no app link opens it.
+  const claude = openChatFor({ key: "claude:x", kind: "claude", id: "x", title: "fix auth", workspace: null, cwd: "/Users/me/Dev/api", meta: {} });
+  assert.equal(claude.url, null);
+  assert.equal(claude.app, "claude");
+  assert.equal(claude.label, "api · fix auth (Claude Code)");
+  assert.match(claude.note, /terminal/);
+  assert.equal(openChatFor(null), null);
+});
+
+test("thread keys come from the one kind list, Antigravity included", () => {
+  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity"]);
+  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity");
+  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
+  for (const key of ["gemini:x", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
+  for (const kind of THREAD_KINDS) assert.ok(KIND_NAMES[kind], kind);
+  assert.equal(kindName("antigravity"), "Antigravity");
+  assert.equal(kindName("other"), "Agent");
+});
+
+
+test("Antigravity openChatFor names the workspace and conversation without a guessed link", () => {
+  const thread = { key: "antigravity:a1", kind: "antigravity", id: "a1", workspace: "api", title: "Fix auth", cwd: "/work/api" };
+  const chat = openChatFor(thread);
+  assert.equal(chat.app, "antigravity");
+  assert.equal(chat.url, null);
+  assert.equal(chat.label, "api · Fix auth (Antigravity)");
+  assert.match(chat.note, /open it in Antigravity/);
+  assert.equal(openChatFor({ ...thread, workspace: null }).label, chat.label);
+  assert.equal(openChatFor({ ...thread, title: "API" }).label, "api (Antigravity)");
+  assert.equal(openChatFor({ ...thread, workspace: null, cwd: null, title: null }).label, "untitled conversation (Antigravity)");
 });

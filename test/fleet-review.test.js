@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, SUPERVISOR_PREFIX, resolveFleetConfig } from "../src/fleet/contracts.js";
-import { REVIEW_SCHEMA, createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "../src/fleet/review.js";
+import { REVIEW_SCHEMA, REVIEW_SCHEMA_CODEX, createReviewRunner, reviewContext, reviewFingerprint, reviewProvider, reviewQuestions } from "../src/fleet/review.js";
 
 const NOW = Date.parse("2026-09-29T06:00:00.000Z");
 const MIN = 60_000;
@@ -343,7 +343,11 @@ test("the runner turns timeouts, exits, errors and missing structured output int
 test("review config: on with the supervisor, off with OPENAGI_FLEET_REVIEW=0, model and interval from env", () => {
   assert.equal(resolveFleetConfig({}, { home: "/h" }).review.enabled, false);
   const on = resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1" }, { home: "/h" }).review;
-  assert.deepEqual(on, { enabled: true, model: "claude-sonnet-5", intervalMs: 30 * MIN, timeoutMs: 360_000 });
+  // provider and model null: codex-lb's gpt-6-luna when configured, else Claude (createReviewRunner).
+  assert.deepEqual(on, { enabled: true, provider: null, model: null, intervalMs: 30 * MIN, timeoutMs: 360_000, codexTimeoutMs: 180_000 });
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1", OPENAGI_FLEET_REVIEW_PROVIDER: " Claude " }, { home: "/h" }).review.provider, "claude");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1", OPENAGI_FLEET_REVIEW_PROVIDER: "codex" }, { home: "/h" }).review.provider, "codex");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1", OPENAGI_FLEET_REVIEW_PROVIDER: "gemini" }, { home: "/h" }).review.provider, null);
   assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1", OPENAGI_FLEET_REVIEW: "0" }, { home: "/h" }).review.enabled, false);
   const custom = resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1", OPENAGI_FLEET_REVIEW_MODEL: " claude-opus-5 ", OPENAGI_FLEET_REVIEW_MS: "600000" }, { home: "/h" }).review;
   assert.equal(custom.model, "claude-opus-5");
@@ -359,4 +363,246 @@ test("the owner's workspace notes go into the review's instructions, not the dat
   assert.equal(requests[0].prompt.includes("wait for a restart"), false);
   await reviewQuestions({ questions: [question()], now: NOW, runModel });
   assert.equal(requests[1].system.includes("owner's notes"), false);
+});
+
+// Audit 2026-10-12: remote-dev-setup #1's "merge now or wait clean review?"
+// (conductor:d1dbe71a, asked 19:27Z) was closed as done-elsewhere on the
+// owner's "admin merge" at 00:35:59Z in sibling session conductor:0056f770,
+// which was about #7611.
+test("done-elsewhere needs a related thread that names this PR, not a bare owner reply there", async () => {
+  const asked = question({
+    id: "fq_73d009284867404c", dedupeKey: "ask:conductor:d1dbe71a:62f2845cb64abc40", threadKey: "conductor:d1dbe71a", prRef: "buildbetter-app/remote-dev-setup#1",
+    title: "remote-dev-setup #1: merge now or wait clean review?", body: "Merge now, or wait for a clean Codex review?", options: ["merge now", "wait"],
+    agentAskedAt: "2026-10-13T00:27:48.881Z", createdAt: "2026-10-13T00:29:58.790Z"
+  });
+  const own = thread({ key: "conductor:d1dbe71a", id: "d1dbe71a", workspace: "remote-dev", repo: "buildbetter-app/remote-dev-setup", prRefs: ["buildbetter-app/remote-dev-setup#1"],
+    lastAgentText: "Merge now, or wait for a clean Codex review?", lastAgentAt: "2026-10-13T00:27:48.881Z", lastUserText: "fix the P1s", lastUserAt: "2026-10-12T15:11:00.000Z" });
+  const sibling = (lastAgentText) => thread({ key: "conductor:0056f770", id: "0056f770", workspace: "remote-dev", repo: "buildbetter-app/remote-dev-setup", prRefs: ["buildbetter-app/remote-dev-setup#1"],
+    lastAgentText, lastAgentAt: "2026-10-13T01:28:23.917Z", lastUserText: "admin merge", lastUserAt: "2026-10-13T00:35:59.732Z", lastActivityAt: "2026-10-13T01:28:23.917Z" });
+  const pr = { ref: "buildbetter-app/remote-dev-setup#1", number: 1, state: "OPEN", isDraft: false, ci: { state: "SUCCESS" } };
+  const review = async (siblingText) => {
+    const threads = new Map([[own.key, own], ["conductor:0056f770", sibling(siblingText)]]);
+    const [verdict] = await reviewQuestions({
+      questions: [asked], now: Date.parse("2026-10-13T01:34:00.000Z"),
+      contextFor: (q) => reviewContext(q, { threads, prs: new Map([[pr.ref, pr]]) }),
+      runModel: async () => ({ reviews: [{ id: asked.id, decision: "close", category: "done-elsewhere", reason: "Related remote-dev-setup#1 thread (conductor:0056f770) shows the owner replying 'admin merge' at 2026-10-13T00:35:59Z, after this ask." }] })
+    });
+    return verdict;
+  };
+  const kept = await review("**01:27 UTC:** #7584's re-verify passed, but it still took 42 minutes even with the builder test down to 4. Something else is slow. Want either, or both?");
+  assert.equal(kept.decision, "keep");
+  assert.match(kept.reason, /^no related thread names this PR/);
+  // A sibling whose own words name #1 can settle it; #10 or #1234 do not.
+  assert.equal((await review("Admin-merged #10 and #1234.")).decision, "keep");
+  assert.equal((await review("Admin-merged #1 at f433206 as you asked.")).decision, "close");
+});
+
+// A related thread found by workspace or repo can talk about a dependency
+// PR with the same number in another repo: that is not this PR.
+test("done-elsewhere checks the repo of the PR a related thread names", async () => {
+  const asked = question({ id: "fq_repo", dedupeKey: "ask:conductor:a1:x", threadKey: "conductor:a1", prRef: "acme/app#42", title: "app #42: merge?", options: ["yes", "no"], agentAskedAt: "2026-10-13T00:00:00.000Z" });
+  const own = thread({ key: "conductor:a1", id: "a1", workspace: "w", repo: "acme/app", prRefs: ["acme/app#42"], lastAgentText: "Merge #42?", lastAgentAt: "2026-10-13T00:00:00.000Z" });
+  const pr = { ref: "acme/app#42", number: 42, state: "OPEN", isDraft: false, ci: { state: "SUCCESS" } };
+  const review = async (lastAgentText, repo = "acme/lib") => {
+    const sibling = thread({ key: "conductor:b2", id: "b2", workspace: "w", repo, prRefs: [], lastAgentText, lastAgentAt: "2026-10-13T01:00:00.000Z", lastActivityAt: "2026-10-13T01:00:00.000Z" });
+    const threads = new Map([[own.key, own], [sibling.key, sibling]]);
+    const [verdict] = await reviewQuestions({
+      questions: [asked], now: Date.parse("2026-10-13T01:10:00.000Z"),
+      contextFor: (q) => reviewContext(q, { threads, prs: new Map([[pr.ref, pr]]) }),
+      runModel: async () => ({ reviews: [{ id: asked.id, decision: "close", category: "done-elsewhere", reason: "A related thread merged #42." }] })
+    });
+    return verdict.decision;
+  };
+  assert.equal(await review("Merged acme/lib#42."), "keep");
+  assert.equal(await review("Merged https://github.com/acme/lib/pull/42."), "keep");
+  assert.equal(await review("Merged #42."), "keep", "a bare #42 from another repo's thread");
+  assert.equal(await review("Merged acme/app#42 for you."), "close");
+  assert.equal(await review("Merged https://github.com/acme/app/pull/42 as asked."), "close");
+  assert.equal(await review("Merged #42.", "acme/app"), "close");
+});
+
+// The review on codex-lb: the nudge judge's locked-down codex exec, with
+// Claude behind it.
+const CODEX_FEATURES = [
+  "shell_tool                               stable             false",
+  "unified_exec                             stable             true"
+].join("\n");
+const OK = { code: 0, stdout: "", stderr: "", timedOut: false, error: null };
+const CLAUDE_OUT = { reviews: [{ id: "fq_a", decision: "keep", category: "live", reason: "from claude" }] };
+
+function codexConfig(t, review = { enabled: true }, { provider = true, providerName = "codex-lb" } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-review-codex-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".codex", "codex-lb.env"), "CODEX_LB_API_KEY=lb-key-review-1\n");
+  fs.writeFileSync(path.join(home, ".codex", "config.toml"), provider
+    ? ['model = "gpt-6.1-sol"', `model_provider = "${providerName}"`, "", "[mcp_servers.x]", 'url = "https://mcp.example"', "", `[model_providers.${providerName}]`, 'name = "openai"', 'base_url = "http://lb.local:2455/backend-api/codex"', 'env_key = "CODEX_LB_API_KEY"'].join("\n")
+    : 'model = "gpt-6.1-sol"\n');
+  return resolveFleetConfig({}, { home, bins: { codex: "/bin/codex-test", claude: "/bin/claude" }, paths: { relayCwd: path.join(home, "relay") }, review });
+}
+
+// Answers the lockdown probes, runs codex exec (writing out as -o would, and
+// keeping the schema it was handed) and claude -p, recording each.
+function reviewRun({ codexOut = null, codexResult = OK, features = { ...OK, stdout: CODEX_FEATURES }, claude = { ...OK, stdout: JSON.stringify({ type: "result", subtype: "success", is_error: false, structured_output: CLAUDE_OUT }) } } = {}) {
+  const codex = [];
+  const claudeCalls = [];
+  const run = async (cmd, args, options) => {
+    if (args[0] === "features") return features;
+    if (args[0] === "mcp") return { ...OK, stdout: "[]" };
+    if (cmd === "/bin/claude") { claudeCalls.push({ cmd, args, options }); return claude; }
+    const schema = JSON.parse(fs.readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
+    codex.push({ cmd, args, options, schema });
+    if (codexOut !== null) fs.writeFileSync(args[args.indexOf("-o") + 1], typeof codexOut === "string" ? codexOut : JSON.stringify(codexOut));
+    return codexResult;
+  };
+  return { run, codex, claudeCalls };
+}
+
+test("the review runs on gpt-6-luna through codex-lb, tool-free, when a provider is configured", async (t) => {
+  const codexOut = { reviews: [{ id: "fq_a", decision: "close", category: "stale", reason: "PR merged", title: null, options: null, duplicateOf: null }, { id: "fq_b", decision: "keep", category: "live", reason: "blocked", title: "app #7: merge?", options: ["merge now", "wait"], duplicateOf: null }] };
+  const { run, codex, claudeCalls } = reviewRun({ codexOut });
+  const runModel = createReviewRunner({ config: codexConfig(t), run, env: { PATH: "/usr/bin", HOME: "/h", ANTHROPIC_API_KEY: "sk-ant-nope" } });
+  assert.deepEqual([runModel.provider, runModel.model, runModel.fallbackModel], ["codex", "gpt-6-luna", "claude-sonnet-5"]);
+  const output = await runModel({ system: "SYS", prompt: "PROMPT", schema: REVIEW_SCHEMA });
+  // Nulls dropped: the verdicts read as Claude's would.
+  assert.deepEqual(output, { reviews: [{ id: "fq_a", decision: "close", category: "stale", reason: "PR merged" }, { id: "fq_b", decision: "keep", category: "live", reason: "blocked", title: "app #7: merge?", options: ["merge now", "wait"] }] });
+  assert.equal(claudeCalls.length, 0);
+  assert.deepEqual(runModel.lastRun, { provider: "codex", model: "gpt-6-luna", fallbackReason: null });
+  const [{ cmd, args, options, schema }] = codex;
+  assert.equal(cmd, "/bin/codex-test");
+  assert.deepEqual(args.slice(0, 7), ["exec", "--ephemeral", "--skip-git-repo-check", "-s", "read-only", "-m", "gpt-6-luna"]);
+  assert.equal(args.at(-1), "-", "the prompt goes over stdin");
+  assert.equal(options.input, "SYS\n\nPROMPT");
+  assert.deepEqual(schema, REVIEW_SCHEMA_CODEX);
+  assert.match(options.env.CODEX_HOME, /codex-home$/);
+  assert.equal(options.env.HOME, options.cwd);
+  assert.equal(options.env.CODEX_LB_API_KEY, "lb-key-review-1");
+  assert.equal(options.env.ANTHROPIC_API_KEY, undefined);
+  assert.ok(options.timeoutMs <= 180_000 && options.timeoutMs > 170_000);
+  assert.equal(fs.existsSync(options.cwd), false, "temp dir removed");
+  // OPENAGI_FLEET_REVIEW_MODEL picks the codex model.
+  const other = reviewRun({ codexOut });
+  await createReviewRunner({ config: codexConfig(t, { enabled: true, model: "gpt-6.1-sol" }), run: other.run, env: { PATH: "/usr/bin" } })({ system: "S", prompt: "P", schema: REVIEW_SCHEMA });
+  assert.equal(other.codex[0].args[6], "gpt-6.1-sol");
+});
+
+test("a failed codex call falls back to Claude Sonnet and records which ran", async (t) => {
+  const cases = [
+    [{ codexResult: { ...OK, code: 1, stderr: "ERROR: model not found" } }, /codex: .*model not found/],
+    [{ codexOut: "not json" }, /codex: output was not JSON/],
+    [{ codexResult: { ...OK, code: null, timedOut: true } }, /codex: timed out/],
+    [{ codexOut: { verdicts: [] } }, /codex: returned no verdicts/]
+  ];
+  for (const [setup, why] of cases) {
+    const { run, codex, claudeCalls } = reviewRun(setup);
+    const runModel = createReviewRunner({ config: codexConfig(t), run, env: { PATH: "/usr/bin" } });
+    const output = await runModel({ system: "SYS", prompt: "PROMPT", schema: REVIEW_SCHEMA });
+    assert.deepEqual(output, CLAUDE_OUT);
+    assert.equal(codex.length, 1);
+    assert.equal(claudeCalls.length, 1);
+    const flag = (name) => claudeCalls[0].args[claudeCalls[0].args.indexOf(name) + 1];
+    assert.equal(flag("--model"), "claude-sonnet-5");
+    assert.deepEqual(JSON.parse(flag("--json-schema")), REVIEW_SCHEMA, "Claude gets the review's own schema");
+    assert.equal(claudeCalls[0].options.input, "PROMPT");
+    assert.equal(runModel.lastRun.provider, "claude");
+    assert.equal(runModel.lastRun.model, "claude-sonnet-5");
+    assert.match(runModel.lastRun.fallbackReason, why);
+  }
+  // Both fail: one error naming both.
+  const { run } = reviewRun({ codexResult: { ...OK, code: 1, stderr: "ERROR: lb down" }, claude: { ...OK, code: 1, stderr: "You are out of usage credits" } });
+  const runModel = createReviewRunner({ config: codexConfig(t), run, env: { PATH: "/usr/bin" } });
+  await assert.rejects(runModel({ system: "S", prompt: "P", schema: REVIEW_SCHEMA }), /codex: .*lb down; claude fallback: review failed: the Claude account is out of usage credits/);
+  assert.equal(runModel.lastRun, null);
+});
+
+test("a codex that cannot show its tools off never runs the review: Claude does", async (t) => {
+  const failures = [
+    { ...OK, stdout: CODEX_FEATURES.replace("shell_tool                               stable             false", "shell_tool                               stable             true") },
+    { ...OK, code: 2, stderr: "error: unrecognized subcommand 'features'" }
+  ];
+  for (const features of failures) {
+    const { run, codex, claudeCalls } = reviewRun({ codexOut: { reviews: [] }, features });
+    const runModel = createReviewRunner({ config: codexConfig(t), run, env: { PATH: "/usr/bin" } });
+    assert.deepEqual(await runModel({ system: "S", prompt: "P", schema: REVIEW_SCHEMA }), CLAUDE_OUT);
+    assert.equal(codex.length, 0, "no codex exec without a confirmed lockdown");
+    assert.equal(claudeCalls.length, 1);
+    assert.match(runModel.lastRun.fallbackReason, /codex: tool lockdown/);
+  }
+});
+
+test("the LB key never leaves in a lockdown error either", async (t) => {
+  const features = { ...OK, code: 2, stderr: "error: lb rejected lb-key-review-1" };
+  const { run, codex } = reviewRun({ codexOut: { reviews: [] }, features });
+  const runModel = createReviewRunner({ config: codexConfig(t), run, env: { PATH: "/usr/bin" } });
+  await runModel({ system: "S", prompt: "P", schema: REVIEW_SCHEMA });
+  assert.equal(codex.length, 0);
+  assert.doesNotMatch(runModel.lastRun.fallbackReason, /lb-key-review-1/);
+  assert.match(runModel.lastRun.fallbackReason, /codex: tool lockdown unconfirmed: .*\[redacted\]/);
+});
+
+test("the provider: codex when codex-lb is configured, else Claude; OPENAGI_FLEET_REVIEW_PROVIDER pins it", async (t) => {
+  assert.equal(reviewProvider(codexConfig(t)), "codex");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { provider: false })), "claude");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true, provider: "claude" })), "claude");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true }, { providerName: "ollama" })), "claude", "only codex-lb is picked on its own");
+  const quoted = codexConfig(t);
+  assert.equal(reviewProvider(quoted, (file, enc) => fs.readFileSync(file, enc).replace("model_provider =", "\"model_provider\" =")), "codex", "a quoted key is the same key");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true, provider: "codex" }, { providerName: "ollama" })), "codex", "an explicit pin still wins");
+  assert.equal(reviewProvider(codexConfig(t, { enabled: true, model: "claude-opus-5" })), "claude", "a Claude model means Claude");
+  // Pinned to Claude: claude -p with the named model, no codex call.
+  const { run, codex, claudeCalls } = reviewRun();
+  const runModel = createReviewRunner({ config: codexConfig(t, { enabled: true, provider: "claude", model: "claude-opus-5" }), run, env: { PATH: "/usr/bin" } });
+  assert.deepEqual([runModel.provider, runModel.model, runModel.fallbackModel], ["claude", "claude-opus-5", null]);
+  await runModel({ system: "S", prompt: "P", schema: REVIEW_SCHEMA });
+  assert.equal(codex.length, 0);
+  assert.equal(claudeCalls[0].args[claudeCalls[0].args.indexOf("--model") + 1], "claude-opus-5");
+  assert.deepEqual(runModel.lastRun, { provider: "claude", model: "claude-opus-5", fallbackReason: null });
+  // No codex-lb here: Claude with the current default model.
+  const plain = createReviewRunner({ config: codexConfig(t, { enabled: true }, { provider: false }), run, env: { PATH: "/usr/bin" } });
+  assert.deepEqual([plain.provider, plain.model], ["claude", "claude-sonnet-5"]);
+});
+
+test("the review's schema and verdict contract are unchanged; the codex form only makes the optional fields nullable", async (t) => {
+  assert.deepEqual(REVIEW_SCHEMA, {
+    type: "object",
+    properties: {
+      reviews: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            decision: { type: "string", enum: ["keep", "close"] },
+            category: { type: "string", enum: ["live", "stale", "junk", "duplicate", "done-elsewhere"] },
+            reason: { type: "string" },
+            title: { type: "string" },
+            options: { type: "array", items: { type: "string" } },
+            duplicateOf: { type: "string" }
+          },
+          required: ["id", "decision", "category", "reason"],
+          additionalProperties: false
+        }
+      }
+    },
+    required: ["reviews"],
+    additionalProperties: false
+  });
+  const item = REVIEW_SCHEMA_CODEX.properties.reviews.items;
+  assert.deepEqual(item.required, ["id", "decision", "category", "reason", "title", "options", "duplicateOf"]);
+  assert.deepEqual(item.properties.title, { type: ["string", "null"] });
+  assert.deepEqual(item.properties.options, { type: ["array", "null"], items: { type: "string" } });
+  for (const name of ["id", "decision", "category", "reason"]) assert.deepEqual(item.properties[name], REVIEW_SCHEMA.properties.reviews.items.properties[name]);
+  assert.equal(item.additionalProperties, false);
+  // The same codex answer and Claude answer give the same verdicts.
+  const questions = [question({ id: "fq_a" }), question({ id: "fq_b", threadKey: "codex:t2" })];
+  const viaCodex = reviewRun({ codexOut: { reviews: [
+    { id: "fq_a", decision: "close", category: "stale", reason: "PR #7 merged", title: null, options: null, duplicateOf: null },
+    { id: "fq_b", decision: "keep", category: "live", reason: "still blocked", title: null, options: null, duplicateOf: null }
+  ] } });
+  const codexVerdicts = await reviewQuestions({ questions, now: NOW, runModel: createReviewRunner({ config: codexConfig(t), run: viaCodex.run, env: { PATH: "/usr/bin" } }) });
+  const claudeVerdicts = await reviewQuestions({ questions, now: NOW, runModel: async () => ({ reviews: [
+    { id: "fq_a", decision: "close", category: "stale", reason: "PR #7 merged" },
+    { id: "fq_b", decision: "keep", category: "live", reason: "still blocked" }
+  ] }) });
+  assert.deepEqual(codexVerdicts, claudeVerdicts);
 });

@@ -81,6 +81,41 @@ class FleetDecodingTest {
 
     // A daemon that has not scanned yet, or predates half these fields.
     @Test
+    fun decodesWatchAndLastAgentAt() {
+        val state = decode(
+            """
+            {"snapshot": {"counts": {"byWatch": {"you": 1, "waiting": 1, "quiet": 0}}, "threads": [
+              {"key": "a", "state": "waiting-ci", "lastAgentAt": "2026-10-12T21:50:00.000Z",
+               "watch": {"group": "waiting", "since": "2026-10-12T21:37:00.000Z", "waitingOn": "BuildBot3 full run",
+                         "waitSince": "2026-10-12T21:37:00.000Z", "runningSince": null, "later": 1}},
+              {"key": "b", "state": "excluded", "watch": null},
+              {"key": "c", "state": "running", "watch": {"group": "working", "since": "not a time"}}
+            ]}}
+            """.trimIndent(),
+        )
+        val snapshot = state.snapshot!!
+        assertEquals(mapOf("you" to 1, "waiting" to 1, "quiet" to 0), snapshot.counts.byWatch)
+        val watch = snapshot.threads[0].watch!!
+        assertEquals("waiting", watch.group)
+        assertEquals(Instant.parse("2026-10-12T21:37:00Z"), watch.since)
+        assertEquals("BuildBot3 full run", watch.waitingOn)
+        assertEquals(Instant.parse("2026-10-12T21:37:00Z"), watch.waitSince)
+        assertNull(watch.runningSince)
+        assertEquals(Instant.parse("2026-10-12T21:50:00Z"), snapshot.threads[0].lastAgentAt)
+        assertNull(snapshot.threads[1].watch)
+        assertEquals("working", snapshot.threads[2].watch!!.group)
+        assertNull(snapshot.threads[2].watch!!.since)
+    }
+
+    @Test
+    fun anOlderDaemonHasNoWatch() {
+        val thread = decode(fullState).snapshot!!.threads.first()
+        assertNull(thread.watch)
+        assertNull(thread.lastAgentAt)
+        assertTrue(decode(fullState).snapshot!!.counts.byWatch.isEmpty())
+    }
+
+    @Test
     fun anEmptyObjectDecodesToAnEmptyState() {
         val state = decode("{}")
         assertNull(state.mode)
@@ -193,4 +228,93 @@ class FleetDecodingTest {
         assertEquals(FleetHealth.GRAY, FleetHealth.of(thread("excluded", error = error)))
         assertEquals(FleetHealth.GRAY, FleetHealth.of(thread("something-new", error = error)))
     }
+
+    // The open-chat, mute and live-question fields the Supervisor tab reads
+    // (src/fleet/supervisor.js getState and questionView).
+    @Test
+    fun decodesOpenChatMuteAndQuestionContext() {
+        val state = decode(
+            """
+            {
+              "snapshot": {"threads": [{
+                "key": "conductor:d1dbe71a", "state": "needs-human",
+                "openChat": {"app": "conductor", "url": "conductor://workspace?id=w1&session=s1", "label": "remote-dev · Codex LB Transcript open (Conductor)", "note": null},
+                "muted": "2026-10-15T00:00:00Z", "lastOwnerAt": "2026-10-13T20:00:00Z",
+                "decision": {"action": "nudge", "playbook": "pr-ci-failing", "reason": "CI red", "message": "CI is red: fix it."},
+                "watch": {"group": "you", "since": "2026-10-14T00:21:00Z", "otherwise": {"group": "push", "waitingOn": null}}
+              }]},
+              "questions": [
+                {"id": "fq_4", "title": "Which BuildBot3 capacity fix should be applied?", "options": ["A", "B"], "kind": "agent-ask",
+                 "threadKey": "conductor:d1dbe71a", "askedAt": "2026-10-14T00:21:00Z", "chatLabel": "remote-dev · Codex LB Transcript open (Conductor)",
+                 "answerIn": "here", "openChat": {"app": "conductor", "url": "conductor://workspace?id=w1&session=s1", "label": "remote-dev", "note": null},
+                 "risky": false, "askContext": "Two options: raise slots or move the queue."},
+                {"id": "fq_5", "title": "cut production release?", "options": ["open thread"], "kind": "agent-card",
+                 "threadKeys": ["codex:a", "claude:b"], "answerIn": "agent app", "risky": true, "openChat": null,
+                 "chats": [{"threadKey": "codex:a", "app": "codex", "url": "codex://threads/a", "label": "docs (Codex)", "note": null},
+                           {"threadKey": "claude:b", "app": "claude", "url": null, "label": "docs (Claude Code)", "note": "open it in its terminal"}]}
+              ]
+            }
+            """,
+        )
+        val thread = state.snapshot!!.threads.single()
+        assertEquals("conductor://workspace?id=w1&session=s1", thread.openChat!!.url)
+        assertEquals(Instant.parse("2026-10-15T00:00:00Z"), thread.muted)
+        assertEquals(Instant.parse("2026-10-13T20:00:00Z"), thread.lastOwnerAt)
+        assertEquals("CI is red: fix it.", thread.decision!!.message)
+        assertEquals("push", thread.watch!!.otherwise!!.group)
+        val (ask, card) = state.questions
+        assertEquals(Instant.parse("2026-10-14T00:21:00Z"), ask.askedAt)
+        assertEquals("remote-dev · Codex LB Transcript open (Conductor)", ask.chatLabel)
+        assertFalse(ask.answeredInAgentApp)
+        assertFalse(ask.risky)
+        assertEquals("Two options: raise slots or move the queue.", ask.askContext)
+        assertTrue(card.answeredInAgentApp)
+        assertTrue(card.risky)
+        assertNull(card.openChat)
+        assertEquals(listOf("codex://threads/a", null), card.chats.map { it.openChat.url })
+        assertEquals("open it in its terminal", card.chats[1].note)
+    }
+
+    // A daemon from before these fields: everything empty, nothing thrown.
+    @Test
+    fun anOlderDaemonLeavesTheNewFieldsEmpty() {
+        val state = decode("""{"snapshot":{"threads":[{"key":"codex:x"}]},"questions":[{"id":"q"}]}""")
+        val thread = state.snapshot!!.threads.single()
+        assertNull(thread.openChat)
+        assertNull(thread.muted)
+        assertNull(thread.decision?.message)
+        val question = state.questions.single()
+        assertFalse(question.risky)
+        assertFalse(question.answeredInAgentApp)
+        assertTrue(question.chats.isEmpty())
+    }
+
+    @Test
+    fun decodesTheThreadDetail() {
+        val detail = FleetJson.json.decodeFromString(
+            FleetThreadDetailResult.serializer(),
+            """
+            {"thread": {"key": "codex:01a13388", "kind": "codex", "title": "Download Amex Statements for Amazon", "live": false,
+              "lastAgentMessage": {"text": "I need you to log in.", "at": "2026-10-13T19:38:00Z"},
+              "lastOwnerAt": null, "pr": {"ref": "x/y#3", "url": null, "state": null},
+              "watch": {"group": "quiet", "since": "2026-10-13T19:38:00Z"},
+              "decision": {"action": "none", "playbook": null, "reason": "nothing to do", "notBefore": null, "message": null},
+              "muted": null, "questions": [], "openChat": {"app": "codex", "url": "codex://threads/01a13388", "label": "Download Amex Statements for Amazon (Codex)", "note": null},
+              "scannedAt": "2026-10-14T04:03:50Z", "prompt": {"kind": "card"}}}
+            """,
+        ).thread!!
+        assertEquals("I need you to log in.", detail.lastAgentMessage!!.text)
+        assertEquals("quiet", detail.watch!!.group)
+        assertNull(detail.pr!!.url)
+        assertEquals("codex://threads/01a13388", detail.openChat!!.url)
+        assertEquals(Instant.parse("2026-10-14T04:03:50Z"), detail.scannedAt)
+    }
+
+    @Test
+    fun anOlderDaemonAppOnlyQuestionKeepsItsHint() {
+        val question = decode("""{"questions":[{"id":"q","options":["open thread"]}]}""").questions.single()
+        assertNull(question.answerIn)
+        assertTrue(question.answeredInAgentApp)
+    }
+
 }

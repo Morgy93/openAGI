@@ -302,7 +302,7 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
     listCodexThreads: async () => [thread()], listClaudeThreads: async () => [], listConductorThreads: async () => [],
     readCodexLbErrors: async () => [], findLocalHeavyVerification: async () => [],
     readLocalGit: async () => ({ head: 'b'.repeat(40), branch: 'spencer/fix', upstream: 'origin/spencer/fix', ahead: 0, remote: 'acme/app' }),
-    findPrForBranch: async () => null, fetchPrStates: async () => new Map(),
+    findPrForBranch: async () => null, fetchPrStates: async () => new Map(), fetchPrStateLite: async () => new Map(),
     probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: 'ok', reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
     checkLb: async () => ({ healthy: true, detail: '200', watchLine: null }),
     findManagerSession: () => null
@@ -333,13 +333,14 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
   glance();
   assert.deepEqual(pings, [copy.id]);
 
-  // Blip: the ask drops out for one tick, then is back within the hour.
+  // Blip: the ask drops out of the read for one tick (the agent wrote
+  // nothing new), then is back. The agent's ask stands throughout.
   lastAgentText = 'Pushed.';
   now += 10 * 60_000;
   await mac.tick();
-  assert.deepEqual(mac.getState().questions, []);
+  assert.deepEqual(mac.getState().questions.map(q => q.id), [question.id]);
   await remote.refresh();
-  assert.equal(outreach.get(copy.id).status, 'dismissed');
+  assert.notEqual(outreach.get(copy.id).status, 'dismissed');
   glance();
 
   lastAgentText = ask;
@@ -348,8 +349,8 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
   const [back] = mac.getState().questions;
   assert.equal(back.id, question.id);
   await remote.refresh();
-  assert.deepEqual(outreach.list().map(item => [item.id, item.status]), [[copy.id, 'seen']]);
-  assert.deepEqual(events.filter(([name]) => name === 'outreach'), [['outreach', copy.id], ['outreach', copy.id]], 'appended, then reopened for the Mac overlay');
+  assert.deepEqual(outreach.list().map(item => [item.id, item.status]), [[copy.id, 'unseen']]);
+  assert.deepEqual(events.filter(([name]) => name === 'outreach'), [['outreach', copy.id]], 'appended once, never closed and reopened');
   glance();
   assert.deepEqual(pings, [copy.id], 'no second ping on the glasses');
   assert.deepEqual(g2.dispatch('glasses', { op: 'feed' }).items.map(item => [item.id, item.notified]), [[copy.id, true]]);
@@ -385,7 +386,7 @@ test('a question the review closes never reaches the main or the glasses, and re
     listCodexThreads: async () => [thread], listClaudeThreads: async () => [], listConductorThreads: async () => [],
     readCodexLbErrors: async () => [], findLocalHeavyVerification: async () => [],
     readLocalGit: async () => ({ head: 'b'.repeat(40), branch: 'spencer/fix', upstream: 'origin/spencer/fix', ahead: 0, remote: 'acme/app' }),
-    findPrForBranch: async () => null, fetchPrStates: async () => new Map(),
+    findPrForBranch: async () => null, fetchPrStates: async () => new Map(), fetchPrStateLite: async () => new Map(),
     probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: 'ok', reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
     checkLb: async () => ({ healthy: true, detail: '200', watchLine: null }),
     findManagerSession: () => null
@@ -436,4 +437,101 @@ test('main reads screens, clicks and controls apps on the Mac through the broker
   await assert.rejects(() => capability.invoke('request', { method: 'POST', path: '/fleet/api/apps/finder/open' }), /Unsupported fleet request/);
   // The chats a restart would stop, read live on the Mac.
   assert.deepEqual(await remote.runningInApp('conductor'), [{ key: 'conductor:s1', name: 'madrid' }]);
+});
+
+test('main reads a thread\'s detail and pushes, mutes and unmutes it on the Mac through the broker', async t => {
+  const { remote, calls } = fixture(t);
+  const seen = [];
+  const mac = {
+    getState: () => ({ mode: 'auto', enabled: true, snapshot: { threads: [] }, questions: [], actions: [] }),
+    threadDetail: async (key) => { seen.push(['detail', key]); return key === 'conductor:s1' ? { key, openChat: { app: 'conductor', url: 'conductor://workspace?id=w&session=s1', label: 'madrid (Conductor)', note: null } } : null; },
+    pushNow: async (key) => { seen.push(['push', key]); return { delivery: { status: 'sent', route: 'computer-use', detail: 'typed' }, action: { id: 'fa_1', by: 'owner' } }; },
+    muteThread: async (key, options) => { seen.push(['mute', key, options.hours]); return { until: '2026-09-27T00:00:00.000Z' }; },
+    unmuteThread: async (key) => { seen.push(['unmute', key]); return { until: null }; }
+  };
+  const capability = createFleetCapability(mac);
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => { calls.push(args); return capability.invoke(args[2], args[3]); };
+  assert.equal((await remote.threadDetail('conductor:s1')).openChat.url, 'conductor://workspace?id=w&session=s1');
+  // Not in the Mac's last scan: null, not an outage.
+  assert.equal(await remote.threadDetail('codex:gone'), null);
+  assert.equal((await remote.pushNow('conductor:s1')).delivery.status, 'sent');
+  assert.equal((await remote.muteThread('conductor:s1', { hours: 3 })).until, '2026-09-27T00:00:00.000Z');
+  assert.equal((await remote.unmuteThread('conductor:s1')).until, null);
+  assert.deepEqual(seen, [['detail', 'conductor:s1'], ['detail', 'codex:gone'], ['push', 'conductor:s1'], ['mute', 'conductor:s1', 3], ['unmute', 'conductor:s1']]);
+  assert.deepEqual(calls.slice(-5).map((call) => [call[3].path, call[4].timeoutMs]), [
+    ['/fleet/api/threads/conductor%3As1', 120000], ['/fleet/api/threads/codex%3Agone', 120000],
+    ['/fleet/api/threads/conductor%3As1/push', 300000], ['/fleet/api/threads/conductor%3As1/mute', 120000], ['/fleet/api/threads/conductor%3As1/unmute', 120000]
+  ], 'a push waits like a send');
+  await assert.rejects(() => capability.invoke('request', { method: 'POST', path: '/fleet/api/threads/codex:t1/delete' }), /Unsupported fleet request/);
+  await assert.rejects(() => capability.invoke('request', { method: 'GET', path: '/fleet/api/threads/../state' }), /Unsupported fleet request/);
+  // Through the main's own route, as the phone and the page call it.
+  const route = createFleetRoute({ supervisor: remote });
+  assert.equal((await route('GET', '/fleet/api/threads/codex:gone', null, async () => ({}))).status, 404);
+  assert.equal((await route('POST', '/fleet/api/threads/conductor:s1/push', null, async () => ({}))).body.delivery.status, 'sent');
+});
+
+test('thread detail preserves computer errors other than not found', async t => {
+  const { remote, runtime, state } = fixture(t);
+  for (const status of [400, 500, 503]) {
+    runtime.nodeCapabilities.dispatch = async () => ({ state, response: { status, body: { error: 'unavailable' } } });
+    await assert.rejects(() => remote.threadDetail('codex:t1'), error => error.status === status);
+  }
+});
+
+test('a missing thread keeps the lastError returned by the computer', async t => {
+  const { remote, runtime, state } = fixture(t);
+  for (const lastError of [null, 'A scan source failed']) {
+    runtime.nodeCapabilities.dispatch = async () => ({ state: { ...state, lastError }, response: { status: 404, body: { error: 'thread not found' } } });
+    assert.equal(await remote.threadDetail('codex:gone'), null);
+    assert.equal(remote.getState().lastError, lastError);
+  }
+  runtime.nodeCapabilities.dispatch = async () => { throw new Error('offline'); };
+  await assert.rejects(() => remote.threadDetail('codex:gone'), /unavailable/);
+  assert.match(remote.getState().lastError, /unavailable/);
+});
+
+
+test('remote Antigravity thread requests reach the supervisor with the broker deadline', async () => {
+  const seen = [];
+  const supervisor = {
+    getState: () => ({}),
+    threadDetail: async key => { seen.push(['detail', key]); return { key }; },
+    pushNow: async (key, options) => { seen.push(['push', key, options.deadlineAt]); return { delivery: { status: 'sent' } }; },
+    muteThread: async key => { seen.push(['mute', key]); return { until: null }; },
+    unmuteThread: async key => { seen.push(['unmute', key]); return { until: null }; }
+  };
+  const capability = createFleetCapability(supervisor);
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  for (const key of ['antigravity:a1', 'antigravity%3Aa1']) {
+    for (const action of ['detail', 'push', 'mute', 'unmute']) {
+      const path = '/fleet/api/threads/' + key + (action === 'detail' ? '' : '/' + action);
+      const result = await capability.invoke('request', { method: action === 'detail' ? 'GET' : 'POST', path }, { expiresAt });
+      assert.equal(result.response.status, 200);
+    }
+  }
+  assert.deepEqual(seen, [...Array(2)].flatMap(() => [['detail', 'antigravity:a1'], ['push', 'antigravity:a1', Date.parse(expiresAt)], ['mute', 'antigravity:a1'], ['unmute', 'antigravity:a1']]));
+  for (const key of ['antigravity:', 'antigravity:a/b', 'gemini:a1']) {
+    await assert.rejects(capability.invoke('request', { method: 'GET', path: '/fleet/api/threads/' + key }), /Unsupported fleet request/);
+  }
+});
+
+test('a remote refresh emits "fleet" once per new snapshot or question set, not when unchanged', async t => {
+  const { remote, runtime, state } = fixture(t);
+  const emitted = [];
+  runtime.events = { emit: (name, data) => emitted.push([name, data]) };
+  state.snapshot = { at: '2026-10-15T12:00:00.000Z', threads: [], counts: { threads: 0 } };
+  await remote.refresh();
+  assert.deepEqual(emitted, [['fleet', { at: '2026-10-15T12:00:00.000Z', reason: 'remote-refresh', counts: { threads: 0 } }]]);
+  await remote.refresh();
+  assert.equal(emitted.length, 1);
+  state.questions = [];
+  await remote.refresh();
+  assert.equal(emitted.length, 2);
+  state.snapshot = { ...state.snapshot, at: '2026-10-15T12:01:00.000Z' };
+  await remote.refresh();
+  await remote.refresh();
+  assert.equal(emitted.length, 3);
+  runtime.events = { emit: () => { throw new Error('listener'); } };
+  state.questions = [{ id: 'fq_two', title: 'x', options: [] }];
+  await remote.refresh();
 });

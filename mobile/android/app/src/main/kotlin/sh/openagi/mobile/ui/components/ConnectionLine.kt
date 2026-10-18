@@ -37,25 +37,46 @@ sealed class ConnectionState {
     data class Reconnecting(val host: String) : ConnectionState()
 }
 
+// The dot's colour and whether it is filled, shared by the connection line and
+// the chat top bar's status dot so the two can never disagree.
 @Composable
-fun ConnectionLine(state: ConnectionState, modifier: Modifier = Modifier) {
+internal fun connectionDotStyle(state: ConnectionState): Pair<androidx.compose.ui.graphics.Color, Boolean> {
     val colors = LocalOpenAGIColors.current
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-
-    val (dotColor, dotFilled) = when (state) {
+    return when (state) {
         is ConnectionState.Synced -> if (state.ageMinutes < 60) colors.live to true else muted to false
         is ConnectionState.Failed -> colors.alert to true
         is ConnectionState.NeverSynced -> muted to false
         is ConnectionState.Live -> colors.live to true
         is ConnectionState.Reconnecting -> muted to false
     }
-    val (host, caption) = when (state) {
-        is ConnectionState.Synced -> state.host to RelativeTime.short(state.ageMinutes)
-        is ConnectionState.Failed -> state.host to "can't reach"
-        is ConnectionState.NeverSynced -> state.host to "not synced yet"
-        is ConnectionState.Live -> state.host to "live"
-        is ConnectionState.Reconnecting -> state.host to "reconnecting"
-    }
+}
+
+// The daemon's address, whatever the state.
+internal fun connectionHost(state: ConnectionState): String = when (state) {
+    is ConnectionState.Synced -> state.host
+    is ConnectionState.Failed -> state.host
+    is ConnectionState.NeverSynced -> state.host
+    is ConnectionState.Live -> state.host
+    is ConnectionState.Reconnecting -> state.host
+}
+
+// The status word the connection line shows after the host.
+internal fun connectionCaption(state: ConnectionState): String = when (state) {
+    is ConnectionState.Synced -> RelativeTime.short(state.ageMinutes)
+    is ConnectionState.Failed -> "can't reach"
+    is ConnectionState.NeverSynced -> "not synced yet"
+    is ConnectionState.Live -> "live"
+    is ConnectionState.Reconnecting -> "reconnecting"
+}
+
+@Composable
+fun ConnectionLine(state: ConnectionState, modifier: Modifier = Modifier) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+
+    val (dotColor, dotFilled) = connectionDotStyle(state)
+    val host = connectionHost(state)
+    val caption = connectionCaption(state)
 
     Row(modifier = modifier) {
         val dotModifier = Modifier

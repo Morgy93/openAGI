@@ -212,3 +212,40 @@ test('unscoped signal evidence remains shared with specialists', (t) => {
   assert.equal(shared.memory.scope, 'main');
   assert.equal(runtime.memory.retrieve('zirconium', { scope: 'specialist:synthetic-a' })[0].item.id, shared.memory.id);
 });
+
+
+for (const body of ['zirconium', { material: 'zirconium' }]) {
+  test(`unscoped integration recall excludes specialist evidence for ${typeof body} bodies`, (t) => {
+    const runtime = fixture(t);
+    const shared = runtime.memory.remember({ content: 'zirconium shared evidence', scope: 'main' });
+    const privateItem = runtime.memory.remember({ content: 'zirconium specialist evidence', scope: 'specialist:synthetic-a' });
+    let scrutinized;
+    let propagated;
+    runtime.scrutiny.evaluate = ({ memories }) => {
+      scrutinized = memories;
+      return { action: 'observe', score: 0.6, reasons: ['retain useful evidence'], dimensions: {} };
+    };
+    runtime.propagation.shouldPropagate = ({ memoryHits }) => {
+      propagated = memoryHits;
+      return { decision: false };
+    };
+    const [output] = runtime.processIntegrationEvent('abi', signal(body));
+    assert.equal(output.memory.scope, 'main');
+    for (const hits of [scrutinized, propagated]) {
+      assert.ok(hits.some(({ item }) => item.id === shared.id));
+      assert.ok(!hits.some(({ item }) => item.id === privateItem.id));
+    }
+    assert.ok(output.customContext.some(({ id }) => id === shared.id));
+    assert.ok(!output.customContext.some(({ id }) => id === privateItem.id));
+  });
+}
+
+test('isolated context neither reads nor writes signal memory after merging main', (t) => {
+  const runtime = fixture(t);
+  runtime.memory.remember({ content: 'zirconium', scope: 'main' });
+  runtime.memory.retrieve = () => { throw new Error('isolated context must not retrieve memory'); };
+  runtime.memory.remember = () => { throw new Error('isolated context must not write memory'); };
+  const output = runtime.processSignal(signal({ material: 'zirconium' }), { isolatedContext: true });
+  assert.deepEqual(output.customContext, []);
+  assert.equal(output.memory, null);
+});

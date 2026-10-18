@@ -95,11 +95,15 @@ test("registers two read-only fleet tools and replaces them on re-register", () 
   }
   assert.deepEqual(tools.get("fleet_thread").parameters.required, ["key"]);
   registerFleetTools(tools, fakeSupervisor());
-  // The two sending tools register only for a supervisor that can send.
-  assert.equal(tools.list().filter((tool) => tool.name.startsWith("fleet_")).length, 2);
+  // The sending tools register only for a supervisor that can send; the
+  // read-only walkthrough and diagnose come with every supervisor.
+  assert.deepEqual(tools.list().filter((tool) => tool.name.startsWith("fleet_")).map((tool) => tool.name).sort(),
+    ["fleet_diagnose", "fleet_status", "fleet_thread", "fleet_walkthrough"]);
   registerFleetTools(tools, null);
   assert.equal(tools.has("fleet_status"), false);
   assert.equal(tools.has("fleet_thread"), false);
+  assert.equal(tools.has("fleet_walkthrough"), false);
+  assert.equal(tools.has("voice_focus"), false);
 });
 
 test("fleet_status lists red, yellow, green, gray, newest first, compact", async () => {
@@ -225,6 +229,11 @@ test("the send and answer tools need approval and pin the exact target", async (
   assert.deepEqual(target, { key: "codex:t1", message: "Rebase on main and push.", name: "apia" });
   assert.match(send.summarize(target), /Send to apia \(codex:t1\):\nRebase on main and push\./);
   assert.throws(() => send.prepareApprovalArgs({ key: "codex:nope", message: "hi" }), /No fleet thread/);
+  // Asked to queue: kept through approval, on its own card.
+  const later = send.prepareApprovalArgs({ key: "codex:t1", message: "Rebase on main and push.", queue: true });
+  assert.equal(later.queue, true);
+  assert.match(send.summarize(later), /queued behind its background tasks/);
+  assert.notEqual(send.approvalDedupeKey(later, {}), send.approvalDedupeKey(target, {}));
   await assert.rejects(send.handler(target, {}), /approval/);
   assert.deepEqual(await send.handler(target, { __confirmed: true }), { status: "sent", route: "computer-use", detail: "typed into Codex" });
   assert.deepEqual(sent, [["codex:t1", "Rebase on main and push."]]);
@@ -341,4 +350,61 @@ test("a send blocked by a card names its buttons and stateId so it can be answer
   const target = send.prepareApprovalArgs({ key: "codex:t1", message: "continue" });
   await assert.rejects(send.handler(target, { __confirmed: true }),
     /Not delivered \(blocked\): permission prompt visible: answer it first \(fleet_click\), then send again; a card is waiting \("Run npm test\?"\) with buttons "Allow once", "Deny" \(stateId 0123456789abcdef\): fleet_click can answer it/);
+});
+
+test("walkthrough counts suggestions once without crowding out ordinary questions", async () => {
+  const questions = Array.from({ length: 24 }, (_, i) => ({ id: `q${i}`, title: `Ask ${i}`, kind: "agent-ask" }));
+  const suggestion = { id: "sg_1", status: "open", proposedFix: "Keep asks closed", area: "policy", score: 10 };
+  questions.unshift({ id: "sq_1", kind: "suggestion", title: suggestion.proposedFix, meta: { suggestionId: suggestion.id } });
+  const tools = registry({ ...fakeSupervisor({ questions }), suggestions: async () => [suggestion] });
+  const all = (await tools.invoke("fleet_walkthrough", {})).result;
+  assert.equal(all.total, 25);
+  assert.equal(all.items.length, 25);
+  assert.equal(all.truncated, undefined);
+  assert.deepEqual(all.items.map((item) => item.id), [...questions.slice(1).map((q) => q.id), suggestion.id]);
+  const asks = (await tools.invoke("fleet_walkthrough", { scope: "questions" })).result;
+  assert.equal(asks.total, 24);
+  assert.ok(asks.items.every((item) => item.kind === "question"));
+  const suggestions = (await tools.invoke("fleet_walkthrough", { scope: "suggestions" })).result;
+  assert.equal(suggestions.total, 1);
+  assert.deepEqual(suggestions.items.map((item) => item.id), [suggestion.id]);
+});
+
+test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix tools", async () => {
+  const questions = [{ id: "fq_1", title: "Merge PR 42?", options: ["Yes", "No"], threadKey: "codex:t1", prRef: "acme/app#42" }];
+  const threads = [
+    row({ key: "codex:red", workspace: "amman", state: "needs-human", health: "red", reason: "Waiting on you" }),
+    row({ key: "codex:green", state: "done", health: "green" })
+  ];
+  const fixes = [{ id: "fix_1", title: "Stop re-asking", area: "policy", state: "queued", createdAt: "2026-10-13T20:00:00.000Z", revisions: [] },
+    { id: "fix_0", title: "Old", area: "judge", state: "abandoned", revisions: [] }];
+  const supervisor = {
+    ...fakeSupervisor({ questions, snapshot: { at: "2026-10-13T20:00:00.000Z", counts: {}, threads, infra: {}, sourceErrors: { claude: "locked" } },
+      actions: [{ id: "fa_1", kind: "nudge", status: "sent", at: new Date().toISOString() }] }),
+    diagnose: async (options) => ({ ...options, metrics: { review: { failures: 35 } }, anomalies: [{ metric: "review-failures" }] }),
+    fixes: async () => fixes,
+    feedback: async () => [{ intent: "change", at: new Date().toISOString() }]
+  };
+  const tools = registry(supervisor);
+  const walk = (await tools.invoke("fleet_walkthrough", {})).result;
+  assert.deepEqual(walk.items.map((item) => item.kind), ["question", "blocked", "fix"]);
+  assert.equal(walk.items[1].threadKey, "codex:red");
+  assert.equal(walk.items[2].id, "fix_1", "a stopped fix is not walked through");
+  assert.deepEqual((await tools.invoke("fleet_walkthrough", { scope: "blocked" })).result.items.map((item) => item.kind), ["blocked"]);
+
+  const focus = await tools.invoke("voice_focus", {}, { __voice: { focus: { view: "supervisor", questionId: "fq_1" } } });
+  assert.deepEqual(focus.result, { focus: { view: "supervisor", questionId: "fq_1" } });
+  assert.deepEqual((await tools.invoke("voice_focus", {})).result, { focus: null });
+
+  const diagnose = (await tools.invoke("fleet_diagnose", { window: "7d" })).result;
+  assert.equal(diagnose.window, "7d");
+  assert.deepEqual(diagnose.metrics, { review: { failures: 35 } });
+  assert.deepEqual(diagnose.anomalies, [{ metric: "review-failures" }]);
+
+  const list = (await tools.invoke("self_fix_list", { status: "queued" })).result;
+  assert.deepEqual(list.fixes.map((fix) => fix.id), ["fix_1"]);
+  assert.match(list.runner, /coding node/);
+  // No queueFix on this supervisor: no start tool; and never a merge tool.
+  assert.equal(tools.has("self_fix_start"), false);
+  assert.ok(!tools.list().some((tool) => /merge|release|deploy/.test(tool.name)));
 });

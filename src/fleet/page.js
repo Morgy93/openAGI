@@ -79,6 +79,16 @@ details.thread>summary{padding:0}
 .more p{margin:4px 0;overflow-wrap:anywhere}
 .more .k{color:var(--muted);margin-right:6px}
 .quote{margin:8px 0 0;padding:8px 10px;border-left:3px solid var(--line);color:var(--soft);white-space:pre-wrap;overflow-wrap:anywhere}
+.quote.clamp{white-space:normal;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+a.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text)}
+a.btn.primary{color:var(--ink)}
+.risk{margin:10px 0 0;font-size:14px;font-weight:650;color:var(--hot)}
+.chats{display:grid;gap:6px;margin-top:10px;font-size:14px;color:var(--soft)}
+.chats div{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
+.acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.item .acts .btn{margin:0;width:auto;flex:1 1 auto}
+.ask{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px}
+.ask .t{display:block}
 @media (prefers-reduced-motion:no-preference){.card{transition:box-shadow .4s ease,border-color .4s ease}}
 @media (min-width:700px){.wrap{padding-top:32px}.opts{grid-template-columns:repeat(2,1fr)}.opts .btn.ghost{grid-column:1/-1}}
 </style></head>
@@ -100,7 +110,8 @@ details.thread>summary{padding:0}
     <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
   <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
-  <section aria-labelledby="fleetH"><h2 id="fleetH">Fleet <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
+  <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
+  <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section>
 </main>
 </div>
 <script>
@@ -129,10 +140,17 @@ details.thread>summary{padding:0}
     'infra-blocked': 'warn', 'local-verify': 'warn', 'waiting-ci': 'good', running: 'good', 'idle-no-pr': 'dim',
     done: 'dim', excluded: 'dim'
   };
-  var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true };
+  var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true, quiet: true };
+  // Watching: what the supervisor watches each thread for (snapshot watch.group).
+  var WATCH_ORDER = ['you', 'working', 'waiting', 'push', 'blocked', 'quiet'];
+  var WATCH_LABEL = {
+    you: 'Waiting on you', working: 'Working', waiting: 'Waiting on CI or BuildBot3', push: 'Needs a push',
+    blocked: 'Blocked by infra', quiet: 'Quiet'
+  };
+  var WATCH_TONE = { you: 'hot', working: 'good', waiting: 'good', push: 'warn', blocked: 'warn', quiet: 'dim' };
   var ACTION_LABEL = { planned: 'Planned', proposed: 'Proposed', sent: 'Sent', 'dry-run': 'Dry run', blocked: 'Blocked', failed: 'Failed', done: 'Done' };
   var ACTION_TONE = { planned: 'dim', proposed: 'warn', sent: 'good', 'dry-run': 'dim', blocked: 'hot', failed: 'hot', done: 'good' };
-  var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app' };
+  var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app', 'antigravity-send': 'Antigravity message' };
   var INFRA_NAME = { 'infra:bb3': 'BuildBot3', 'infra:lb': 'Codex load balancer' };
   var CLEARED_LABEL = { stale: 'Stale', junk: 'Junk', duplicate: 'Duplicate', 'done-elsewhere': 'Done elsewhere' };
   var DOING_MAX = 20;
@@ -147,6 +165,14 @@ details.thread>summary{padding:0}
   var openThreads = new Set();
   var groupOpen = new Map();
   var cards = new Map();
+  // Expanded rows: thread key -> { at, thread, error } from the detail route,
+  // and the function that repaints that row once its detail arrives.
+  var details = new Map();
+  var detailLoading = new Set();
+  var painters = new Map();
+  var DETAIL_TTL_MS = 20000;
+  var MUTE_HOURS = 24;
+  var APP_NAME = { conductor: 'Conductor', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' };
 
   function $(id) { return document.getElementById(id); }
 
@@ -193,6 +219,21 @@ details.thread>summary{padding:0}
     return secs(Math.max(0, (Date.now() - t) / 1000)) + ' ago';
   }
 
+  // How long since iso, without "ago": "23m", "2h".
+  function dur(iso) {
+    var t = Date.parse(iso || '');
+    if (!isFinite(t)) return '';
+    return secs(Math.max(0, (Date.now() - t) / 1000));
+  }
+
+  // "on BuildBot3 full run for 23m", "for 1h": the row's watch line.
+  function watchText(w) {
+    if (!w) return '';
+    var d = dur(w.since);
+    var on = w.waitingOn && w.group === 'waiting' ? 'on ' + w.waitingOn + ' ' : '';
+    return d ? on + 'for ' + d : on.trim();
+  }
+
   function when(iso) {
     var t = Date.parse(iso || '');
     return isFinite(t) ? new Date(t).toLocaleString() : '';
@@ -218,6 +259,43 @@ details.thread>summary{padding:0}
     a.target = '_blank';
     a.rel = 'noopener noreferrer';
     return a;
+  }
+
+  // Only the app links the server builds open a chat (conductor:// and
+  // codex://, the ones its own sends navigate by); anything else stays text.
+  function chatHref(oc) {
+    var url = oc && typeof oc.url === 'string' ? oc.url : '';
+    return /^(?:conductor|codex):\/\/[^\s"'<>]+$/.test(url) ? url : '';
+  }
+
+  // "Open chat" for a chat a link opens. Same tab: the link hands off to the app.
+  function openChatLink(oc, cls, parent) {
+    var href = chatHref(oc);
+    if (!href) return null;
+    var a = el('a', cls, 'Open chat', parent);
+    a.href = href;
+    a.title = 'Opens ' + (oc.label || 'the chat') + ' on this Mac';
+    return a;
+  }
+
+  // Which chat, by workspace and app; for one no link opens, why not.
+  function chatNote(oc, parent) {
+    if (!oc) return;
+    el('p', 'note', 'Chat: ' + (oc.label || 'unknown'), parent);
+    if (!chatHref(oc) && oc.note) el('p', 'note', oc.note, parent);
+  }
+
+  // Where a question that only the agent's app takes is answered.
+  function appNote(q) {
+    var app = q.openChat && APP_NAME[q.openChat.app] ? APP_NAME[q.openChat.app] : 'the app';
+    return 'Answer this in ' + app + '. Nothing is sent from here.';
+  }
+
+  function questionsFor(key) {
+    var list = current && Array.isArray(current.questions) ? current.questions : [];
+    return list.filter(function (q) {
+      return q.threadKey === key || (Array.isArray(q.threadKeys) && q.threadKeys.indexOf(key) >= 0);
+    });
   }
 
   function threadName(t) {
@@ -299,22 +377,65 @@ details.thread>summary{padding:0}
       el('h3', null, q.title || 'Question', card);
       var ctx = el('div', 'ctx', null, card);
       var t = q.threadKey ? byKey.get(q.threadKey) : null;
-      if (t) el('span', null, t.workspace || threadName(t), ctx);
+      // In which chat (workspace and app), else the thread's workspace.
+      var chat = q.chatLabel || (q.openChat && q.openChat.label) || (t ? t.workspace || threadName(t) : '');
+      if (chat) el('span', null, 'in ' + chat, ctx);
       if (q.prRef) link(shortRef(q.prRef), prHref(t && t.pr, q.prRef), ctx);
-      if (q.createdAt) el('span', null, ago(q.createdAt), ctx);
-      if (q.body) el('p', null, q.body, card);
+      var asked = q.askedAt || q.createdAt;
+      if (asked) el('span', null, 'asked ' + ago(asked), ctx).title = when(asked);
+      var inApp = q.answerIn ? q.answerIn === 'agent app' : q.kind === 'agent-card';
+      if (!inApp) openChatLink(q.openChat, null, ctx);
+      askText(q, card);
       reviewNote(q, card);
+      if (q.openChat && !chatHref(q.openChat) && q.openChat.note) el('p', 'note', q.openChat.note, card);
+      chatList(q, card);
       var opts = el('div', 'opts', null, card);
-      var buttons = [];
-      var options = Array.isArray(q.options) ? q.options.filter(function (o) { return o && o !== 'dismiss'; }) : [];
-      options.forEach(function (option, index) {
-        buttons.push(button(option, 'btn' + (index === 0 ? ' primary' : ''), opts, function () {
-          return decide(q, { answer: option }, buttons);
-        }));
-      });
-      buttons.push(button('Dismiss', 'btn ghost', opts, function () { return decide(q, { dismiss: true }, buttons); }));
-      if (q.kind === 'agent-ask') el('p', 'note', 'Your answer goes to the agent.', card);
+      // Answered only in the agent's app: the way there comes first.
+      if (inApp) openChatLink(q.openChat, 'btn primary', opts);
+      answerButtons(q, opts, !inApp);
+      if (inApp) {
+        el('p', 'note', appNote(q), card);
+      } else if (q.kind === 'agent-ask') {
+        el('p', 'note', 'Your answer goes to the agent.', card);
+      }
     });
+  }
+
+  // The question's words. A risky ask (merge, release, deploy, delete) says
+  // so and shows all of it, the agent's own message too, before any button.
+  function askText(q, parent) {
+    if (q.risky) el('p', 'risk', 'Risky: read all of it before you answer.', parent);
+    if (q.body) el('p', null, q.body, parent);
+    if (typeof q.askContext === 'string' && q.askContext && q.askContext !== q.body) {
+      el('p', 'k', 'The agent wrote:', parent);
+      el('blockquote', q.risky ? 'quote' : 'quote clamp', q.askContext, parent);
+    }
+  }
+
+  // A grouped question names each of its chats, each with its own link.
+  function chatList(q, parent) {
+    var chats = Array.isArray(q.chats) ? q.chats : [];
+    if (!chats.length) return;
+    var box = el('div', 'chats', null, parent);
+    chats.forEach(function (c) {
+      var row = el('div', null, null, box);
+      el('span', null, c.label || c.threadKey || 'chat', row);
+      openChatLink(c, null, row);
+    });
+  }
+
+  // The question's options and Dismiss. On a risky ask no option is the
+  // highlighted default.
+  function answerButtons(q, parent, primary) {
+    var buttons = [];
+    var options = Array.isArray(q.options) ? q.options.filter(function (o) { return o && o !== 'dismiss' && o !== 'open thread'; }) : [];
+    options.forEach(function (option, index) {
+      buttons.push(button(option, 'btn' + (primary && index === 0 && !q.risky ? ' primary' : ''), parent, function () {
+        return decide(q, { answer: option }, buttons);
+      }));
+    });
+    buttons.push(button('Dismiss', 'btn ghost', parent, function () { return decide(q, { dismiss: true }, buttons); }));
+    return buttons;
   }
 
   // Why the supervisor's review kept an open question (live), or the close
@@ -366,6 +487,11 @@ details.thread>summary{padding:0}
   }
 
   async function decide(q, body, buttons) {
+    if (q.kind === 'self-fix' && body.answer === 'Request changes') {
+      var instructions = window.prompt('What should the fixer change?');
+      if (!instructions || !instructions.trim()) return;
+      body.instructions = instructions.trim();
+    }
     buttons.forEach(function (b) { b.disabled = true; });
     try {
       var r = await api('/fleet/api/questions/' + encodeURIComponent(q.id), body);
@@ -407,7 +533,8 @@ details.thread>summary{padding:0}
       var row = el('div', 'item', null, wrap);
       var head = el('div', 'head', null, row);
       el('span', 't', targetName(a, byKey), head);
-      el('span', 'chip ' + (ACTION_TONE[a.status] || 'dim'), ACTION_LABEL[a.status] || a.status || 'Unknown', head);
+      var label = a.kind === 'judge' ? 'Judge: ' + (a.verdict || a.status) : (ACTION_LABEL[a.status] || a.status || 'Unknown');
+      el('span', 'chip ' + (ACTION_TONE[a.status] || 'dim'), label, head);
       var sub = el('div', 'sub', null, row);
       if (a.playbook) el('span', null, a.playbook, sub);
       if (a.route) el('span', null, ROUTE_LABEL[a.route] || a.route, sub);
@@ -522,71 +649,254 @@ details.thread>summary{padding:0}
     return typeof ci.state === 'string' ? ci.state : '';
   }
 
-  function renderThread(t, parent) {
-    var d = el('details', 'thread item', null, parent);
-    d.open = openThreads.has(t.key);
-    d.addEventListener('toggle', function () {
-      if (d.open) openThreads.add(t.key); else openThreads.delete(t.key);
-    });
-    var s = el('summary', null, null, d);
-    var head = el('div', 'head', null, s);
-    el('span', 't', threadName(t), head);
-    if (t.live) el('span', 'live', 'live', head);
-    var sub = el('div', 'sub', null, s);
-    if (t.workspace) el('span', null, t.workspace, sub);
-    else if (t.repo) el('span', null, t.repo, sub);
-    if (t.pr && t.pr.ref) link(shortRef(t.pr.ref), prHref(t.pr, t.pr.ref), sub);
-    if (t.lastActivityAt) el('span', null, ago(t.lastActivityAt), sub);
-    var blockers = Array.isArray(t.blockers) ? t.blockers : [];
-    var top = blockers[0] || t.reason;
-    if (top) el('div', 'blocker ' + (STATE_TONE[t.state] || 'dim'), clip(top, 160), s);
+  function ciLine(ci) {
+    if (!ci) return '';
+    if (typeof ci === 'string') return 'CI ' + ci;
+    var bits = [typeof ci.state === 'string' ? 'CI ' + ci.state : ''];
+    if (Array.isArray(ci.failing) && ci.failing.length) bits.push('failing: ' + ci.failing.join(', '));
+    if (Array.isArray(ci.pending) && ci.pending.length) bits.push('pending: ' + ci.pending.join(', '));
+    return bits.filter(Boolean).join(', ');
+  }
 
-    var more = el('div', 'more', null, d);
-    line(more, 'Agent', [t.kind, t.agentStatus].filter(Boolean).join(', '));
-    line(more, 'Branch', t.branch);
-    if (t.pr) {
-      var prBits = [t.pr.state, ciText(t.pr.ci) ? 'CI ' + ciText(t.pr.ci) : '',
-        typeof t.pr.unresolvedThreads === 'number' ? t.pr.unresolvedThreads + ' open threads' : '', t.pr.mergeState];
-      line(more, 'PR', prBits.filter(Boolean).join(', '));
+  function prLine(parent, pr) {
+    if (!pr || (!pr.ref && !pr.url)) return;
+    var p = el('p', null, null, parent);
+    el('span', 'k', 'PR', p);
+    link(pr.ref ? shortRef(pr.ref) : 'pull request', prHref(pr, pr.ref), p);
+    var bits = [pr.state, ciLine(pr.ci), typeof pr.unresolvedThreads === 'number' ? pr.unresolvedThreads + ' open threads' : '', pr.mergeState];
+    var rest = bits.filter(Boolean).join(', ');
+    if (rest) el('span', null, ' ' + rest, p);
+    if (pr.title) el('p', 'why', pr.title, parent);
+  }
+
+  // A row's expanded context: the last scan's row, and once it arrives the
+  // thread's detail for the longer message and fields the row lacks.
+  function paintMore(more, t, entry) {
+    var x = entry && entry.thread ? entry.thread : null;
+    function field(name) {
+      return Object.prototype.hasOwnProperty.call(t, name) ? t[name] : (x && x[name]);
     }
+    var w = field('watch');
+    if (w && w.group) {
+      var since = w.waitSince || w.since;
+      var what = (WATCH_LABEL[w.group] || w.group) + (w.waitingOn ? ': ' + w.waitingOn : '');
+      line(more, 'Waits on', what + (since ? ', for ' + dur(since) + ' (since ' + when(since) + ')' : ''));
+    }
+    line(more, 'Agent', [t.kind, field('agentStatus')].filter(Boolean).join(', '));
+    if (w && w.runningSince) line(more, 'Turn running', 'for ' + dur(w.runningSince) + ' (since ' + when(w.runningSince) + ')');
+    var spoke = (x && x.lastAgentMessage && x.lastAgentMessage.at) || t.lastAgentAt;
+    if (spoke) line(more, 'Agent last spoke', ago(spoke));
+    var owner = field('lastOwnerAt');
+    if (owner) line(more, 'You last wrote', ago(owner));
+    if (t.lastActivityAt) line(more, 'Last activity', ago(t.lastActivityAt));
+    line(more, 'Branch', t.branch);
+    prLine(more, field('pr'));
+    var blockers = Array.isArray(t.blockers) ? t.blockers : [];
     if (blockers.length > 1) line(more, 'Blockers', blockers.join('; '));
-    var dec = t.decision || null;
+    var dec = field('decision');
     if (dec && dec.action && dec.action !== 'none') {
       line(more, 'Next', dec.action + (dec.playbook ? ' (' + dec.playbook + ')' : '') + (dec.notBefore ? ', not before ' + when(dec.notBefore) : ''));
     }
     if (dec && dec.reason) line(more, 'Why', dec.reason);
-    if (t.lastAgentText) {
+    var muted = field('muted');
+    if (muted) line(more, 'Muted until', when(muted));
+    chatNote(field('openChat'), more);
+    var said = x && x.lastAgentMessage && typeof x.lastAgentMessage.text === 'string' ? x.lastAgentMessage.text : t.lastAgentText;
+    if (said) {
       el('p', 'k', 'Last agent message (unverified):', more);
-      el('blockquote', 'quote', t.lastAgentText, more);
+      el('blockquote', 'quote', said, more);
+    }
+    if (x && x.scannedAt) el('p', 'note', 'As of the scan ' + ago(x.scannedAt) + '.', more);
+    if (entry && entry.error) el('p', 'note', 'More detail could not load: ' + clip(entry.error, 160), more);
+    else if (!x && detailLoading.has(t.key)) el('p', 'note', 'Loading the latest…', more);
+  }
+
+  function threadPath(key) {
+    return '/fleet/api/threads/' + encodeURIComponent(key);
+  }
+
+  // Fetch a row's detail when it opens (and again on a later render once it
+  // is stale), then repaint just that row.
+  async function wantDetail(key, maxAgeMs) {
+    var have = details.get(key);
+    if (detailLoading.has(key) || (have && Date.now() - have.at < maxAgeMs)) return;
+    detailLoading.add(key);
+    var paint = painters.get(key);
+    if (paint) paint();
+    try {
+      var r = await api(threadPath(key));
+      details.set(key, { at: Date.now(), thread: r && r.thread ? r.thread : null, error: '' });
+    } catch (e) {
+      details.set(key, { at: Date.now(), thread: null, error: e.status === 404 ? 'not in the last scan; scan again' : e.message });
+    } finally {
+      detailLoading.delete(key);
+    }
+    paint = painters.get(key);
+    if (paint) paint();
+  }
+
+  // What the owner can do from the row: answer or dismiss the question it
+  // waits on, Push now (only a planned nudge, the words shown first), Mute or
+  // Unmute. Open chat sits on the row itself.
+  var pushing = new Set();
+  function rowActions(t, parent) {
+    var group = t.watch ? t.watch.group : '';
+    var asks = group === 'you' ? questionsFor(t.key) : [];
+    asks.forEach(function (q) {
+      var box = el('div', 'ask', null, parent);
+      el('span', 't', q.title || 'Question', box);
+      var asked = q.askedAt || q.createdAt;
+      if (asked) el('div', 'sub', 'asked ' + ago(asked) + (q.chatLabel ? ' in ' + q.chatLabel : ''), box);
+      askText(q, box);
+      var inApp = q.answerIn ? q.answerIn === 'agent app' : q.kind === 'agent-card';
+      var acts = el('div', 'acts', null, box);
+      if (inApp) openChatLink(q.openChat, 'btn primary', acts);
+      answerButtons(q, acts, !inApp);
+      if (inApp) el('p', 'note', appNote(q), box);
+    });
+    if (!t.watch) return;
+    var dec = t.pushPreview || null;
+    var why = dec || t.decision || null;
+    var plan = dec && dec.action === 'nudge' && typeof dec.message === 'string' ? dec.message : '';
+    var canPush = Boolean(plan) && !t.muted && group !== 'you';
+    if (canPush) {
+      el('p', 'k', 'Push now sends:', parent);
+      el('blockquote', 'quote', plan, parent);
+    } else if (group === 'push' && !t.muted) {
+      el('p', 'why', 'No nudge planned yet' + (why && why.reason ? ': ' + clip(why.reason, 160) : '.'), parent);
+    }
+    var acts = el('div', 'acts', null, parent);
+    if (canPush) {
+      var push = button('Push now', 'btn primary', acts, function () { return pushNow(t, push); });
+      push.disabled = t.pushing || pushing.has(t.key);
+    }
+    if (t.muted) {
+      var un = button('Unmute', 'btn', acts, function () { return mute(t, false, un); });
+    } else {
+      var mu = button('Mute ' + MUTE_HOURS + 'h', 'btn', acts, function () { return mute(t, true, mu); });
+    }
+  }
+
+  function renderThread(t, parent) {
+    var d = el('details', 'thread item', null, parent);
+    d.open = openThreads.has(t.key);
+    var s = el('summary', null, null, d);
+    var head = el('div', 'head', null, s);
+    el('span', 't', threadName(t), head);
+    if (t.live) el('span', 'live', 'live', head);
+    if (t.muted) el('span', 'chip dim', 'muted', head).title = 'Muted until ' + when(t.muted);
+    var sub = el('div', 'sub', null, s);
+    if (t.openChat && t.openChat.label) el('span', null, t.openChat.label, sub);
+    else if (t.workspace) el('span', null, t.workspace, sub);
+    else if (t.repo) el('span', null, t.repo, sub);
+    if (t.pr && t.pr.ref) link(shortRef(t.pr.ref), prHref(t.pr, t.pr.ref), sub);
+    if (t.watch && t.watch.since) el('span', 'since', watchText(t.watch), sub);
+    else if (t.lastActivityAt) el('span', null, ago(t.lastActivityAt), sub);
+    // A link inside summary opens the chat without toggling the row.
+    openChatLink(t.openChat, null, sub);
+    var blockers = Array.isArray(t.blockers) ? t.blockers : [];
+    var top = blockers[0] || t.reason;
+    if (top) el('div', 'blocker ' + (STATE_TONE[t.state] || 'dim'), clip(top, 160), s);
+
+    rowActions(t, d);
+    var more = el('div', 'more', null, d);
+    var paint = function () {
+      more.replaceChildren();
+      paintMore(more, t, details.get(t.key));
+    };
+    painters.set(t.key, paint);
+    paint();
+    // A row the owner just opened wants fresh detail; one a re-render keeps
+    // open (its toggle fires too) refetches only once the detail is stale.
+    d.addEventListener('toggle', function () {
+      if (!d.open) { openThreads.delete(t.key); return; }
+      var fresh = !openThreads.has(t.key);
+      openThreads.add(t.key);
+      wantDetail(t.key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);
+    });
+    if (d.open) wantDetail(t.key, DETAIL_TTL_MS);
+  }
+
+  function pushNote(delivery) {
+    var status = delivery && delivery.status;
+    var detail = delivery && typeof delivery.detail === 'string' ? clip(delivery.detail, 160) : '';
+    var card = delivery && delivery.prompt && delivery.prompt.text ? ' The chat shows a card: ' + clip(delivery.prompt.text, 120) : '';
+    if (status === 'sent') return { text: 'Pushed. Sent to the agent.', bad: false };
+    if (status === 'blocked') return { text: 'Not pushed' + (detail ? ': ' + detail : '.') + card, bad: true };
+    if (status === 'failed') return { text: 'Push failed' + (detail ? ': ' + detail : '.') + card, bad: true };
+    return { text: 'Push sent.', bad: false };
+  }
+
+  // The owner's Push now: the planned nudge goes out at once, as theirs.
+  async function pushNow(t, b) {
+    if (pushing.has(t.key)) return;
+    pushing.add(t.key);
+    b.disabled = true;
+    b.textContent = 'Pushing…';
+    try {
+      var r = await api(threadPath(t.key) + '/push', {});
+      var note = pushNote(r && r.delivery);
+      details.delete(t.key);
+      pushing.delete(t.key);
+      if (r && r.state) render(r.state); else await load();
+      say(note.text, note.bad);
+    } catch (e) {
+      b.disabled = false;
+      b.textContent = 'Push now';
+      say(e.message, true);
+      if (e.status === 404) await load();
+    } finally { pushing.delete(t.key); }
+  }
+
+  async function mute(t, on, b) {
+    b.disabled = true;
+    try {
+      var r = await api(threadPath(t.key) + (on ? '/mute' : '/unmute'), on ? { hours: MUTE_HOURS } : {});
+      details.delete(t.key);
+      if (r && r.state) render(r.state); else await load();
+      say(on ? 'Muted until ' + when(r && r.muted) + '. No nudges or questions for it till then.' : 'Unmuted.');
+    } catch (e) {
+      b.disabled = false;
+      say(e.message, true);
     }
   }
 
   function renderFleet(snap) {
     var box = $('fleetList');
     box.replaceChildren();
+    painters.clear();
     var threads = snap && Array.isArray(snap.threads) ? snap.threads : [];
     var counts = snap && snap.counts ? snap.counts : null;
     var inScope = counts && typeof counts.inScope === 'number' ? counts.inScope : threads.length;
     $('fleetCount').textContent = threads.length ? String(inScope) : '';
     if (!snap) { el('p', 'empty', 'No scan yet. Tap Scan now.', box); return; }
     if (!threads.length) { el('p', 'empty', 'No recent coding threads.', box); return; }
+    // Grouped by what the supervisor watches each thread for; a snapshot from
+    // before watch existed groups by state as it used to. Out of scope last.
+    var byWatch = threads.some(function (t) { return t.watch; });
     var groups = new Map();
     threads.forEach(function (t) {
-      var st = t.state || 'unknown';
+      var st = byWatch ? (t.watch ? t.watch.group : 'excluded') : (t.state || 'unknown');
       if (!groups.has(st)) groups.set(st, []);
       groups.get(st).push(t);
     });
-    var order = STATE_ORDER.filter(function (st) { return groups.has(st); });
+    var order = (byWatch ? WATCH_ORDER.concat(['excluded']) : STATE_ORDER).filter(function (st) { return groups.has(st); });
     groups.forEach(function (_list, st) { if (order.indexOf(st) < 0) order.push(st); });
     order.forEach(function (st) {
+      // Longest-waiting first where time matters; newest activity first otherwise.
       var list = groups.get(st).slice().sort(function (a, b) {
+        if (byWatch && st !== 'quiet' && st !== 'excluded' && a.watch && b.watch) {
+          return String(a.watch.since || '').localeCompare(String(b.watch.since || ''));
+        }
         return String(b.lastActivityAt || '').localeCompare(String(a.lastActivityAt || ''));
       });
       var g = el('details', 'group', null, box);
       g.open = groupOpen.has(st) ? groupOpen.get(st) : !COLLAPSED[st];
       g.addEventListener('toggle', function () { groupOpen.set(st, g.open); });
       var sum = el('summary', null, null, g);
-      el('span', 'chip ' + (STATE_TONE[st] || 'dim'), STATE_LABEL[st] || st, sum);
+      var label = byWatch ? (WATCH_LABEL[st] || STATE_LABEL[st] || st) : (STATE_LABEL[st] || st);
+      var tone = byWatch ? (WATCH_TONE[st] || STATE_TONE[st] || 'dim') : (STATE_TONE[st] || 'dim');
+      el('span', 'chip ' + tone, label, sum);
       el('span', 'n', String(list.length), sum);
       var wrap = el('div', 'list', null, g);
       list.forEach(function (t) { renderThread(t, wrap); });
@@ -620,6 +930,18 @@ details.thread>summary{padding:0}
     renderDoing(Array.isArray(s.actions) ? s.actions : [], byKey);
     renderInfra(snap);
     renderFleet(snap);
+    var fixes = document.getElementById('self-fixes');
+    if (fixes) {
+      fixes.textContent = '';
+      (Array.isArray(s.fixes) ? s.fixes : []).forEach(function (fix) {
+        var row = document.createElement('p');
+        row.textContent = fix.title + ' · ' + fix.state + ' · round ' + (fix.round || 0);
+        if (fix.prUrl && /^https:\/\/github\.com\/Spshulem\/openAGI\/pull\/[0-9]+$/i.test(fix.prUrl)) {
+          var link = document.createElement('a'); link.href = fix.prUrl; link.textContent = ' Review PR'; row.appendChild(link);
+        }
+        fixes.appendChild(row);
+      });
+    }
     focusQuestion();
   }
 

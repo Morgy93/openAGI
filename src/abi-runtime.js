@@ -21,6 +21,8 @@ import { registerIMessagePoller } from "./integrations/imessage-poller.js";
 import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { registerCalendarIntegration } from "./integrations/calendar.js";
 import { registerWebSearchTools } from "./integrations/web-search.js";
+import { GoogleClient, registerGoogleTools } from "./integrations/google.js";
+import { registerSubagentTools } from "./subagent-tools.js";
 import { VocaleoClient, registerVocaleoTools } from "./integrations/vocaleo.js";
 import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
 import { createEmbedder } from "./embeddings.js";
@@ -58,6 +60,7 @@ import { composeDigest, deliverDigest } from "./outreach-digest.js";
 import { MemorySystem } from "./memory-system.js";
 import { PropagationController } from "./propagation-controller.js";
 import { SkillRegistry } from "./skills.js";
+import { installMobileCronFilter, isMobileProfile } from "./mobile-profile.js";
 import { registerCoreTools, ToolRegistry } from "./tool-registry.js";
 import { registerDefaultWorkflows, WorkflowRegistry } from "./workflow-registry.js";
 import { applyPersona } from "./persona.js";
@@ -245,7 +248,7 @@ export class AbiRuntime {
     // Watches every recent Codex/Claude/Conductor coding thread. The
     // constructor has no side effects; hosted-interface starts it on listen.
     this.fleetSupervisor = options.fleetSupervisor ?? (process.env.OPENAGI_FLEET_NODE
-      ? new RemoteFleetSupervisor({ runtime: this, nodeId: process.env.OPENAGI_FLEET_NODE })
+      ? new RemoteFleetSupervisor({ runtime: this, nodeId: process.env.OPENAGI_FLEET_NODE, dataDir: options.dataDir ?? resolveDataDir() })
       : new FleetSupervisor({ ...options.fleetSupervisorOptions, dataDir: options.dataDir, runtime: this }));
     if (this.outreachConfig.enabled) {
       this.outreachMapper = new OutreachMapper({ store: this.outreach, events: this.events });
@@ -260,6 +263,10 @@ export class AbiRuntime {
     this._tickInFlight = false;
     this._tickSkips = 0;
 
+    // Mobile profile: default jobs a phone cannot run are not registered
+    // (src/mobile-profile.js). Restored after integrations register below.
+    const mobileProfile = isMobileProfile();
+    const restoreCronAddJob = mobileProfile ? installMobileCronFilter(this.cron) : null;
     if (options.registerDefaults !== false) {
       this.integrations.register(createAbiIntegration());
       this.cron.addJob(createDailyAdaptationReviewJob());
@@ -546,7 +553,8 @@ export class AbiRuntime {
         intervalMs: 60 * 60 * 1000
       });
       registerCoreTools(this.tools, this);
-      registerCodingSupervisorTools(this.tools, this.codingSupervisor);
+      registerSubagentTools(this.tools, this);
+      if (!mobileProfile) registerCodingSupervisorTools(this.tools, this.codingSupervisor);
       // Read-only fleet_status / fleet_thread. this.fleetSupervisor is
       // constructed above, before this block runs.
       registerFleetTools(this.tools, this.fleetSupervisor);
@@ -555,7 +563,7 @@ export class AbiRuntime {
       // an LLM can't accidentally try to drive the user's screen. The
       // dashboard's toggle can flip this at runtime without a restart;
       // see /computer-use/toggle in hosted-interface.js.
-      if (isComputerUseEnabled()) {
+      if (!mobileProfile && isComputerUseEnabled()) {
         registerComputerUseTools(this.tools, this);
       }
     }
@@ -575,6 +583,8 @@ export class AbiRuntime {
       // Calendar via secret ICS feed — env-gated on CALENDAR_ICS_URL.
       // Feeds reconciliation ("did the meeting happen?") + daily planner.
       registerCalendarIntegration(this);
+      this.google = options.googleClient ?? new GoogleClient();
+      registerGoogleTools(this.tools, this.google);
       // Linear is env-gated — silently no-ops if LINEAR_API_KEY isn't set.
       registerLinearTaskSource(this);
       // BuildBetter is env-gated too. Needs BUILDBETTER_API_KEY plus either
@@ -589,7 +599,7 @@ export class AbiRuntime {
       // IMESSAGE_ENABLED=1 + a self-handle, and macOS Full Disk Access.
       // The source attaches to runtime even when disabled so the dashboard
       // can render the toggle + permission status.
-      registerIMessagePoller(this);
+      if (!mobileProfile) registerIMessagePoller(this);
       // Web search tools (web_search / fetch_url). Always registered; web_search
       // returns a clear "no provider configured" error until a key is set.
       registerWebSearchTools(this);
@@ -597,6 +607,7 @@ export class AbiRuntime {
       // `openagi imessage-server`) is configured via OPENAGI_IMESSAGE_NODE.
       registerImessageSearchTool(this);
     }
+    restoreCronAddJob?.();
   }
 
   processIntegrationEvent(source, payload) {
@@ -605,17 +616,18 @@ export class AbiRuntime {
   }
 
   processSignal(signal, options = {}) {
+    const scope = options.scope ?? "main";
     // Use the same evidence for pre-decision recall and subsequent storage.
     // Accepted JSON bodies must not collapse to "[object Object]" in queries.
     const body = signal.content != null && typeof signal.content === "object"
       ? JSON.stringify(signal.content)
       : signal.content;
     const workflow = this.workflows.select(signal);
-    const memoryHits = this.memory.retrieve([signal.summary, body, ...(signal.tags ?? [])]
+    const memoryHits = options.isolatedContext ? [] : this.memory.retrieve([signal.summary, body, ...(signal.tags ?? [])]
       .filter((part) => part != null && part !== "")
       .join(" "), {
       limit: 6,
-      scope: options.scope
+      scope
     });
     const scrutiny = this.scrutiny.evaluate({
       signal,
@@ -628,7 +640,7 @@ export class AbiRuntime {
     const parentSpecialistId = options.parentSpecialistId ?? null;
     const propagationDecision = this.propagation.shouldPropagate({ signal, scrutiny, memoryHits, parentSpecialistId });
     const propagated =
-      propagationDecision.decision && scrutiny.action !== "ignore"
+      options.allowPropagation !== false && propagationDecision.decision && scrutiny.action !== "ignore"
         ? this.propagation.propagate({
             signal,
             workflow,
@@ -656,13 +668,13 @@ export class AbiRuntime {
         summary: signal.summary,
         score: scrutiny.score
       });
-    } else if (!options.ephemeral) {
+    } else if (!options.ephemeral && !options.isolatedContext) {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
           // Match the caller's retrieval scope; specialist evidence must not
           // become shared main memory or deduplicate across specialists.
-          scope: options.scope ?? "main",
+          scope,
           // Put body evidence first so a long summary cannot consume its
           // compression budget. Normalization may use the summary as the
           // body fallback; compare using the same normalization and length

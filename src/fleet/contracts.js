@@ -7,8 +7,24 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
-export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor"]);
+export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity"]);
+// The one list every thread-key matcher is built from (server routes, the
+// broker's and the phone's allowlists): "kind:id", the id as sources mint it.
+export const THREAD_KIND_PATTERN = THREAD_KINDS.join("|");
+export const THREAD_KEY_PATTERN = new RegExp(`^(?:${THREAD_KIND_PATTERN}):[A-Za-z0-9_.-]{1,120}$`);
+
+export function isThreadKey(key) {
+  return typeof key === "string" && THREAD_KEY_PATTERN.test(key);
+}
+
+// What the owner calls each kind's app in questions and labels.
+export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity" });
+
+export function kindName(kind) {
+  return KIND_NAMES[kind] ?? "Agent";
+}
 
 // Provider-level status of the thread's last turn, before PR/infra context.
 export const AGENT_STATUS = Object.freeze(["running", "idle", "waiting", "stalled", "aborted", "error", "unknown"]);
@@ -26,7 +42,8 @@ export const STATES = Object.freeze([
 
 export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager", "ask-user"]);
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
-export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use"]);
+// antigravity-send: agentapi send-message, the Antigravity app's own API.
+export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use", "antigravity-send"]);
 // How supervisor text reaches a thread. "cli" is the original set of routes;
 // "computer-use" types into the app that shows the thread and never runs a
 // CLI; "computer-use-first" types when computer use is ready, else falls back.
@@ -36,9 +53,20 @@ export const DELIVERY_MODES = Object.freeze(["cli", "computer-use", "computer-us
 // to tell the supervisor's own sends apart from the owner typing.
 export const SUPERVISOR_PREFIX = "[OpenAGI supervisor]";
 
+// The supervisor's own chats: the G2 display thread opens with this prompt
+// (g2 agentctl.mjs). They are never watched or nudged (codex:01a0df66 got
+// 54 "LB is up" nudges).
+const SUPERVISOR_OWN_PROMPTS = [/^\s*You are the Agent Supervisor display\b/i];
+
+export function isSupervisorOwnPrompt(text) {
+  const head = String(text ?? "");
+  return SUPERVISOR_OWN_PROMPTS.some((pattern) => pattern.test(head));
+}
+
 const MIN = 60_000;
 
 export const DEFAULTS = Object.freeze({
+  selfFix: Object.freeze({ mode: "propose", concurrency: 1, dailyCap: 3, wallMs: 2 * 60 * MIN, tokenCap: 6_000_000, rounds: 3, replayRetries: 1, reviewWaitMs: 25 * MIN }),
   tickMs: 5 * MIN,
   lookbackHours: 48,
   // A transcript written within this window counts as a turn in progress.
@@ -49,6 +77,9 @@ export const DEFAULTS = Object.freeze({
   maxSendsPerTick: 4,
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
+  // No playbook nudge this long after the owner's own message in a thread:
+  // they are driving it, often on something other than its PR.
+  ownerDrivenMs: 3 * 60 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
   // A run holding a verification slot is slow only past this: normal runs
   // finish well inside it, and the verifier kills one at 90 min. The 30-min
@@ -76,7 +107,11 @@ export const DEFAULTS = Object.freeze({
   pushPerHour: 3,
   titleMax: 100,
   bodyMax: 220,
+  // A question card item's full question and its numbered choices.
+  cardBodyMax: 900,
   excerptMax: 600,
+  // The agent's whole final message, lines kept, for reading its report.
+  fullTextMax: 8000,
   // The self-review reads this much of each thread's last agent message.
   reviewTailMax: 1500,
   maxThreads: 150,
@@ -121,8 +156,16 @@ export const DEFAULT_LB_URL = null;
 export const DEFAULT_MANAGER_REF = null;
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
 // Model for the review of the needs-you list, chosen by the owner on
-// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
+// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides. Since
+// 2026-10-13 it is the Claude fallback: the review runs on Codex through
+// codex-lb (DEFAULT_REVIEW_CODEX_MODEL) when a provider is configured, and
+// on Claude when that call fails. OPENAGI_FLEET_REVIEW_PROVIDER=codex|claude
+// pins one.
 export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
+export const DEFAULT_REVIEW_CODEX_MODEL = "gpt-6-luna";
+export const REVIEW_PROVIDERS = Object.freeze(["codex", "claude"]);
+// The Codex try leaves the Claude fallback its own full timeout.
+export const DEFAULT_REVIEW_CODEX_TIMEOUT_MS = 180_000;
 export const DEFAULT_REVIEW_MS = 30 * MIN;
 // Sonnet took about 3 minutes on 13 questions, mostly thinking.
 export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
@@ -147,9 +190,15 @@ export function defaultPaths(home = os.homedir()) {
     bb3WatchState: path.join(home, ".bb3-watch-state"),
     bb3WatchGateState: path.join(home, ".bb3-watch-gate-state"),
     lbWatchLog: path.join(home, "Library", "Logs", "lb-watch.log"),
-    relayCwd: path.join(home, ".agent-supervisor", "relay")
+    relayCwd: path.join(home, ".agent-supervisor", "relay"),
+    // Antigravity's data: conversation_summaries.db and conversations/<id>.db.
+    antigravityHome: path.join(home, ".gemini", "antigravity")
   };
 }
+
+// The Antigravity app's language server: its agent API, and the process the
+// running instance's loopback port and csrf token are read from.
+export const ANTIGRAVITY_LS = "/Applications/Antigravity.app/Contents/Resources/bin/language_server";
 
 // The OpenAGI.app daemon runs with PATH=/usr/bin:/bin:/usr/sbin:/sbin, so
 // every child binary is resolved to an absolute path up front.
@@ -170,7 +219,11 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     df: pick(["/bin/df"], "df"),
     ditto: pick(["/usr/bin/ditto"], "ditto"),
     diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
-    rm: pick(["/bin/rm"], "rm")
+    rm: pick(["/bin/rm"], "rm"),
+    // A shim that runs the app's language server with "agentapi". The server
+    // binary itself is how the running instance is found in ps.
+    agentapi: pick([path.join(home, ".gemini", "antigravity", "bin", "agentapi")], null),
+    antigravityLs: pick([ANTIGRAVITY_LS, path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server")], ANTIGRAVITY_LS)
   };
 }
 
@@ -213,7 +266,7 @@ export function resolveOcuPath(env = process.env, { exists = fs.existsSync, real
 // Non-UI routes a computer-use send may fall back to while the owner is at
 // the Mac (so nothing takes the screen). claude-resume is never one: it
 // forks a session behind Conductor.
-export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay"]);
+export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay", "antigravity-send"]);
 
 export function parseBackgroundRoutes(value) {
   const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
@@ -223,6 +276,12 @@ export function parseBackgroundRoutes(value) {
 export function parseDeliveryMode(value) {
   const text = String(value ?? "").trim().toLowerCase();
   return DELIVERY_MODES.includes(text) ? text : "cli";
+}
+
+// OPENAGI_FLEET_REVIEW_PROVIDER: "codex" or "claude"; anything else is auto (null).
+export function parseReviewProvider(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return REVIEW_PROVIDERS.includes(text) ? text : null;
 }
 
 function envFlag(value) {
@@ -245,7 +304,10 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
   const mode = MODES.includes(overrides.mode) ? overrides.mode
     : MODES.includes(String(env.OPENAGI_FLEET_MODE ?? "").trim()) ? String(env.OPENAGI_FLEET_MODE).trim()
     : "observe";
-  const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...(overrides.selfSessionIds ?? [])]
+  // OPENAGI_FLEET_SELF_SESSION_IDS: more of the supervisor's own sessions
+  // (comma or space separated), for ones no prompt marker names.
+  const configuredSelf = String(env.OPENAGI_FLEET_SELF_SESSION_IDS ?? "").split(/[\s,]+/);
+  const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...configuredSelf, ...(overrides.selfSessionIds ?? [])]
     .filter(Boolean);
   const enabled = overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR);
   return {
@@ -260,6 +322,15 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     relayModel: overrides.relayModel ?? (String(env.OPENAGI_FLEET_RELAY_MODEL ?? "").trim() || DEFAULT_RELAY_MODEL),
     publicUrl: overrides.publicUrl ?? (String(env.OPENAGI_PUBLIC_URL ?? "").trim() || null),
     selfSessionIds,
+    selfFix: {
+      ...DEFAULTS.selfFix,
+      mode: envOff(env.OPENAGI_FLEET_SELF_FIX) ? "off" : (["off", "propose", "auto"].includes(env.OPENAGI_FLEET_SELF_FIX) ? env.OPENAGI_FLEET_SELF_FIX : "propose"),
+      dailyCap: Math.min(3, envNumber(env.OPENAGI_FLEET_SELF_FIX_DAILY_CAP, 3)),
+      wallMs: Math.min(DEFAULTS.selfFix.wallMs, envNumber(env.OPENAGI_FLEET_SELF_FIX_WALL_MS, DEFAULTS.selfFix.wallMs)),
+      tokenCap: Math.min(DEFAULTS.selfFix.tokenCap, envNumber(env.OPENAGI_FLEET_SELF_FIX_TOKEN_CAP, DEFAULTS.selfFix.tokenCap)),
+      rounds: Math.min(3, envNumber(env.OPENAGI_FLEET_SELF_FIX_ROUNDS, 3)),
+      ...overrides.selfFix
+    },
     // repo -> UI path prefixes that make visual QA required; github.js has
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},
@@ -280,9 +351,20 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // supervisor unless OPENAGI_FLEET_REVIEW=0.
     review: {
       enabled: overrides.review?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_REVIEW)),
-      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
+      // null: codex when the Codex config names a provider (codex-lb),
+      // else claude (resolved in review.js). model null: that provider's default.
+      provider: overrides.review?.provider ?? parseReviewProvider(env.OPENAGI_FLEET_REVIEW_PROVIDER),
+      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || null),
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
-      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
+      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS,
+      codexTimeoutMs: overrides.review?.codexTimeoutMs ?? DEFAULT_REVIEW_CODEX_TIMEOUT_MS
+    },
+    // The nudge judge (judge.js): a model reads the chat before an automatic
+    // nudge. Off unless OPENAGI_FLEET_JUDGE=1 and a model is named.
+    judge: {
+      enabled: Boolean(overrides.judge?.enabled ?? envFlag(env.OPENAGI_FLEET_JUDGE)) && Boolean(overrides.judge?.model ?? String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim()),
+      model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
+      timeoutMs: overrides.judge?.timeoutMs ?? 40_000
     },
     // Disk space: safe cleanup, archive to the SD card, and asks. On with
     // the supervisor unless OPENAGI_FLEET_STORAGE=0.
@@ -298,6 +380,11 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       ...(overrides.storage ?? {}),
       enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
     },
+    // Antigravity conversations: read, and sent to with agentapi, unless
+    // OPENAGI_FLEET_ANTIGRAVITY=0. No data dir means no threads.
+    antigravity: {
+      enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
@@ -312,6 +399,15 @@ export const UI_APPS = Object.freeze({
   conductor: Object.freeze({ app: "conductor", name: "Conductor", bundleId: "com.conductor.app" }),
   codex: Object.freeze({ app: "codex", name: "Codex", bundleId: "com.openai.codex" })
 });
+
+// How the owner opens an Antigravity conversation: { app, url, label, note },
+// the shape of the other apps' open-chat links. The app registers
+// antigravity:// but handles only antigravity://teleport/ai_studio, and the
+// /c/<id> page its window shows is a loopback URL on a random port that opens
+// a browser tab, not the app. No link opens one conversation, so url is null.
+export function antigravityOpenChat(thread) {
+  return openChatFor(thread);
+}
 
 // Codex threads started by Conductor's Codex agent carry this originator;
 // they show in Conductor, not in the Codex app.
@@ -398,6 +494,44 @@ export function linkUiHosts(threads) {
   });
 }
 
+const CHAT_NAME_MAX = 80;
+const sameName = (a, b) => String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+
+// How the owner opens one thread's own chat: { app, url, label, note }. url
+// is the app's id link, the one computer-use sends navigate by, and they
+// check on screen that it lands on exactly that chat (Conductor's page URL
+// carries the workspace and session ids, Codex labels the page with the
+// thread). A chat no link opens (a Claude Code terminal session, a
+// Conductor Codex thread with no Conductor tab, an archived thread) has url
+// null; its label names the workspace or folder and the app instead, and
+// note says why. Labels tell apart chats that share a workspace name.
+export function openChatFor(thread) {
+  if (!thread?.kind) return null;
+  const name = (value) => clampText(value, CHAT_NAME_MAX);
+  const title = name(thread.title);
+  const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
+  const target = uiTargetFor(thread);
+  if (target?.app === "conductor") {
+    const workspace = name(target.workspace);
+    const tab = name(target.title);
+    const shown = [workspace, tab && !sameName(tab, workspace) ? tab : ""].filter(Boolean).join(" · ") || title || "untitled chat";
+    return { app: "conductor", url: target.deepLink, label: `${shown} (Conductor)`, note: null };
+  }
+  if (target?.app === "codex") return { app: "codex", url: target.deepLink, label: `${title || "untitled thread"} (Codex)`, note: null };
+  const where = name(thread.workspace) || folder;
+  if (thread.kind === "antigravity") return { app: "antigravity", url: null, label: `${[where, title && !sameName(title, where) ? title : ""].filter(Boolean).join(" · ") || "untitled conversation"} (Antigravity)`, note: "Antigravity has no link to one conversation: open it in Antigravity and pick it in the sidebar." };
+  if (thread.kind === "conductor") return { app: "conductor", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled chat"} (Conductor)`, note: "Conductor gave no workspace or session id for this chat; open it from the sidebar." };
+  if (thread.kind === "codex") {
+    const inConductor = thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR;
+    return {
+      app: inConductor ? "conductor" : "codex", url: null,
+      label: `${[where, title].filter(Boolean).join(" · ") || "untitled thread"} (${inConductor ? "Conductor" : "Codex"})`,
+      note: thread.archived ? "Archived in Codex: unarchive it to open." : inConductor ? `No Conductor tab shows this Codex thread now; open ${where || "its workspace"} in Conductor.` : "No link opens this thread."
+    };
+  }
+  return { app: "claude", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled session"} (Claude Code)`, note: `A Claude Code terminal session${folder ? ` in ${folder}` : ""}: no app link opens it; open it in its terminal.` };
+}
+
 // Runs a child process and never throws. Timeouts kill only the child this
 // call spawned (SIGTERM, then SIGKILL after a grace) and always settle.
 // Output is capped so a chatty command cannot exhaust memory.
@@ -444,6 +578,61 @@ export function runCommand(cmd, args = [], options = {}) {
   });
 }
 
+// ---------- question cards ----------
+
+const CARD_LABEL_MAX = 200;
+const CARD_ITEMS_MAX = 20;
+// The app's Skip is local, so an item nobody answers may stay open for good:
+// past a day it is asked once more, and past two it is dropped.
+export const CARD_STALE_MS = 24 * 60 * MIN;
+export const CARD_DROP_MS = 48 * 60 * MIN;
+// Excluded threads whose open cards still reach the owner (never self or
+// archived ones). They are never read for git or PRs.
+export const CARD_EXCLUSIONS = new Set(["automation", "no-repo"]);
+// One-option acknowledgements ("Okay", "Continue") ask nothing.
+const ACK_LABELS = new Set(["ok", "okay", "continue", "got it", "acknowledge", "acknowledged", "understood"]);
+
+// A note with no choices that says it needs nothing ("No input is needed
+// from you right now") is one too.
+const NOTHING_NEEDED = /\bno (?:input|action|response|reply|decision)\b[^.?!]{0,30}\b(?:needed|required)\b|\bnothing (?:is )?needed from you\b/i;
+
+export function isAckItem(item) {
+  const options = Array.isArray(item?.options) ? item.options : [];
+  if (!options.length) return NOTHING_NEEDED.test(String(item?.question ?? ""));
+  // "Continue (Recommended)": the app's recommendation suffix is not the label.
+  const label = String(options[0]).trim().toLowerCase().replace(/\s*\(recommended\)$/, "").replace(/[.!]+$/, "");
+  return options.length === 1 && ACK_LABELS.has(label);
+}
+
+// The items of an open card the owner is asked about now. Only Codex items
+// age out: a Conductor card holds its turn until it is answered.
+export function liveCardItems(card, now = Date.now()) {
+  const items = Array.isArray(card?.items) ? card.items : [];
+  return items.filter((item) => {
+    if (isAckItem(item)) return false;
+    if (card.app !== "codex") return true;
+    const at = Date.parse(item.at ?? "");
+    return !Number.isFinite(at) || now - at < CARD_DROP_MS;
+  });
+}
+
+// Agent text, redacted and bounded; labels stay whole up to CARD_LABEL_MAX.
+export function cleanCardItem(item, limits) {
+  const max = limits?.cardBodyMax ?? DEFAULTS.cardBodyMax;
+  const header = clampText(redactSecrets(item.header ?? ""), limits?.titleMax ?? DEFAULTS.titleMax);
+  return {
+    index: Number(item.index) || 0,
+    itemId: String(item.itemId ?? item.index ?? ""),
+    header: header || null,
+    question: clampText(redactSecrets(item.question ?? ""), max),
+    options: (Array.isArray(item.options) ? item.options : [])
+      .map((option) => clampText(redactSecrets(option), CARD_LABEL_MAX)).filter(Boolean).slice(0, CARD_ITEMS_MAX),
+    multiSelect: item.multiSelect === true,
+    freeText: item.freeText !== false,
+    at: item.at ?? null
+  };
+}
+
 // Collapse whitespace and cut to max chars with an ellipsis.
 export function clampText(value, max) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
@@ -457,12 +646,27 @@ const SECRET_PATTERNS = [
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[redacted]"],
   [/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, "[redacted]"],
   [/(https:\/\/ping\.buzzkit\.dev\/)[^\s"')]+/g, "$1[redacted]"],
-  [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"]
+  [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"],
+  // An Authorization header an agent printed in a curl example.
+  [/(\bBearer\s+)[A-Za-z0-9._~+/=-]{12,}/g, "$1[redacted]"],
+  // The Antigravity language server's flags and header (ps args, curl lines).
+  [/(--(?:csrf_token|host_bridge_token)[= ])\S+/g, "$1[redacted]"],
+  [/(x-codeium-csrf-token["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, "$1[redacted]"],
+  [/("csrfToken"\s*:\s*")[^"]+/g, "$1[redacted]"]
 ];
 
 // Keeps the END of a message: agents put their question or wait notice last.
 export function clampTail(value, max) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!max || text.length <= max) return text;
+  return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
+}
+
+// clampTail with the lines kept: spaces collapse, newlines (and one blank
+// line between blocks) stay, so lists and sections can still be read.
+export function clampTailLines(value, max) {
+  const text = String(value ?? "").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ")
+    .replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   if (!max || text.length <= max) return text;
   return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
 }
@@ -517,6 +721,13 @@ export function msSince(iso, now = Date.now()) {
 
 export function shortHash(value) {
   return createHash("sha256").update(String(value ?? "")).digest("hex").slice(0, 16);
+}
+
+// A check that reports main's own health ("main-health", "Reconcile main
+// health"): red on every PR while main is red. Shared infra, not the PR's
+// work, so no nudge to its agent clears it.
+export function isMainHealthCheck(name) {
+  return /\bmain[-_ ]?health\b/i.test(String(name ?? ""));
 }
 
 // Reads "export KEY=value" / "KEY=value" lines without touching process.env.
@@ -579,10 +790,27 @@ export async function openReadOnlyDb(filePath) {
   }
 }
 
+// A WAL database another app is writing (Antigravity's) opened as an
+// immutable snapshot: no lock, no -shm, nothing written. It misses rows still
+// in the WAL, so callers try openReadOnlyDb first.
+export async function openImmutableDb(filePath) {
+  if (sqliteModule === undefined) {
+    try { sqliteModule = await import("node:sqlite"); } catch { sqliteModule = null; }
+  }
+  if (!sqliteModule || !fs.existsSync(filePath)) return null;
+  try {
+    const url = pathToFileURL(filePath);
+    url.searchParams.set("immutable", "1");
+    return new sqliteModule.DatabaseSync(url, { readOnly: true });
+  } catch {
+    return null;
+  }
+}
+
 /**
  * @typedef {Object} FleetThread
- * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>"
- * @property {"codex"|"claude"|"conductor"} kind
+ * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>" | "antigravity:<conversationId>"
+ * @property {"codex"|"claude"|"conductor"|"antigravity"} kind
  * @property {string} id
  * @property {string} title
  * @property {string|null} cwd
@@ -594,6 +822,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {string|null} lastActivityAt ISO
  * @property {string} lastAgentText       untrusted, redacted, <= excerptMax
  * @property {string} lastAgentTail       the same message, <= reviewTailMax (self-review only)
+ * @property {string} [lastAgentFull]     the last real (not synthetic) agent message, lines kept, <= fullTextMax
+ * @property {string|null} [lastAgentFullAt] when that message was written
  * @property {string|null} lastAgentAt
  * @property {string} lastUserText
  * @property {string|null} lastUserAt
@@ -605,8 +835,18 @@ export async function openReadOnlyDb(filePath) {
  * @property {boolean} archived
  * @property {string|null} excluded       reason, or null when in scope
  * @property {Object} meta               source extras: model, file, turnStartedAt, abortReason, heartbeat,
- *   lastSupervisorAt, pendingQuestion, provider, threadSource, conductorHosted, entrypoint, waitingFor,
+ *   lastSupervisorAt, pendingQuestion, pendingCard, provider, threadSource, conductorHosted, entrypoint, waitingFor,
  *   peerStatus, derivedStatus, dbRemote
+ */
+
+/**
+ * @typedef {Object} QuestionCard          an open question card (meta.pendingCard)
+ * @property {"conductor"|"codex"} app
+ * @property {string} cardId              Conductor: the AskUserQuestion tool_use id. Codex: the ask turn id.
+ * @property {string|null} at             ISO; the first open item's ask time
+ * @property {number} count               items the card asked, answered ones included
+ * @property {{index: number, itemId: string, header: string|null, question: string, options: string[],
+ *   multiSelect: boolean, freeText: boolean, at: string|null}[]} items   the open ones; index is stable within the card
  */
 
 /**
@@ -667,7 +907,25 @@ export async function openReadOnlyDb(filePath) {
  * @property {string} reason              short human-readable why
  * @property {string[]} blockers          short readiness blockers
  * @property {{title: string, body: string, options: string[], dedupeKey: string,
- *   kind: "agent-ask"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
+ *   kind: "agent-ask"|"agent-card"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
+ * @property {Object} [cardQuestion]     a Codex question card asked beside this decision (one per card)
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */
+
+/**
+ * @typedef {Object} FleetPushPreview
+ * @property {"nudge"} action
+ * @property {string} playbook
+ * @property {string} reason
+ * @property {string} message             full text Push now sends verbatim
+ */
+
+/**
+ * @typedef {Object} FleetQuestionView
+ * @property {string|null} askContext     redacted agent context, for display only
+ * @property {boolean} risky             classify the ask and options, not context
+ */
+
+// Supervisor state and thread detail carry pushPreview (FleetPushPreview or
+// null) and pushing (a send is in flight). No repeat until the agent replies.

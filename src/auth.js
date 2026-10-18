@@ -56,8 +56,19 @@ export function isPublicRoute(pathname) {
     pathname === "/health" ||
     pathname === "/sign-in" ||
     pathname === "/nodes/enroll/exchange" ||
+    // Sign in with ChatGPT's browser redirect carries no owner token; the
+    // one-time state and PKCE verifier it must match protect it.
+    pathname === "/auth/callback" ||
+    pathname === "/auth/chatgpt/callback" ||
     pathname === "/channels/telegram/webhook" ||
-    pathname === "/webhooks/buildbetter"
+    pathname === "/webhooks/buildbetter" ||
+    pathname === "/channels/sendblue/webhook" ||
+    pathname === "/channels/linq/webhook" ||
+    pathname === "/channels/twilio/webhook" ||
+    pathname === "/channels/telnyx/webhook" ||
+    pathname === "/channels/surge/webhook" ||
+    pathname === "/webhooks/pebble" ||
+    pathname === "/integrations/google/callback"
   );
 }
 

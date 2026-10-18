@@ -78,6 +78,36 @@ The first run shows the dashboard's web wizard at `http://127.0.0.1:43210/setup`
 
 Quit from the tray menu (or `Cmd-Q`) terminates the Node child cleanly via `Process.terminate()`, then `SIGKILL` after 3s if still alive.
 
+## Voice Supervisor
+
+Hold **Option-Shift-Space** to talk, then release to send. On the first turn,
+wait for **Listening…** before speaking. In the Supervisor tab, **Talk** starts
+a turn and **Send** finishes it. **End**, closing the panel, or switching to
+Tasks stops voice. Option-Space still opens Quick Ask.
+
+Voice connects to the paired main's `/nodes/voice`, using the existing
+`daemonBaseURL` / `daemonToken` settings (or the outreach main URL/token when
+no capture main is configured). Use an HTTPS hub URL. The local daemon's token
+is never sent to another host. The hub needs `OPENAGI_VOICE=1` and its own
+OpenAI key; no provider key is stored by this client.
+
+Opening a question card, choosing **Chat**, or opening a Watching row updates
+the voice focus. Talking during a reply stops playback and tells the hub how
+many milliseconds were heard. Transcripts are saved by the hub in the shared
+Supervisor thread. Allow OpenAGI microphone access when macOS asks.
+
+The voice shortcut is configurable through UserDefaults; the key code and
+modifier mask use Carbon values. These restore Option-Shift-Space:
+
+```bash
+defaults write app.openagi.daemon openagi.voice.hotkey.keyCode -int 49
+defaults write app.openagi.daemon openagi.voice.hotkey.modifiers -int 2560
+```
+
+The app re-registers the shortcut when its defaults change; relaunch if an
+external defaults edit hasn't appeared. A conflicting shortcut leaves the
+mic button available.
+
 ## What's not here yet (and is out of scope for v1)
 
 - A native settings window — Settings menu opens the web wizard. Good enough for v1.

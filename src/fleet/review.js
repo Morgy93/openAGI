@@ -6,9 +6,13 @@
 // duplicates and cross-thread supersession. The model only ever returns
 // verdicts; the supervisor applies them to its own records, never to a thread.
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { DEFAULTS, DEFAULT_REVIEW_MODEL, DEFAULT_REVIEW_TIMEOUT_MS, SUPERVISOR_PREFIX, clampTail, clampText, parsePrRef, redactSecrets, runCommand, shortHash } from "./contracts.js";
+import { DEFAULTS, DEFAULT_REVIEW_CODEX_MODEL, DEFAULT_REVIEW_CODEX_TIMEOUT_MS, DEFAULT_REVIEW_MODEL, DEFAULT_REVIEW_TIMEOUT_MS, SUPERVISOR_PREFIX, clampTail, clampText, parsePrRef, redactSecrets, runCommand, shortHash } from "./contracts.js";
 import { fleetChildEnv, summariseRelayFailure } from "./executor.js";
+import { codexModelProvider, createLockedCodexExec, judgeCodexConfig } from "./judge.js";
 import { ownerLabel } from "./policy.js";
 
 export const REVIEW_CATEGORIES = Object.freeze(["live", "stale", "junk", "duplicate", "done-elsewhere"]);
@@ -58,6 +62,25 @@ export const REVIEW_SCHEMA = Object.freeze({
   additionalProperties: false
 });
 
+// The same contract for codex --output-schema, whose strict mode wants every
+// property required: the optional ones may be null instead, and a null is
+// dropped again before the verdicts are read (codexReviews).
+const REVIEW_OPTIONAL = new Set(["title", "options", "duplicateOf"]);
+export const REVIEW_SCHEMA_CODEX = Object.freeze({
+  ...REVIEW_SCHEMA,
+  properties: {
+    reviews: {
+      ...REVIEW_SCHEMA.properties.reviews,
+      items: {
+        ...REVIEW_SCHEMA.properties.reviews.items,
+        properties: Object.fromEntries(Object.entries(REVIEW_SCHEMA.properties.reviews.items.properties)
+          .map(([name, spec]) => [name, REVIEW_OPTIONAL.has(name) ? { ...spec, type: [spec.type, "null"] } : spec])),
+        required: Object.keys(REVIEW_SCHEMA.properties.reviews.items.properties)
+      }
+    }
+  }
+});
+
 export const REVIEW_SYSTEM_PROMPT = [
   "You manage the OpenAGI fleet supervisor's own needs-you list: questions it raised for the owner about coding agent threads (Codex, Claude Code, Conductor).",
   "Each open question is mirrored to the owner's phone and glasses, so every one costs attention. Review the questions in <questions> together and return one verdict per id.",
@@ -75,7 +98,7 @@ export const REVIEW_SYSTEM_PROMPT = [
   "Weighing the evidence:",
   "- An owner message answers a question only if it came after the ask (lastUser.at later than the question's askedAt) and speaks to that exact thing. A yes to an earlier ask is not an answer.",
   "- askContext is the agent message the ask came from; the thread's lastAgentText may be newer.",
-  "- related lists OTHER sessions, even when they share a workspace, repo or PR. Their activity never means this thread moved on. Close as answered or done-elsewhere only when a related thread's own text shows this exact work done or this exact question answered.",
+  "- related lists OTHER sessions, even when they share a workspace, repo or PR. Their activity never means this thread moved on. Close as answered or done-elsewhere only when a related thread's own text shows this exact work done or this exact question answered, naming this question's PR (#number). A bare owner reply there (\"yes\", \"admin merge\") answers that thread's own conversation, not this question.",
   "- kind ready asks the owner to merge a green PR: keep it while that PR is OPEN, not draft, CI green and at the head named in the body, whatever its thread is doing now (the thread may be on another branch).",
   "",
   "For every agent-ask you keep, also write:",
@@ -291,6 +314,11 @@ function cleanVerdict(raw, entry, ids) {
   if (close && entry.pinned) return { id: entry.id, decision: "keep", category: "live", reason: text(`pinned by the owner; review said: ${reason}`, REASON_MAX) };
   // A close with no evidence is a guess.
   if (close && !reason) return { id: entry.id, decision: "keep", category: "live", reason: "close without a reason" };
+  // Done elsewhere only on a related thread that names this PR: an owner's
+  // "admin merge" about another PR in a sibling session answers nothing here.
+  if (close && raw.category === "done-elsewhere" && !relatedNamesPr(entry)) {
+    return { id: entry.id, decision: "keep", category: "live", reason: text(`no related thread names this PR; review said: ${reason}`, REASON_MAX) };
+  }
   if (close) {
     const duplicateOf = raw.category === "duplicate" && ids.has(raw.duplicateOf) && raw.duplicateOf !== entry.id ? raw.duplicateOf : null;
     // A duplicate of nothing it can name is a guess: keep.
@@ -306,6 +334,24 @@ function cleanVerdict(raw, entry, ids) {
   const options = cleanOptions(raw.options);
   if (options) verdict.options = options;
   return verdict;
+}
+
+// A related thread's own text (owner or agent) names this question's PR:
+// "owner/name#42" or a /pull/42 link of the same repo, or a bare "#42" from a
+// thread on that repo. Another repo's #42 is not it. A question with no PR
+// cannot be checked this way.
+function relatedNamesPr(entry) {
+  const ref = parsePrRef(entry.prRef) ?? parsePrRef(entry.prs?.[0]?.ref);
+  if (!ref) return true;
+  const repo = ref.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const qualified = new RegExp(`(?:github\\.com/|(?<![\\w./-]))${repo}(?:#|/pull/)${ref.number}(?!\\d)`, "i");
+  const bare = new RegExp(`(?<![\\w./-])#${ref.number}(?!\\d)`);
+  return (entry.related ?? []).some((thread) => {
+    const words = `${thread.lastAgentText ?? ""}\n${thread.lastUser?.text ?? ""}`;
+    if (qualified.test(words)) return true;
+    const threadRepo = thread.repo ?? parsePrRef(thread.prRefs?.[0])?.repo ?? null;
+    return Boolean(threadRepo) && threadRepo.toLowerCase() === ref.repo.toLowerCase() && bare.test(words);
+  });
 }
 
 // A duplicate closes only when the question it points at, followed down
@@ -415,16 +461,15 @@ function parseResult(stdout) {
 // the result's structured_output). --safe-mode skips the owner's hooks,
 // CLAUDE.md, skills and MCP servers, so a Stop hook never pushes the phone;
 // --no-session-persistence keeps the run out of the fleet's own scan.
-export function createReviewRunner({ config, run = runCommand, env = process.env } = {}) {
-  const review = config?.review ?? {};
+function createClaudeReview({ config, run, env, model }) {
   const cwd = config?.paths?.relayCwd ?? null;
-  const timeoutMs = review.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
-  return async function runModel({ system, prompt, schema }) {
+  const timeoutMs = config?.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+  return async function runClaude({ system, prompt, schema }) {
     try { if (cwd) ensureDir(cwd); } catch { /* the run surfaces a real failure */ }
     const args = [
       "-p",
       "--safe-mode",
-      "--model", review.model ?? DEFAULT_REVIEW_MODEL,
+      "--model", model,
       "--output-format", "json",
       "--json-schema", JSON.stringify(schema),
       "--tools", "",
@@ -453,4 +498,71 @@ export function createReviewRunner({ config, run = runCommand, env = process.env
     if (!isObject(parsed.structured_output)) throw new Error("review returned no structured output");
     return parsed.structured_output;
   };
+}
+
+// Which model runs the review. config.review.provider "codex" or "claude"
+// pins it; unset, a Claude model name means claude, else codex when the
+// owner's Codex config uses codex-lb (another provider would get a model
+// name and key it does not know), else claude.
+export function reviewProvider(config, read = fs.readFileSync) {
+  const review = config?.review ?? {};
+  if (review.provider === "codex" || review.provider === "claude") return review.provider;
+  if (/^claude/i.test(String(review.model ?? ""))) return "claude";
+  let toml = "";
+  try { toml = read(path.join(config?.paths?.codexHome ?? path.join(os.homedir(), ".codex"), "config.toml"), "utf8"); } catch { /* no Codex here */ }
+  return codexModelProvider(toml) === "codex-lb" && judgeCodexConfig(toml) ? "codex" : "claude";
+}
+
+// codex output back to the review's own contract: a null optional field is
+// left out, as Claude leaves it out.
+function codexReviews(output) {
+  if (!isObject(output) || !Array.isArray(output.reviews)) throw new Error("returned no verdicts");
+  return {
+    reviews: output.reviews.map((raw) => (isObject(raw)
+      ? Object.fromEntries(Object.entries(raw).filter(([name, value]) => !(REVIEW_OPTIONAL.has(name) && value === null)))
+      : raw))
+  };
+}
+
+// runModel for reviewQuestions. On codex it runs tool-free through codex-lb
+// (createLockedCodexExec, as the nudge judge does; the system prompt leads
+// the prompt, which goes over stdin), and on Claude when that call fails for
+// any reason, the tool lockdown included. runModel.lastRun says which ran:
+// { provider, model, fallbackReason }. runModel.provider and .model are what
+// it tries first; .fallbackModel the Claude model behind codex.
+export function createReviewRunner({ config, run = runCommand, env = process.env, now = Date.now, read = fs.readFileSync } = {}) {
+  const review = config?.review ?? {};
+  const provider = reviewProvider(config, read);
+  const claudeModel = (provider === "claude" ? review.model : review.fallbackModel) ?? DEFAULT_REVIEW_MODEL;
+  const codexModel = provider === "codex" ? (review.model ?? DEFAULT_REVIEW_CODEX_MODEL) : null;
+  const runClaude = createClaudeReview({ config, run, env, model: claudeModel });
+  const codex = codexModel ? createLockedCodexExec({ config, run, env, now, tempPrefix: "openagi-review-" }) : null;
+  const codexTimeoutMs = review.codexTimeoutMs ?? DEFAULT_REVIEW_CODEX_TIMEOUT_MS;
+
+  async function runModel({ system, prompt, schema }) {
+    let fallbackReason = null;
+    if (codex) {
+      try {
+        const output = codexReviews(await codex({ prompt: `${system}\n\n${prompt}`, schema: REVIEW_SCHEMA_CODEX, model: codexModel, timeoutMs: codexTimeoutMs, stdin: true }));
+        runModel.lastRun = { provider: "codex", model: codexModel, fallbackReason: null };
+        return output;
+      } catch (error) {
+        fallbackReason = text(`codex: ${error?.message ?? String(error)}`, 160);
+      }
+    }
+    try {
+      const output = await runClaude({ system, prompt, schema });
+      runModel.lastRun = { provider: "claude", model: claudeModel, fallbackReason };
+      return output;
+    } catch (error) {
+      runModel.lastRun = null;
+      if (!fallbackReason) throw error;
+      throw new Error(`${fallbackReason}; claude fallback: ${error?.message ?? String(error)}`);
+    }
+  }
+  runModel.provider = provider;
+  runModel.model = codexModel ?? claudeModel;
+  runModel.fallbackModel = codexModel ? claudeModel : null;
+  runModel.lastRun = null;
+  return runModel;
 }
