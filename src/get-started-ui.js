@@ -10,7 +10,13 @@ function gettingStartedProgress() {
 async function startGettingStartedChat(id) {
   const flow = GET_STARTED_FLOWS.find(item => item.id === id);
   if (!flow) return;
+  if (state.modelReady === false) {
+    try { sessionStorage.setItem("openagi.setupDraft", flow.prompt); } catch { /* browser storage unavailable */ }
+    window.location.href = "/setup";
+    return;
+  }
   Object.assign(state, {
+    guidedFlow: flow.id,
     sessionId: null, messages: [], freshChatRequested: true, agentId: "main",
     channel: "local", from: "browser-" + Date.now(), activeRequestId: null,
     activeRequestStage: null, activeRequestError: null, activeRequestMissingSince: null,
@@ -40,49 +46,47 @@ function renderGettingStarted() {
     if (className) node.className = className;
     return node;
   };
-  main.append(el("h2", "Make OpenAGI useful to you"));
-  main.append(el("p", "Pick one thing you want help with. Connect your model, then let the agent walk you through it in chat. You can skip a flow and come back any time.", "muted"));
-  main.append(el("p", progress.size + " of " + GET_STARTED_FLOWS.length + " flows tried in this browser. This is your checklist, not a connection or permission check.", "muted"));
-  const grid = el("div");
-  Object.assign(grid.style, { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))", gap: "16px" });
-  for (const flow of GET_STARTED_FLOWS) {
-    const card = el("section", "", "card");
-    card.style.padding = "18px";
-    card.append(el("h3", flow.title));
-    card.append(el("p", flow.time, "muted"));
-    card.append(el("p", flow.description));
-    const steps = el("ol");
-    for (const step of flow.steps) steps.append(el("li", step));
-    card.append(steps);
-    const chat = el("button", "Guide me in chat", "ui-btn ui-btn-primary");
+  const page = el("div", "", "guide-page");
+  page.append(el("div", "Make it yours", "eyebrow"));
+  page.append(el("h2", "A little more useful, every day."));
+  page.append(el("p", "An agent that remembers your preferences, follows your work, and connects your devices. Start with one conversation. Add the rest when you need it.", "guide-intro"));
+  const cardFor = (flow, featured = false) => {
+    const card = el("section", "", featured ? "guide-featured" : "guide-card");
+    if (featured) card.append(el("span", "01", "guide-number"));
+    const body = el("div");
+    if (featured) body.append(el("div", "Start here · " + flow.time, "eyebrow"));
+    body.append(el("h3", flow.title), el("p", flow.description));
+    const chat = el("button", featured ? "Meet your agent →" : "Try it in chat →", featured ? "ui-btn ui-btn-primary" : "");
     chat.type = "button";
     chat.onclick = () => startGettingStartedChat(flow.id);
-    const link = el("a", flow.linkLabel, "ui-btn ui-btn-secondary");
-    link.href = flow.link;
+    body.append(chat);
+    const details = el("details");
+    details.append(el("summary", "What you’ll try"));
+    const steps = el("ol");
+    for (const step of flow.steps) steps.append(el("li", step));
+    const link = el("a", flow.linkLabel + " →"); link.href = flow.link;
     if (flow.link.startsWith("https://")) { link.target = "_blank"; link.rel = "noopener noreferrer"; }
-    const actions = el("div", "", "row");
-    Object.assign(actions.style, { gap: "8px", flexWrap: "wrap", margin: "12px 0" });
-    actions.append(chat, link);
-    card.append(actions);
-    const label = el("label");
-    const check = el("input");
-    check.type = "checkbox";
-    check.checked = progress.has(flow.id);
+    details.append(steps, link);
+    const label = el("label", "", "guide-check");
+    const check = el("input"); check.type = "checkbox"; check.checked = progress.has(flow.id);
     check.onchange = () => {
       if (check.checked) progress.add(flow.id); else progress.delete(flow.id);
       try { localStorage.setItem("openagi.getStarted.v1", JSON.stringify([...progress])); } catch { /* private browsing */ }
       renderGettingStarted();
     };
-    label.append(check, el("span", " I tried this flow"));
-    card.append(label);
-    grid.append(card);
-  }
-  main.append(grid);
-  const guide = el("a", "Installation, troubleshooting, and first-use guide");
-  guide.href = "https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md";
-  guide.target = "_blank";
-  guide.rel = "noopener noreferrer";
-  main.append(el("p", "Your agent's state is stored on its host. Model providers and connected services may receive the context needed for your requests. Start with non-sensitive examples.", "muted"), guide);
+    label.append(check, el("span", "I tried this guide"));
+    details.append(label); body.append(details); card.append(body); return card;
+  };
+  page.append(cardFor(GET_STARTED_FLOWS[0], true));
+  page.append(el("h3", "Explore at your own pace", "section-label"));
+  const grid = el("div", "", "guide-grid");
+  for (const flow of GET_STARTED_FLOWS.slice(1)) grid.append(cardFor(flow));
+  page.append(grid);
+  const footer = el("div", "", "guide-footer");
+  footer.append(el("span", progress.size + " of " + GET_STARTED_FLOWS.length + " guides tried · Your personal checklist"));
+  const guide = el("a", "Read the getting started guide ↗");
+  guide.href = "https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md"; guide.target = "_blank"; guide.rel = "noopener noreferrer";
+  footer.append(guide); page.append(footer); main.append(page);
 }
 
 export const getStartedUi = `const GET_STARTED_FLOWS = ${JSON.stringify(GET_STARTED_FLOWS)};\n`

@@ -60,7 +60,7 @@ test("progress is explicit, reversible, and tolerates corrupt browser storage", 
   checks[1].checked = false;
   checks[1].onchange();
   assert.equal(h.writes[0][1], "[]");
-  assert.equal(all(h.main).filter(e => e.textContent === "Guide me in chat").length, 6);
+  assert.equal(all(h.main).filter(e => /Meet your agent →|Try it in chat →/.test(e.textContent)).length, 6);
 });
 
 test("guided instructions reach the agent on every chat surface without changing approval authority", () => {

@@ -103,6 +103,29 @@ npm run install-launchd              # macOS
 ./scripts/install-systemd.sh user     # Linux user service
 ```
 
+## Connect a model
+
+The first-run wizard at `/setup` has three steps: **Choose**, **Connect**, and
+**Start**. Only your selected provider's fields appear. It sends a short test
+message and requires a model answer before handing off to chat.
+
+- **Anthropic / OpenAI:** enter your API key. Existing keys stay private and are
+  kept when a field is blank. The model can be changed in Model options.
+- **ChatGPT plan:** sign in to an eligible account, then verify the connection.
+- **Ollama / LM Studio:** start the server, enter its URL ending in `/v1`, and
+  the exact installed model name. Ollama defaults to
+  `http://localhost:11434/v1`; for example, run `ollama pull llama3.2` and enter
+  `llama3.2`. No cloud key is required. `localhost` means the agent's host.
+- **Apple Intelligence:** use the native Mac or iPhone app on macOS 26/iOS 26
+  with compatible hardware and Apple Intelligence enabled and downloaded.
+  The wizard reports the native model's availability. Browser-only runtimes
+  do not provide Apple's native model bridge.
+
+After verification, save your dashboard access token and choose **Meet your
+agent**. Add integrations, devices, or screen access when you need them.
+Reopen **Model & settings** from the sidebar to change models. Existing
+integration and channel settings remain under **Advanced settings**.
+
 ## Docker
 
 Use the version tag you selected from GitHub Releases. Replace `<version>`

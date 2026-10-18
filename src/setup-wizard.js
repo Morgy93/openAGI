@@ -5,6 +5,7 @@ import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 import { resolveDataDir } from "./data-dir.js";
 import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
+import { renderModelSetup } from "./model-setup-ui.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -13,6 +14,7 @@ import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
 
 const WIZARD_FIELDS = [
   "OPENAGI_PROVIDER",
+  "OPENAGI_LOCAL_BASE_URL", "OPENAGI_LOCAL_MODEL", "OPENAGI_LOCAL_API_KEY",
   "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
   "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT",
   "OPENAGI_AUTH_TOKEN",
@@ -119,7 +121,11 @@ function parseEnvText(text) {
   return out;
 }
 
-export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
+export function renderWizard(options = {}) {
+  return renderModelSetup({ ...options, proposedToken: options.proposedToken || options.existingEnv?.OPENAGI_AUTH_TOKEN?.trim() || generateToken(32) });
+}
+
+export function renderAdvancedWizard({ proposedToken, existingEnv = {} } = {}) {
   // Re-running /setup must NOT rotate the auth token: every save used to
   // overwrite OPENAGI_AUTH_TOKEN with a fresh value because the hidden field
   // always submitted. Keep the existing token when there is one.

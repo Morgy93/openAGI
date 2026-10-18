@@ -3,45 +3,45 @@
 export const GET_STARTED_FLOWS = [
   {
     id: "chat", title: "Meet your agent", time: "2 minutes",
-    description: "Connect a model and get one useful answer. Your agent keeps working between conversations when you enable background features.",
+    description: "Tell your agent what you’re working on. Get one small, useful result and build from there.",
     steps: ["Connect your own model in Settings and save your dashboard login.", "Tell the agent what you want help with and how you prefer to work.", "Ask for one small result, then check the answer and model status."],
     link: "/setup", linkLabel: "Connect a model",
-    prompt: "Help me get started with OpenAGI through chat. Ask what I want help with, one question at a time. Check which model and tools are actually available, explain any missing setup, then help me get one small useful result. Do not enable integrations or take external actions just to demonstrate them."
+    prompt: "Help me get started with OpenAGI. Ask what I’m working on and help me get one useful result, one step at a time."
   },
   {
     id: "memory", title: "Teach it how you work", time: "3 minutes",
-    description: "Preferences and corrections can carry across chats. Review what it remembers; useful routines can become skills you choose to adopt.",
+    description: "Save a preference, recall it in another chat, and see how corrections help your agent adapt.",
     steps: ["Choose one non-sensitive preference you want remembered.", "Ask the agent to remember it, then ask it to recall it in another chat.", "Try correcting it and review the Memory and Skills tabs. Learning needs useful input and time; suggestions are not guaranteed."],
     link: "/?tab=memory", linkLabel: "Review memory",
-    prompt: "Walk me through OpenAGI memory and learning, one step at a time. Ask me for one non-sensitive preference before storing anything. Help me verify recall and try a correction. Explain how observed routines become suggested skills and where I review them; do not invent memories or promise a learning timeline."
+    prompt: "Walk me through remembering how I work. Help me save one non-sensitive preference and verify that you can recall it."
   },
   {
     id: "agents", title: "Monitor your coding agents", time: "5 minutes",
-    description: "See what needs your attention across coding sessions. Start by observing; approved replies and managed runs are separate choices.",
+    description: "Follow coding sessions and see what needs your attention. Start with a read-only view.",
     steps: ["Open Coding Agents to configure a supported CLI and select existing Git projects.", "Use Fleet to inspect recent sessions in observe mode. Available sources depend on the host and installed apps.", "Review a real session and its evidence. A reported status is not proof that code passed tests, merged, or shipped."],
     link: "/?tab=coding-agents", linkLabel: "Set up Coding Agents",
-    prompt: "Help me monitor coding agents with OpenAGI. First ask which coding app and computer I use. Explain Coding Agents versus Fleet, check available read-only status, and walk me through setup in observe mode. Do not start a run, send a nudge, or switch to automatic mode without my separate request."
+    prompt: "Help me monitor my coding agents in read-only mode. First ask which coding app and computer I use."
   },
   {
     id: "screen", title: "See your screen and take action", time: "5 minutes",
-    description: "Screen observation gives context on macOS. Computer Use adds approved interaction on a selected, ready computer. Each is optional.",
+    description: "Give your agent context from your Mac, or approve actions on a ready computer. You choose when.",
     steps: ["On the Mac app, choose Capture from the menu bar to opt into observation and grant Screen Recording yourself.", "Review Computer History. Captured text is history; it does not prove live screen access or input readiness.", "For Computer Use, check the selected node and its permissions, then request a harmless read-only screen summary. Approve the session explicitly before interaction."],
     link: "/?tab=computer-use", linkLabel: "Check Computer Use",
-    prompt: "Teach me screen observation and Computer Use in OpenAGI, one step at a time. First ask my operating system and whether I want observation or interactive control. Explain what is captured and sent to my model. Check readiness without starting a control session. Help me set up the supported path; ask before inspecting my screen or requesting a session, and never bypass operating-system permissions."
+    prompt: "Help me understand screen observation and Computer Use. Ask about my computer and explain the options before we enable anything."
   },
   {
     id: "devices", title: "Connect your phone or another node", time: "5 minutes",
-    description: "Keep a main agent on an always-on computer and reach it from your own devices. Pair each device with a scoped credential.",
+    description: "Reach your main agent from your phone or another computer. Keep each device’s access scoped.",
     steps: ["Choose the main computer and a private network or authenticated HTTPS address the other device can reach.", "For iPhone or Android, install a build of the companion app and run openagi pair-phone on the main. App source is included; a public store download is not promised.", "For another computer, use openagi pair with the main address. Check Nodes for a fresh heartbeat and the capabilities that device actually offers. Glasses use Connect glasses."],
     link: "/?tab=nodes", linkLabel: "Review connected nodes",
-    prompt: "Help me connect a device to OpenAGI. Ask whether it is an iPhone, Android phone, another computer, or Even G2, and where my main agent runs. Walk me through the matching pairing flow and verify reachability and a fresh heartbeat. Never ask me to paste tokens or pairing codes into chat. Explain that an online node only supports its advertised capabilities."
+    prompt: "Help me connect my phone or another computer to OpenAGI. Ask which device I have and where my main agent runs."
   },
   {
     id: "build", title: "Build your own agent or device", time: "Explore",
-    description: "Inspect the runtime, add skills or MCP tools, and run it on Linux, a Raspberry Pi, or your own hardware. Bring your own model and accounts.",
+    description: "Add a skill, connect an MCP tool, or run a node on your own hardware. Explore the source and license.",
     steps: ["Read the source and license: PolyForm Noncommercial 1.0.0 permits noncommercial use; it is not an OSI open-source license.", "Start with one skill or MCP connection before changing the runtime. Connect only tools and data you intend to share with your model.", "Run a separate node on supported hardware and test one advertised capability. Device integrations need their own compatible software and permissions."],
     link: "https://github.com/Spshulem/openAGI", linkLabel: "Explore the source",
-    prompt: "Help me build on OpenAGI. Ask what I want to make and which hardware I have. Explain skills, MCP tools, and nodes, then suggest the smallest working example. Explain the current PolyForm Noncommercial license accurately; do not describe it as OSI open source or promise support for an untested device."
+    prompt: "Help me build on OpenAGI. Ask what I want to make and which hardware I have, then guide me through the smallest working example."
   }
 ];
 

@@ -1,0 +1,19 @@
+name: Mac native model bridge
+on:
+  pull_request:
+    paths:
+      - 'mac/**'
+      - 'mobile/ios/Sources/Embedded/DeviceModel*.swift'
+      - 'mobile/ios/Sources/Embedded/OnDeviceModel.swift'
+      - 'mobile/ios/Sources/Protocol/JSONValue.swift'
+      - '.github/workflows/native-models.yml'
+permissions:
+  contents: read
+jobs:
+  mac-tests:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test native Mac integration
+        run: swift test --package-path mac --scratch-path "$RUNNER_TEMP/openagi-mac"

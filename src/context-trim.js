@@ -131,7 +131,7 @@ export class ToolLoopContext {
     if (info.kind === "image") {
       item.content = trimmedToolStub(info.tool, before);
     } else {
-      item.output = trimmedToolStub(info.tool, before);
+      item[info.contentKey ?? "output"] = trimmedToolStub(info.tool, before);
     }
     info.stubbed = true;
     return before - itemChars(item);

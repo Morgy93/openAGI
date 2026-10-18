@@ -5,8 +5,21 @@ preferences, track work, schedule prompts, connect tools, observe activity, and
 reach the same main agent from other devices. Start with one useful result and
 add access only when you need it.
 
-**[Install or download](INSTALL.md)**, connect a model at `/setup`, then open
-**Get started** in the dashboard. Every flow has **Guide me in chat**: it opens
+**[Install or download](INSTALL.md)**, then use the three-step `/setup` wizard:
+choose a model, connect and verify it, and enter your workspace. API keys stay
+in setup; you do not need to paste them into chat. An unreachable provider or
+fallback echo does not pass model verification.
+
+Use Anthropic or OpenAI with an API key, sign in with an eligible ChatGPT plan,
+connect an Ollama/LM Studio server, or choose Apple Intelligence in the native
+Mac or iPhone app. Apple Intelligence requires macOS 26/iOS 26, compatible
+hardware, enabled Intelligence, and downloaded models. Local servers need an
+installed model; use the server URL ending in `/v1`. Small local models have
+limits on context, tools, and vision. Verification proves a text response,
+not that every tool or computer-control workflow works with that model.
+
+Start in **Chat**, or open **Get started** in the sidebar to choose a guide.
+**Meet your agent** and **Try it in chat** open
 a new conversation with an editable starter request. Nothing is sent until you
 press Send. The agent asks one question at a time and helps check your result.
 You can also ask "Help me get started" from a connected phone chat.
@@ -117,5 +130,5 @@ Use **Approvals** for pending actions, **Memory** for stored context,
 **Skills** for reusable workflows, **Computer History** for observations,
 **Computer Use** for control activity, **Nodes** for devices, and **Credits**
 for the agent's tracked model spend. Coding CLI/provider usage can be billed
-separately. Checks in Get started mean "I tried this flow" in this browser;
+separately. Checks in Get started mean "I tried this guide" in this browser;
 they do not grant permissions or certify that a connection is working.

@@ -4,6 +4,7 @@ import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
 import { isMobileProfile } from "./mobile-profile.js";
+import { LocalModelProvider } from "./local-model-provider.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -762,6 +763,8 @@ export function createModelProvider(options = {}) {
   const mobile = options.mobile ?? isMobileProfile();
   const onDevice = () => new OnDeviceModelProvider(options.onDevice ?? {});
   const cloud = (provider) => (mobile ? new OfflineFallbackProvider(provider, onDevice()) : provider);
+  // An explicit local choice must never silently send the prompt to a cloud model.
+  if (preference === "local") return new LocalModelProvider(options.local ?? {});
   if (preference === "on-device") return onDevice();
   if (preference === "openai" && openai.isConfigured()) return cloud(openai);
   if (preference === "anthropic" && anthropic.isConfigured()) return cloud(anthropic);
