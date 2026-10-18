@@ -57,6 +57,7 @@ import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
+import { logOperationalEvent, validRequestId } from "./operational-log.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -506,8 +507,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   if (runtime.agentHost) {
     const original = runtime.agentHost.handleMessage.bind(runtime.agentHost);
     runtime.agentHost.handleMessage = async (input, handleOptions) => {
+      const startedAt = Date.now();
+      input = { ...input, metadata: { ...input?.metadata, requestId: validRequestId(input?.metadata?.requestId) ?? randomUUID() } };
       try {
         const result = await original(input, handleOptions);
+        logOperationalEvent("agent-turn-completed", {
+          component: "agent", requestId: input.metadata.requestId,
+          sessionId: result.session?.id, durationMs: Date.now() - startedAt,
+          provider: result.model?.provider, model: result.model?.model
+        });
         events.emit("message", {
           sessionId: result.session.id,
           requestId: boundedProgressText(input?.metadata?.requestId, 200) || null,
@@ -899,9 +907,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   };
 
   const server = http.createServer(async (req, res) => {
+    const startedAt = Date.now();
+    req.openagiRequestId = randomUUID();
+    res.setHeader("x-request-id", req.openagiRequestId);
+    let logRoute = "/other";
+    res.once("close", () => logOperationalEvent("http-request", {
+      component: "http", requestId: req.openagiRequestId, method: req.method,
+      route: logRoute, status: res.statusCode, durationMs: Date.now() - startedAt,
+      reason: res.writableFinished ? "finished" : "disconnected"
+    }, "debug"));
     try {
       const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
       const pathname = url.pathname;
+      if (["/message", "/events", "/health", "/setup/test"].includes(pathname)) logRoute = pathname;
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
@@ -2034,6 +2052,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
         if (body && typeof body === "object") delete body.ephemeral;
+        if (!body || typeof body !== "object" || Array.isArray(body)) return sendJson(res, 400, { error: "message must be an object" });
+        req.openagiRequestId = validRequestId(body.metadata?.requestId) ?? req.openagiRequestId;
+        body.metadata = { ...body.metadata, requestId: req.openagiRequestId };
+        res.setHeader("x-request-id", req.openagiRequestId);
         // Who is speaking, proven by the transport auth above, never by the
         // body: the owner's own credential (bearer, cookie, query token or a
         // tokenless loopback install) or a paired phone's node credential.
@@ -2060,7 +2082,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const result = await channels.handleLocalMessage(body, { principal });
           return sendJson(res, 200, result);
         } catch (error) {
-          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
+          logAgentFailure(error, { sessionId: error?.openagiSessionId, requestId: req.openagiRequestId });
+          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null, req.openagiRequestId));
         }
       }
 
@@ -3887,12 +3910,14 @@ function handleSse(req, res, clients) {
   });
   res.write(`event: hello\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
   clients.add(res);
+  logOperationalEvent("sse-open", { component: "http", requestId: req.openagiRequestId, route: "/events", subscribers: clients.size }, "debug");
   const heartbeat = setInterval(() => {
     try { res.write(": ping\n\n"); } catch { /* dropped */ }
   }, 15000);
   req.on("close", () => {
     clearInterval(heartbeat);
     clients.delete(res);
+    logOperationalEvent("sse-close", { component: "http", requestId: req.openagiRequestId, route: "/events", subscribers: clients.size, reason: "client-close" }, "debug");
   });
 }
 
@@ -3966,6 +3991,7 @@ async function streamLocalMessage(res, channels, body, principal = null) {
   let stage = "queued";
   let sessionId = boundedProgressText(body?.sessionId, 500) || null;
   const requestId = boundedProgressText(body?.metadata?.requestId, 200) || null;
+  logOperationalEvent("sse-open", { component: "http", requestId, route: "/message" }, "debug");
   const write = (event, data) => {
     if (!connected || res.destroyed || res.writableEnded) return false;
     try {
@@ -3984,6 +4010,7 @@ async function streamLocalMessage(res, channels, body, principal = null) {
   res.on("close", () => {
     connected = false;
     clearInterval(heartbeat);
+    logOperationalEvent("sse-close", { component: "http", requestId, route: "/message", reason: res.writableFinished ? "finished" : "disconnected" }, "debug");
   });
 
   const onProgress = (raw) => {
@@ -4019,6 +4046,7 @@ async function streamLocalMessage(res, channels, body, principal = null) {
     sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
     write("final", result);
   } catch (error) {
+    logAgentFailure(error, { sessionId: error?.openagiSessionId ?? sessionId, requestId });
     write("failure", { ...messageFailure(error, error?.openagiSessionId ?? sessionId), ...(requestId ? { requestId } : {}) });
   } finally {
     clearInterval(heartbeat);
@@ -4082,8 +4110,8 @@ function boundedProgressText(value, max) {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
 
-function messageFailure(error, sessionId = null) {
-  return publicAgentFailure(error, sessionId);
+function messageFailure(error, sessionId = null, requestId = null) {
+  return publicAgentFailure(error, sessionId, requestId);
 }
 
 // SEC-4: every HTML response this daemon serves gets a per-response nonce and

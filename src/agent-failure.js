@@ -48,12 +48,13 @@ export function classifyAgentFailure(error) {
   return { code: "agent-error", message: PUBLIC_FAILURES["agent-error"] };
 }
 
-export function publicAgentFailure(error, sessionId = null) {
+export function publicAgentFailure(error, sessionId = null, requestId = null) {
   const failure = classifyAgentFailure(error);
   return {
     code: failure.code,
     error: failure.message,
-    sessionId: boundedString(sessionId, 500) || null
+    sessionId: boundedString(sessionId, 500) || null,
+    ...(requestId ? { requestId } : {})
   };
 }
 
@@ -68,6 +69,8 @@ export function logAgentFailure(error, context = {}) {
   const record = {
     at: new Date().toISOString(),
     event: "agent-turn-failed",
+    level: "error",
+    component: "agent",
     code: failure.code,
     sessionId: boundedString(context.sessionId, 500) || null,
     requestId: boundedString(context.requestId, 200) || null,
