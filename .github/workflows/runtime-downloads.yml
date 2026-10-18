@@ -16,6 +16,7 @@ on:
       - 'package*.json'
       - '.github/workflows/runtime-downloads.yml'
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
