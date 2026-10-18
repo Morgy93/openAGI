@@ -766,7 +766,7 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | chatgpt | on-device | auto (default).
+  // Explicit preference wins. anthropic | openai | chatgpt | local | on-device | auto (default).
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
   // Phone-only mode (the daemon inside the phone app): with nothing
   // configured the agent thinks with the phone's own model, and a cloud model
@@ -784,11 +784,13 @@ export function createModelProvider(options = {}) {
   if (preference === "chatgpt" && chatgpt.isConfigured()) return cloud(chatgpt);
 
   // auto: anthropic first if configured, then openai, then ChatGPT sign-in,
-  // then on-device on a phone, then deterministic.
+  // then on-device on a phone, then a configured local server, then deterministic.
   if (anthropic.isConfigured()) return cloud(anthropic);
   if (openai.isConfigured()) return cloud(openai);
   if (chatgpt.isConfigured()) return cloud(chatgpt);
   if (mobile) return onDevice();
+  const local = new LocalModelProvider(options.local ?? {});
+  if (local.isConfigured()) return local;
   return new DeterministicModelProvider();
 }
 

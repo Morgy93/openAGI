@@ -57,6 +57,7 @@ export class LocalModelProvider {
         return { provider: "local", model: this.model, text, toolCalls, usage: result.usage };
       }
       conversation.push(budget.mark({ role: "assistant", content: message.content ?? null, tool_calls: calls }, { kind: "call", hop }));
+      const imageMessages = [];
       for (const call of calls) {
         context.signal?.throwIfAborted?.();
         let args;
@@ -69,11 +70,13 @@ export class LocalModelProvider {
         conversation.push(budget.mark({ role: "tool", tool_call_id: call.id,
           content: clipToolOutput(JSON.stringify(image ? { ...image.meta, image: "[attached as image below]" } : result), call.function.name)
         }, { kind: "output", contentKey: "content", tool: call.function.name, hop }));
-        if (image) conversation.push(budget.mark({ role: "user", content: [
+        if (image) imageMessages.push(budget.mark({ role: "user", content: [
           { type: "text", text: `Screenshot (${image.meta.width}×${image.meta.height}, click coordinates are in this image's space):` },
           { type: "image_url", image_url: { url: `data:image/${image.format};base64,${image.data}` } }
         ] }, { kind: "image", tool: call.function.name, hop }));
       }
+      // Chat Completions requires the entire tool-result batch before a user message.
+      conversation.push(...imageMessages);
     }
   }
 }

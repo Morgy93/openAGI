@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { LocalModelProvider } from "../src/local-model-provider.js";
 import { createModelProvider } from "../src/model-provider.js";
 import { ToolLoopContext, itemChars } from "../src/context-trim.js";
@@ -9,6 +12,21 @@ test("explicit local inference never falls through to a configured cloud provide
   assert.equal(provider.name, "local");
   assert.equal(provider.isConfigured(), false);
   await assert.rejects(provider.generate({ input: "hi" }), /installed/);
+});
+
+test("automatic selection keeps a desktop with only a local model able to chat", async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-local-auto-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const options = {
+    preferred: "auto", mobile: false,
+    anthropic: { apiKey: "" }, openai: { apiKey: "" }, chatgpt: { dataDir },
+    local: { model: "local-fixture", fetchImpl: async () => Response.json({ choices: [{ message: { content: "Still connected" } }] }) }
+  };
+  const provider = createModelProvider(options);
+  assert.ok(provider instanceof LocalModelProvider);
+  assert.equal((await provider.generate({ input: "hi" })).text, "Still connected");
+  assert.equal(createModelProvider({ ...options, anthropic: { apiKey: "configured" } }).constructor.name, "AnthropicProvider");
+  assert.equal(createModelProvider({ ...options, local: { model: "" } }).constructor.name, "DeterministicModelProvider");
 });
 
 test("keyless local inference uses Chat Completions and does not send cloud credentials", async () => {
@@ -56,7 +74,11 @@ test("local vision models receive screenshot bytes as an image and preserve tool
   const image = "A".repeat(40_000);
   const requests = [];
   const replies = [
-    { content: null, tool_calls: [{ id: "screen-1", type: "function", function: { name: "computer_screenshot", arguments: "{}" } }] },
+    { content: null, tool_calls: [
+      { id: "screen-1", type: "function", function: { name: "computer_screenshot", arguments: "{}" } },
+      { id: "recall-1", type: "function", function: { name: "recall", arguments: "{}" } },
+      { id: "screen-2", type: "function", function: { name: "computer_screenshot", arguments: "{}" } }
+    ] },
     { content: "I can see the screen." }
   ];
   const provider = new LocalModelProvider({ model: "vision-fixture", fetchImpl: async (_url, request) => {
@@ -64,10 +86,12 @@ test("local vision models receive screenshot bytes as an image and preserve tool
     return Response.json({ choices: [{ message: replies.shift() }] });
   } });
   await provider.generate({ input: "What is on screen?", toolRegistry: {
-    toOpenAITools: () => [{ name: "computer_screenshot" }],
-    invoke: async () => ({ ok: true, result: { image, format: "png", width: 1280, height: 900 } })
+    toOpenAITools: () => [{ name: "computer_screenshot" }, { name: "recall" }],
+    invoke: async name => ({ ok: true, result: name === "recall" ? "A saved note" : { image, format: "png", width: 1280, height: 900 } })
   } });
   const messages = requests[1].messages;
+  assert.deepEqual(messages.map(message => message.role), ["system", "user", "assistant", "tool", "tool", "tool", "user", "user"]);
+  assert.deepEqual(messages.filter(message => message.role === "tool").map(message => message.tool_call_id), ["screen-1", "recall-1", "screen-2"]);
   const result = messages.find(message => message.role === "tool");
   assert.equal(result.tool_call_id, "screen-1");
   assert.doesNotMatch(result.content, /AAAA/);

@@ -79,3 +79,15 @@ are in the Codex artifact `onboarding-redesign/walkthrough.html`.
 
 The earlier secondary portable-document links and broader packaging-trigger
 coverage remain documented 4/10 deferrals; neither was claimed fixed by this PR.
+
+## Final local-model review fixes
+
+- Buffer screenshot messages until every result in a tool-call batch has been
+  appended. This keeps multi-tool screen requests valid for Chat Completions
+  servers, including batches with more than one screenshot.
+- Automatic provider selection retains a configured local model on a desktop
+  without cloud credentials. Cloud precedence and the phone's native fallback
+  remain unchanged.
+- All 13 affected local-provider and offline-fallback regressions passed. The
+  context-trimming checks and `git diff --check` also passed. Final-head hosted
+  verification is reported on PR #215 before merge.
