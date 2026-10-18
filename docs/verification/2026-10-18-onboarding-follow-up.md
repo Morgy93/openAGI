@@ -15,6 +15,9 @@ late review findings without changing the green design or removing features.
   navigation between deep-linked chats and persisted until a reload or manual
   selection, risking a follow-up in the wrong conversation. History navigation
   now loads the URL's session and request handoff after rendering the chat tab.
+  A generation/location guard ignores superseded loads, including requests
+  already in flight. Failed or deleted targets clear the previous conversation
+  and request state before rendering a fresh chat.
 - **Configured local first run (6/10):** an environment-configured local model
   in supported auth-disabled loopback mode was redirected from the dashboard
   to setup on every visit. Refresh could not repair it; completing the wizard
@@ -34,6 +37,10 @@ late review findings without changing the green design or removing features.
   allowlists and approval gates still enforce access. A bounded or read-only
   turn can waste model context or tool attempts on rejected calls; this does
   not establish an unauthorized action. Schema filtering is deferred.
+- **Additional Automatic choices (4/10):** the conservative menu guard can also
+  disable Automatic when Apple Intelligence is selected alongside a local model
+  or ChatGPT sign-in. Those models remain selectable through setup; extending
+  the quick menu's availability payload is deferred.
 
 ## Verification
 
@@ -42,6 +49,8 @@ and the dashboard's history handler. Test servers use unique temporary data
 directories and close in teardown. Final CI evidence is recorded in the PR.
 The focused setup file passed twice, including the broader 45-test run covering
 setup, conversation handoffs/history, local inference, and health/auth behavior.
+After adding the history concurrency and failure guards, all 23 conversation
+handoff/history tests passed twice, including delayed tab and session responses.
 `git diff --check` passed.
 No tagged release, public download, or installed-app update is part of this
 follow-up.

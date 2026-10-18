@@ -5180,12 +5180,27 @@ document.addEventListener("click", event => {
   if (!$("appNavigation").contains(event.target) && !$("menuToggle").contains(event.target)) closeNavigation();
 });
 async function restoreHistoryLocation() {
+  const generation = (state.historyRestorationGeneration ?? 0) + 1;
+  state.historyRestorationGeneration = generation;
   const search = window.location.search;
+  const isCurrent = () => state.historyRestorationGeneration === generation && window.location.search === search;
   const requestedTab = new URLSearchParams(search).get("tab");
   const tab = VALID_TABS.has(requestedTab) ? requestedTab : "chat";
   await switchTab(tab);
+  if (!isCurrent()) return;
   const session = deepLinkSessionId(search);
-  if (tab === "chat" && session) await openSessionDeepLink(session, deepLinkRequestId(search));
+  if (tab === "chat" && session) {
+    const opened = await openSessionDeepLink(session, deepLinkRequestId(search), isCurrent);
+    if (!opened && isCurrent()) {
+      Object.assign(state, {
+        sessionId: null, messages: [], agentId: "main", channel: "local", from: "browser-" + Date.now(),
+        activeRequestId: null, activeRequestStage: null, activeRequestError: null,
+        activeRequestText: "", activeRequestModel: "", activeRequestMissingSince: null,
+        freshChatRequested: true, guidedFlow: null
+      });
+      renderChat();
+    }
+  }
 }
 window.addEventListener("popstate", restoreHistoryLocation);
 document.getElementById("setupBtn").onclick = () => { window.location.href = "/setup"; };
@@ -5767,7 +5782,7 @@ function deepLinkRequestId(search) {
 // Land the user on the conversation named by the deep link. Returns true when
 // the thread was actually loaded, false when we said so and left them on a
 // fresh chat instead.
-async function openSessionDeepLink(id, requestId = null) {
+async function openSessionDeepLink(id, requestId = null, isCurrent = () => true) {
   let session = null;
   // The popup knows the session id before it opens POST /message, specifically
   // so its handoff is available while work is running. If the user clicks in
@@ -5775,14 +5790,17 @@ async function openSessionDeepLink(id, requestId = null) {
   // named request rather than declaring its brand-new session "gone".
   const attempts = requestId ? 4 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!isCurrent()) return false;
     try {
       session = await fetchJson("/sessions/" + encodeURIComponent(id));
     } catch (err) {
+      if (!isCurrent()) return false;
       if (attempt === attempts - 1) {
         showToast("Could not open that conversation: " + err.message, false);
         return false;
       }
     }
+    if (!isCurrent()) return false;
     const candidateMessages = Array.isArray(session?.messages) ? session.messages : [];
     const requestedTurnIsPresent = !requestId || candidateMessages.some((message) => {
       const metadata = message?.metadata;
@@ -5840,6 +5858,7 @@ async function openSessionDeepLink(id, requestId = null) {
   state.channel = (messages[0] && messages[0].channel) || "local";
   state.from = (messages[0] && messages[0].from) || "browser";
   await refreshSessions();
+  if (!isCurrent()) return false;
   renderChat();
   return true;
 }
