@@ -10,7 +10,7 @@ test("JSON and streaming messages correlate responses with private operational l
   const runtime = createDefaultRuntime({ dataDir });
   runtime.agentHost.handleMessage = async (input) => {
     if (input.text === "fail") throw new Error("provider unavailable Bearer private-fixture");
-    return { session: { id: "local:test:main" }, model: { provider: "test", model: "fixture" }, reply: "PRIVATE_REPLY" };
+    return { session: { id: "telegram:PRIVATE_CHAT:main" }, model: { provider: "test", model: "fixture" }, reply: "PRIVATE_REPLY" };
   };
   const channels = { start() {}, stop() {}, handleLocalMessage: (input, options) => runtime.agentHost.handleMessage(input, options) };
   const app = createHostedInterface(runtime, { dataDir, port: 0, channels, tickerMs: 60_000 });
@@ -47,5 +47,5 @@ test("JSON and streaming messages correlate responses with private operational l
   assert.match(output, /http-request/);
   assert.match(output, /sse-open/);
   assert.match(output, /sse-close/);
-  assert.doesNotMatch(output, /PRIVATE_PROMPT|PRIVATE_REPLY|PRIVATE_QUERY|private-fixture/);
+  assert.doesNotMatch(output, /PRIVATE_PROMPT|PRIVATE_REPLY|PRIVATE_QUERY|PRIVATE_CHAT|private-fixture/);
 });

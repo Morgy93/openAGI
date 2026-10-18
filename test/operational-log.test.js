@@ -15,13 +15,14 @@ test("operational logs filter levels and omit payloads and unsafe metadata", (t)
   process.env.OPENAGI_LOG_LEVEL = "info";
   logOperationalEvent("http-request", { route: "/message" }, "debug");
   assert.equal(output, "");
-  logOperationalEvent("agent-turn-completed", { requestId: "request-1", durationMs: 8, body: "private-note", authorization: "private-token", model: "secret\nline" });
+  logOperationalEvent("agent-turn-completed", { requestId: "request-1", sessionId: "PRIVATE_SESSION_LABEL", durationMs: 8, body: "private-note", authorization: "private-token", model: "secret\nline" });
   const record = JSON.parse(output.slice("[openagi] ".length));
   assert.equal(record.requestId, "request-1");
   assert.equal(record.durationMs, 8);
   assert.equal(record.level, "info");
   assert.ok(Number.isFinite(Date.parse(record.at)));
-  assert.doesNotMatch(output, /private|secret/);
+  assert.equal(record.sessionId, undefined);
+  assert.doesNotMatch(output, /private|secret/i);
   process.env.OPENAGI_LOG_LEVEL = "debug";
   logOperationalEvent("sse-open", { route: "/events" }, "debug");
   assert.match(output, /sse-open/);

@@ -1,7 +1,7 @@
 // Operational metadata only. Callers must never pass bodies, headers, tool
 // arguments/results, URLs, or arbitrary remote diagnostics here.
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
-const FIELDS = new Set(["requestId", "sessionId", "durationMs", "method", "route", "status", "reason", "subscribers", "provider", "model", "component"]);
+const FIELDS = new Set(["requestId", "durationMs", "method", "route", "status", "reason", "subscribers", "provider", "model", "component"]);
 
 export function logOperationalEvent(event, fields = {}, level = "info") {
   const threshold = LEVELS[process.env.OPENAGI_LOG_LEVEL] ?? LEVELS.info;

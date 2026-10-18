@@ -516,7 +516,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const result = await original(input, handleOptions);
         logOperationalEvent("agent-turn-completed", {
           component: "agent", requestId: input.metadata.requestId,
-          sessionId: result.session?.id, durationMs: Date.now() - startedAt,
+          durationMs: Date.now() - startedAt,
           provider: result.model?.provider, model: result.model?.model
         });
         events.emit("message", {
