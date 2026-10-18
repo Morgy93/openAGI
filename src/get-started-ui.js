@@ -15,8 +15,11 @@ async function startGettingStartedChat(id) {
     window.location.href = "/setup";
     return;
   }
+  // A guide starts a new draft. Do not carry an unrelated composer into it.
+  const previousInput = document.getElementById("input");
+  if (previousInput) previousInput.value = flow.prompt;
   Object.assign(state, {
-    guidedFlow: flow.id,
+    chatDraft: flow.prompt, guidedFlow: flow.id,
     sessionId: null, messages: [], freshChatRequested: true, agentId: "main",
     channel: "local", from: "browser-" + Date.now(), activeRequestId: null,
     activeRequestStage: null, activeRequestError: null, activeRequestMissingSince: null,

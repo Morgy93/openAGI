@@ -5507,6 +5507,7 @@ newBtn.addEventListener("click", async () => {
     state.activeRequestMissingSince = null;
     state.freshChatRequested = true;
     state.guidedFlow = null;
+    state.chatDraft = "";
     state.from = "browser-" + Date.now();
     renderTab();
   } else if (state.tab === "cron") {
@@ -5541,6 +5542,7 @@ newBtn.addEventListener("click", async () => {
 
 async function switchTab(tab) {
   if (!document.querySelector('nav button[data-tab="' + CSS.escape(tab) + '"]')) tab = "chat";
+  if (state.tab === "chat" && $("input")) state.chatDraft = $("input").value;
   state.tab = tab;
   main.dataset.tab = tab;
   $("pageTitle").textContent = document.querySelector('nav button[data-tab="' + tab + '"] span')?.textContent || "Chat";
@@ -5664,7 +5666,10 @@ async function refreshSessions() {
   for (const s of sessions) {
     const li = document.createElement("li");
     li.className = state.sessionId === s.id ? "active" : "";
-    li.innerHTML = \`<div class="title">\${escapeHtml(s.id)}</div><div class="preview">\${escapeHtml(s.lastMessage || "")}</div>\`;
+    const label = s.title || s.lastMessage || "New conversation";
+    const updated = new Date(s.updatedAt);
+    const subtitle = Number.isNaN(updated.getTime()) ? "Saved conversation" : updated.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    li.innerHTML = \`<div class="title">\${escapeHtml(label.length > 65 ? label.slice(0, 65) + "…" : label)}</div><div class="preview">\${escapeHtml(subtitle)}</div>\`;
     li.addEventListener("click", () => loadSession(s.id));
     sidebarList.appendChild(li);
   }
@@ -5675,6 +5680,7 @@ async function loadSession(id) {
   state.sessionId = id;
   state.freshChatRequested = false;
   state.guidedFlow = null;
+  state.chatDraft = "";
   const session = await fetchJson("/sessions/" + encodeURIComponent(id));
   // Sidebar clicks can race. If B (or + New) was selected while A's history
   // was in flight, A's late response must not overwrite B's conversation.
@@ -6075,6 +6081,7 @@ function renderChat() {
   updateModelNotice();
   document.querySelectorAll("[data-starter]").forEach(button => { button.onclick = () => startGettingStartedChat(button.dataset.starter); });
   const input = $("input");
+  input.value = state.chatDraft || "";
   try {
     const draft = sessionStorage.getItem("openagi.setupDraft");
     if (draft && state.messages.length === 0) { input.value = draft; sessionStorage.removeItem("openagi.setupDraft"); }
@@ -6111,6 +6118,7 @@ function renderChat() {
   }
   if (!composerBlocked) input.focus();
   input.addEventListener("input", () => {
+    state.chatDraft = input.value;
     input.style.height = "auto";
     input.style.height = Math.min(200, input.scrollHeight) + "px";
   });
@@ -6149,6 +6157,7 @@ function renderChat() {
     state.activeRequestMissingSince = null;
     state.activeRequestText = "";
     state.activeRequestModel = "";
+    state.chatDraft = "";
     input.value = "";
     input.style.height = "auto";
     const optimistic = {
