@@ -61,15 +61,50 @@ a restart. See [all install paths, Docker, updates, and troubleshooting](docs/IN
 | --- | --- | --- |
 | **Talk to one persistent agent** | Chat; connect only the integrations you need | The configured model answers and uses the tools actually connected |
 | **Remember preferences and corrections** | Memory, then Skills | Ask it to remember a non-sensitive preference, recall it in another chat, and correct it |
-| **Monitor coding agents** | More → Coding Agents; Fleet | Supported providers, project folders, current sessions, and actual verification evidence; begin in observe mode |
+| **Supervise a coding fleet** | [Supervisor / Fleet](#supervisor-keep-coding-work-moving); More → Coding Agents | Codex, Claude Code, Conductor and Antigravity sessions, open questions, PRs and verification evidence; begin in observe mode |
+| **Talk to the Supervisor** | [Voice setup](docs/setup/fleet-supervisor.md#voice) on Mac, Android or Even G2 | Enable voice, start with a gesture, and confirm actions with the spoken approval code |
 | **Learn from routines** | Optional Mac Capture, Computer History, Skills suggestions | Review captured context and suggested workflows before adopting them |
 | **Watch a screen or take action** | More → Computer Use | A selected supported node, fresh readiness, required OS permissions, and your explicit session approval |
 | **Connect several computers** | More → Nodes | Your main host, scoped pairing, fresh heartbeats, and each node's actual capabilities |
 | **Connect an iPhone or Android phone** | [Pair a companion app](mobile/README.md) | The phone can reach the main host and perform the flow you need |
 | **Use glasses or build onto hardware** | Connect glasses; [G2 guide](docs/setup/even-g2.md); Linux/arm64 runtime | Compatible client software, transport, and advertised capabilities |
+| **Connect your inbox, calendar or an agent phone number** | [Channels → Connections](docs/setup/partner-and-integrations.md) | Connect your own accounts, approve contacts, and review email/calendar writes |
 | **Extend the agent** | Skills and Integrations / MCP | Review the code, tools, accounts, and permissions you add |
 
 **[Walk through these flows in chat →](docs/GETTING_STARTED.md)**
+
+## Supervisor: keep coding work moving
+
+Supervisor brings supported coding sessions into one view on the Mac, web
+dashboard and paired phones. See what is running, waiting on CI, blocked, or
+waiting for your decision, with the thread and PR behind each item. It reads
+verification evidence rather than treating an agent's "done" as a passing check.
+
+- **Keep approvals visible.** Review open questions, inspect the affected
+  thread, and answer through a supported route or open the coding app.
+- **Choose how work resumes.** Observe plans without sending, Propose asks
+  you to send, and Auto sends bounded nudges after you explicitly enable it.
+- **Ask by voice.** Mac, Android and Even G2 clients can use the configured
+  voice service. Actions require a readback and your spoken approval code.
+- **Diagnose and repair.** Fleet health metrics surface delivery failures,
+  repeated nudges and other anomalies. With a configured coding worker, the
+  self-fix runner can open, review and revise a bounded repair PR. You merge it.
+
+Automatic scanning and voice require setup. Start in Observe; sending nudges,
+using Computer Use and running repairs have their own controls. See the
+[Supervisor guide](docs/setup/fleet-supervisor.md),
+[voice setup](docs/setup/fleet-supervisor.md#voice) and
+[self-fix setup](docs/setup/fleet-supervisor.md#self-fix-runner).
+
+## Availability
+
+This README describes the repository's current capabilities. Check the
+[release assets](https://github.com/Spshulem/openAGI/releases/latest) for the
+installers actually published. The latest Mac release is **v0.0.58**; newer
+source includes iOS phone-agent/offline-workspace work, additional messaging
+and Google integrations, and the latest provider, cost and approval fixes.
+The mobile apps are source/QA builds; no public store release is linked here.
+Windows/Linux portable downloads depend on a release publishing those assets.
 
 ## Why a persistent runtime helps
 
@@ -92,9 +127,12 @@ results, and screen context may be sent to your configured provider and services
 local storage does not mean inference always stays on-device.
 
 Observation, live computer control, coding-agent instructions, and automatic
-nudging have separate setup and approval boundaries. Phones and glasses reach
-the main over a network you configure; the host needs to be awake and reachable.
-An online device only supports the capabilities it advertises.
+nudging have separate setup and approval boundaries. Paired phones and glasses
+reach the main over a network you configure; that host needs to be awake and
+reachable. The iOS source also supports a phone-agent mode on compatible
+devices. Optional iOS push alerts use a relay and Apple's notification service;
+they do not make the main host available offline. An online device only
+supports the capabilities it advertises.
 
 The code is **source-available under [PolyForm Noncommercial 1.0.0](LICENSE)**.
 You can inspect and build within its terms. It is not an OSI open-source license;
@@ -118,6 +156,9 @@ claim universal hardware support.
 | Capability | Detail |
 |------------|--------|
 | **Chat UI** | `/` — sessions sidebar, message thread, tabs for Memory / Cron / Skills / MCP / Agents / Channels / Activity. SSE event stream so the UI updates live. |
+| **Supervisor / Fleet** | `/fleet` and native Supervisor views — coding threads, owner questions, PR/check evidence and Observe / Propose / Auto modes. [Setup](docs/setup/fleet-supervisor.md). |
+| **Supervisor voice** | Opt-in voice on Mac, Android and Even G2, with shared history, spoken-code approvals and a daily voice budget. [Setup](docs/setup/fleet-supervisor.md#voice). |
+| **Diagnosis and repair PRs** | Fleet health metrics plus a configured self-fix worker that opens and reviews bounded repairs; owner merge remains separate. [Setup](docs/setup/fleet-supervisor.md#self-fix-runner). |
 | **Tool-use loop** | When `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set, the agent uses tool calling with structured args. Default model: `gpt-5`. |
 | **Internal tools** | `remember`, `recall`, `schedule_message`, `list_sessions`, `list_skills`, `run_skill`, `list_mcp_tools`, `run_mcp_tool`, `register_mcp_server`, `connect_mcp_server`, `disconnect_mcp_server`, `list_cron_jobs`, `cancel_cron_job`, `get_audit`, `get_budget`, `set_provider`, `retire_specialist`, `replay_skill`. |
 | **Skills** | Drop a `SKILL.md` (frontmatter + body) under `.openagi/skills/<name>/` — it shows up as a first-class tool the agent can invoke. |
@@ -132,7 +173,7 @@ claim universal hardware support.
 | **On-demand subagents** | `run_subagent` — bounded read-only delegation; use existing scheduled prompts for daily routines. |
 | **Capability QA** | `npm run qa:capabilities` — ten offline capability areas plus [live test prompts](qa/scenarios.json). |
 | **Even Realities G2 node** | Enroll from the Nodes tab, speak through the glasses microphone, and read OpenAGI's answer on the display. G2 gets a constrained, revocable node credential; question audio is transcribed transiently and is not saved. [Setup guide](docs/setup/even-g2.md). |
-| **Mobile apps (iOS + Android)** | Pair a phone as a node and get today's tasks on a home-screen widget with tap-to-complete — local/Tailscale only, no cloud relay. [`mobile/README.md`](mobile/README.md). |
+| **Mobile apps (iOS + Android)** | Today, tasks, Inbox approvals, chat, Supervisor and task widgets. Paired mode reaches your main host; iOS source also includes phone-agent/offline workspace and optional encrypted push/Live Activity support. [`mobile/README.md`](mobile/README.md). |
 | **Persistent state** | All under `.openagi/`: memory (JSONL audit + atomic snapshot), cron jobs, agent/session store, specialist workspaces, MCP logs. |
 
 ### Credits
@@ -142,6 +183,13 @@ The **Credits** dashboard tab shows today's LLM spend vs the daily cap (`OPENAGI
 Ask the agent in chat via the **`recall_spend`** tool ("why did I spend $4 today?") — it reads the same ledger.
 
 Data is a local rolling 30-day ledger at `~/.openagi/budget/ledger.jsonl`. It stores cost + attribution only — **no message content**.
+
+Daily and per-turn model spend limits bound long runs. OpenAI and Anthropic
+also have an estimated input-token cap; requests that still exceed it after
+trimming stop before the next provider call. Spend/input-limit stops retain
+bounded, redacted progress so a continuation can see completed actions. Token
+estimates, especially for images, are approximate; see `.env.example` for the
+controls and review an uncertain external action before repeating it.
 
 ---
 

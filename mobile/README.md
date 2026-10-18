@@ -5,6 +5,10 @@ approvals, and the fleet supervisor. The iOS SwiftUI and Android Compose apps
 have separate codebases; see [the mobile feature surface](FEATURES.md) for the
 current navigation and capabilities. Widgets show a cached task snapshot.
 
+Android also supports Supervisor voice. The iOS source includes an offline
+workspace, a phone-agent mode on compatible Apple Intelligence devices, and
+optional encrypted Supervisor push alerts and a Live Activity.
+
 **App availability:** this repository includes source and build instructions.
 There is no public App Store, TestFlight, or Play Store download link advertised
 here. Install an available build of the app before pairing. iOS also has an
