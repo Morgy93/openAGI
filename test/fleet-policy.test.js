@@ -483,6 +483,8 @@ test("chooseRoute follows the delivery table", () => {
   assert.equal(chooseRoute(null, "auto"), null);
   // A Codex thread Conductor started is never resumed behind Conductor.
   assert.equal(chooseRoute({ ...codex, meta: { originator: "codex_sdk_ts" } }, "auto"), null);
+  // Nor one the Codex app started: the turn would lock the app out of it.
+  assert.equal(chooseRoute({ ...codex, meta: { originator: "Codex Desktop" } }, "auto"), null);
 });
 
 test("chooseRoute honours OPENAGI_FLEET_DELIVERY: computer-use never picks a CLI route", () => {

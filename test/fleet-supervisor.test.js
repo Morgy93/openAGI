@@ -1217,9 +1217,16 @@ test("computer-use not ready: the tick waits and sends nothing; computer-use-fir
   assert.equal(snapshot.threads[0].decision.action, "wait");
   assert.match(snapshot.threads[0].decision.reason, /computer use not ready: screen locked/);
   assert.equal(strict.supervisor.getState().settings.deliveryDetail, "screen locked");
-  const first = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [thread], deps: { uiDriver: readyDriver(false, "screen locked") } });
+  // A thread codex exec started falls back to it; one the Codex app started
+  // waits, since the turn would lock the owner out of it in the app.
+  const cli = makeThread({ meta: { originator: "codex_exec" } });
+  const first = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [cli], deps: { uiDriver: readyDriver(false, "screen locked") } });
   await first.supervisor.tick({ reason: "test" });
   assert.deepEqual(first.delivered.map((d) => d.route), ["codex-exec"]);
+  const app = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [thread], deps: { uiDriver: readyDriver(false, "screen locked") } });
+  const waiting = await app.supervisor.tick({ reason: "test" });
+  assert.equal(app.delivered.length, 0);
+  assert.equal(waiting.threads[0].route, null);
 });
 
 test("a blocked app send spends no attempt and no cooldown, but backs off before trying again", async (t) => {
