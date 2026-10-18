@@ -41,6 +41,7 @@ const ALERTS_PER_PASS = 5;
 const NON_ACTIONS = new Set(["dismiss", "open thread"]);
 // A backlog over the cap drains on a follow-up pass this long after.
 const ALERT_BACKLOG_MS = 30_000;
+const RETRY_MS = 30_000;
 // The relay will not take this pass again; the phone must mint a new one.
 const RENEW_ERRORS = new Set(["bad_pass", "pass_expired", "pass_revoked"]);
 const SEALED_MAX = 3000;
@@ -282,16 +283,17 @@ export class MobilePush {
     const notified = registration.notified.filter((id) => open.has(id));
     const unsent = [...new Map(questions.filter((q) => !notified.includes(q.id)).map((q) => [q.id, q])).values()];
     const fresh = unsent.slice(0, ALERTS_PER_PASS);
-    let failed = false;
+    let sent = 0;
     for (const question of fresh) {
       const result = await this.send(registration, { type: "alert", sealed: this.sealAlert(registration.key, question), collapseId: question.id });
       if (result === "gone" || result === "renew") return { stop: true, backlog: false };
-      // A failed send stays un-notified and is retried on the next change.
-      if (result !== "ok") { failed = true; break; }
+      // Retry unsent questions even if no new fleet event arrives.
+      if (result !== "ok") break;
       notified.push(question.id);
+      sent += 1;
     }
     this.store.setNotified(registration.nodeId, notified);
-    return { stop: false, backlog: !failed && unsent.length > fresh.length };
+    return { stop: false, backlog: unsent.length > sent };
   }
 
   // Returns when the next pass is due for this registration, or null.
@@ -334,7 +336,7 @@ export class MobilePush {
 
     if (active > 0 && now - live.startedAt >= t.restartAfterMs) {
       const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now) });
-      if (ended !== "ok") return null;
+      if (ended !== "ok") return now + RETRY_MS;
       this.live.delete(nodeId);
       this.store.setActivity(nodeId, registration.pass, null);
       return this.syncActivity(registration, activity, now);
@@ -344,10 +346,9 @@ export class MobilePush {
       live.idleSince ??= now;
       if (now - live.idleSince >= t.endAfterIdleMs) {
         const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now + t.dismissAfterMs) });
-        if (ended === "ok") {
-          this.live.delete(nodeId);
-          this.store.setActivity(nodeId, registration.pass, null);
-        }
+        if (ended !== "ok") return now + RETRY_MS;
+        this.live.delete(nodeId);
+        this.store.setActivity(nodeId, registration.pass, null);
         return null;
       }
     } else {

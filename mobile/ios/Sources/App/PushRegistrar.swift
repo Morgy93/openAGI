@@ -229,7 +229,13 @@ final class PushRegistrar {
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         // Activities on the lock screen now belong to the pass being retired;
         // taken before the daemon learns the new pass and can start another.
-        let oldActivityIDs = current.retire == nil ? [] : Set(Activity<SupervisorActivityAttributes>.activities.map(\.id))
+        if current.retire != nil, current.retiringActivityIDs == nil {
+            // Persist the snapshot before the daemon can start a new activity.
+            // A retry, including after relaunch, must never end that new one.
+            current.retiringActivityIDs = Activity<SupervisorActivityAttributes>.activities.map(\.id)
+            guard PushPassStore.save(current) else { return }
+        }
+        let oldActivityIDs = Set(current.retiringActivityIDs ?? [])
         // A failure here is retried on the next sync with the same pass.
         guard let result = try? await client.registerPush(pass: current.pass, key: key.base64URLEncodedString(),
                                                          env: Self.env, activities: startToken != nil, alerts: alerts),
@@ -243,7 +249,8 @@ final class PushRegistrar {
             try? await relay.unregister(pass: retire)
             guard stillCurrent() else { return }
             current.retire = nil
-            PushPassStore.save(current)
+            current.retiringActivityIDs = nil
+            guard PushPassStore.save(current) else { return }
         }
         if Self.shouldRenew(daemonSaysRenew: result.renew, justMinted: minted) {
             // Persisted as "too old", so the next run (now, or after a kill)
@@ -354,12 +361,15 @@ enum PushPassStore {
         // The pass this one replaced, unregistered at the relay once the
         // daemon holds the new one.
         var retire: String?
+        var retiringActivityIDs: [String]?
 
-        init(pass: String, signature: String, mintedAt: Date? = nil, retire: String? = nil) {
+        init(pass: String, signature: String, mintedAt: Date? = nil, retire: String? = nil,
+             retiringActivityIDs: [String]? = nil) {
             self.pass = pass
             self.signature = signature
             self.mintedAt = mintedAt
             self.retire = retire
+            self.retiringActivityIDs = retiringActivityIDs
         }
     }
 

@@ -131,6 +131,9 @@ final class SupervisorPushRequestTests: XCTestCase {
         respond(200, #"{"delivery":{"status":"blocked","detail":"Agent is busy"}}"#)
         let blocked = await send(.answer(questionId: "q", answer: "Approve"))
         XCTAssertEqual(blocked, .undelivered("Agent is busy"))
+        respond(200, #"{"delivery":{"status":"queued","detail":"Saved."}}"#)
+        let queued = await send(.answer(questionId: "q", answer: "Approve"))
+        XCTAssertEqual(queued, .done, "queued answers are durably accepted")
         respond(200, #"{"delivery":{"status":"failed"}}"#)
         let failed = await send(.answer(questionId: "q", answer: "Approve"))
         XCTAssertEqual(failed, .undelivered("The agent could not be reached"))
@@ -321,6 +324,13 @@ final class SupervisorPushRequestTests: XCTestCase {
         XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.x", signature: "s1"))
         PushPassStore.save(.init(pass: "p1.y", signature: "s2", mintedAt: now, retire: "p1.x"))
         XCTAssertEqual(PushPassStore.load(), .init(pass: "p1.y", signature: "s2", mintedAt: now, retire: "p1.x"))
+        let retiring = PushPassStore.Stored(pass: "p1.y", signature: "s2", mintedAt: now,
+                                           retire: "p1.x", retiringActivityIDs: ["old-activity"])
+        XCTAssertTrue(PushPassStore.save(retiring))
+        XCTAssertEqual(PushPassStore.load()?.retiringActivityIDs, ["old-activity"],
+                       "relaunch must retain the old IDs rather than capture a new activity")
+        let legacy = Data(#"{"pass":"p1.old","signature":"s1"}"#.utf8)
+        XCTAssertNil(try? JSONDecoder().decode(PushPassStore.Stored.self, from: legacy).retiringActivityIDs)
     }
 
     // forget() bumps the generation and marks the node forgotten; an

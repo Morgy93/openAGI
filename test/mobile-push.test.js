@@ -546,3 +546,35 @@ test("over 200 open questions never re-alert an old one", async (t) => {
   assert.equal(new Set(ids).size, 210);
   assert.equal(h.store.get(NODE).notified.length, 210);
 });
+
+test("rate-limited alerts retry without another fleet event", async (t) => {
+  const h = harness(t, { questions: [question("fq_a"), question("fq_b")] });
+  t.after(() => h.push.stop());
+  let limited = true;
+  h.setReply((body) => body.type === "alert" && body.collapseId === "fq_b" && limited
+    ? { __status: 429, ok: false, error: "rate_limited" } : { ok: true });
+  await h.push.flush();
+  assert.deepEqual(h.store.get(NODE).notified, ["fq_a"]);
+  limited = false;
+  await h.advance(30 * SEC);
+  assert.deepEqual(h.store.get(NODE).notified, ["fq_a", "fq_b"]);
+});
+
+test("a failed idle end retries without another fleet event", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  t.after(() => h.push.stop());
+  await h.push.flush();
+  h.state.snapshot.threads = [];
+  await h.advance(30 * SEC);
+  await h.push.flush();
+  let down = true;
+  h.setReply((body) => body.type === "activity-end" && down
+    ? { __status: 502, ok: false, error: "apns_unreachable" } : { ok: true });
+  await h.advance(2 * MIN);
+  const ends = () => h.types().filter((type) => type === "activity-end").length;
+  assert.equal(ends(), 1);
+  down = false;
+  await h.advance(30 * SEC);
+  assert.equal(ends(), 2);
+  assert.equal(h.store.get(NODE).activity, null);
+});

@@ -17,7 +17,8 @@ enum SupervisorAnswerOutcome: Equatable {
     // the owner is told to check rather than to send it again.
     case unknown
 
-    private static let delivered: Set<String> = ["sent", "dry-run", "done"]
+    // Queued answers are durable and the daemon has closed the question.
+    private static let delivered: Set<String> = ["sent", "dry-run", "done", "queued"]
 
     static func of(error: Error?, delivery: FleetDelivery?) -> SupervisorAnswerOutcome {
         if let error {
