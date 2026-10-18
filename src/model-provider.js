@@ -5,6 +5,7 @@ import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
 import { isMobileProfile } from "./mobile-profile.js";
+import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -83,7 +84,7 @@ export class OpenAIResponsesProvider {
     // because sending `reasoning` to a non-reasoning model is a 400 — an opt-in
     // key must never become a floor that breaks every other model in the table.
     this.reasoningEffort = options.reasoningEffort ?? process.env.OPENAI_REASONING_EFFORT ?? null;
-    this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    this.baseUrl = String(options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
@@ -111,6 +112,7 @@ export class OpenAIResponsesProvider {
     const model = this.resolveModel({ model: modelOverride, tier, task });
     let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
+    validateOpenAIKey(this.apiKey, this.baseUrl);
     this.budgetGuard?.check();
 
     // Stateless tool loop — accumulates the full conversation in `input` each
