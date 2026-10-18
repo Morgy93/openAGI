@@ -1328,3 +1328,11 @@ test("cards past the in-scope stop are read from the rollout tail when the histo
     assert.ok(!cardScanned.has("codex:t-auto"));
   }
 });
+
+
+test("answering a later item clears the legacy pending question for that call", () => {
+  const ask = { timestamp: iso(9 * MIN), type: "response_item", payload: { type: "function_call", name: "request_user_input_async", call_id: "call-later", arguments: JSON.stringify({ questions: [{ title: "First?", options: ["yes"] }, { title: "Second?", options: ["no"] }] }) } };
+  const reply = ev.user(cardReply([["call-later", 1, "no"]]), 5 * MIN);
+  const summary = parseRolloutTail([ask, reply].map(JSON.stringify).join("\n"));
+  assert.equal(summary.pendingQuestion, null);
+});

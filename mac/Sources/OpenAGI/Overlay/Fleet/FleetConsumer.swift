@@ -221,7 +221,7 @@ final class FleetConsumer: ObservableObject {
 
   /// The open questions about one thread, grouped ones included.
   func questions(about key: String) -> [FleetQuestion] {
-    questions.filter { $0.threadKey == key || $0.chats.contains { $0.threadKey == key } }
+    questions.filter { $0.threadKey == key || $0.threadKeys.contains(key) || $0.chats.contains { $0.threadKey == key } }
   }
 
   func thread(_ key: String) -> FleetThread? { threads.first { $0.key == key } }
@@ -401,6 +401,9 @@ final class FleetConsumer: ObservableObject {
     if let key = expandedThread, !keys.contains(key) { expandedThread = nil }
     expandedQuestions.formIntersection(open)
     details = details.filter { keys.contains($0.key) }
+    for (key, note) in threadNotes where !keys.contains(key) {
+      lastOutcome = "\(key): \(note.text)"
+    }
     threadNotes = threadNotes.filter { keys.contains($0.key) }
     // A new scan: the opened row's agent message may have moved on.
     if state.lastTickAt != lastDetailTick, let key = expandedThread { Task { await loadDetail(key) } }

@@ -223,7 +223,7 @@ function judgeable(decision, thread) {
 // themselves; masked, so only a change in the facts reads the chat again
 // (the cache still expires after JUDGE_CACHE_MS).
 function withoutElapsed(text) {
-  return String(text ?? "").replace(/\b\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "#");
+  return String(text ?? "").replace(/\b((?:waiting|queued|elapsed|idle|silent|full verify|quick verify)\s+(?:for\s+)?)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#");
 }
 
 // Every fact the judge's prompt shows besides the chat (judge.js prLines and
@@ -254,13 +254,13 @@ function replyMark(thread) {
   return shortHash(`${reply.at ?? ""}\n${reply.text}`);
 }
 
-// The judge's question is the agent's ask, keyed like the policy's own
-// (agentAskKey): on the agent message it was read from, never its wording.
-// A reread that words it differently updates the same question in place
-// (and an answer to it keeps it quiet), while a new reply may ask anew.
-export function judgeAskKey(thread, _question = null) {
+// The reply and the substantive ask identify a decision. Cosmetic titles
+// may change on a reread; body/options change what the owner is approving.
+export function judgeAskKey(thread, question = null) {
   const reply = agentReply(thread);
-  return agentAskKey(thread.key, { at: reply.at, text: reply.text });
+  const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  const ask = [normalize(question?.body), (question?.options ?? []).map(normalize).sort()];
+  return `${agentAskKey(thread.key, { at: reply.at, text: reply.text })}:${shortHash(JSON.stringify(ask))}`;
 }
 
 // A judge question that asks to merge holds like the policy's merge asks.
@@ -806,7 +806,11 @@ export class FleetSupervisor {
 
   getState() {
     const store = this.store;
-    const open = store.openQuestions().filter((question) => !this.awaitingReview.has(question.id));
+    const open = store.openQuestions().filter((question) => {
+      if (this.awaitingReview.has(question.id)) return false;
+      const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+      return !keys.length || keys.some((key) => !store.mutedUntil(key));
+    });
     // A read can expire a question too (the /fleet page, the main's refresh)
     // while no tick runs.
     this.closeExpired();
@@ -1646,6 +1650,7 @@ export class FleetSupervisor {
       if (settled) return blocked(`not sent: ${settled}`);
       const currentAsk = this.store.openQuestions().find((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
       if (currentAsk) return blocked(`waits on your answer first: ${currentAsk.title}`);
+      if (this.store.mutedUntil(threadKey)) return blocked("muted: unmute it to push");
       if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
       // The owner is speaking to this thread now: an automatic nudge a scan
       // decided meanwhile is held, as for an owner answer.
@@ -2488,17 +2493,25 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;
       }
+      if (store.mutedUntil(decision.threadKey) || store.mutedUntil(targetKey)) {
+        decision.reason = `${decision.reason}; held: muted by owner`;
+        continue;
+      }
+      if (decision.action === "nudge" && repeatsLastSend(target, store.ledgerFor(decision.threadKey), decision.messageHash)) continue;
       if (uiKey) typedInto.add(uiKey);
       tries += 1;
       attempted.add(decision.threadKey);
       const sentAt = new Date(this.now()).toISOString();
-      const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
-      if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
-      if (delivery.status !== "blocked") sends += 1;
-      if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
-      if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
-      else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
-      this.recordSend(record, delivery, sentAt);
+      this.pushing.add(decision.threadKey);
+      try {
+        const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
+        if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
+        if (delivery.status !== "blocked") sends += 1;
+        if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
+        if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
+        else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
+        this.recordSend(record, delivery, sentAt);
+      } finally { this.pushing.delete(decision.threadKey); }
     }
 
     // A planned/proposed action the policy no longer wants is stale.

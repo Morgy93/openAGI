@@ -414,3 +414,25 @@ test("the judge's Codex config keeps a provider set with dotted keys or an inlin
     assert.ok(minimal.indexOf("web_search") < minimal.indexOf("[model_providers]"), name);
   }
 });
+
+
+test("the judge copies the active profile's provider and catalog, keeping tools disabled", () => {
+  const minimal = judgeCodexConfig(`profile = "work"
+model_provider = "old"
+model_catalog_json = "/old/catalog.json"
+[profiles.work]
+model_provider = "selected"
+model_catalog_json = "/selected/catalog.json"
+[model_providers.old]
+base_url = "https://old.example"
+[model_providers.selected]
+base_url = "https://selected.example"
+[mcp_servers.private]
+url = "https://private.example"
+`);
+  assert.ok(minimal.includes('model_provider = "selected"'));
+  assert.ok(minimal.includes('model_catalog_json = "/selected/catalog.json"'));
+  assert.ok(minimal.includes('base_url = "https://selected.example"'));
+  assert.doesNotMatch(minimal, /old.example|private.example|profiles/);
+  assert.match(minimal, /shell_tool = false/);
+});

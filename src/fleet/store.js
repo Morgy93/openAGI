@@ -1064,6 +1064,15 @@ export class FleetStore {
   // carry mergeAsk; a structured ask's key (its own id) never changed.
   _adoptLegacyAsk(key, fields, origin) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return;
+    // A reread may refine an unanswered judge ask. Keep its card and update
+    // the decision key; an answered card keeps its old key and cannot approve
+    // changed details. Also adopts the earlier reply-only judge keys.
+    if (fields.askedBy === "judge") {
+      const replyKey = key.slice(0, key.lastIndexOf(":"));
+      const open = this.state.questions.find((q) => q.status === "open" && q.askedBy === "judge" && q.threadKey === fields.threadKey
+        && (q.dedupeKey === replyKey || String(q.dedupeKey ?? "").startsWith(`${replyKey}:`)));
+      if (open) { open.dedupeKey = key; this._save(); return; }
+    }
     const askedAt = toMs(origin.agentAskedAt, null);
     if (askedAt === null) return;
     let latest = null;
