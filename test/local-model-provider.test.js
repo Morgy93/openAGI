@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { LocalModelProvider } from "../src/local-model-provider.js";
 import { createModelProvider } from "../src/model-provider.js";
-import { ToolLoopContext } from "../src/context-trim.js";
+import { ToolLoopContext, itemChars } from "../src/context-trim.js";
 
 test("explicit local inference never falls through to a configured cloud provider", async () => {
   const provider = createModelProvider({ preferred: "local", anthropic: { apiKey: "cloud" }, local: { model: "" } });
@@ -50,6 +50,32 @@ test("failed and empty local responses cannot masquerade as a working model", as
     const provider = new LocalModelProvider({ model: "llama", fetchImpl: async () => response });
     await assert.rejects(provider.generate({ input: "hi", agent: { name: "test" } }), /HTTP 503|no answer/);
   }
+});
+
+test("local vision models receive screenshot bytes as an image and preserve tool-call pairing", async () => {
+  const image = "A".repeat(40_000);
+  const requests = [];
+  const replies = [
+    { content: null, tool_calls: [{ id: "screen-1", type: "function", function: { name: "computer_screenshot", arguments: "{}" } }] },
+    { content: "I can see the screen." }
+  ];
+  const provider = new LocalModelProvider({ model: "vision-fixture", fetchImpl: async (_url, request) => {
+    requests.push(JSON.parse(request.body));
+    return Response.json({ choices: [{ message: replies.shift() }] });
+  } });
+  await provider.generate({ input: "What is on screen?", toolRegistry: {
+    toOpenAITools: () => [{ name: "computer_screenshot" }],
+    invoke: async () => ({ ok: true, result: { image, format: "png", width: 1280, height: 900 } })
+  } });
+  const messages = requests[1].messages;
+  const result = messages.find(message => message.role === "tool");
+  assert.equal(result.tool_call_id, "screen-1");
+  assert.doesNotMatch(result.content, /AAAA/);
+  assert.match(result.content, /attached as image/);
+  const vision = messages.at(-1).content;
+  assert.equal(vision[1].image_url.url, "data:image/png;base64," + image);
+  assert.match(vision[0].text, /1280×900/);
+  assert.equal(itemChars(messages.at(-1)), 6_000 + vision[0].text.length, "base64 length must not inflate the context estimate");
 });
 
 test("context trimming preserves local tool-call pairing and trims the content field", () => {

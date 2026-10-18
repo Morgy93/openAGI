@@ -1053,10 +1053,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { error: choice === "local" ? "Enter the name of an installed local model." : "Enter your API key to connect this provider." });
           }
         }
-        const result = saveEnv({ dataDir, values: body });
+        let result;
+        try { result = saveEnv({ dataDir, values: body }); }
+        catch (error) {
+          if (error?.code === "PROVIDER_CONFIG_MISMATCH") return sendJson(res, 400, messageFailure(error, null));
+          throw error;
+        }
         try {
           const { createModelProvider } = await import("./model-provider.js");
-          if (runtime.agentHost) {
+          if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
           }
         } catch { /* swallow */ }
@@ -1074,17 +1079,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, { name: applied?.name ?? name, focus });
       }
       if (method === "POST" && pathname === "/setup/test") {
-        await readJson(req);
-        const provider = runtime.agentHost?.modelProvider;
+        const body = await readJson(req);
+        let provider = runtime.agentHost?.modelProvider;
+        const preference = (body.setupModel === true ? String(body.OPENAGI_PROVIDER || "") : process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
+        if (body.setupModel === true) {
+          if (!["anthropic", "openai", "local", "on-device", "chatgpt"].includes(preference)) {
+            return sendJson(res, 400, { ok: false, error: "Choose a model provider." });
+          }
+          const value = key => String(body[key] ?? "").trim() || process.env[key] || undefined;
+          const { createModelProvider } = await import("./model-provider.js");
+          // Verify a candidate without changing live credentials or the provider
+          // used by existing chats and background jobs. Mobile fallback is off.
+          provider = createModelProvider({ preferred: preference, mobile: false, budgetGuard: runtime.budget,
+            anthropic: { apiKey: value("ANTHROPIC_API_KEY"), model: value("ANTHROPIC_MODEL") },
+            openai: { apiKey: value("OPENAI_API_KEY"), model: value("OPENAI_MODEL"), baseUrl: value("OPENAI_BASE_URL") },
+            local: { apiKey: value("OPENAGI_LOCAL_API_KEY"), model: value("OPENAGI_LOCAL_MODEL"), baseUrl: value("OPENAGI_LOCAL_BASE_URL") }
+          });
+        }
         const kind = providerKind(provider?.primary ?? provider);
-        const preference = (process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
         if (!provider || kind === "none" || !provider.isConfigured?.() || (preference !== "auto" && kind !== preference)) {
           return sendJson(res, 400, { ok: false, error: "Connect the selected model before continuing. A fallback response is not a model connection." });
         }
         try {
           // Test inference alone. No agent routing, tools, memory or sessions.
-          // Native first-run setup saves the owner token before the app can
-          // attach its authenticated local model bridge.
+          // Native setup bootstraps only dashboard auth so the local bridge
+          // can attach; model settings are saved after successful inference.
           if (kind === "on-device") await deviceModelHub.waitForDevice(10_000);
           const result = await provider.generate({ input: "Reply with one short greeting.", messages: [], tools: [], agent: { name: "OpenAGI" }, context: { signal: AbortSignal.timeout(30_000) } });
           if (!String(result?.text || "").trim()) throw new Error("The model returned no answer. Try again.");
@@ -5111,7 +5130,7 @@ const state = {
   activeRequestMissingSince: null,
   activeRequestText: "",
   activeRequestModel: "",
-  freshChatRequested: false,
+  freshChatRequested: new URLSearchParams(window.location.search).get("onboarding") === "1",
   sessions: [],
   agentId: "main",
   channel: "local",
@@ -9929,6 +9948,7 @@ async function refreshHealth() {
       ? '<span class="status-pill">' + escapeHtml(model || providerLabel) + '</span>' + (budgetLabel ? '<span class="status-pill">' + escapeHtml(budgetLabel) + '</span>' : '')
       : '<a class="status-pill" href="/setup">Connect a model →</a>';
     updateModelNotice();
+    if (p) renderProviderSwitch(p);
   } catch {
     $("status").innerHTML = '<span class="status-pill">offline</span>';
   }
@@ -9966,6 +9986,21 @@ async function refreshAmbientBadge() {
   }
 }
 
+
+function renderProviderSwitch(provider) {
+  const host = $("providerSwitch");
+  if (!host || document.activeElement?.id === "providerSelect") return;
+  const choices = [["auto", "Automatic"], ["anthropic", "Anthropic"], ["openai", "OpenAI / compatible"]];
+  if (!choices.some(([id]) => id === provider.preference)) choices.push([provider.preference, provider.model || "Current model"]);
+  host.hidden = false;
+  host.innerHTML = '<details><summary>Switch model</summary><label for="providerSelect">Saved providers</label><select id="providerSelect">' + choices.map(([id, label]) =>
+    '<option value="' + escapeHtml(id) + '"' + (provider.preference === id ? ' selected' : '') + (id !== "auto" && !provider.available?.[id] && id !== provider.preference ? ' disabled' : '') + '>' + escapeHtml(label) + '</option>'
+  ).join('') + '</select></details>';
+  $("providerSelect").onchange = async event => {
+    try { await postJson("/admin/provider", { preference: event.target.value }); await refreshHealth(); }
+    catch (error) { showToast("Could not switch model: " + error.message, false); await refreshHealth(); }
+  };
+}
 
 const evt = new EventSource("/events");
 evt.addEventListener("message", (e) => {

@@ -32,11 +32,12 @@ exact source under **Assets → Source code**.
 ## Your first five minutes
 
 1. Install and open **http://127.0.0.1:43210/**. The Mac app opens setup for you.
-2. Connect your model in **Settings** and save your dashboard login. Use your
-   own API account, or the ChatGPT sign-in offered by setup. Confirm the model
-   test works; a saved key alone does not mean the agent can answer.
-3. Choose **Save now — set up the rest later**. Other integrations are optional.
-4. Open **Get started**, choose a goal, and click **Guide me in chat**. Read or
+2. Choose a cloud API, ChatGPT sign-in, a local model server, or Apple Intelligence
+   on a compatible Mac or iPhone. Click **Continue**, then **Connect & verify**.
+   Setup saves the model after a real response succeeds.
+3. Save your dashboard access token and choose **Meet your agent**. Other
+   integrations are optional.
+4. Open **Get started**, choose a goal, and click **Try it in chat**. Read or
    edit the starter message, then press Send. The agent teaches one step at a
    time and helps you verify a small result.
 5. Come back for another flow when you need it. Checklists mean you tried a

@@ -91,6 +91,7 @@ jobs:
           fail_on_unmatched_files: true
 
   build-and-publish:
+    needs: native-tests
     if: github.event_name != 'pull_request' && !inputs.verify_only
     runs-on: macos-26   # FoundationModels requires the macOS 26 SDK.
     timeout-minutes: 45

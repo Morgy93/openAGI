@@ -1,4 +1,4 @@
-import { buildDefaultInstructions, buildTurnContext } from "./model-provider.js";
+import { buildDefaultInstructions, buildTurnContext, toolResultImage } from "./model-provider.js";
 import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 
 // Ollama and LM Studio expose Chat Completions, not OpenAI's Responses API.
@@ -64,7 +64,15 @@ export class LocalModelProvider {
         onProgress?.({ stage: "tool", provider: "local", model: this.model, hop: hop + 1, tool: call.function.name });
         const invocation = await toolRegistry.invoke(call.function.name, args, context);
         toolCalls.push({ name: call.function.name, arguments: args, result: invocation });
-        conversation.push(budget.mark({ role: "tool", tool_call_id: call.id, content: clipToolOutput(JSON.stringify(invocation.ok ? invocation.result : { error: invocation.error }), call.function.name) }, { kind: "output", contentKey: "content", tool: call.function.name, hop }));
+        const result = invocation.ok ? invocation.result : { error: invocation.error };
+        const image = invocation.ok ? toolResultImage(result) : null;
+        conversation.push(budget.mark({ role: "tool", tool_call_id: call.id,
+          content: clipToolOutput(JSON.stringify(image ? { ...image.meta, image: "[attached as image below]" } : result), call.function.name)
+        }, { kind: "output", contentKey: "content", tool: call.function.name, hop }));
+        if (image) conversation.push(budget.mark({ role: "user", content: [
+          { type: "text", text: `Screenshot (${image.meta.width}×${image.meta.height}, click coordinates are in this image's space):` },
+          { type: "image_url", image_url: { url: `data:image/${image.format};base64,${image.data}` } }
+        ] }, { kind: "image", tool: call.function.name, hop }));
       }
     }
   }

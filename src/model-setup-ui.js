@@ -12,9 +12,7 @@ export function renderModelSetup({ proposedToken, existingEnv = {} }) {
 ${designTokens}
 body { margin:0; background:var(--panel); color:var(--text); font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
 a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
-.setup-top { display:flex; align-items:center; justify-content:space-between; max-width:1160px; margin:auto; padding:28px 32px; }
-.brand { color:var(--text); font-size:17px; font-weight:650; letter-spacing:-.5px; display:flex; gap:10px; align-items:center; }
-.brand-mark { width:28px; height:28px; border-radius:8px; background:var(--text); color:var(--bg); text-align:center; font-size:24px; line-height:25px; }
+.setup-top { display:flex; align-items:center; justify-content:flex-end; max-width:1160px; margin:auto; padding:28px 32px; }
 .setup-top>a { color:var(--muted); font-size:12px; }
 .setup-layout { max-width:1000px; margin:52px auto; padding:0 32px; display:grid; grid-template-columns:270px minmax(0,1fr); gap:72px; }
 .setup-context { padding-top:24px; }
@@ -56,21 +54,22 @@ button:disabled { opacity:.55; cursor:wait; } .actions .back { border:0; padding
 .token-actions { display:flex; gap:8px; align-items:center; margin-top:8px; } .token-actions button { flex-shrink:0; }
 @media(max-width:760px) { .setup-top { padding:20px; } .setup-layout { margin:12px auto 32px; grid-template-columns:1fr; gap:16px; padding:0 20px; max-width:600px; } .setup-context { padding:0; } .setup-context h1 { font-size:28px; margin-bottom:12px; } .setup-context>p:not(.eyebrow) { display:none; } .setup-steps { display:flex; margin:22px 0 12px; gap:20px; } .setup-steps li { gap:7px; font-size:12px; } .setup-steps span { height:22px; width:22px; } .setup-card { padding:24px; } .choice-badge { display:none; } }
 </style></head><body>
-<header class="setup-top"><a class="brand" href="/"><span class="brand-mark">o·</span>OpenAGI</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md" target="_blank" rel="noopener noreferrer">Setup guide ↗</a></header>
+<header class="setup-top"><a href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md" target="_blank" rel="noopener noreferrer">Setup guide ↗</a></header>
 <main class="setup-layout"><aside class="setup-context"><p class="eyebrow">A little setup. A lot of possibility.</p><h1>Your agent.<br>Your choice of model.</h1><p>Start with a model that works for you. Then we’ll help you put it to work, one conversation at a time.</p>
 <ol class="setup-steps" aria-label="Setup progress"><li aria-current="step"><span>1</span>Choose</li><li><span>2</span>Connect</li><li><span>3</span>Start</li></ol><p class="hint">Keys stay on your agent’s host. Requests go to the model you choose.</p></aside>
-<div><form class="setup-card" id="form" data-selected="${selected}"><input type="hidden" name="OPENAGI_AUTH_TOKEN" id="tokenInput" value="${escape(proposedToken)}">
+<div><form class="setup-card" id="form" data-selected="${selected}" data-has-auth="${Boolean(existingEnv.OPENAGI_AUTH_TOKEN)}"><input type="hidden" name="OPENAGI_AUTH_TOKEN" id="tokenInput" value="${escape(proposedToken)}">
 <section data-step="0"><h2>Choose your model</h2><p class="subtext">Use a cloud provider or keep inference on your device.</p><div class="model-options">
 ${choice('anthropic','Anthropic','Claude with your API key','Cloud')}${choice('openai','OpenAI','GPT with your API key','Cloud')}${choice('local','Local model','Ollama, LM Studio, or a compatible server','Your computer')}${choice('on-device','Apple Intelligence','Built-in model on a compatible Mac or iPhone','No API key')}${choice('chatgpt','ChatGPT plan','Connect an eligible ChatGPT account','Sign in')}
 </div><div class="actions"><span class="hint">You can change this later.</span><button class="primary" type="button" id="chooseNext">Continue →</button></div></section>
 <section data-step="1" hidden><h2 id="connectTitle">Connect your model</h2><p class="subtext" id="connectDescription">We’ll check the connection before you start chatting.</p>
 <fieldset data-provider="anthropic" disabled hidden><label class="field" for="anthropicKey">Anthropic API key ${saved('ANTHROPIC_API_KEY')}</label><input id="anthropicKey" name="ANTHROPIC_API_KEY" type="password" autocomplete="off" placeholder="sk-ant-…"><p class="hint">Get a key at <a href="https://console.anthropic.com/" target="_blank" rel="noopener noreferrer">console.anthropic.com ↗</a></p><details><summary>Model options</summary><label class="field" for="anthropicModel">Model</label><input id="anthropicModel" name="ANTHROPIC_MODEL" type="text" value="${value('ANTHROPIC_MODEL','claude-sonnet-4-6')}"></details></fieldset>
-<fieldset data-provider="openai" disabled hidden><label class="field" for="openaiKey">OpenAI API key ${saved('OPENAI_API_KEY')}</label><input id="openaiKey" name="OPENAI_API_KEY" type="password" autocomplete="off" placeholder="sk-…"><p class="hint">Get a key at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com ↗</a></p><details><summary>Model options</summary><label class="field" for="openaiModel">Model</label><input id="openaiModel" name="OPENAI_MODEL" type="text" value="${value('OPENAI_MODEL','gpt-5')}"></details></fieldset>
-<fieldset data-provider="local" disabled hidden><label class="field" for="localUrl">Model server URL</label><input id="localUrl" name="OPENAGI_LOCAL_BASE_URL" type="url" value="${value('OPENAGI_LOCAL_BASE_URL','http://localhost:11434/v1')}" required><label class="field" for="localModel">Installed model name</label><input id="localModel" name="OPENAGI_LOCAL_MODEL" type="text" value="${value('OPENAGI_LOCAL_MODEL')}" placeholder="e.g. llama3.2" required><div class="note"><strong>Using Ollama?</strong><br>Start <a href="https://ollama.com/download" target="_blank" rel="noopener noreferrer">Ollama</a>, run <code>ollama pull llama3.2</code>, then enter <code>llama3.2</code> above. For LM Studio, start its local server and use its URL ending in <code>/v1</code>.<br>Choose a model with tool support to let your agent take actions.</div><details><summary>Server authentication (optional)</summary><label class="field" for="localKey">Server API key ${saved('OPENAGI_LOCAL_API_KEY')}</label><input id="localKey" name="OPENAGI_LOCAL_API_KEY" type="password" autocomplete="off" placeholder="Only if your server requires one"></details></fieldset>
+<fieldset data-provider="openai" disabled hidden><label class="field" for="openaiKey">OpenAI API key ${saved('OPENAI_API_KEY')}</label><input id="openaiKey" name="OPENAI_API_KEY" type="password" autocomplete="off" placeholder="sk-…"><p class="hint">Get a key at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com ↗</a></p><details><summary>Model options</summary><label class="field" for="openaiModel">Model</label><input id="openaiModel" name="OPENAI_MODEL" type="text" value="${value('OPENAI_MODEL','gpt-5')}"><label class="field" for="openaiBaseUrl">Responses-compatible base URL</label><input id="openaiBaseUrl" name="OPENAI_BASE_URL" type="url" value="${value('OPENAI_BASE_URL','https://api.openai.com/v1')}"><p class="hint">Use the endpoint and model supplied by your provider. An OpenRouter key cannot use the default OpenAI endpoint.</p></details></fieldset>
+<fieldset data-provider="local" disabled hidden><label class="field" for="localUrl">Model server URL</label><input id="localUrl" name="OPENAGI_LOCAL_BASE_URL" type="url" value="${value('OPENAGI_LOCAL_BASE_URL','http://localhost:11434/v1')}" required><label class="field" for="localModel">Installed model name</label><input id="localModel" name="OPENAGI_LOCAL_MODEL" type="text" value="${value('OPENAGI_LOCAL_MODEL')}" placeholder="e.g. llama3.2" required><div class="note"><strong>Using Ollama?</strong><br>Start <a href="https://ollama.com/download" target="_blank" rel="noopener noreferrer">Ollama</a>, run <code>ollama pull llama3.2</code>, then enter <code>llama3.2</code> above. For LM Studio, start its local server and use its URL ending in <code>/v1</code>.<br>Choose a model with tool support to let your agent take actions. Screen tools also require a model with vision support.</div><details><summary>Server authentication (optional)</summary><label class="field" for="localKey">Server API key ${saved('OPENAGI_LOCAL_API_KEY')}</label><input id="localKey" name="OPENAGI_LOCAL_API_KEY" type="password" autocomplete="off" placeholder="Only if your server requires one"></details></fieldset>
 <fieldset data-provider="on-device" disabled hidden><div class="note"><strong>Apple Intelligence</strong><p id="appleAvailability">Checking the native model connection…</p>Requires the OpenAGI Mac or iPhone app, macOS 26 or iOS 26, a compatible device, and Apple Intelligence enabled with its model downloaded. Small on-device models have a shorter context and a smaller tool set.</div><p class="hint">No API key or cloud model account is required.</p></fieldset>
 <fieldset data-provider="chatgpt" disabled hidden><div class="note">Sign in to connect your eligible ChatGPT plan. Your plan’s usage limits apply.</div><button type="button" id="chatgptSignIn">Sign in with ChatGPT ↗</button><p class="hint" id="signInStatus">Return here after signing in, then check the connection.</p></fieldset>
+${!existingEnv.OPENAGI_AUTH_TOKEN ? `<details id="bootstrapAccess" hidden open><summary>Save your dashboard login</summary><p class="hint">Native models and ChatGPT sign-in need a dashboard login before model verification. Copy this token now so you can return even if the connection fails. Keep it private.</p><div class="token-actions"><input type="password" readonly value="${escape(proposedToken)}" aria-label="Dashboard access token"><button type="button" data-copy-token>Copy</button></div></details>` : ''}
 <div class="actions"><button class="back" type="button" id="connectBack">← Back</button><button class="primary" type="submit" id="saveBtn">Connect & verify →</button></div><p class="hint">Verification sends one short test message to your selected model.</p></section>
-<section data-step="2" hidden><div class="ready-mark" aria-hidden="true">✓</div><h2>Your agent is ready.</h2><p class="subtext" id="verifiedModel"></p><div class="ready-list"><div><strong>Start with one useful result</strong>Tell your agent what you’re working on. It will guide you from there.</div><div><strong>Make it yours over time</strong>Add memory, tools, coding agents, or other devices when you need them.</div></div><details><summary>Save your dashboard access</summary><p class="hint">We auto-generated a strong one for this dashboard. Save this token to sign in from another browser. Keep it private; don’t paste it into chat.</p><div class="token-actions"><input id="tokenView" type="password" readonly value="${escape(proposedToken)}" aria-label="Dashboard access token"><button id="copyToken" type="button">Copy</button></div></details><div class="actions"><button class="back" type="button" id="readyBack">← Change model</button><a class="primary-link" href="/?tab=chat&onboarding=1">Meet your agent →</a></div></section>
+<section data-step="2" hidden><div class="ready-mark" aria-hidden="true">✓</div><h2>Your agent is ready.</h2><p class="subtext" id="verifiedModel"></p><div class="ready-list"><div><strong>Start with one useful result</strong>Tell your agent what you’re working on. It will guide you from there.</div><div><strong>Make it yours over time</strong>Add memory, tools, coding agents, or other devices when you need them.</div></div><details><summary>Save your dashboard access</summary><p class="hint">We auto-generated a strong one for this dashboard. Save this token to sign in from another browser. Keep it private; don’t paste it into chat.</p><div class="token-actions"><input id="tokenView" type="password" readonly value="${escape(proposedToken)}" aria-label="Dashboard access token"><button id="copyToken" data-copy-token type="button">Copy</button></div></details><div class="actions"><button class="back" type="button" id="readyBack">← Change model</button><a class="primary-link" href="/?tab=chat&onboarding=1">Meet your agent →</a></div></section>
 <div id="output" role="status" aria-live="polite" hidden></div></form><p class="footnote">Screen access and connected accounts are optional.</p>${existingEnv.OPENAGI_AUTH_TOKEN ? '<p class="footnote"><a href="/">Back to workspace</a> · <a href="/setup?advanced=1">Advanced settings</a></p>' : ''}</div></main>
 <script>(${setupClient.toString()})();</script></body></html>`;
 }
@@ -102,8 +101,17 @@ function setupClient() {
     await post('/setup/save', { ...values, setupModel: true });
     document.cookie = 'openagi_token=' + encodeURIComponent(values.OPENAGI_AUTH_TOKEN) + '; path=/; max-age=2592000; SameSite=Strict';
   };
+  const bootstrapAuth = async () => {
+    if (form.dataset.hasAuth === 'true') return;
+    const token = document.getElementById('tokenInput').value;
+    await post('/setup/save', { OPENAGI_AUTH_TOKEN: token });
+    document.cookie = 'openagi_token=' + encodeURIComponent(token) + '; path=/; max-age=2592000; SameSite=Strict';
+    form.dataset.hasAuth = 'true';
+  };
   const configure = async () => {
     const p = provider();
+    const access = document.getElementById('bootstrapAccess');
+    if (access) access.hidden = !['on-device','chatgpt'].includes(p);
     const names = { anthropic:'Anthropic', openai:'OpenAI', local:'your local model', 'on-device':'Apple Intelligence', chatgpt:'your ChatGPT plan' };
     document.getElementById('connectTitle').textContent = 'Connect ' + names[p];
     form.querySelectorAll('[data-provider]').forEach(el => { el.hidden = el.dataset.provider !== p; el.disabled = el.hidden; });
@@ -125,11 +133,11 @@ function setupClient() {
   form.onsubmit = async event => {
     event.preventDefault(); if (busy) return; busy = true; button.disabled = true;
     document.getElementById('connectBack').disabled = true;
-    message('Saving your model settings…');
+    message('Checking the model connection. This can take a moment…');
     try {
+      if (['on-device','chatgpt'].includes(provider())) await bootstrapAuth();
+      const result = await post('/setup/test', { ...selectedValues(), setupModel: true });
       await save();
-      message('Checking the model connection. This can take a moment…');
-      const result = await post('/setup/test', {});
       document.getElementById('verifiedModel').textContent = result.model + ' answered successfully. You’re connected.';
       show(2);
     } catch (error) { message(error.message + ' You can edit these settings and retry.', true); }
@@ -139,7 +147,7 @@ function setupClient() {
     const signIn = document.getElementById('chatgptSignIn');
     const popup = window.open('about:blank','_blank');
     try {
-      signIn.disabled = true; await save();
+      signIn.disabled = true; await bootstrapAuth();
       const auth = await post('/auth/chatgpt/start', {});
       if (!auth.authorizeUrl) throw new Error('Sign-in could not start.');
       if (popup) { popup.opener = null; popup.location.href = auth.authorizeUrl; }
@@ -150,8 +158,8 @@ function setupClient() {
     } catch (error) { popup?.close(); message(error.message, true); }
     finally { signIn.disabled = false; }
   };
-  document.getElementById('copyToken').onclick = async () => {
-    try { await navigator.clipboard.writeText(document.getElementById('tokenInput').value); document.getElementById('copyToken').textContent = 'Copied'; }
-    catch { document.getElementById('tokenView').type = 'text'; document.getElementById('tokenView').select(); }
-  };
+  form.querySelectorAll('[data-copy-token]').forEach(copy => { copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(document.getElementById('tokenInput').value); copy.textContent = 'Copied'; }
+    catch { const input = copy.parentElement.querySelector('input'); input.type = 'text'; input.select(); }
+  }; });
 }

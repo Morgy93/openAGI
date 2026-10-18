@@ -3,14 +3,14 @@ export const designTokens = `
 :root {
   color-scheme: light;
   --bg:#ffffff; --panel:#f8f9fb; --panel-2:#f0f1f5; --text:#20232b;
-  --muted:#646b79; --line:#e4e6ec; --accent:#5145cd; --accent-soft:#efedfc;
-  --user:#efedfc; --assistant:#fff; --warn:#95621b; --err:#bd3544;
+  --muted:#646b79; --line:#e4e6ec; --accent:#187047; --accent-soft:#eaf5ee;
+  --user:#eaf5ee; --assistant:#fff; --warn:#95621b; --err:#bd3544;
   --background:var(--bg); --foreground:var(--text); --card:var(--bg);
   --card-foreground:var(--text); --popover:var(--bg); --popover-foreground:var(--text);
   --primary:var(--accent); --primary-foreground:#fff; --secondary:var(--panel-2);
   --secondary-foreground:var(--text); --muted-bg:var(--panel); --muted-foreground:var(--muted);
   --accent-bg:var(--accent-soft); --accent-foreground:var(--accent);
-  --border:var(--line); --input:var(--bg); --ring:#5145cd40;
+  --border:var(--line); --input:var(--bg); --ring:#18704740;
   --destructive:var(--err); --destructive-foreground:#fff;
   --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px;
   --radius-sm:6px; --radius:8px; --radius-lg:12px;
@@ -19,9 +19,9 @@ export const designTokens = `
 }
 @media (prefers-color-scheme:dark) {
   :root { color-scheme:dark; --bg:#17181c; --panel:#1e1f24; --panel-2:#292b32;
-    --text:#eff0f5; --muted:#a0a5b3; --line:#32343d; --accent:#b1a6ff;
-    --accent-soft:#302b48; --user:#302b48; --assistant:#17181c; --err:#ff9ca9;
-    --warn:#e6bb73; --primary-foreground:#211c38; --ring:#b1a6ff50; }
+    --text:#eff0f5; --muted:#a0a5b3; --line:#32343d; --accent:#91cfaa;
+    --accent-soft:#21392c; --user:#21392c; --assistant:#17181c; --err:#ff9ca9;
+    --warn:#e6bb73; --primary-foreground:#102b1c; --ring:#91cfaa50; }
 }
 * { box-sizing:border-box; }
 button,input,textarea,select { font:inherit; }
@@ -47,7 +47,6 @@ const item = (id, label, image, extra = '') => `<button type="button" data-tab="
 
 export const navigation = `
 <aside class="app-navigation" id="appNavigation">
-  <a class="app-brand" href="/?tab=chat"><span class="brand-symbol">o<span>·</span></span>OpenAGI</a>
   <nav id="nav" aria-label="Main navigation">
     <div class="nav-group">${item('chat','Chat','chat')}${item('get-started','Get started','start')}</div>
     <div class="nav-group"><p class="nav-label">Workspace</p>
@@ -67,7 +66,7 @@ export const navigation = `
       ${item('outcomes','Outcomes','tasks')}${item('scrutiny','Scrutiny','settings')}
     </div></details>
   </nav>
-  <div class="nav-footer"><button id="setupBtn" type="button">${icon('settings')}Model & settings</button>
+  <div class="nav-footer"><div id="providerSwitch" class="model-switch" hidden></div><button id="setupBtn" type="button">${icon('settings')}Model & settings</button>
   <a href="https://github.com/Spshulem/openAGI" target="_blank" rel="noopener noreferrer">Source & documentation <span>↗</span></a></div>
 </aside>`;
 
@@ -78,9 +77,6 @@ a { color:var(--accent); }
 .app { display:grid; grid-template-columns:224px minmax(0,1fr); grid-template-rows:1fr; }
 .workspace { display:grid; grid-template-rows:64px minmax(0,1fr); min-width:0; min-height:0; }
 .app-navigation { background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0; padding:24px 12px 14px; }
-.app-brand { display:flex; align-items:center; gap:10px; padding:0 12px 26px; color:var(--text); text-decoration:none; font-size:17px; font-weight:650; letter-spacing:-.5px; }
-.brand-symbol { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; background:var(--text); border-radius:8px; color:var(--bg); font-size:26px; line-height:1; font-weight:500; }
-.brand-symbol span { color:#c5bcff; }
 #nav { display:block; overflow-y:auto; margin:0; flex:1; min-height:0; }
 #nav button,#nav a,.nav-footer button { display:flex; align-items:center; gap:10px; padding:9px 12px; width:100%; min-height:38px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:13px; line-height:20px; font-weight:500; text-align:left; text-decoration:none; cursor:pointer; }
 #nav button:hover,#nav a:hover,.nav-footer button:hover { background:var(--panel-2); color:var(--text); }
@@ -91,6 +87,10 @@ a { color:var(--accent); }
 .nav-advanced { margin:0 0 20px; }
 .nav-advanced summary { padding:8px 12px; font-size:12px; color:var(--muted); cursor:pointer; }
 .nav-footer { border-top:1px solid var(--line); padding-top:10px; }
+.model-switch { padding:8px 12px; color:var(--muted); font-size:12px; }
+.model-switch summary { cursor:pointer; }
+.model-switch label { display:block; margin:10px 0 5px; }
+.model-switch select { width:100%; padding:7px; border:1px solid var(--line); border-radius:6px; color:var(--text); background:var(--bg); }
 .nav-footer a { display:flex; justify-content:space-between; color:var(--muted); text-decoration:none; padding:8px 12px; font-size:11px; }
 .workspace-header { background:var(--bg); height:64px; padding:0 28px; gap:16px; }
 .workspace-header h1 { font-size:14px; font-weight:600; letter-spacing:0; }
@@ -149,7 +149,7 @@ a { color:var(--accent); }
 @media(max-width:1100px) { .body { grid-template-columns:190px minmax(0,1fr); } .guide-page { padding:32px; } .app { grid-template-columns:200px minmax(0,1fr); } }
 @media(max-width:760px) {
   .app { grid-template-columns:minmax(0,1fr); } .app-navigation { display:none; position:fixed; inset:56px auto 0 0; width:240px; z-index:60; box-shadow:var(--shadow); }
-  .app-navigation.open { display:flex; } .app-brand { padding-bottom:16px; }
+  .app-navigation.open { display:flex; }
   .workspace { grid-template-rows:56px minmax(0,1fr); } .workspace-header { height:56px; padding:0 16px; gap:10px; }
   .workspace-header #menuToggle { display:block; border:1px solid var(--line); background:var(--bg); color:var(--text); border-radius:6px; padding:6px 10px; cursor:pointer; }
   .workspace-header .status-pill:nth-child(n+2) { display:none; }

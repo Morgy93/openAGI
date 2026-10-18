@@ -47,3 +47,35 @@ Native model availability requires compatible hardware, OS, enabled Apple Intell
 
 The local standalone walkthrough and additional error/native-model screenshots
 are in the Codex artifact `onboarding-redesign/walkthrough.html`.
+
+## Green refinement and functionality parity
+
+- Restored green accents in light and dark appearance and removed the upper-left
+  branding from the workspace and setup page. Refreshed the screenshots above.
+- Compared navigation with current main: all 21 original destinations remain,
+  plus Get started. Fleet and glasses links, advanced settings, and the original
+  quick switch between saved providers remain accessible. The quick switch is
+  now in a compact footer menu.
+- This PR includes functional setup improvements as well as visual changes:
+  candidate models are verified before their settings are saved or activated.
+  A failed change leaves the working model, keys, and background work intact.
+- Native/ChatGPT first-run setup bootstraps only dashboard authentication. Its
+  access token is available to copy before that step, including after a failed
+  model connection. Existing owner tokens remain unchanged.
+- Local vision models receive screenshots as multimodal image content using
+  the existing provider-neutral image parser, with bounded context accounting.
+  Plain-text local models still require a compatible vision model for screen use.
+- The onboarding handoff requests a fresh chat; the compact on-device prompt
+  includes stepwise onboarding and credential/approval guidance. Installation
+  instructions now use the labels displayed by the new wizard.
+- Release signing and publishing now depend on the native test job. No release
+  was created by this verification.
+- Current main's provider-key checks, regional diagnostics, spend/context caps,
+  and Fleet approval/storage fixes were retained during conflict resolution.
+- Verification: 49 focused regressions passed, followed by the six local-model
+  tests after image context accounting changed. Source startup smoke passed.
+  Browser QA verified green accents, no branding, model verification then save,
+  the chat handoff, desktop navigation and the menu at 390px without overflow.
+
+The earlier secondary portable-document links and broader packaging-trigger
+coverage remain documented 4/10 deferrals; neither was claimed fixed by this PR.

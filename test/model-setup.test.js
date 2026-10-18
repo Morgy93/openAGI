@@ -8,6 +8,7 @@ import { renderWizard } from "../src/setup-wizard.js";
 import { createDefaultRuntime, createHostedInterface } from "../src/index.js";
 import { LocalModelProvider } from "../src/local-model-provider.js";
 import { _resetDataDirCache } from "../src/data-dir.js";
+import { createServer } from "node:http";
 
 test("short setup has three steps, one provider at a time, and preserves secrets", () => {
   const html = renderWizard({ existingEnv: { OPENAGI_AUTH_TOKEN: "same-token", OPENAI_API_KEY: "secret-not-rendered", OPENAGI_PROVIDER: "openai" } });
@@ -78,4 +79,41 @@ test("a failed provider stays recoverable and cannot report success", async t =>
   assert.equal(result.status, 400);
   assert.equal(result.body.ok, false);
   assert.doesNotMatch(JSON.stringify(result.body), /private provider diagnostics/);
+});
+
+test("candidate verification preserves the working model, credentials and dashboard login until save", async t => {
+  const working = new LocalModelProvider({ model: "working" });
+  const { post, runtime, dir } = await appFor(t, working);
+  process.env.OPENAGI_PROVIDER = "local";
+  process.env.OPENAGI_LOCAL_MODEL = "working";
+  const saved = "OPENAGI_PROVIDER=local\nOPENAGI_LOCAL_MODEL=working\n";
+  fs.writeFileSync(path.join(dir, ".env"), saved);
+  const fixture = createServer((req, res) => {
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      const fails = JSON.parse(body).model === "broken";
+      res.writeHead(fails ? 503 : 200, { "content-type": "application/json" });
+      res.end(JSON.stringify(fails ? { error: "fixture unavailable" } : { choices: [{ message: { content: "Hello" } }] }));
+    });
+  });
+  await new Promise(resolve => fixture.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => fixture.close(resolve)));
+  const candidate = { setupModel: true, OPENAGI_PROVIDER: "local", OPENAGI_LOCAL_MODEL: "broken",
+    OPENAGI_LOCAL_BASE_URL: `http://127.0.0.1:${fixture.address().port}/v1`, OPENAGI_AUTH_TOKEN: "owner" };
+  assert.equal((await post("/setup/test", candidate)).status, 400);
+  assert.equal(runtime.agentHost.modelProvider, working);
+  assert.equal(process.env.OPENAGI_LOCAL_MODEL, "working");
+  assert.equal(process.env.OPENAGI_AUTH_TOKEN, undefined);
+  assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), saved);
+  candidate.OPENAGI_LOCAL_MODEL = "candidate";
+  const verified = await post("/setup/test", candidate);
+  assert.equal(verified.status, 200);
+  assert.equal(verified.body.model, "candidate");
+  assert.equal(runtime.agentHost.modelProvider, working, "verification alone must not activate the model");
+  assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), saved);
+  assert.equal((await post("/setup/save", candidate)).status, 200);
+  assert.equal(runtime.agentHost.modelProvider.model, "candidate");
+  assert.equal(process.env.OPENAGI_AUTH_TOKEN, "owner");
+  assert.equal(runtime.agentHost.store.listSessions().length, 0);
 });

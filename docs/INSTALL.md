@@ -39,8 +39,8 @@ PowerShell or `sha256sum <file>` on Linux against its accompanying checksum.
    and download its `.dmg`.
 2. Drag OpenAGI to Applications and launch it. The current release workflow
    builds on Apple Silicon; Intel users can run the source runtime below.
-3. Open the menu bar icon and finish **Settings**. Connect your model and save
-   your dashboard login, then choose **Save now**.
+3. Open the menu bar icon and follow **Choose → Connect → Start**. Choose
+   **Connect & verify**, save your dashboard login, then **Meet your agent**.
 4. Choose **Get started** to pick a guided chat. Screen capture, Accessibility,
    account connections, and remote devices are optional, separate steps.
 
@@ -156,8 +156,9 @@ and billing. A connectivity error needs repair before you rely on chat. Without
 a usable provider, deterministic mode lets you explore the UI but does not
 provide normal model reasoning.
 
-Choose **Save now — set up the rest later**, then **Get started**. Pick a goal
-and choose **Guide me in chat**. Read or edit the starter request and press Send.
+Choose **Connect & verify**, save your dashboard access token, then choose
+**Meet your agent**. Under **Get started**, pick a goal and choose **Try it in chat**.
+Read or edit the starter request and press Send.
 See the [first-use guide](GETTING_STARTED.md) for the six flows.
 
 ## Common fixes
