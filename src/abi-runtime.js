@@ -660,6 +660,9 @@ export class AbiRuntime {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
+          // Match the caller's retrieval scope; specialist evidence must not
+          // become shared main memory or deduplicate across specialists.
+          scope: options.scope ?? "main",
           // Put body evidence first so a long summary cannot consume its
           // compression budget. Normalization may use the summary as the
           // body fallback; compare using the same normalization and length

@@ -188,3 +188,27 @@ for (const body of [undefined, null]) {
     assert.match(output.memory.content, /Project update/);
   });
 }
+
+test('specialist signal evidence stays scoped and cannot be recalled by peers', (t) => {
+  const runtime = fixture(t);
+  const scoped = runtime.processSignal(signal('zirconium'), { scope: 'specialist:synthetic-a' });
+  assert.equal(scoped.memory.scope, 'specialist:synthetic-a');
+  assert.equal(runtime.memory.retrieve('zirconium', { scope: 'main' }).length, 0);
+  assert.equal(runtime.memory.retrieve('zirconium', { scope: 'specialist:synthetic-b' }).length, 0);
+  assert.equal(runtime.memory.retrieve('zirconium', { scope: 'specialist:synthetic-a' })[0].item.id, scoped.memory.id);
+});
+
+test('identical signal evidence does not deduplicate across specialist scopes', (t) => {
+  const runtime = fixture(t);
+  const first = runtime.processSignal(signal('zirconium'), { scope: 'specialist:synthetic-a' });
+  const second = runtime.processSignal(signal('zirconium'), { scope: 'specialist:synthetic-b' });
+  assert.notEqual(first.memory.id, second.memory.id);
+  assert.equal(runtime.processSignal(signal('zirconium'), { scope: 'specialist:synthetic-a' }).memory.id, first.memory.id);
+});
+
+test('unscoped signal evidence remains shared with specialists', (t) => {
+  const runtime = fixture(t);
+  const shared = runtime.processSignal(signal('zirconium'));
+  assert.equal(shared.memory.scope, 'main');
+  assert.equal(runtime.memory.retrieve('zirconium', { scope: 'specialist:synthetic-a' })[0].item.id, shared.memory.id);
+});
