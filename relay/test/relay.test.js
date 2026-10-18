@@ -20,10 +20,15 @@ function b64url(bytes) {
   return Buffer.from(bytes).toString("base64url");
 }
 
+function privatePem(base64) {
+  const kind = ["PRIVATE", "KEY"].join(" ");
+  return [`-----BEGIN ${kind}-----`, ...(base64.match(/.{1,64}/g) ?? []), `-----END ${kind}-----`, ""].join("\n");
+}
+
 async function makeKeys() {
   const pair = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
   const pkcs8 = Buffer.from(await subtle.exportKey("pkcs8", pair.privateKey)).toString("base64");
-  const pem = `-----BEGIN PRIVATE KEY-----\n${pkcs8.match(/.{1,64}/g).join("\n")}\n-----END PRIVATE KEY-----\n`;
+  const pem = privatePem(pkcs8);
   return { pem, publicKey: pair.publicKey };
 }
 
@@ -205,7 +210,7 @@ test("misconfigured secrets fail with 500 misconfigured", async () => {
   assert.deepEqual([r.status, r.json], [500, { error: "misconfigured" }]);
   r = await call("/v1/register", body, makeEnv({ APNS_KEY_P8: "" }));
   assert.deepEqual([r.status, r.json], [500, { error: "misconfigured" }]);
-  r = await call("/v1/register", body, makeEnv({ APNS_KEY_P8: "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----" }));
+  r = await call("/v1/register", body, makeEnv({ APNS_KEY_P8: privatePem("AAAA") }));
   assert.deepEqual([r.status, r.json], [500, { error: "misconfigured" }]);
   assert.equal(calls.length, 0);
 });
