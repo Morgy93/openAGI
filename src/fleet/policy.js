@@ -671,7 +671,8 @@ function resolveNudge(ctx, intent, base) {
     // tells the owner why once it has waited a while.
     const ui = deliveryOf(ctx.delivery);
     const uiBlocked = ui.mode !== "cli" && ui.ready === false && Boolean(uiTargetFor(thread));
-    const waitUi = uiWaitReason(thread, ctx.delivery);
+    // computer-use-first too for a thread no CLI may reach (the Codex app's).
+    const waitUi = uiWaitReason(thread, ctx.delivery) ?? (codexExecBarred(thread) ? uiBlockedReason(thread, ctx.delivery) : null);
     if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
     return { ...unreachableDecision(ctx, decision), uiBlocked };
   }

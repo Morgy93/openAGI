@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { CODEX_DESKTOP_ORIGINATOR, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { runStatusOf, findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
 import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
@@ -290,7 +290,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
     if (thread.kind !== "codex") return "codex-exec needs a codex thread";
     if (thread.writerLocked) return "writer-locked: the thread is open in another Codex writer";
     if (thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return "conductor-owned: open it in Conductor";
-    if (thread.meta?.originator === CODEX_DESKTOP_ORIGINATOR) return "codex-app-owned: typed into the Codex app only";
+    if (codexAppOwned(thread)) return "codex-app-owned: typed into the Codex app only";
     if (!isDirectory(thread.cwd)) return "cwd missing";
   }
   if (route === "peer-relay" && !thread.live?.peerName) return "no live peer";
@@ -679,7 +679,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     const route = backgroundRouteFor(thread, config);
     if (!route) {
       // The Codex app owns its threads even while it has not loaded one.
-      if (thread?.kind === "codex" && (thread.writerLocked || thread.meta?.originator === CODEX_DESKTOP_ORIGINATOR)) why.locked = true;
+      if (thread?.kind === "codex" && (thread.writerLocked || codexAppOwned(thread))) why.locked = true;
       return null;
     }
     // An earlier app send may sit in that composer unconfirmed.

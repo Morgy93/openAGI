@@ -419,12 +419,19 @@ export const CONDUCTOR_CODEX_ORIGINATOR = "codex_sdk_ts";
 // verify), and the app then refuses to open it ("open in another app"). So
 // they are only ever typed into the app, never resumed in the background.
 export const CODEX_DESKTOP_ORIGINATOR = "Codex Desktop";
+const CODEX_APP_ORIGINATORS = new Set([CODEX_DESKTOP_ORIGINATOR, "codex_work_desktop"]);
+
+// A thread an app started. Older catalogs leave originator null, but still
+// record source "vscode" for the app's threads (codex exec writes "exec",
+// the CLI "cli").
+export function codexAppOwned(thread) {
+  return CODEX_APP_ORIGINATORS.has(thread?.meta?.originator) || thread?.meta?.source === "vscode";
+}
 
 // A Codex thread codex exec must not resume: Conductor's (it would fork) or
 // the Codex app's (it would lock the owner out of it).
 export function codexExecBarred(thread) {
-  const originator = thread?.meta?.originator;
-  return originator === CONDUCTOR_CODEX_ORIGINATOR || originator === CODEX_DESKTOP_ORIGINATOR;
+  return thread?.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR || codexAppOwned(thread);
 }
 
 // sessionTitle: the Conductor tab title (null when untitled); sessionCount:

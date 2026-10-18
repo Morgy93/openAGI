@@ -1226,7 +1226,8 @@ test("computer-use not ready: the tick waits and sends nothing; computer-use-fir
   const app = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [thread], deps: { uiDriver: readyDriver(false, "screen locked") } });
   const waiting = await app.supervisor.tick({ reason: "test" });
   assert.equal(app.delivered.length, 0);
-  assert.equal(waiting.threads[0].route, null);
+  assert.equal(waiting.threads[0].decision.action, "wait");
+  assert.match(waiting.threads[0].decision.reason, /computer use not ready: screen locked/);
 });
 
 test("a blocked app send spends no attempt and no cooldown, but backs off before trying again", async (t) => {
