@@ -320,12 +320,12 @@ function tomlHeader(raw) {
   return key.parts;
 }
 
-// A top-level `key = "string"` line: { name, value }, else null.
+// A `key = "string"` line, including dotted keys: { parts, value }.
 function tomlStringEntry(raw) {
   const key = tomlKey(raw);
-  if (!key || key.parts.length !== 1 || key.rest[0] !== "=") return null;
+  if (!key || key.rest[0] !== "=") return null;
   const value = tomlString(key.rest.slice(1).trimStart());
-  return value && tomlLineEnds(value.rest) ? { name: key.parts[0], value: value.value } : null;
+  return value && tomlLineEnds(value.rest) ? { parts: key.parts, value: value.value } : null;
 }
 
 // A key part written back: bare when it can be, else a basic string.
@@ -348,10 +348,11 @@ function activeCodexSettings(text) {
     if (header) { table = raw.trim().startsWith("[[") ? null : header; continue; }
     const entry = tomlStringEntry(raw);
     if (!entry || !table) continue;
-    if (!table.length) top[entry.name] = entry.value;
-    else if (table.length === 2 && table[0] === "profiles") {
-      if (!profiles.has(table[1])) profiles.set(table[1], {});
-      profiles.get(table[1])[entry.name] = entry.value;
+    const full = [...table, ...entry.parts];
+    if (full.length === 1) top[full[0]] = entry.value;
+    else if (full.length === 3 && full[0] === "profiles") {
+      if (!profiles.has(full[1])) profiles.set(full[1], {});
+      profiles.get(full[1])[full[2]] = entry.value;
     }
   }
   return { ...top, ...(profiles.get(top.profile) ?? {}) };

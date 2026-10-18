@@ -281,8 +281,8 @@ final class FleetConsumer: ObservableObject {
       switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
       case 200..<300:
         let decoded = try? JSONDecoder().decode(FleetThreadActionResponse.self, from: data)
-        if let state = decoded?.state { apply(state) } else { await refresh() }
         threadNotes[key] = action == "push" ? FleetThreadOutcome.push(decoded?.delivery) : FleetThreadOutcome.muted(decoded?.muted)
+        if let state = decoded?.state { apply(state) } else { await refresh() }
         if expandedThread == key { await loadDetail(key) }
       case 503:
         threadNotes[key] = FleetNote(text: Self.serverError(data) ?? "Supervisor isn't available.", isError: true)

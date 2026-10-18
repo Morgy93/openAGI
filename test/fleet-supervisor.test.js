@@ -4630,6 +4630,28 @@ test("planned durations invalidate judge cache entries", () => {
   assert.notEqual(judgeCacheKey(thread, decision), judgeCacheKey(thread, { ...decision, message: "Run the trial for 60m." }));
 });
 
+test("policy silence and empty-wait counters do not spend another judge call", () => {
+  const thread = makeThread();
+  for (const reason of ["no word in 60m while waiting on bb-verify --full", "waited 60m with nothing visible"]) {
+    const decision = { playbook: "status-check", reason, message: "The agent has been silent for 60m." };
+    assert.equal(judgeCacheKey(thread, decision), judgeCacheKey(thread, { ...decision, reason: reason.replace("60m", "61m"), message: "The agent has been silent for 61m." }));
+  }
+});
+
+test("a mute during question review also holds its phone notification", async (t) => {
+  const judge = fakeJudge({ action: "ask-owner", reason: "needs a call", question: { title: "Continue?", body: "Choose how to proceed.", options: ["yes", "no"] } });
+  const { supervisor, notified } = fixture(t, { mode: "auto", deps: { judge } });
+  supervisor.reviewOpenQuestions = async () => {
+    await Promise.resolve();
+    supervisor.muteThread("codex:t1");
+    return new Set();
+  };
+  await supervisor.tick();
+  assert.ok(supervisor.store.openQuestions().length);
+  assert.equal(notified.length, 0);
+  assert.equal(supervisor.getState().questions.length, 0);
+});
+
 test("muting while a PR check is pending cancels automatic and manual pushes", async (t) => {
   for (const mode of ["auto", "propose"]) {
     const { supervisor, delivered } = fixture(t, { mode });

@@ -223,7 +223,7 @@ function judgeable(decision, thread) {
 // themselves; masked, so only a change in the facts reads the chat again
 // (the cache still expires after JUDGE_CACHE_MS).
 function withoutElapsed(text) {
-  return String(text ?? "").replace(/\b((?:waiting|queued|elapsed|idle|silent|full verify|quick verify)\s+(?:for\s+)?)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#");
+  return String(text ?? "").replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent|full verify|quick verify)\s+(?:for\s+)?)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#");
 }
 
 // Every fact the judge's prompt shows besides the chat (judge.js prLines and
@@ -2395,6 +2395,8 @@ export class FleetSupervisor {
     for (const { id, reopened } of toNotify) {
       const question = store.question(id);
       if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
+      const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+      if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
       if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
-import { JUDGED_PLAYBOOKS, JUDGE_FEATURES_OFF, JUDGE_INSTRUCTIONS, JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFeaturesList, parseFirstJson, validateVerdict, judgeCodexConfig } from "../src/fleet/judge.js";
+import { JUDGED_PLAYBOOKS, JUDGE_FEATURES_OFF, JUDGE_INSTRUCTIONS, JUDGE_SCHEMA, buildJudgePrompt, createNudgeJudge, parseFeaturesList, parseFirstJson, validateVerdict, judgeCodexConfig, codexModelProvider } from "../src/fleet/judge.js";
 
 const NOW = Date.parse("2026-10-11T12:00:00.000Z");
 
@@ -435,4 +435,20 @@ url = "https://private.example"
   assert.ok(minimal.includes('base_url = "https://selected.example"'));
   assert.doesNotMatch(minimal, /old.example|private.example|profiles/);
   assert.match(minimal, /shell_tool = false/);
+});
+
+test("active profile selection accepts dotted and quoted TOML keys", () => {
+  for (const profile of [
+    'profiles.work.model_provider = "selected"\nprofiles.work.model_catalog_json = "/selected/catalog.json"',
+    '[profiles]\nwork.model_provider = "selected"\nwork.model_catalog_json = "/selected/catalog.json"',
+    '[profiles."work"]\n"model_provider" = "selected"\nmodel_catalog_json = "/selected/catalog.json"'
+  ]) {
+    const config = `profile = "work"\nmodel_provider = "old"\n${profile}\n[model_providers.selected]\nbase_url = "https://selected.example"\n[model_providers.old]\nbase_url = "https://old.example"\n`;
+    assert.equal(codexModelProvider(config), "selected");
+    const minimal = judgeCodexConfig(config);
+    assert.match(minimal, /^model_catalog_json = "\/selected\/catalog.json"$/m);
+    assert.match(minimal, /https:\/\/selected.example/);
+    assert.doesNotMatch(minimal, /old.example|profiles/);
+    assert.match(minimal, /shell_tool = false/);
+  }
 });
