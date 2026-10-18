@@ -46,8 +46,48 @@ async function appFor(t, provider) {
     const response = await fetch(address.url + route, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer owner" }, body: JSON.stringify(body) });
     return { status: response.status, body: await response.json() };
   };
-  return { runtime, post, dir };
+  return { runtime, post, dir, url: address.url };
 }
+
+test("configured local loopback models open the dashboard without repeating setup", async t => {
+  const { url } = await appFor(t, new LocalModelProvider({ model: "fixture" }));
+  process.env.OPENAGI_LOCAL_MODEL = "fixture";
+  for (const preference of ["local", "auto"]) {
+    process.env.OPENAGI_PROVIDER = preference;
+    assert.equal((await (await fetch(url + "/health")).json()).firstRun, false);
+    const page = await fetch(url + "/", { redirect: "manual" });
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /id="appNavigation"/);
+  }
+  process.env.OPENAGI_LOCAL_MODEL = "   ";
+  assert.equal((await (await fetch(url + "/health")).json()).firstRun, true);
+  const page = await fetch(url + "/", { redirect: "manual" });
+  assert.equal(page.status, 302);
+  assert.equal(page.headers.get("location"), "/setup");
+});
+
+test("the saved-provider menu cannot disconnect an Apple Intelligence-only setup", async t => {
+  const { url } = await appFor(t);
+  process.env.OPENAGI_AUTH_TOKEN = "owner";
+  const response = await fetch(url + "/", { headers: { authorization: "Bearer owner" } });
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  const source = html.match(/function renderProviderSwitch\(provider\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(source, "run the provider menu shipped in the dashboard");
+  const host = {}, select = {};
+  const context = vm.createContext({
+    $: id => id === "providerSwitch" ? host : select,
+    document: { activeElement: null }, escapeHtml: value => String(value)
+  });
+  vm.runInContext(source, context);
+  context.renderProviderSwitch({ preference: "on-device", model: "Apple Intelligence", available: {} });
+  assert.match(host.innerHTML, /<option value="auto" disabled>/);
+  assert.match(host.innerHTML, /<option value="on-device" selected>/);
+  context.renderProviderSwitch({ preference: "on-device", available: { anthropic: true } });
+  assert.match(host.innerHTML, /<option value="auto">/);
+  context.renderProviderSwitch({ preference: "local", available: {} });
+  assert.match(host.innerHTML, /<option value="auto">/, "local-only Automatic remains available");
+});
 
 test("empty credentials and deterministic fallback are rejected before onboarding success", async t => {
   const { post, dir } = await appFor(t);

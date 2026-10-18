@@ -5179,7 +5179,15 @@ document.addEventListener("keydown", event => { if (event.key === "Escape") clos
 document.addEventListener("click", event => {
   if (!$("appNavigation").contains(event.target) && !$("menuToggle").contains(event.target)) closeNavigation();
 });
-window.addEventListener("popstate", () => switchTab(new URLSearchParams(window.location.search).get("tab") || "chat"));
+async function restoreHistoryLocation() {
+  const search = window.location.search;
+  const requestedTab = new URLSearchParams(search).get("tab");
+  const tab = VALID_TABS.has(requestedTab) ? requestedTab : "chat";
+  await switchTab(tab);
+  const session = deepLinkSessionId(search);
+  if (tab === "chat" && session) await openSessionDeepLink(session, deepLinkRequestId(search));
+}
+window.addEventListener("popstate", restoreHistoryLocation);
 document.getElementById("setupBtn").onclick = () => { window.location.href = "/setup"; };
 
 // Small, dependency-free Markdown renderer for chat replies. It is block-aware
@@ -9991,10 +9999,11 @@ function renderProviderSwitch(provider) {
   const host = $("providerSwitch");
   if (!host || document.activeElement?.id === "providerSelect") return;
   const choices = [["auto", "Automatic"], ["anthropic", "Anthropic"], ["openai", "OpenAI / compatible"]];
+  const automaticWouldDisconnect = provider.preference === "on-device" && !provider.available?.anthropic && !provider.available?.openai;
   if (!choices.some(([id]) => id === provider.preference)) choices.push([provider.preference, provider.model || "Current model"]);
   host.hidden = false;
   host.innerHTML = '<details><summary>Switch model</summary><label for="providerSelect">Saved providers</label><select id="providerSelect">' + choices.map(([id, label]) =>
-    '<option value="' + escapeHtml(id) + '"' + (provider.preference === id ? ' selected' : '') + (id !== "auto" && !provider.available?.[id] && id !== provider.preference ? ' disabled' : '') + '>' + escapeHtml(label) + '</option>'
+    '<option value="' + escapeHtml(id) + '"' + (provider.preference === id ? ' selected' : '') + ((id === "auto" && automaticWouldDisconnect || id !== "auto" && !provider.available?.[id] && id !== provider.preference) ? ' disabled' : '') + '>' + escapeHtml(label) + '</option>'
   ).join('') + '</select></details>';
   $("providerSelect").onchange = async event => {
     try { await postJson("/admin/provider", { preference: event.target.value }); await refreshHealth(); }

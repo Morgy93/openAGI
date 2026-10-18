@@ -69,6 +69,35 @@ function escapeHtmlSource(script) {
   return line;
 }
 
+test("browser Back and Forward restore the URL's conversation and request handoff", async () => {
+  const { script } = await boot();
+  assert.match(script, /window\.addEventListener\("popstate", restoreHistoryLocation\)/);
+  const window = { location: { search: "?tab=chat&session=A&request=request-A" } };
+  const events = [];
+  let shown = "B";
+  const restore = new Function("window", "VALID_TABS", "switchTab", "openSessionDeepLink", `
+    ${extractFunction(script, "deepLinkSessionId")}
+    ${extractFunction(script, "deepLinkRequestId")}
+    ${extractFunction(script, "restoreHistoryLocation")}
+    return restoreHistoryLocation;
+  `)(window, new Set(["chat", "memory"]), async tab => events.push(["tab", tab]), async (session, request) => {
+    shown = session;
+    events.push(["session", session, request]);
+  });
+  await restore();
+  assert.equal(shown, "A");
+  assert.deepEqual(events, [["tab", "chat"], ["session", "A", "request-A"]]);
+  events.length = 0;
+  window.location.search = "?tab=memory&session=B";
+  await restore();
+  assert.deepEqual(events, [["tab", "memory"]], "a different tab ignores conversation parameters");
+  events.length = 0;
+  window.location.search = "?tab=chat&session=B";
+  await restore();
+  assert.equal(shown, "B");
+  assert.deepEqual(events, [["tab", "chat"], ["session", "B", null]]);
+});
+
 // ─── The premise: the overlay ask really does create a durable session ───────
 
 test("premise: an overlay ask persists a session and the reply names its id", async () => {

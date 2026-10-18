@@ -9,7 +9,7 @@ import { renderModelSetup } from "./model-setup-ui.js";
 import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
-// configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
+// or local model configured AND no auth token, every
 // route except /setup, /setup/save, /setup/test, /health, and webhooks
 // redirects to the wizard.
 
@@ -48,11 +48,11 @@ const WIZARD_FIELDS = [
 
 export function isFirstRun() {
   // Considered a first run if both:
-  //   - no provider API key in env
+  //   - no provider API key or local model in env
   //   - no auth token in env
   // (We don't use the .env file directly here because env-loading already
   // happened at boot; the wizard saves to .env so subsequent boots have it.)
-  const hasProvider = Boolean(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY);
+  const hasProvider = Boolean(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENAGI_LOCAL_MODEL?.trim());
   const hasAuth = Boolean(process.env.OPENAGI_AUTH_TOKEN);
   return !hasProvider && !hasAuth;
 }
