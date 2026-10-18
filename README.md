@@ -2,208 +2,114 @@
   <img src="assets/logo.png" alt="OpenAGI" width="128" height="128" />
 </p>
 
-<h1 align="center">OpenAGI — Proactive Personal Assistant That Learns</h1>
+<h1 align="center">OpenAGI — an agent that keeps context and keeps working</h1>
 
-<p align="center"><strong>A self-improving, proactive agent.</strong></p>
-<p align="center"><em>It learns. It reaches out. It earns its keep.</em></p>
+Run a personal agent on a computer you control. Chat with it, teach it your
+preferences, monitor coding agents, and connect your tools and devices. Add
+screen observation or approved computer interaction when you need them.
 
-> Most agents sit there and wait for a prompt. OpenAGI runs as a daemon on your machine, picks up on the things you do over and over, and pings you with what it can take off your plate.
+**[Download for macOS](https://github.com/Spshulem/openAGI/releases/latest)** ·
+**[Windows install](docs/INSTALL.md#windows-from-source-powershell)** ·
+**[Linux / Raspberry Pi install](docs/INSTALL.md#linux-and-raspberry-pi)** ·
+**[First-use guide](docs/GETTING_STARTED.md)** ·
+**[Website](https://openagi.sh)**
 
-**Website:** [openagi.sh](https://openagi.sh) · **Install:** `curl -fsSL openagi.sh | sh` · **Source:** [github.com/Spshulem/openAGI](https://github.com/Spshulem/openAGI)
+## Pick your install
 
-```text
-[Mon · 7:42 am]
-↗ I noticed a morning routine.
-  For the past 5 weekdays you:
-    · check #incidents in Slack
-    · pull yesterday's deploys from GitHub
-    · draft a standup note
-  I can run this every morning at 7:30 am and have it waiting.
-  → approved · saved as /morning-standup
+| Platform | Start here | Includes |
+| --- | --- | --- |
+| **macOS** | [Download the latest DMG](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
+| **Windows** | [Download source ZIP](https://github.com/Spshulem/openAGI/archive/refs/heads/main.zip), then [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; Node.js 22+ required for source installs |
+| **Linux / Raspberry Pi** | [Install guide](docs/INSTALL.md#linux-and-raspberry-pi) or [download source archive](https://github.com/Spshulem/openAGI/archive/refs/heads/main.tar.gz) | Browser dashboard, persistent runtime, optional systemd service; Linux x64/arm64 Docker image |
+| **iPhone / Android** | [Companion app and pairing](mobile/README.md) | Mobile source with tasks, chat, approvals, and supervisor views; no public store download linked |
 
-[Mon · 2:31 pm]
-↗ Prep for your 3 pm with Acme Corp.
-  4 tickets in last 30 days about CSV export limits.
-  Mentioned competitor "Vellum" last call.
-  Renewal in 6 weeks — expansion potential.
-  Brief drafted. Want me to open it?
+The latest release currently has a Mac installer. Releases built with the new
+portable-download workflow also attach Windows x64 and Linux x64/arm64 bundles
+with Node included. See [download availability and launch instructions](docs/INSTALL.md#downloads).
+Source ZIP/archive links above track `main`; each GitHub release also offers its
+exact source under **Assets → Source code**.
+
+## Your first five minutes
+
+1. Install and open **http://127.0.0.1:43210/**. The Mac app opens setup for you.
+2. Connect your model in **Settings** and save your dashboard login. Use your
+   own API account, or the ChatGPT sign-in offered by setup. Confirm the model
+   test works; a saved key alone does not mean the agent can answer.
+3. Choose **Save now — set up the rest later**. Other integrations are optional.
+4. Open **Get started**, choose a goal, and click **Guide me in chat**. Read or
+   edit the starter message, then press Send. The agent teaches one step at a
+   time and helps you verify a small result.
+5. Come back for another flow when you need it. Checklists mean you tried a
+   flow; they do not automatically connect accounts or grant permissions.
+
+For a source install with Node.js 22+:
+
+```sh
+git clone https://github.com/Spshulem/openAGI.git
+cd openAGI
+npm ci --ignore-scripts
+npm run serve
 ```
 
-That's the difference. Hermes Agent, OpenClaw, SwarmClaw, even cloud agents like Claude.ai and Operator sit dormant until you type something. OpenAGI is **proactive** — it runs as a daemon, reads your activity, and surfaces things on its own. The first hour you have it installed, it's already noticing patterns. The first week, it's drafting skills. By month two it's doing the boring half of your work without being asked.
+Windows PowerShell users can use `npm.cmd ci --ignore-scripts` and
+`npm.cmd run serve`. Source/portable users should relaunch after setup asks for
+a restart. See [all install paths, Docker, updates, and troubleshooting](docs/INSTALL.md).
 
-Everything lives under `~/.openagi/` on your machine. No accounts. No telemetry. No cloud component. Bring your own LLM (OpenAI, Anthropic, Ollama).
+## What you can do
 
----
+| Goal | Where to start | What to verify |
+| --- | --- | --- |
+| **Talk to one persistent agent** | Chat; connect only the integrations you need | The configured model answers and uses the tools actually connected |
+| **Remember preferences and corrections** | Memory, then Skills | Ask it to remember a non-sensitive preference, recall it in another chat, and correct it |
+| **Monitor coding agents** | More → Coding Agents; Fleet | Supported providers, project folders, current sessions, and actual verification evidence; begin in observe mode |
+| **Learn from routines** | Optional Mac Capture, Computer History, Skills suggestions | Review captured context and suggested workflows before adopting them |
+| **Watch a screen or take action** | More → Computer Use | A selected supported node, fresh readiness, required OS permissions, and your explicit session approval |
+| **Connect several computers** | More → Nodes | Your main host, scoped pairing, fresh heartbeats, and each node's actual capabilities |
+| **Connect an iPhone or Android phone** | [Pair a companion app](mobile/README.md) | The phone can reach the main host and perform the flow you need |
+| **Use glasses or build onto hardware** | Connect glasses; [G2 guide](docs/setup/even-g2.md); Linux/arm64 runtime | Compatible client software, transport, and advertised capabilities |
+| **Extend the agent** | Skills and Integrations / MCP | Review the code, tools, accounts, and permissions you add |
 
-## The three innovations
+**[Walk through these flows in chat →](docs/GETTING_STARTED.md)**
 
-Stronger reasoning and prediction alone aren't going to produce AGI. A system that can perform emergent tasks and interact with the world without intervention needs three things working together. OpenAGI is built around them.
+## Why a persistent runtime helps
 
-> The full thinking is in **[WHITEPAPER.md](WHITEPAPER.md)** — a personal essay on why these three, why now, and how they map to the code. If you want the marketing-friendly version, keep scrolling. If you want the manifesto, read that.
+OpenAGI connects work across conversations. Its scrutiny loop evaluates incoming
+signals, its tiered memory keeps and consolidates useful context, and bounded
+specialists can handle recurring work. Corrections can update stored facts.
+Scheduled prompts and enabled integrations let work happen between chats, while
+reviewed skills make useful routines repeatable. The [whitepaper](WHITEPAPER.md)
+and [architecture guide](docs/abi-architecture.md) explain the design.
 
-### 1. Directional Adaptive Scrutiny — `src/directional-adaptive-scrutiny.js`
+These are capabilities to configure and verify, not a promise that installing
+an app will make it autonomously learn or finish work. Useful results depend on
+the model, inputs, connected tools, running host, and permissions you choose.
 
-A scrutinizer with **direction but no fixed outcome**, predictable in its logic, diverse in what it can evaluate, and capable of polarized verdicts. Today's reinforcement learning is monolithic — one objective, one right answer. Real environments are *cyclical, diverse, and extreme,* and that's what produces emergent intelligence. OpenAGI scores every incoming signal on seven axes (`urgency / impact / novelty / repetition / risk / confidence / specificity`) and decides one of five things: `act`, `ask`, `watch`, `ignore`, `propagate`. That decision drives everything downstream.
+## Your data, devices, and control
 
-### 2. Tiered Memory — `src/memory-system.js`
+State defaults to `~/.openagi` on the host (`%USERPROFILE%\.openagi` on Windows).
+You choose the main computer, model, and integrations. Selected prompts, tool
+results, and screen context may be sent to your configured provider and services;
+local storage does not mean inference always stays on-device.
 
-Short-term (RAM — what you need right now), medium-term (day-to-day), long-term **Lava** (durable truths reasoned from feeling, not logic). Memory decays. Repeated raw items get condensed into principles. Compression isn't a performance optimization — it's evolutionary pressure. Perfect memory is a curse, not a gift; a system that can't forget can't progress. Most LLMs only have RAM and long-term storage with nothing managing what flows where. OpenAGI manages it: durable JSONL+snapshot stores for each tier, a condenser that promotes/demotes, and a recall layer that reasons about *fidelity*, not just hits.
+Observation, live computer control, coding-agent instructions, and automatic
+nudging have separate setup and approval boundaries. Phones and glasses reach
+the main over a network you configure; the host needs to be awake and reachable.
+An online device only supports the capabilities it advertises.
 
-### 3. Propagation — `src/propagation-controller.js`
+The code is **source-available under [PolyForm Noncommercial 1.0.0](LICENSE)**.
+You can inspect and build within its terms. It is not an OSI open-source license;
+commercial use requires separate permission. We do not change the license or
+claim universal hardware support.
 
-Specialization through **division, not multiplication.** When a task becomes repetitive *or* novel-but-high-risk, the system spawns a bounded specialist with its own scope, memory, and tools — and the main system goes on autopilot for that lane. Multiplying the agent 1:1 is cancerous (creates complexity without value); dividing creates depth without sprawl. Specialists that don't earn their keep get retired by the daily quality sweep. Whether you look at synapses, hierarchies, or companies, the goal is the same: specialize repetitive tasks, recover the cycles for the things that matter.
+## Guides
 
----
-
-## What this looks like to you
-
-The three innovations above are the engine. The user-visible behavior that falls out of them:
-
-- **Proactive.** The agent runs in the background, watches your activity (opt-in), and reaches out — "I noticed a routine," "Heads up," "I drafted a skill." It starts the conversation. Other local agents wait for prompts.
-- **Persistent.** Conversations, corrections, and decisions stick across sessions. Corrections you make once never have to be made twice.
-- **Specialized over time.** As your patterns become clear, OpenAGI propagates specialists — by month three, the boring half of your work is being handled by sub-agents that aren't asking you for input.
-- **Local + private.** Everything lives under `~/.openagi/`. No accounts, no telemetry, no cloud component. Bring your own LLM (OpenAI, Anthropic, anything that speaks the OpenAI Responses API).
-
----
-
-## How OpenAGI compares
-
-The highlighted rows are the bet — Scrutiny, tiered Memory, Propagation, the corrections loop, and the proactive behavior they enable. Everything below the line is table stakes for any local-agent runtime now.
-
-|                                                | OpenAGI | Hermes Agent  | OpenClaw    | SwarmClaw       | Operator | Claude.ai |
-|------------------------------------------------|:-------:|:-------------:|:-----------:|:---------------:|:--------:|:---------:|
-|                                                | _local_ |    _local_    |   _local_   |     _local_     | _cloud_  |  _cloud_  |
-| **Directional Adaptive Scrutiny**              | **✅**  |       —       |      —      |        —        |    —     |     —     |
-| **Tiered Memory (short / medium / Lava)**      | **✅**  |       —       |      —      |        —        |    —     |     —     |
-| **Propagation — bounded specialists**          | **✅ auto-spawn** | parallel only |  —  | manual org chart |    —     |     —     |
-| **Corrections lock in, never repeat**          | **✅**  |       —       |      —      |        —        |    —     |     —     |
-| **Reaches out to you (proactive)**             | **✅**  |       —       |      —      |        —        |    —     |     —     |
-| **Watches your work, learns patterns**         | **✅**  |       —       |      —      |        —        |    —     |     —     |
-| **Auto-drafts skills from observed routines**  | **✅**  |       —       |      —      |        —        |    —     |     —     |
-| Runs on your machine                           |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
-| Your data stays local (bar prompts to your LLM) |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
-| Bring your own LLM                             | ✅ any  |   ✅ 200+    |     ✅      |     ✅ 23+      |    —     |     —     |
-| Persistent memory across sessions              | ✅ tiered | ✅ FTS5     | ✅ markdown |    ✅ durable   | limited  | limited   |
-| Multi-channel (Sendblue / Telegram / HTTP)          |   ✅    |      ✅       |     ✅      |  dashboard only |    —     |     —     |
-| MCP server support                             |   ✅    |      ✅       |     ✅      |       ✅        |   some   |     —     |
-| Skills system                                  |   ✅    |      ✅       |     ✅      |    ✅ reviewed  |    —     |     —     |
-| Cron / scheduled tasks                         |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
-| Source-available                               |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
-| No telemetry, no accounts                      |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
-
-The three direct competitors all sit in the local-first daemon space. [Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearch, 142k+ stars) is the current leader and absorbed OpenClaw via `hermes claw migrate`. [OpenClaw](https://github.com/openclaw/openclaw) (formerly Moltbot / Clawdbot) is the original daemon shape — messaging gateway + memory + skills. [SwarmClaw](https://github.com/swarmclawai/swarmclaw) is the newest, dashboard-first multi-agent runtime with manually-configured org charts of persistent agents that delegate to each other. All three are answer-machines: you start every conversation. They handle propagation differently — Hermes spawns **parallel subagents per turn**, SwarmClaw uses **manually-configured org charts**, OpenAGI **auto-spawns persistent specialists** when Scrutiny decides the task warrants one. Cloud agents (Operator, Claude.ai) sit dormant too. The hard problem in agents isn't running locally; it's **a system that scrutinizes signals, manages memory at three fidelities, specializes through division, and locks in your corrections.** Once those four loops are running, *reaching out first* isn't a feature you bolt on — it's what falls out.
-
-If you want the long form on why these (and not, say, "more parameters") get you closer to AGI, read **[WHITEPAPER.md](WHITEPAPER.md)**.
-
----
-
-## Get started
-
-One command. Then leave it running. The proactive part needs time to watch.
-
-**Linux / Raspberry Pi / SBC:**
-```bash
-curl -fsSL openagi.sh | sh
-```
-
-**macOS / from source:**
-```bash
-git clone https://github.com/Spshulem/openAGI && cd openAGI && npm install && npm run serve
-```
-
-**Docker:**
-```bash
-docker run -d --name openagi -p 43210:43210 -v openagi-data:/data ghcr.io/spshulem/openagi:latest
-```
-
-Open `http://127.0.0.1:43210/`. Drop in an OpenAI or Anthropic key in the wizard (or skip and run in deterministic mode while you poke around). That's all the setup — there's nothing else to configure to get the proactive value flowing.
-
-### What happens next, with no further input from you
-
-| When | What you'll see |
-|------|-----------------|
-| Right away | Chat UI, MCP tab, Skills tab, Memory tab, Activity tab. Tools like `remember`, `recall`, `schedule_message` already work. |
-| After 1 chat | The agent remembers. Ask it later "what did we decide about X" — it knows. |
-| First night _(03:30 UTC)_ | **Session miner** runs across your chat history, clusters recurring intents, drafts skills you might want, drops them in the Suggested tab. |
-| First hour | If you've enabled Mac screen capture, the **workflow miner** checks action sequences and can surface an already-repeated routine without waiting overnight. |
-| First night _(02:30 local)_ | The deep pass rechecks day/week cadence and longer-running workflows, then drafts any newly supported skills. |
-| Each Mac notification | "OpenAGI learned a new skill" — click to review, accept with one click, and it's saved as a real `SKILL.md` the agent can run. |
-| Ongoing | Schedule a prompt with `schedule_message` and OpenAGI texts/Telegrams you when it fires. |
-
-The whole point is you don't sit there typing prompts. You install it, you go back to work, and it tells you what's worth doing.
-
----
-
-## Install
-
-All install paths end with a daemon listening on `127.0.0.1:43210` and a setup wizard at `/setup`.
-
-### Linux (one-line installer)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh | sh
-```
-
-Auto-detects Docker vs. native systemd, installs Node if missing, sets up the service, prints the wizard URL.
-
-### macOS / Linux (from source)
-
-```bash
-git clone https://github.com/Spshulem/openAGI && cd openAGI
-npm install
-npm run serve                # http://127.0.0.1:43210/setup
-```
-
-For always-on:
-
-```bash
-npm run install-launchd      # macOS — auto-start at login + auto-restart on crash
-npm run install-systemd      # Linux — same, via systemd (sudo for system-wide; pass 'user' for rootless)
-```
-
-Supervised installs intentionally exit non-zero after an uncaught synchronous
-exception so launchd/systemd can replace a potentially corrupted process. A PID
-that still owns the port is not considered healthy unless `GET /health` answers;
-recoverable asynchronous integration failures remain logged without stopping
-the daemon.
-
-### macOS native menu bar app
-
-A SwiftUI menubar app that bundles Node + the runtime + Sparkle auto-update + screen capture + replay confirmation:
-
-```bash
-./scripts/build-mac-app.sh                            # unsigned local build
-SIGN_IDENTITY="Developer ID Application: ..." \
-  NOTARIZE=1 DMG=1 \
-  AC_USERNAME=... AC_PASSWORD=... AC_TEAM_ID=... \
-  ./scripts/build-mac-app.sh                          # signed, notarized .dmg
-```
-
-Output: `build/OpenAGI.app` (+ optional `.dmg`). See [`mac/README.md`](mac/README.md) for Sparkle key setup, hardened-runtime entitlements, and release signing.
-
-### Docker / Linux SBC (Raspberry Pi, Jetson, x86)
-
-```bash
-docker run -d --name openagi \
-  -p 43210:43210 -v openagi-data:/data \
-  ghcr.io/spshulem/openagi:latest
-```
-
-Multi-arch image (`linux/amd64` + `linux/arm64`). Or with compose:
-
-```bash
-cp .env.example .env
-docker compose -f docker-compose.example.yml up -d
-```
-
-### Updates
-
-```bash
-npm run update                 # auto-detects mode (docker/systemd/launchd/source) and updates in place
-npm run install-update-timer   # Linux: install a weekly auto-update timer (Sundays 04:00)
-```
-
-For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the OpenAGI container. Signed Mac `.app` releases check daily and install/restart automatically by default, which keeps unattended nodes current. The menu-bar **Updates** submenu remains the source of truth and lets a user disable either behavior; saved choices override the first-run defaults.
+- [Install, downloads, updates, and troubleshooting](docs/INSTALL.md)
+- [Guided first-use flows](docs/GETTING_STARTED.md)
+- [Coding Agents](docs/setup/coding-supervisor.md) and [Fleet supervisor](docs/setup/fleet-supervisor.md)
+- [Computer Use readiness](docs/setup/computer-use-readiness.md) and [optional backend](docs/setup/open-computer-use.md)
+- [Mobile setup](mobile/README.md) and [mobile feature surface](mobile/FEATURES.md)
+- [Even G2](docs/setup/even-g2.md), [remote channels](docs/setup/remote-channels.md), and [integrations](docs/setup/partner-and-integrations.md)
+- [Architecture](docs/abi-architecture.md), [whitepaper](WHITEPAPER.md), and [release process](docs/RELEASE.md)
 
 ---
 
@@ -583,14 +489,12 @@ test/
 
 ---
 
-## Roadmap
+## Development direction
 
-- **Remote capture streaming _(coming soon)_** — run the agent daemon on one machine (e.g. a home Mac mini) and stream screen captures + activity from any number of laptops/desktops to it. Foundation is already wired: `CaptureBridge` POSTs observations to `/observations` over HTTP with bearer auth. What's left is a thin "capture-only" client mode that points at a remote daemon URL + a tunnel, plus per-source attribution so the agent can answer "what was I doing on the work laptop yesterday vs. the home Mac". Track in [`docs/ROADMAP.md`](docs/ROADMAP.md).
-- HTTP / SSE MCP transport for a richer client capability than current stdio.
-- Specialist routing — when a message matches a specialist's bounded scope, route to it instead of always `main`.
-- Embeddings-backed memory search alongside the current keyword overlap.
-- Per-channel delivery policies and retry queues.
-- Sparkle release pipeline so the Mac `.app` updates automatically.
+See [the architecture](docs/abi-architecture.md), the setup guides above, and
+current issues/PRs for implementation work. Older scope documents describe plans
+at the time they were written; use a release's assets and a verified setup flow
+to establish what is available on your platform today.
 
 ---
 

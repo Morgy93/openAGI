@@ -14,6 +14,7 @@ import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
 import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
 import { codingSupervisorUi } from "./coding-supervisor-ui.js";
+import { getStartedUi } from "./get-started-ui.js";
 import { VocaleoClient } from "./integrations/vocaleo.js";
 import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
@@ -5163,6 +5164,7 @@ function renderApp() {
       <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
            on narrow windows; the other 11 tabs live behind "More ▾". -->
       <button data-tab="chat" class="active" title="Talk to your agent in natural language.">Chat</button>
+      <button data-tab="get-started" title="Choose a goal and learn OpenAGI with guided chat.">Get started</button>
       <button data-tab="tasks" title="My tasks + agent tasks. The agent's own queue gets drained every 30 min by the autopilot pulse.">Tasks</button>
       <button data-tab="review" title="Search and work through every open task, draft, clarification, and suggestion behind Quick Ask.">Review</button>
       <button data-tab="approvals" id="approvalsNav" title="Agent actions that require your explicit approval before they run.">Approvals <span id="approvalsNavCount" class="badge" hidden></span></button>
@@ -5678,6 +5680,9 @@ async function switchTab(tab) {
       const latest = latestInteractiveSession(state.sessions);
       if (latest) await loadSession(latest.id);
     }
+  } else if (tab === "get-started") {
+    showSidebar(false);
+    renderGettingStarted();
   } else if (tab === "cron") {
     showSidebar(true);
     sidebarTitle.textContent = "Schedules";
@@ -6435,7 +6440,8 @@ function renderFirstRunWelcome() {
   return \`
     <div class="ui-card ui-card-elev" style="margin: var(--space-4) 0; padding: var(--space-5);">
       <h2 style="margin: 0 0 var(--space-2); font-size: 18px;">Welcome to OpenAGI 👋</h2>
-      <p class="ui-muted" style="margin: 0 0 var(--space-4);">You're set up. Here's what's worth doing first — talk to your agent any time you want, but most users start with one of these:</p>
+      <p class="ui-muted" style="margin: 0 0 var(--space-4);">Start with one useful result. Learn memory, agent monitoring, screen observation, computer control, and connected devices at your own pace.</p>
+      <p><a class="ui-btn ui-btn-primary" href="/?tab=get-started">Choose a goal and get guided in chat</a></p>
       <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-3);">
         <a class="ui-card" data-welcome-target="integrations" style="cursor:pointer; text-decoration:none; color:inherit;">
           <div style="font-weight: 600; margin-bottom: 4px;">🔌 Connect your tools</div>
@@ -7134,6 +7140,7 @@ function openMcpComposer() {
 }
 
 ${codingSupervisorUi}
+${getStartedUi}
 ${vocaleoUi}
 
 async function renderAgents() {
@@ -10279,7 +10286,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","get-started","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");

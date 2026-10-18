@@ -26,6 +26,11 @@ permissions:
   contents: write   # so we can upload release assets
 
 jobs:
+  publish-runtime:
+    needs: build-and-publish
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    uses: ./.github/workflows/runtime-downloads.yml
+
   build-g2:
     runs-on: ubuntu-latest
     timeout-minutes: 15
