@@ -14,8 +14,11 @@ tomorrow” can support a proposal. Existing pending tasks are supplied to the
 observer so it can avoid duplicates. Screen text remains untrusted context.
 
 Suggestions require acceptance by default. With `OPENAGI_AUTO_TASKS=1`, only
-an unfinished task backed by an excerpt from the owner's direct recent chat
-can be created automatically. Screen-derived plans still appear as proposals
+an unfinished task whose title exactly matches a complete supplied owner chat
+statement can be created automatically. The statement must have at least four
+words and 20 characters. It is filed in the user's queue with a fixed capture
+description; generated rationale cannot append extra work. Paraphrases, short
+fragments and screen-derived plans still appear as proposals
 for review, even when that flag is enabled. Older proposals without intent
 metadata also require review; accepting a proposal manually still works.
 

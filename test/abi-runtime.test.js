@@ -2645,7 +2645,7 @@ test("proactive-observer: evidenced owner intent materializes with OPENAGI_AUTO_
         generate: async () => ({
           text: JSON.stringify({
             category: "task",
-            title: "Review PR #42 before standup",
+            title: "I will review PR #42 before standup",
             taskIntent: { state: "planned", evidence: "I will review PR #42 before standup" },
             rationale: "The PR was open repeatedly and standup is coming up.",
             queue: "agent",
@@ -2674,13 +2674,13 @@ test("proactive-observer: evidenced owner intent materializes with OPENAGI_AUTO_
   assert.equal(result.candidate.taskAutoCreated, true);
   assert.ok(result.candidate.taskId);
 
-  const queued = tasks.list({ queue: "agent", limit: 10 });
+  const queued = tasks.list({ queue: "user", limit: 10 });
   assert.equal(queued.length, 1);
-  assert.equal(queued[0].title, "Review PR #42 before standup");
+  assert.equal(queued[0].title, "I will review PR #42 before standup");
   assert.equal(queued[0].source, "proactive-observer");
   assert.equal(queued[0].sourceMeta.suggestionId, result.candidate.id);
-  assert.match(queued[0].description, /Produce a draft only/);
-  assert.ok(queued[0].tags.includes("draft-only"));
+  assert.match(queued[0].description, /Captured from your explicit recent chat plan/);
+  assert.equal(queued[0].queue, "user");
 
   assert.equal(observer.list().length, 0, "auto-created task suggestions should not sit pending");
   assert.equal(observer.list({ status: null }).length, 1, "resolved suggestion remains in history");

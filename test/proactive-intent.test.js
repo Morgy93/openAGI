@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { ProactiveObserver } from "../src/proactive-observer.js";
 
-async function observe(t, { state, evidence, chat = [], auto = false, mode = "default" }) {
+async function observe(t, { state, evidence, title = "Review PR 42", chat = [], auto = false, mode = "default" }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-intent-"));
   const previous = process.env.OPENAGI_AUTO_TASKS;
   if (auto) process.env.OPENAGI_AUTO_TASKS = "1"; else delete process.env.OPENAGI_AUTO_TASKS;
@@ -26,7 +26,7 @@ async function observe(t, { state, evidence, chat = [], auto = false, mode = "de
         isConfigured: () => true,
         generate: async (input) => {
           instructions = input.instructions;
-          return { text: JSON.stringify({ category: "task", title: "Review PR 42", rationale: "Follow-up", taskIntent: { state, evidence } }) };
+          return { text: JSON.stringify({ category: "task", title, rationale: "Unrelated generated instructions", queue: "agent", taskIntent: { state, evidence } }) };
         }
       }
     },
@@ -54,18 +54,33 @@ test("screen-derived plans stay proposals even with automatic tasks enabled", as
   const { result, added } = await observe(t, { state: "planned", evidence: "I will review PR 42 tomorrow.", auto: true });
   assert.equal(result.suggested, 1);
   assert.equal(result.candidate.status, "pending");
-  assert.deepEqual(result.candidate.taskIntent, { state: "planned", source: "screen" });
+  assert.deepEqual(result.candidate.taskIntent, { state: "planned", source: "screen", autoCreateApproved: false });
   assert.equal(added.length, 0);
 });
 
 for (const mode of ["default", "long-horizon"]) {
   test(`${mode} observer accepts direct owner plans and applies context rules`, async (t) => {
     const evidence = "I will review PR 42 tomorrow.";
-    const { result, added, instructions } = await observe(t, { state: "planned", evidence, chat: [evidence], auto: true, mode });
+    const { result, added, instructions } = await observe(t, { state: "planned", evidence, title: evidence, chat: [evidence], auto: true, mode });
     assert.equal(result.candidate.status, "accepted");
     assert.equal(added.length, 1);
+    assert.equal(added[0].title, evidence);
+    assert.doesNotMatch(added[0].description, /Unrelated generated instructions/);
+    assert.equal(result.candidate.taskQueue, "user");
     assert.equal(result.candidate.taskIntent.source, "user-chat");
     assert.match(instructions, /already completed/);
     assert.match(instructions, /untrusted context/);
+  });
+}
+
+for (const evidence of ["will", "I will review PR 42 tomorrow."]) {
+  test(`owner quote ${JSON.stringify(evidence)} cannot authorize an unrelated task`, async (t) => {
+    const { result, added } = await observe(t, {
+      state: "planned", evidence, title: "Delete an unrelated archive", auto: true,
+      chat: ["I will review PR 42 tomorrow."]
+    });
+    assert.equal(result.candidate.status, "pending");
+    assert.equal(result.candidate.taskIntent.autoCreateApproved, false);
+    assert.equal(added.length, 0);
   });
 }

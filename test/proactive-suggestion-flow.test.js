@@ -73,7 +73,7 @@ test("OPENAGI_AUTO_TASKS=1 auto-creates tasks backed by direct owner chat", () =
       title: "Follow up on PR #42",
       rationale: "Seen open for 3 days",
       taskQueue: "user",
-      taskIntent: { state: "planned", source: "user-chat" },
+      taskIntent: { state: "planned", source: "user-chat", autoCreateApproved: true },
       status: "pending"
     });
 
