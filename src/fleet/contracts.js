@@ -414,6 +414,26 @@ export function antigravityOpenChat(thread) {
 // they show in Conductor, not in the Codex app.
 export const CONDUCTOR_CODEX_ORIGINATOR = "codex_sdk_ts";
 
+// Threads the Codex app started carry this originator. codex exec on one
+// takes its writer lock for the whole turn, often hours (a CI wait, a full
+// verify), and the app then refuses to open it ("open in another app"). So
+// they are only ever typed into the app, never resumed in the background.
+export const CODEX_DESKTOP_ORIGINATOR = "Codex Desktop";
+const CODEX_APP_ORIGINATORS = new Set([CODEX_DESKTOP_ORIGINATOR, "codex_work_desktop"]);
+
+// A thread an app started. Older catalogs leave originator null, but still
+// record source "vscode" for the app's threads (codex exec writes "exec",
+// the CLI "cli").
+export function codexAppOwned(thread) {
+  return CODEX_APP_ORIGINATORS.has(thread?.meta?.originator) || thread?.meta?.source === "vscode";
+}
+
+// A Codex thread codex exec must not resume: Conductor's (it would fork) or
+// the Codex app's (it would lock the owner out of it).
+export function codexExecBarred(thread) {
+  return thread?.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR || codexAppOwned(thread);
+}
+
 // sessionTitle: the Conductor tab title (null when untitled); sessionCount:
 // visible sessions in the workspace; titleShared: another tab there has the
 // same title. They decide whether the workspace name alone proves the tab.

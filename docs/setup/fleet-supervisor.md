@@ -381,8 +381,10 @@ or `waiting for idle`) is not left for the next 5-min scan:
   needs-you review (the next scheduled scan runs it). At most one a minute.
 - **Background routes** (off until listed in `OPENAGI_FLEET_BACKGROUND_ROUTES`).
   The send goes now, without the screen, instead of waiting:
-  - `codex-exec`: a Codex thread no app holds open (no writer lock, read again
-    at send time) and that Conductor did not start.
+  - `codex-exec`: a Codex thread started in the Codex CLI that no app holds
+    open (no writer lock, read again at send time). Never a
+    thread the Codex app or Conductor started: a resumed turn holds the
+    writer lock for hours, and the app then cannot open the thread.
   - `peer-relay`: a Conductor chat whose live Claude session is idle right
     now, with no open pick in the chat.
   Never `claude-resume`, never a thread with a running turn or a permission
@@ -392,8 +394,8 @@ or `waiting for idle`) is not left for the next 5-min scan:
 
 - Non-live Conductor sessions: no CLI delivery route. You get "open it" after
   90 min stuck, unless computer-use delivery is on.
-- Codex threads held open by Codex Desktop (writer lock): blocked on the CLI
-  route. Close the thread in Desktop, send by hand, or use computer-use delivery.
+- Codex threads the Codex app started: never sent through `codex exec`, even
+  with the app closed. Send by hand or use computer-use delivery.
 - Computer-use delivery reads the apps' accessibility trees. An app update can
   change them; a thread it cannot verify is blocked, never guessed.
 - Main mirroring requires an explicitly selected enrolled coding Mac; without

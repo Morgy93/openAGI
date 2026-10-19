@@ -628,6 +628,7 @@ test("listCodexThreads exposes the originator; Conductor-hosted threads type int
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run }));
   assert.equal(map["t-desktop"].meta.originator, "Codex Desktop");
   assert.equal(map["t-hosted"].meta.originator, "codex_sdk_ts");
+  assert.equal(map["t-desktop"].meta.source, "vscode", "an app's thread, even where originator is null");
 
   const desktop = uiTargetFor(map["t-desktop"]);
   assert.equal(desktop.bundleId, "com.openai.codex");
