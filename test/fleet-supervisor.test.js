@@ -3366,8 +3366,8 @@ test("judge ask-owner: an agent-ask question whose answer is relayed to the agen
   assert.equal(delivered.length, 0);
   const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
   assert.ok(question, "question raised");
-  assert.equal(question.dedupeKey, judgeAskKey(makeThread()));
-  assert.match(question.dedupeKey, /^ask:codex:t1:[0-9a-f]{16}$/);
+  assert.equal(question.dedupeKey, judgeAskKey(makeThread(), { body: "Agent asks: --admin or wait for Nikhil.", options: ["merge --admin", "wait for Nikhil"] }));
+  assert.match(question.dedupeKey, /^ask:codex:t1:[0-9a-f]{16}:[0-9a-f]{16}$/);
   assert.equal(question.askedBy, "judge");
   assert.equal(question.mergeAsk, true);
   assert.match(question.title, /Merge with --admin\?$/);
@@ -3819,13 +3819,14 @@ test("the judge cache key changes with the earlier nudges the prompt shows", () 
   assert.notEqual(judgeCacheKey(thread, decision, null, null, [{ ...nudgeA, message: "A2" }]), key);
 });
 
-test("a re-read of the same reply worded differently is the same judge question", async (t) => {
+test("a changed judge question body is a new decision even on the same reply", async (t) => {
   const thread = makeThread({ lastAgentFull: "Merge with --admin or wait for Nikhil?", lastAgentFullAt: ago(10 * MIN) });
   const a = judgeAskKey(thread, { title: "Merge with --admin?", body: "The agent asks: admin or wait.", options: ["merge --admin", "wait"] });
   const b = judgeAskKey(thread, { title: "  merge WITH --admin? ", body: "Branch protection blocks a normal merge.", options: ["Wait", "merge --admin"] });
-  assert.equal(a, b);
+  assert.notEqual(a, b);
+  assert.equal(a, judgeAskKey(thread, { title: " MERGE WITH --admin? ", body: "The agent asks: admin or wait.", options: ["wait", "merge --admin"] }), "case, spacing and option order alone are not a new decision");
   assert.notEqual(judgeAskKey({ ...thread, lastAgentFull: "Now: close it?", lastAgentFullAt: ago(MIN) }, { title: "Merge with --admin?", options: ["merge --admin", "wait"] }), a, "a new reply may ask anew");
-  // In a scan: the owner's answer keeps the re-worded ask quiet.
+  // A changed body asks the owner to make a fresh decision.
   let clock = NOW;
   let verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Merge with --admin?", body: "The agent asks: admin or wait.", options: ["merge --admin", "wait"] } };
   const prs = new Map([["acme/app#7", makePr()]]);
@@ -3833,6 +3834,15 @@ test("a re-read of the same reply worded differently is the same judge question"
   const { supervisor, notified } = fixture(t, { mode: "auto", threads: [thread], prs, now: () => clock, deps: { judge } });
   await supervisor.tick({ reason: "test" });
   const first = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  // While still open, changed details replace the card instead of piling up.
+  prs.set("acme/app#7", makePr({ ci: { state: "FAILURE", failing: ["lint"], pending: [] } }));
+  verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Admin merge?", body: "Lint is failing; bypass protection?", options: ["merge --admin", "wait"] } };
+  clock += 20 * MIN;
+  await supervisor.tick({ reason: "test" });
+  const updated = supervisor.getState().questions.filter((q) => q.kind === "agent-ask");
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0].id, first.id);
+  assert.equal(updated[0].body, "Lint is failing; bypass protection?");
   await supervisor.answerQuestion(first.id, "wait");
   // CI moved, so the judge reads the same reply again and words it anew.
   prs.set("acme/app#7", makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }));
@@ -3840,9 +3850,9 @@ test("a re-read of the same reply worded differently is the same judge question"
   const pings = notified.length;
   clock += 20 * MIN;
   await supervisor.tick({ reason: "test" });
-  assert.equal(judge.calls.length, 2);
-  assert.equal(supervisor.getState().questions.filter((q) => q.kind === "agent-ask" && q.status === "open").length, 0);
-  assert.equal(notified.length, pings, "no new ping");
+  assert.equal(judge.calls.length, 3);
+  assert.equal(supervisor.getState().questions.filter((q) => q.kind === "agent-ask" && q.status === "open").length, 1);
+  assert.equal(notified.length, pings + 1, "a different decision needs a fresh answer");
 });
 
 test("the snapshot says what each thread is watched for, and keeps when it started across scans", async (t) => {
@@ -4500,6 +4510,7 @@ test("mute immediately removes Waiting on you and snapshot excerpts redact secre
   const state = supervisor.getState();
   assert.equal(state.snapshot.threads[0].watch.group, "quiet");
   assert.equal(state.snapshot.counts.byWatch.you, 0);
+  assert.equal(state.questions.length, 0, "muting hides its open questions immediately");
   supervisor.unmuteThread(thread.key);
   assert.equal(supervisor.getState().snapshot.threads[0].watch.group, "you");
 });
@@ -4618,4 +4629,56 @@ test("Antigravity open-chat guidance reaches the public fleet snapshot", async (
   const snapshot = await supervisor.tick({ reason: "test" });
   assert.deepEqual(snapshot.threads[0].openChat, openChat);
   assert.deepEqual((await supervisor.threadDetail(thread.key)).openChat, openChat);
+});
+
+
+test("planned durations invalidate judge cache entries", () => {
+  const thread = makeThread();
+  const decision = { playbook: "status-check", message: "Run the trial for 5m." };
+  assert.notEqual(judgeCacheKey(thread, decision), judgeCacheKey(thread, { ...decision, message: "Run the trial for 60m." }));
+});
+
+test("policy silence and empty-wait counters do not spend another judge call", () => {
+  const thread = makeThread();
+  for (const reason of ["no word in 60m while waiting on bb-verify --full", "waited 60m with nothing visible"]) {
+    const decision = { playbook: "status-check", reason, message: "The agent has been silent for 60m." };
+    assert.equal(judgeCacheKey(thread, decision), judgeCacheKey(thread, { ...decision, reason: reason.replace("60m", "61m"), message: "The agent has been silent for 61m." }));
+  }
+});
+
+test("a mute during question review also holds its phone notification", async (t) => {
+  const judge = fakeJudge({ action: "ask-owner", reason: "needs a call", question: { title: "Continue?", body: "Choose how to proceed.", options: ["yes", "no"] } });
+  const { supervisor, notified } = fixture(t, { mode: "auto", deps: { judge } });
+  supervisor.reviewOpenQuestions = async () => {
+    await Promise.resolve();
+    supervisor.muteThread("codex:t1");
+    return new Set();
+  };
+  await supervisor.tick();
+  assert.ok(supervisor.store.openQuestions().length);
+  assert.equal(notified.length, 0);
+  assert.equal(supervisor.getState().questions.length, 0);
+});
+
+test("muting while a PR check is pending cancels automatic and manual pushes", async (t) => {
+  for (const mode of ["auto", "propose"]) {
+    const { supervisor, delivered } = fixture(t, { mode });
+    if (mode === "propose") await supervisor.tick();
+    supervisor.prSettledBeforeSend = async () => { supervisor.muteThread("codex:t1"); return null; };
+    if (mode === "auto") await supervisor.tick();
+    else assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /muted/);
+    assert.equal(delivered.length, 0);
+  }
+});
+
+test("Push now shares the automatic-send lock through recording its receipt", async (t) => {
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const pending = new Promise(resolve => { release = resolve; });
+  const executor = { deliver: async () => { entered(); await pending; return { status: "sent", route: "cli" }; }, inFlight: () => [], whenIdle: async () => {} };
+  const { supervisor } = fixture(t, { mode: "auto", deps: { executor } });
+  const tick = supervisor.tick();
+  await started;
+  try { assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already being sent/); }
+  finally { release(); await tick; }
 });

@@ -139,7 +139,7 @@ function readUserInput(summary, raw, at, turnId = null) {
     // before it. It is still the owner at work.
     const ids = new Set(parseCardReply(text));
     summary.cardReplies.push({ ids, order: summary.rows });
-    if (summary.pendingQuestion && ids.has(`${summary.pendingQuestion.callId}:0`)) summary.pendingQuestion = null;
+    if (summary.pendingQuestion && [...ids].some((id) => id.startsWith(`${summary.pendingQuestion.callId}:`))) summary.pendingQuestion = null;
     summary.lastUser = { text: "Answered a question card.", at };
     return;
   }

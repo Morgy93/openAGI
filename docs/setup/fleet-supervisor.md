@@ -446,7 +446,9 @@ on; the same outreach item updates in place. The supervisor's own questions
 - A closed question stays closed while the same ask repeats, for up to 6
   hours. Then the same ask is a new question, reviewed again before it pings.
   A changed ask is a new question.
-- If the model fails or times out (6 min), questions go out as before and the
+- If the model fails, questions go out as before. With the default timeouts,
+  the Codex attempt can take 3 minutes and the Claude fallback another 6 minutes
+  (about 9 minutes total, plus process termination grace), and the
   error shows in **Doing**. It retries after 15 minutes.
 - Every decision is in **Doing** (`review`). **Cleared by supervisor** under
   **Needs you** lists every close asked in the last day, one per ask, with
