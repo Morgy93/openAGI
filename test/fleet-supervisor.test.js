@@ -3825,6 +3825,8 @@ test("a changed judge question body is a new decision even on the same reply", a
   const b = judgeAskKey(thread, { title: "  merge WITH --admin? ", body: "Branch protection blocks a normal merge.", options: ["Wait", "merge --admin"] });
   assert.notEqual(a, b);
   assert.equal(a, judgeAskKey(thread, { title: " MERGE WITH --admin? ", body: "The agent asks: admin or wait.", options: ["wait", "merge --admin"] }), "case, spacing and option order alone are not a new decision");
+  assert.notEqual(a, judgeAskKey(thread, { body: "The agent asks: admin or WAIT.", options: ["merge --admin", "wait"] }), "body case can change an identifier or path");
+  assert.notEqual(a, judgeAskKey(thread, { body: "The agent asks: admin or wait.", options: ["merge --ADMIN", "wait"] }), "option case can change a command");
   assert.notEqual(judgeAskKey({ ...thread, lastAgentFull: "Now: close it?", lastAgentFullAt: ago(MIN) }, { title: "Merge with --admin?", options: ["merge --admin", "wait"] }), a, "a new reply may ask anew");
   // A changed body asks the owner to make a fresh decision.
   let clock = NOW;

@@ -77,7 +77,11 @@ export class McpStdioClient {
     });
     // EPIPE is emitted asynchronously when a server exits during a request.
     // It must fail the request rather than crash the daemon.
-    proc.stdin.on("error", () => { if (this.proc === proc) this.handleExit(null, "stdin-closed"); });
+    proc.stdin.on("error", () => {
+      if (this.proc !== proc) return;
+      this.handleExit(null, "stdin-closed");
+      this.close();
+    });
 
     try {
       this.serverInfo = await this.request(

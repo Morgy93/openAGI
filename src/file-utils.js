@@ -307,7 +307,7 @@ export function appendJsonLine(filePath, value, mode = 0o600) {
   }
 }
 
-export function loadEnvFile(filePath) {
+export function loadEnvFile(filePath, { onShadowed } = {}) {
   let text;
   try {
     text = fs.readFileSync(filePath, "utf8");
@@ -328,6 +328,7 @@ export function loadEnvFile(filePath) {
       value = value.slice(1, -1);
     }
     if (!(key in process.env)) process.env[key] = value;
+    else if (process.env[key] !== value) onShadowed?.(key);
     loaded[key] = value;
   }
   return loaded;

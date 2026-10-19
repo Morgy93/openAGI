@@ -258,7 +258,7 @@ function replyMark(thread) {
 // may change on a reread; body/options change what the owner is approving.
 export function judgeAskKey(thread, question = null) {
   const reply = agentReply(thread);
-  const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ");
   const ask = [normalize(question?.body), (question?.options ?? []).map(normalize).sort()];
   return `${agentAskKey(thread.key, { at: reply.at, text: reply.text })}:${shortHash(JSON.stringify(ask))}`;
 }
