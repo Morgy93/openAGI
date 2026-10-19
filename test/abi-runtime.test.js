@@ -2624,7 +2624,7 @@ test("McpRegistry persist surfaces filesystem errors instead of swallowing", asy
   fs.rmSync(dir, { recursive: true });
 });
 
-test("proactive-observer: task proposals materialize into real tasks with OPENAGI_AUTO_TASKS=1", async (t) => {
+test("proactive-observer: evidenced owner intent materializes with OPENAGI_AUTO_TASKS=1", async (t) => {
   process.env.OPENAGI_AUTO_TASKS = "1";
   t.after(() => { delete process.env.OPENAGI_AUTO_TASKS; });
   const { ProactiveObserver } = await import("../src/proactive-observer.js");
@@ -2639,13 +2639,14 @@ test("proactive-observer: task proposals materialize into real tasks with OPENAG
     events: { emit: (name, data) => events.push({ name, data }) },
     mcp: { listServers: () => [] },
     agentHost: {
-      store: { listSessions: () => [] },
+      store: { listSessions: () => [{ id: "observer-intent-fixture", messages: [{ role: "user", content: "I will review PR #42 before standup" }] }], getSession: () => null },
       modelProvider: {
         isConfigured: () => true,
         generate: async () => ({
           text: JSON.stringify({
             category: "task",
             title: "Review PR #42 before standup",
+            taskIntent: { state: "planned", evidence: "I will review PR #42 before standup" },
             rationale: "The PR was open repeatedly and standup is coming up.",
             queue: "agent",
             bucket: "today"

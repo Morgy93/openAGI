@@ -1082,7 +1082,7 @@ export class FleetStore {
       const open = this.state.questions.find((q) => q.status === "open" && q.askedBy === "judge" && q.threadKey === fields.threadKey
         && (q.dedupeKey === replyKey || String(q.dedupeKey ?? "").startsWith(`${replyKey}:`)));
       if (open) { open.dedupeKey = key; this._save(); return; }
-      const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+      const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ");
       const choices = (options) => JSON.stringify((options ?? []).map(normalize).sort());
       const closed = this.state.questions.find((q) => ["answered", "dismissed"].includes(q.status) && q.askedBy === "judge"
         && q.threadKey === fields.threadKey && q.dedupeKey === replyKey
