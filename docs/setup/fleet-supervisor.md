@@ -381,8 +381,8 @@ or `waiting for idle`) is not left for the next 5-min scan:
   needs-you review (the next scheduled scan runs it). At most one a minute.
 - **Background routes** (off until listed in `OPENAGI_FLEET_BACKGROUND_ROUTES`).
   The send goes now, without the screen, instead of waiting:
-  - `codex-exec`: a Codex thread started by `codex exec` or the Codex CLI
-    that no app holds open (no writer lock, read again at send time). Never a
+  - `codex-exec`: a Codex thread started in the Codex CLI that no app holds
+    open (no writer lock, read again at send time). Never a
     thread the Codex app or Conductor started: a resumed turn holds the
     writer lock for hours, and the app then cannot open the thread.
   - `peer-relay`: a Conductor chat whose live Claude session is idle right
