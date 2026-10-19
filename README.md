@@ -562,3 +562,16 @@ number and an SMS code, or an existing API key. OpenAGI can then make approved
 calls and retrieve their results. See [Vocaleo setup](docs/vocaleo.md) for details.
 
 [openagi.sh](https://openagi.sh) · [Issues](https://github.com/Spshulem/openAGI/issues) · [Docs](https://github.com/Spshulem/openAGI/tree/main/docs)
+
+### Memory correction scopes
+
+Shared `main` memories can be recalled by specialists. Corrections supersede
+only memories in the caller's own scope: a specialist can retain a local
+correction without hiding the shared fact from other agents. An explicit ID
+outside the caller's scope is rejected before any memory is changed or target
+content is returned. Query corrections rank only same-scope candidates, so
+shared matches cannot crowd out a specialist's own facts. Legacy memories
+without a scope belong to `main` for corrections.
+
+This protects future corrections; it does not restore previously superseded
+memories or rewrite existing data.
