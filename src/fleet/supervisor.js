@@ -2178,6 +2178,17 @@ export class FleetSupervisor {
     // Unseen branches precede expired negative results, then oldest first;
     // a thread with no PR at all before a chat whose created PRs stand in.
     const candidates = [...inScope].sort((a, b) => lastAt(a) - lastAt(b) || hasRefs(a) - hasRefs(b));
+    // A checkout several chats work in (one main clone, not a worktree each)
+    // has one branch at a time, and every chat there records it: its PR is
+    // none of theirs in particular. 21 Codex chats in one clone were all told
+    // to finish its open PR. Such a chat's PR is only one it linked itself.
+    // Counted by checkout root, so chats in two of its subfolders share it.
+    const checkoutOf = (thread) => (thread.cwd ? localGit.get(thread.cwd)?.root ?? path.resolve(thread.cwd) : null);
+    const perCheckout = new Map();
+    for (const thread of inScope) {
+      const checkout = checkoutOf(thread);
+      if (checkout) perCheckout.set(checkout, (perCheckout.get(checkout) ?? 0) + 1);
+    }
     const jobs = new Map();
     for (const thread of candidates) {
       if (thread.prRefs?.length && thread.kind !== "conductor") continue;
@@ -2185,6 +2196,7 @@ export class FleetSupervisor {
       // not be read) leaves it unknown.
       if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { noPr(thread); continue; }
       if (!thread.repo) continue;
+      if (thread.kind !== "conductor" && perCheckout.get(checkoutOf(thread)) > 1) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
       // PR, so a new head is a new lookup.

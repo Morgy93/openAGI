@@ -580,7 +580,7 @@ test("branch discovery reaches new branches before refreshing expired negative l
   let now = NOW;
   const lookedUp = [];
   const { supervisor } = fixture(t, { now: () => now, deps: { findPrForBranch: async (_, branch) => { lookedUp.push(branch); return null; } } });
-  const threads = Array.from({ length: 65 }, (_, i) => makeThread({ branch: `branch-${i}`, prRefs: [] }));
+  const threads = Array.from({ length: 65 }, (_, i) => makeThread({ cwd: `/work/b${i}`, branch: `branch-${i}`, prRefs: [] }));
   for (let i = 0; i < 9; i++) {
     await supervisor.resolvePrRefs(threads, new Map(), supervisor.config, null, {});
     now += 5 * MIN;
@@ -738,6 +738,31 @@ test("a worktree whose git read failed is never offered as ready to merge", asyn
   assert.equal(snapshot.threads[0].state, "pr-not-ready");
   assert.deepEqual(snapshot.threads[0].blockers, ["local git unknown"]);
   assert.equal(supervisor.getState().questions.length, 0);
+});
+
+test("chats sharing one checkout never take its branch's PR", async (t) => {
+  // 21 Codex chats in one clone all recorded its branch and were each told
+  // to finish that branch's PR. Only a chat alone in its checkout gets it.
+  const seen = [];
+  const supervisor = { skip: {}, deps: { findPrForBranch: async (repo, branch) => { seen.push(branch); return "acme/app#8091"; } }, branchLookups: new Map(), now: () => NOW };
+  const shared = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id, cwd: "/work/clone", branch: "feature/canvas", prRefs: [] }));
+  const linked = makeThread({ key: "codex:c", id: "c", cwd: "/work/clone", branch: "feature/canvas", prRefs: ["acme/app#7"] });
+  const alone = makeThread({ key: "codex:d", id: "d", cwd: "/work/own", branch: "feature/own", prRefs: [] });
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, [...shared, linked, alone], new Map(), {}, null, {});
+  assert.deepEqual(seen, ["feature/own"]);
+  for (const thread of shared) {
+    assert.deepEqual(thread.prRefs, [], thread.id);
+    assert.notEqual(thread.prLookedUp, true, "unknown, not PR-less");
+  }
+  assert.deepEqual(linked.prRefs, ["acme/app#7"], "a PR the chat linked itself stays");
+  assert.deepEqual(alone.prRefs, ["acme/app#8091"]);
+  // Two subfolders of one checkout are the same checkout.
+  seen.length = 0;
+  const sub = ["/work/mono", "/work/mono/packages/api"].map((cwd, i) => makeThread({ key: `codex:s${i}`, id: `s${i}`, cwd, branch: "feature/mono", prRefs: [] }));
+  const git = new Map(sub.map((thread) => [thread.cwd, { root: "/work/mono", branch: "feature/mono", head: null }]));
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, sub, git, {}, null, {});
+  assert.deepEqual(seen, []);
+  assert.ok(sub.every((thread) => thread.prRefs.length === 0));
 });
 
 test("branch discovery passes the local head so a reused branch skips its old PR", async (t) => {
