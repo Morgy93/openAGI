@@ -330,10 +330,34 @@ export class MemorySystem {
       { strength: 1.0, tier: targetTier }
     );
 
+    // A principle remains evidence for recall even after its raw source was
+    // corrected. Invalidate the same-scope dependency closure as part of this
+    // correction, so stale conclusions and their vectors cannot survive it.
+    const supersededIds = new Set(targets.map((target) => target.id));
+    for (const target of targets) {
+      for (const dependent of this.items.values()) {
+        if (dependent.kind !== "principle" || dependent.metadata?.supersededBy
+          || (dependent.scope ?? "main") !== scope || supersededIds.has(dependent.id)
+          || !Array.isArray(dependent.metadata?.sources)
+          || !dependent.metadata.sources.includes(target.id)) continue;
+        supersededIds.add(dependent.id);
+        targets.push(dependent);
+      }
+    }
+
     const at = nowIso();
     for (const target of targets) {
       target.metadata = { ...target.metadata, supersededBy: corrected.id, supersededAt: at };
       this.dropPrincipleVector(target.id);
+    }
+
+    // Surviving evidence may be distilled again with the corrected fact.
+    // Keep superseded rows and their lineage intact for the audit trail.
+    for (const source of this.items.values()) {
+      if ((source.scope ?? "main") === scope && !source.metadata?.supersededBy
+        && supersededIds.has(source.metadata?.condensedInto)) {
+        delete source.metadata.condensedInto;
+      }
     }
 
     return { item: corrected, superseded: targets };

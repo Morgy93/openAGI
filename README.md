@@ -575,9 +575,12 @@ without a scope belong to `main` for corrections.
 
 Nightly condensation excludes superseded facts from both model input and principle
 lineage. If a source is corrected or removed while distillation is running, the
-result is discarded; a later run can distill the current evidence. Historical
-source rows remain available for audit. This does not repair principles created
-by an earlier version.
+result is discarded; queued groups are rechecked before model dispatch as well.
+Correcting a source also supersedes its existing same-scope derived principles,
+removes their vectors, and releases surviving source notes for later condensation.
+These changes persist across restart. Historical rows remain available for audit;
+principles from an earlier version are invalidated when their source is corrected,
+without a bulk rewrite of existing data.
 
-This protects future corrections; it does not restore previously superseded
-memories or rewrite existing data.
+No bulk migration runs automatically, and previously superseded memories are
+not restored.
