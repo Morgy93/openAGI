@@ -573,5 +573,11 @@ content is returned. Query corrections rank only same-scope candidates, so
 shared matches cannot crowd out a specialist's own facts. Legacy memories
 without a scope belong to `main` for corrections.
 
+Nightly condensation excludes superseded facts from both model input and principle
+lineage. If a source is corrected or removed while distillation is running, the
+result is discarded; a later run can distill the current evidence. Historical
+source rows remain available for audit. This does not repair principles created
+by an earlier version.
+
 This protects future corrections; it does not restore previously superseded
 memories or rewrite existing data.
