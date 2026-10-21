@@ -142,3 +142,52 @@ test("queued groups invalidated by an earlier model call never reach the model",
   assert.equal(result.principles, 1);
   assert.ok(queued.every(row => !row.metadata.condensedInto));
 });
+
+for (const mode of ["id", "query"]) {
+  test(`direct ${mode} principle correction cannot resurrect its obsolete sources after restart`, async t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-direct-correction-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const memory = new FileBackedMemorySystem({ dir });
+    const rows = ["Review at nine under the old schedule.", "Prepare review at nine.", "Confirm review at nine."].map(content =>
+      memory.remember({ source: "local", content, tags: ["review", "schedule"] }, { tier: "medium" }));
+    const first = await new MemoryCondenser({ runtime: { memory } }).condense();
+    const principle = memory.items.get(first.items[0].id);
+    const { item: correction } = memory.correct({
+      ...(mode === "id" ? { id: principle.id } : { query: principle.content }),
+      content: "Review starts at ten."
+    });
+    assert.equal(correction.tier, "long");
+    assert.equal(principle.metadata.supersededBy, correction.id);
+    const restored = new FileBackedMemorySystem({ dir });
+    const result = await new MemoryCondenser({ runtime: { memory: restored } }).condense();
+    assert.equal(result.principles, 0, "unchanged notes cannot re-create the corrected conclusion");
+    assert.ok(rows.every(row => restored.items.get(row.id).metadata.condensedInto === principle.id));
+    assert.ok(restored.retrieve("review", { limit: 20 }).some(hit => hit.item.id === correction.id));
+  });
+}
+
+test("correcting a source cancels its principle's in-flight embedding durably", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-pending-vector-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const embedder = new HashBagEmbedder();
+  const vectors = new VectorStore({ dir, embedder: { embed: async text => {
+    await pending;
+    return embedder.embed(text);
+  } } });
+  const { memory, rows } = fixture();
+  memory.bindVectorStore(vectors);
+  let write;
+  const result = await new MemoryCondenser({ runtime: { memory, vectorStore: {
+    upsert(...args) { write = vectors.upsert(...args); return write; }
+  } } }).condense();
+  const principle = memory.items.get(result.items[0].id);
+  assert.equal(vectors.list("principle").length, 0, "embedding is still pending");
+  memory.correct({ id: rows[0].id, content: "Review starts at ten." });
+  assert.ok(principle.metadata.supersededBy);
+  release();
+  await write;
+  assert.equal(vectors.list("principle").length, 0, "retired principle must not be re-indexed");
+  assert.equal(new VectorStore({ dir, embedder }).list("principle").length, 0);
+});

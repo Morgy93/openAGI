@@ -351,10 +351,12 @@ export class MemorySystem {
       this.dropPrincipleVector(target.id);
     }
 
-    // Surviving evidence may be distilled again with the corrected fact.
-    // Keep superseded rows and their lineage intact for the audit trail.
+    // Release evidence only when the replacement can join the next distillation.
+    // Long-tier corrections (including direct principle corrections) are not
+    // condenser inputs: requeuing their unchanged notes would recreate the old
+    // conclusion without the correction. Retain those consumption markers.
     for (const source of this.items.values()) {
-      if ((source.scope ?? "main") === scope && !source.metadata?.supersededBy
+      if (corrected.tier !== "long" && (source.scope ?? "main") === scope && !source.metadata?.supersededBy
         && supersededIds.has(source.metadata?.condensedInto)) {
         delete source.metadata.condensedInto;
       }
