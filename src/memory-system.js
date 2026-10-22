@@ -703,7 +703,8 @@ export class MemorySystem {
   promote(item, tier, now) {
     const promoted = {
       ...item,
-      id: createId(`mem_${tier}`),
+      // Tier changes preserve identity: principle sources and correction links
+      // must still address this evidence after promotion and persistence.
       tier,
       content: this.compressForTier(item.content, tier, item.fidelity),
       createdAt: now,
@@ -712,7 +713,6 @@ export class MemorySystem {
       lastDecayedAt: now,
       strength: clamp(item.strength + 0.08)
     };
-    this.items.delete(item.id);
     this.items.set(promoted.id, promoted);
     this.enforceLimits(tier);
     return promoted;
