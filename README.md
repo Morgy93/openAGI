@@ -573,6 +573,10 @@ content is returned. Query corrections rank only same-scope candidates, so
 shared matches cannot crowd out a specialist's own facts. Legacy memories
 without a scope belong to `main` for corrections.
 
+Tier promotion preserves memory IDs, so saved references, correction links, and
+derived-principle lineage remain valid across promotion and restart. This protects
+future promotions; it does not reconstruct links lost by earlier versions.
+
 Nightly condensation excludes superseded facts from both model input and principle
 lineage. If a source is corrected or removed while distillation is running, the
 result is discarded; queued groups are rechecked before model dispatch as well.
