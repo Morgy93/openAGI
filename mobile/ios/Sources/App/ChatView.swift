@@ -1,29 +1,29 @@
 import SwiftUI
 
-// DESIGN.md's Chat section, added after the first build of this screen put
-// a "You"/"OpenAGI" caption above every message and rendered them all
-// full-width and left-aligned: "that reads as a log file... Alignment
-// carries the speaker... it means no speaker labels at all." Everything
-// below follows that section point for point: right/left-aligned bubbles
-// with asymmetric corners, tightened/opened spacing by speaker (see
-// `MessageGrouping`), Markdown for assistant replies (see `Markdown.swift`),
-// a resting three-dot indicator before the first token, a "jump to latest"
-// affordance instead of yanking a scrolled-up reader back down, and a
-// composer that sits above the keyboard rather than behind it.
-//
-// mobile/FEATURES.md's Chat tab: "the one that makes the phone genuinely
-// useful away from the desk." Sends over `POST /message`, streaming the
-// reply as it arrives rather than waiting for the whole answer — see
-// ChatEvent's doc comment for why this rides the POST itself rather than
-// the shared `GET /events` connection. That shared connection is still what
-// the header's dot reflects: "filled while the SSE stream is attached."
+// Native SwiftUI navigation, text entry and controls. Conversation state stays
+// on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
+    @State private var showingFallback = false
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         NavigationStack {
             ChatConversationView(conversation: model.agentChat, title: "Chat")
                 .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    if let onClose {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close chat", systemImage: "xmark", action: onClose)
+                                .accessibilityIdentifier("close-chat-pane")
+                        }
+                    }
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
+                            .accessibilityIdentifier("chat-fallback")
+                    }
+                }
+                .sheet(isPresented: $showingFallback) { FallbackChatView() }
         }
     }
 }
@@ -43,56 +43,73 @@ struct ChatConversationView: View {
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
+    var onComposerFocusChanged: (Bool) -> Void = { _ in }
 
-    @State private var draft = ""
     @State private var isPinnedToBottom = true
+    @FocusState private var composerFocused: Bool
+    @Environment(\.layoutDirection) private var layoutDirection
 
     private var messages: [ChatMessage] { conversation.messages }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            GeometryReader { geometry in
-                messageScroll(width: geometry.size.width)
+        GeometryReader { geometry in
+            ConversationLayout(division: division(in: geometry), rightToLeft: layoutDirection == .rightToLeft) {
+                VStack(spacing: 0) {
+                    header
+                    GeometryReader { messagesGeometry in
+                        messageScroll(width: messagesGeometry.size.width)
+                    }
+                }
+                .frame(maxWidth: 600)
+                .frame(maxWidth: .infinity)
+                inputBar
+                    .frame(maxWidth: 600)
+                    .frame(maxWidth: .infinity)
             }
-            inputBar
         }
-        .background(Theme.canvas)
+        .background(Color(uiColor: .systemBackground))
+        .navigationTitle(showsTitle ? title : "")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
         .task { await conversation.refresh() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await conversation.refresh() } }
         }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
-            if showsTitle {
-                Text(title)
-                    .font(Theme.Typography.screenTitle)
-                    .foregroundStyle(Theme.ink)
-            }
-            HStack(spacing: Theme.Spacing.x1) {
-                ConnectionDot(state: model.isStreamConnected ? .fresh : .stale)
-                Text(model.hostLabel)
-                    .font(Theme.Typography.dataMono)
-                    .foregroundStyle(Theme.muted)
-                Text("·").font(Theme.Typography.caption).foregroundStyle(Theme.muted)
-                Text(model.isStreamConnected ? "live" : "reconnecting")
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
-            }
-            // A main from before shared threads: this phone's own copy still
-            // shows, but the glasses and other phones can't see it.
-            if conversation.historyStatus == .needsUpdate {
-                Text("Update OpenAGI on your main to share this chat with your other devices.")
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
+    private func division(in geometry: GeometryProxy) -> CGRect? {
+        if #available(iOS 27.1, *) {
+            return geometry.reservedRegions(kind: .division, layoutDirectionBehavior: .fixed).first.map { region in
+                let frame = region.frame
+                let left = layoutDirection == .rightToLeft ? region.margins.trailing : region.margins.leading
+                return CGRect(x: frame.minX - left,
+                              y: frame.minY - region.margins.top,
+                              width: frame.width + region.margins.leading + region.margins.trailing,
+                              height: frame.height + region.margins.top + region.margins.bottom)
             }
         }
-        .padding(.horizontal, Theme.gutter)
-        .padding(.top, Theme.Spacing.x2)
-        .padding(.bottom, Theme.Spacing.x4)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        return nil
+    }
+
+    @ViewBuilder
+    private var header: some View {
+        if conversation.historyStatus == .needsUpdate {
+            Label("Update OpenAGI on your main to share this chat with your other devices.", systemImage: "arrow.down.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding()
+        } else if conversation.historyStatus == .offline || conversation.historyStatus == .needsPairing {
+            VStack(alignment: .leading, spacing: 8) {
+                Label(conversation.historyStatus == .needsPairing
+                      ? "Connect to your main again in Settings to load chat history."
+                      : "Couldn't load chat history. Saved messages are still available.",
+                      systemImage: "exclamationmark.bubble")
+                Button("Retry") { Task { await conversation.refresh() } }
+                    .disabled(conversation.isRefreshingHistory)
+            }
+            .font(.footnote)
+            .padding()
+        }
     }
 
     private func messageScroll(width: CGFloat) -> some View {
@@ -100,8 +117,28 @@ struct ChatConversationView: View {
             ZStack(alignment: .bottom) {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        if messages.isEmpty {
-                            EmptyStateView(headline: "Say something.", detail: emptyDetail)
+                        if conversation.nextBefore != nil {
+                            VStack(spacing: 8) {
+                                Button("Load earlier messages") {
+                                    Task { await conversation.loadOlder() }
+                                }
+                                .disabled(conversation.isLoadingOlder)
+                                if conversation.isLoadingOlder { ProgressView("Loading earlier messages…") }
+                                if let error = conversation.olderHistoryError {
+                                    Text(error).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.bottom)
+                        }
+                        if messages.isEmpty && conversation.historyStatus == .unknown {
+                            ProgressView("Loading chat history…")
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, Theme.Spacing.x8)
+                        } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
+                            EmptyStateView(headline: conversation.historyStatus == .synced
+                                           ? "No messages on this server yet." : "No saved messages on this phone.",
+                                           detail: emptyDetail + " Older conversations stay on the server where they happened. Check your connected server in Settings if you expected them here.")
                                 .padding(.top, Theme.Spacing.x8)
                             if !starters.isEmpty { starterButtons }
                         }
@@ -116,11 +153,15 @@ struct ChatConversationView: View {
                 } action: { _, atBottom in
                     isPinnedToBottom = atBottom
                 }
-                .onChange(of: messages) { _, _ in
-                    if isPinnedToBottom { scrollToLatest(proxy) }
+                .onChange(of: messages) { old, new in
+                    if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
+                        // Keep the message the reader was looking at in place
+                        // when an earlier page is inserted above it.
+                        proxy.scrollTo(first, anchor: .top)
+                    } else if isPinnedToBottom { scrollToLatest(proxy) }
                 }
                 .onAppear { scrollToLatest(proxy) }
-                .scrollDismissesKeyboard(.immediately)
+                .scrollDismissesKeyboard(.interactively)
 
                 if !isPinnedToBottom && !messages.isEmpty {
                     jumpToLatestButton(proxy)
@@ -205,37 +246,67 @@ struct ChatConversationView: View {
         .id(item.message.id)
     }
 
+    @ViewBuilder
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: Theme.Spacing.x2) {
-            TextField(placeholder, text: $draft, axis: .vertical)
-                .font(Theme.Typography.body)
-                .lineLimit(1...5)
-                .padding(.horizontal, Theme.Spacing.x3)
-                .padding(.vertical, Theme.Spacing.x2)
-                .background(Theme.surface)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.rowGroupRadius, style: .continuous))
-            Button {
-                let text = draft
-                draft = ""
-                isPinnedToBottom = true
-                Task { await conversation.send(text) }
-            } label: {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(canSend ? Theme.live : Theme.muted)
-                    .clipShape(Circle())
+        if #available(iOS 26, *) {
+            GlassEffectContainer(spacing: 12) {
+                HStack(alignment: .bottom, spacing: 12) {
+                    composerField
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 26))
+                    sendButton
+                        .buttonStyle(.glassProminent)
+                        .buttonBorderShape(.circle)
+                        .controlSize(.large)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
             }
-            .disabled(!canSend)
-            .accessibilityLabel("Send")
+        } else {
+            HStack(alignment: .bottom, spacing: 12) {
+                composerField
+                    .textFieldStyle(.roundedBorder)
+                sendButton
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.circle)
+                    .controlSize(.large)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(.bar)
         }
-        .padding(Theme.gutter)
-        .background(Theme.canvas)
+    }
+
+    private var composerField: some View {
+        @Bindable var conversation = conversation
+        return TextField(placeholder, text: $conversation.draft, axis: .vertical)
+            .focused($composerFocused)
+            .font(.body)
+            .lineLimit(1...5)
+            .submitLabel(.send)
+            .onSubmit { sendDraft() }
+            .accessibilityLabel(placeholder)
+            .accessibilityIdentifier("chat-composer")
+    }
+
+    private var sendButton: some View {
+        Button("Send", systemImage: "arrow.up", action: sendDraft)
+            .labelStyle(.iconOnly)
+            .disabled(!canSend)
+            .accessibilityIdentifier("chat-send")
+    }
+
+    private func sendDraft() {
+        guard canSend else { return }
+        let text = conversation.draft
+        conversation.draft = ""
+        isPinnedToBottom = true
+        Task { await conversation.send(text) }
     }
 
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
+        !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
     }
 }
 
@@ -277,6 +348,8 @@ enum ChatErrorCopy {
             return "OpenAGI can't reply -- no agent host is configured on this daemon. Open its dashboard and finish setup, then try again."
         case .unauthorized:
             return "Needs re-pairing -- revoke and pair again in Settings."
+        case .mainConnection(let issue):
+            return issue.message
         case .notFound, .conflict, .malformedResponse, .server, .unreachableHost, .transport:
             return "Can't reach OpenAGI. Check your connection and try again."
         }
@@ -312,8 +385,8 @@ private struct MessageBubbleRow: View {
             MarkdownContent(blocks: MarkdownParser.parse(message.text))
         } else {
             Text(message.text)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.ink)
+                .font(.body)
+                .foregroundStyle(.white)
                 .textSelection(.enabled)
         }
     }
@@ -337,10 +410,9 @@ private struct MessageBubbleRow: View {
             }
     }
 
-    // DESIGN.md: "You: ... `live` at 12% opacity as the bubble fill ...
-    // OpenAGI: ... `surface` fill."
+    // Messages remain in the content layer; glass belongs to the controls.
     private var fill: Color {
-        message.role == .user ? Theme.live.opacity(0.12) : Theme.surface
+        message.role == .user ? .blue : Color(uiColor: .secondarySystemBackground)
     }
 
     // DESIGN.md: "radius 18 with the bottom-trailing corner at 4" (you) /

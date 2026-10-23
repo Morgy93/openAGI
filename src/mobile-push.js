@@ -175,7 +175,23 @@ export class MobilePush {
   /// after the first change of a burst.
   changed() {
     try {
-      if (this.stopped || this.debounceTimer) return;
+      if (this.stopped) return;
+      // Observe closes before debouncing delivery: a close and reopen may
+      // otherwise collapse into a snapshot that still contains the same ID.
+      let questions;
+      try {
+        const state = this.supervisor.getState();
+        if (state?.questionsAuthoritative !== false) questions = state?.questions;
+      }
+      catch (error) { this.report(`could not read supervisor state: ${error?.message ?? error}`); }
+      if (Array.isArray(questions)) {
+        const open = new Set(questions.filter((q) => (q?.status ?? "open") === "open").map((q) => q?.id));
+        for (const registration of this.store.list()) {
+          const notified = registration.notified.filter((id) => open.has(id));
+          if (notified.length !== registration.notified.length) this.store.setNotified(registration.nodeId, notified);
+        }
+      }
+      if (this.debounceTimer) return;
       this.debounceTimer = this.setTimer(() => {
         this.debounceTimer = null;
         void this.flush();
@@ -253,6 +269,7 @@ export class MobilePush {
       return;
     }
     const now = this.now();
+    if (state?.questionsAuthoritative === false) return;
     const activity = buildActivity(state, new Date(now));
     const questions = Array.isArray(state?.questions)
       ? state.questions.filter((q) => typeof q?.id === "string" && q.id && (q.status ?? "open") === "open")
@@ -286,11 +303,15 @@ export class MobilePush {
   // questions are left over the per-pass cap.
   async sendAlerts(registration, questions, isCurrent) {
     if (!isCurrent()) return { stop: true, backlog: false };
-    // alerts: false is the phone's notification permission turned off.
-    if (!questions || registration.alerts === false) return { stop: false, backlog: false };
+    if (!questions) return { stop: false, backlog: false };
     const open = new Set(questions.map((q) => q.id));
     // Pruned to open ids, so a question that closes and reopens alerts again.
-    const notified = registration.notified.filter((id) => open.has(id));
+    const notified = this.store.get(registration.nodeId).notified.filter((id) => open.has(id));
+    this.store.setNotified(registration.nodeId, notified);
+    // Permission affects delivery, not the history of questions that closed.
+    if (registration.alerts === false) {
+      return { stop: false, backlog: false };
+    }
     const unsent = [...new Map(questions.filter((q) => !notified.includes(q.id)).map((q) => [q.id, q])).values()];
     const fresh = unsent.slice(0, ALERTS_PER_PASS);
     let sent = 0;
@@ -300,10 +321,15 @@ export class MobilePush {
       if (result === "gone" || result === "renew") return { stop: true, backlog: false };
       // Retry unsent questions even if no new fleet event arrives.
       if (result !== "ok") break;
-      notified.push(question.id);
+      // A watched event can prune a closed question while the relay is
+      // answering. Never restore the pre-send snapshot over that pruning.
+      const current = this.store.get(registration.nodeId).notified;
+      const latest = this.supervisor.getState();
+      if (latest?.questions?.some((q) => q.id === question.id && (q.status ?? "open") === "open")) {
+        this.store.setNotified(registration.nodeId, [...new Set([...current, question.id])]);
+      }
       sent += 1;
     }
-    this.store.setNotified(registration.nodeId, notified);
     return { stop: false, backlog: unsent.length > sent };
   }
 
@@ -341,7 +367,7 @@ export class MobilePush {
       if (active === 0) return null;
       const result = await this.sendActivity(registration, "activity-start", activity, { staleAt: this.epoch(now + t.staleAfterMs) });
       if (!isCurrent()) return null;
-      if (result !== "ok") return null;
+      if (result !== "ok") return result === "error" ? now + RETRY_MS : null;
       this.live.set(nodeId, { pass: registration.pass, startedAt: now, lastHash: hash, lastSentAt: now, lastYou: activity.counts.you, idleSince: null });
       this.store.setActivity(nodeId, registration.pass, { startedAt: new Date(now).toISOString() });
       return now + t.restartAfterMs;
@@ -381,6 +407,7 @@ export class MobilePush {
         });
         if (!isCurrent()) return null;
         if (result === "ok") Object.assign(live, { lastHash: hash, lastSentAt: now, lastYou: activity.counts.you });
+        else if (result === "error") due = Math.min(due, now + RETRY_MS);
       } else {
         // The trailing send: the wake pass reads the latest state then.
         due = Math.min(due, nextAllowed);

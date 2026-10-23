@@ -1,5 +1,10 @@
 # OpenAGI mobile (iOS + Android)
 
+The combined iOS onboarding, Supervisor push, and Android compatibility work
+is tracked in [PR #211](https://github.com/Spshulem/openAGI/pull/211).
+Use [QA.md](QA.md) for its current automated gates and device acceptance
+checklist; the phase-by-phase notes below include historical verification.
+
 Connect a phone to your main OpenAGI host for tasks, shared agent chat,
 approvals, and the fleet supervisor. The iOS SwiftUI and Android Compose apps
 have separate codebases; see [the mobile feature surface](FEATURES.md) for the
@@ -42,6 +47,23 @@ enter (or arrive with) the server and code, and the phone exchanges the
 code for its own permanent node credential — a random token it generates
 itself, never one the daemon hands back.
 
+### Connected, but Tasks or Chat are empty
+
+Pair the phone to the **main that owns your data**. A separate test daemon
+has its own task and conversation stores, even when its Supervisor shows
+the same fleet activity. Check the server in the app's Settings and run
+`openagi pair-phone --platform ios` (or `android`) on the correct main to
+generate a fresh pairing link. An upstream-paired desktop node cannot issue
+the main's phone enrollment codes.
+
+Tasks has separate user and agent queues. Today shows user tasks in today's
+bucket; Inbox shows pending actions and task clarifications. Fleet Supervisor
+questions are a separate surface. Chat and Ask supervisor show their shared
+device conversations on that main, with **Load earlier messages** on iOS
+when more history is available. Owner dashboard and individual coding-agent
+session histories remain separate. A history request that fails is shown
+with a retry action rather than as an empty conversation.
+
 ## Reachability: the rule that will trip you up
 
 **Cleartext `http://` only works when the daemon's host is a Tailscale
@@ -58,6 +80,29 @@ to its tailnet or LAN address (`OPENAGI_BIND=0.0.0.0` plus
 against *that* address, not `127.0.0.1:43210`.
 
 ## Building and testing
+
+### Chat when the server is unavailable
+
+Both apps offer **Chat without server** from Chat and Settings. Choose the
+phone's local model or OpenAI, Claude, OpenRouter or Gemini. Hosted modes use
+your own API key, entered in a masked native field and saved in iOS Keychain
+or Android Keystore-protected storage. Keys go only to the selected provider's
+fixed HTTPS endpoint; redirects are refused. No server credential or provider
+key is exported by the daemon.
+
+This is a separate conversation on the phone. Existing server messages, memory
+and integration data are never automatically sent to a hosted provider.
+Provider usage may incur charges on your own account. The active provider and
+model are always shown. Return to the server chat to retry the saved pairing.
+Tasks, integrations, approvals and fleet controls still require the server;
+direct chat does not pretend to perform those actions.
+
+Android uses ML Kit's on-device Gemini Nano Prompt API and checks actual
+availability. **Download local model** appears when AICore reports a download
+is needed; unsupported or unready devices show that status and can use hosted
+chat. iOS uses Apple Intelligence when enabled and downloaded. Neither app
+silently changes provider or automatically resends a possibly completed server
+turn to another model.
 
 ### iOS
 

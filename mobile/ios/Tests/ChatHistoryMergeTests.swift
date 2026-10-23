@@ -9,6 +9,17 @@ final class ChatHistoryMergeTests: XCTestCase {
 
     private func at(_ seconds: TimeInterval) -> Date { base.addingTimeInterval(seconds) }
 
+    func testOlderPagesReconcileLegacyCacheWithoutDuplicatingRepeatedMessages() {
+        let first = ChatMessage(role: .user, text: "same question", timestamp: at(0))
+        let second = ChatMessage(role: .user, text: "same question", timestamp: at(10))
+        let latest = ChatMessage(role: .assistant, text: "latest", timestamp: at(100), serverID: "cursor")
+        let page = [server("older-1", .user, "same question", 1), server("older-2", .user, "same question", 11)]
+        let merged = ChatHistoryMerge.prependOlder(local: [first, second, latest], server: page, before: "cursor")
+        XCTAssertEqual(merged.map(\.id), [first.id, second.id, latest.id])
+        XCTAssertEqual(merged.map(\.serverID), ["older-1", "older-2", "cursor"])
+        XCTAssertEqual(ChatHistoryMerge.prependOlder(local: merged, server: page, before: "cursor"), merged)
+    }
+
     private func server(_ id: String, _ role: ConversationMessage.Role, _ text: String, _ seconds: TimeInterval,
                         source: String? = nil) -> ConversationMessage {
         ConversationMessage(id: id, role: role, text: text, at: at(seconds), sourceNodeId: source, sourceName: source.map { "\($0) name" })
@@ -17,6 +28,21 @@ final class ChatHistoryMergeTests: XCTestCase {
     func testEmptyServerPageKeepsTheLocalCache() {
         let local = [ChatMessage(role: .user, text: "hi", timestamp: at(0))]
         XCTAssertEqual(ChatHistoryMerge.merge(local: local, server: []), local)
+    }
+
+    func testEarlierPageKeepsNewerMessagesTheirIdentityAndUnfinishedReply() {
+        let recent = ChatMessage(role: .user, text: "Recent question", timestamp: at(60), serverID: "m3")
+        let streaming = ChatMessage(role: .assistant, text: "Working…", isStreaming: true, timestamp: at(61))
+        let merged = ChatHistoryMerge.prependOlder(local: [recent, streaming], server: [
+            server("m1", .user, "Earlier question", 0, source: "g2:fixture"),
+            server("m2", .assistant, "Earlier reply", 5),
+            server("m2", .assistant, "Earlier reply", 5),
+            server("m3", .user, "Recent question", 60),
+        ], before: "m3")
+        XCTAssertEqual(merged.map(\.text), ["Earlier question", "Earlier reply", "Recent question", "Working…"])
+        XCTAssertEqual(Array(merged.suffix(2)), [recent, streaming])
+        XCTAssertEqual(merged.first?.sourceNodeId, "g2:fixture")
+        XCTAssertEqual(ChatHistoryMerge.prependOlder(local: merged, server: [], before: "m3"), merged)
     }
 
     func testFreshPhoneTakesTheServerThreadIncludingOtherDevicesLines() {

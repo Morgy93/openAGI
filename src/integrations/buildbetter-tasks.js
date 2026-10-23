@@ -38,8 +38,11 @@ export class BuildBetterTaskSource {
   constructor(options = {}) {
     this.runtime = options.runtime;
     this._apiKey = options.apiKey ?? null;
-    this._userEmail = options.userEmail ?? null;
-    this._userName = options.userName ?? null;
+    this._configuredUserEmail = options.userEmail ?? null;
+    this._configuredUserName = options.userName ?? null;
+    this._userEmail = this._configuredUserEmail;
+    this._userName = this._configuredUserName;
+    this._identityApiKey = this.apiKey;
     // Identity auto-derivation (option 1): once we've successfully asked `me`,
     // don't ask again this process — even if it returned no user.
     this._identityResolved = false;
@@ -90,6 +93,12 @@ export class BuildBetterTaskSource {
   // asked successfully (an org-scoped key legitimately returns no user — we
   // don't keep re-asking, we just fall back to the env-provided identity).
   async ensureIdentity() {
+    if (this._identityApiKey !== this.apiKey) {
+      this._identityApiKey = this.apiKey;
+      this._identityResolved = false;
+      this._userEmail = this._configuredUserEmail;
+      this._userName = this._configuredUserName;
+    }
     if (this.userEmail || this.userName) return;
     if (this._identityResolved) return;
     try {
@@ -325,7 +334,15 @@ export class BuildBetterTaskSource {
   }
 
   // Mode-aware dispatcher invoked by the cron handler and triggerSync().
-  async sync({ now = new Date() } = {}) {
+  sync(opts = {}) {
+    // All triggers enter here, not just webhooks. Keep the entire read and
+    // import inside the same in-flight pass to prevent duplicate source IDs.
+    if (this._syncPromise) return this._syncPromise;
+    this._syncPromise = this._runSync(opts).finally(() => { this._syncPromise = null; });
+    return this._syncPromise;
+  }
+
+  async _runSync({ now = new Date() } = {}) {
     const out = {};
     if (this.ingestMode === "signals" || this.ingestMode === "both") {
       out.signals = await this.syncSignals({ now });
@@ -334,6 +351,7 @@ export class BuildBetterTaskSource {
       out.transcripts = await this.syncTranscripts({ now });
     }
     this.lastSyncResult = { at: new Date().toISOString(), ...out };
+    if (Object.values(out).every((result) => !result.skipped && !result.failed)) this.lastSyncedAt = now.toISOString();
     return out;
   }
 
@@ -346,6 +364,7 @@ export class BuildBetterTaskSource {
       return { coalesced: true };
     }
     this._syncing = true;
+    if (this._syncPromise) this._syncPending = true;
     try {
       let result = await this.sync({ now });
       while (this._syncPending) {

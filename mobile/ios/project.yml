@@ -7,6 +7,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "2113"
     DEVELOPMENT_TEAM: ""
     # Ad-hoc signing ("-" needs no Apple Developer Team, certificate, or
     # provisioning profile — it works on any Mac, headless or not) rather
@@ -62,6 +64,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         UILaunchScreen: {}
         CFBundleURLTypes:
@@ -73,7 +77,8 @@ targets:
             ts.net:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: true
-        NSLocalNetworkUsageDescription: OpenAGI talks to the daemon on your own machine.
+        NSLocalNetworkUsageDescription: OpenAGI finds and connects to your OpenAGI servers on your local network.
+        NSBonjourServices: ["_openagi._tcp"]
         BGTaskSchedulerPermittedIdentifiers: [sh.openagi.refresh]
         UIBackgroundModes: [fetch, remote-notification]
         NSSupportsLiveActivities: true
@@ -108,6 +113,7 @@ targets:
     platform: iOS
     sources:
       - path: Widget
+      - path: Sources/PrivacyInfo.xcprivacy
       - path: Sources/Protocol
       - path: Sources/Store
       - path: Sources/UI
@@ -118,6 +124,8 @@ targets:
       path: Widget/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI Today
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
@@ -134,9 +142,11 @@ targets:
     platform: iOS
     sources:
       - path: Notify
+      - path: Sources/PrivacyInfo.xcprivacy
       - path: Sources/Protocol/PushEnvelope.swift
       - path: Sources/Protocol/SupervisorPushContent.swift
       - path: Sources/Store/PushKeyStore.swift
+      - path: Sources/Store/SharedContainer.swift
       - path: Sources/Notifications/SupervisorCategories.swift
     settings:
       base:
@@ -145,6 +155,8 @@ targets:
       path: Notify/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI Notify
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
@@ -166,10 +178,20 @@ targets:
         BUNDLE_LOADER: $(TEST_HOST)
     info:
       path: Tests/Info.plist
+  OpenAGIUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: OpenAGI
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   OpenAGI:
     build:
       targets:
         OpenAGI: all
     test:
-      targets: [OpenAGITests]
+      targets: [OpenAGITests, OpenAGIUITests]

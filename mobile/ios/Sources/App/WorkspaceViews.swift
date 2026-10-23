@@ -5,41 +5,40 @@ import SwiftUI
 // iPhone or a paired Mac). Spec: docs/superpowers/specs/
 // 2026-10-16-openagi-phone-workspace-design.md.
 
-struct WorkspaceSection: View {
-    @Environment(AppModel.self) private var model
+enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
+    case model, instructions, integrations, skills, scheduled
 
-    var body: some View {
-        RowGroup {
-            link("Model", detail: nil) { ModelSettingsView() }
-            RowHairline()
-            link("Instructions", detail: nil) { InstructionsView() }
-            RowHairline()
-            link("Skills", detail: nil) { SkillsView() }
-            RowHairline()
-            link("Scheduled", detail: nil) { ScheduledJobsView() }
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .model: "Model"
+        case .instructions: "Instructions"
+        case .integrations: "Integrations"
+        case .skills: "Skills"
+        case .scheduled: "Scheduled"
         }
     }
-
-    private func link<Destination: View>(_ title: String, detail: String?, @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink(destination: destination().environment(model)) {
-            HStack {
-                Text(title)
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(Theme.ink)
-                Spacer()
-                if let detail {
-                    Text(detail)
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.muted)
-                }
-                Image(systemName: "chevron.right")
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
-            }
-            .padding(.horizontal, Theme.Spacing.x4)
-            .frame(minHeight: Theme.rowMinHeight)
+    var symbol: String {
+        switch self {
+        case .model: "brain"
+        case .instructions: "text.page"
+        case .integrations: "link"
+        case .skills: "wrench.and.screwdriver"
+        case .scheduled: "calendar.badge.clock"
         }
-        .buttonStyle(.plain)
+    }
+}
+
+struct WorkspaceSection: View {
+    var body: some View {
+        Section("Agent") {
+            ForEach(WorkspaceDestination.allCases) { destination in
+                NavigationLink(value: destination) {
+                    Label(destination.title, systemImage: destination.symbol)
+                }
+                .accessibilityIdentifier("settings-\(destination.rawValue)")
+            }
+        }
     }
 }
 
@@ -57,7 +56,7 @@ struct ModelSettingsView: View {
 
     private var choices: [(id: String, label: String)] {
         var list = [("auto", "Automatic"), ("anthropic", "Claude"), ("openai", "OpenAI"), ("chatgpt", "ChatGPT")]
-        if model.isOnPhone { list.append(("on-device", "This iPhone")) }
+        if model.isOnPhone { list.append(("on-device", "Apple Intelligence")) }
         return list
     }
 
@@ -71,10 +70,13 @@ struct ModelSettingsView: View {
                     )) {
                         ForEach(choices, id: \.id) { Text($0.label).tag($0.id) }
                     }
+                    .pickerStyle(.navigationLink)
+                    .accessibilityIdentifier("model-provider")
                     LabeledContent("Now answering", value: activeLabel(settings))
+                        .accessibilityIdentifier("model-active")
                 } footer: {
                     Text(model.isOnPhone
-                         ? "Automatic uses Claude or OpenAI when a key is set, and this iPhone's own model otherwise. Without internet, a cloud model falls back to this iPhone."
+                         ? "Apple Intelligence keeps model requests on this iPhone. Automatic can use saved cloud keys or ChatGPT sign-in. Cloud models send requests to that provider and can fall back to this iPhone when offline."
                          : "Automatic uses Claude when its key is set, then OpenAI.")
                 }
 
@@ -110,6 +112,7 @@ struct ModelSettingsView: View {
                 Section {
                     Button("Test the model") { Task { await test() } }
                         .disabled(isWorking)
+                        .accessibilityIdentifier("model-test")
                     if let status {
                         Text(status.text)
                             .font(Theme.Typography.secondary)
@@ -122,7 +125,9 @@ struct ModelSettingsView: View {
                 ProgressView()
             }
         }
+        .accessibilityIdentifier("model-form")
         .navigationTitle("Model")
+        .navigationBarTitleDisplayMode(.inline)
         .disabled(isWorking)
         .task { await reload() }
     }

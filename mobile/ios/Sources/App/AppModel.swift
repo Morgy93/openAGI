@@ -47,26 +47,29 @@ final class AppModel {
     private(set) var fleetGeneration = 0
 
     private var eventStream: EventStreamController?
+    @ObservationIgnored private var todayRefresh: Task<Void, Never>?
+    private var isActive = true
 
     var inboxBadgeCount: Int { pendingActionsCount + clarificationsCount }
 
-    init(credentials: Credentials) {
+    init(credentials: Credentials, client: DaemonClient? = nil,
+         store: SnapshotStore = SnapshotStore(), queue: OutboundQueue = OutboundQueue(),
+         chatDirectory: URL = ChatHistoryStore.defaultDirectory) {
+        let client = client ?? DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         self.credentials = credentials
-        self.client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
-        self.store = SnapshotStore()
-        self.queue = OutboundQueue()
+        self.client = client
+        self.store = store
+        self.queue = queue
         self.snapshot = store.load()
         self.agentChat = ChatConversation(thread: .agent, client: client,
-                                          store: ChatHistoryStore(thread: ConversationThread.agent.rawValue),
+                                          store: ChatHistoryStore(thread: ConversationThread.agent.rawValue, directory: chatDirectory),
                                           nodeID: credentials.nodeID)
         self.supervisorChat = ChatConversation(thread: .supervisor, client: client,
-                                               store: ChatHistoryStore(thread: ConversationThread.supervisor.rawValue),
+                                               store: ChatHistoryStore(thread: ConversationThread.supervisor.rawValue, directory: chatDirectory),
                                                nodeID: credentials.nodeID)
     }
 
-    private var coordinator: RefreshCoordinator {
-        RefreshCoordinator(client: client, store: store, queue: queue)
-    }
+    @ObservationIgnored private lazy var coordinator = RefreshCoordinator(client: client, store: store, queue: queue)
 
     var statusLine: String {
         if case .unauthorized = lastOutcome { return "Needs re-pairing" }
@@ -79,19 +82,61 @@ final class AppModel {
     // The connection line names where the agent runs.
     var hostLabel: String { isOnPhone ? "This iPhone" : credentials.server.host ?? "" }
 
+    // An attached fleet event stream does not establish that task data loaded.
+    var dataStatus: String {
+        switch lastOutcome {
+        case .updated, .unchanged: "Synced"
+        case .unauthorized: "Needs re-pairing"
+        case .offline: snapshot == nil ? "Couldn't load data" : "Showing saved data"
+        case .mainUnavailable: "Main connection needs attention"
+        case nil: "Not synced yet"
+        }
+    }
+
     var ageMinutes: Int { snapshot?.ageInMinutes() ?? 0 }
+    var mainConnectionIssue: MainConnectionIssue? {
+        if case .mainUnavailable(let issue) = lastOutcome { return issue }
+        return nil
+    }
     var refreshFailed: Bool {
+        if mainConnectionIssue != nil { return true }
         if case .offline = lastOutcome { return true }
         return snapshot?.lastRefreshFailedAt != nil
     }
 
     // MARK: - Today
 
+    // Resume and reconnect can follow missed events or failed initial loads.
+    // Refresh the observable model as well as disk, and invalidate both lists.
+    func refreshData() async {
+        tasksGeneration += 1
+        inboxGeneration += 1
+        async let inboxRefresh: Void = refreshInboxCounts()
+        await refreshToday()
+        await inboxRefresh
+    }
+
     func refreshToday() async {
-        isRefreshingToday = true
-        defer { isRefreshingToday = false }
-        lastOutcome = await coordinator.refresh()
-        snapshot = store.load()
+        guard isActive else { return }
+        if let todayRefresh {
+            await todayRefresh.value
+            return
+        }
+        // Resume, reconnect and the Today view can refresh together. Share
+        // the whole operation so they cannot send the same queued completion.
+        let refresh = Task {
+            isRefreshingToday = true
+            defer {
+                isRefreshingToday = false
+                todayRefresh = nil
+            }
+            let outcome = await coordinator.refresh()
+            guard isActive, !Task.isCancelled else { return }
+            lastOutcome = outcome
+            snapshot = store.load()
+        }
+        todayRefresh = refresh
+        await refresh.value
     }
 
     // Optimistic: hide the row immediately, queue the completion, then try
@@ -100,9 +145,11 @@ final class AppModel {
     // `refresh()`, so ticking a task off from inside the app left the home
     // screen widget showing it as still open.
     func completeToday(taskID: String) async {
+        guard isActive else { return }
         snapshot = try? store.applyOptimisticCompletion(taskID: taskID)
         try? queue.enqueue(PendingOp(kind: .completeTask(taskID)))
         await coordinator.drainQueue()
+        guard isActive, !Task.isCancelled else { return }
         snapshot = store.load()
         WidgetReload.reloadToday()
     }
@@ -113,6 +160,7 @@ final class AppModel {
         async let actions = try? client.pendingActions(status: "pending")
         async let clarifications = try? client.clarifications(status: "pending")
         let (a, c) = await (actions, clarifications)
+        guard isActive, !Task.isCancelled else { return }
         if let a { pendingActionsCount = a.count }
         if let c { clarificationsCount = c.count }
     }
@@ -158,6 +206,7 @@ final class AppModel {
             fleetGeneration += 1
         case .hello:
             // A (re)connected stream may have missed updates while it was down.
+            Task { await refreshData() }
             Task { await agentChat.refresh() }
             Task { await supervisorChat.refresh() }
         case .unknown:
@@ -168,6 +217,7 @@ final class AppModel {
     // MARK: - Revoke
 
     func revoke() async {
+        invalidateRefresh()
         // Local push state goes first; best-effort relay cleanup runs apart
         // from the credential revocation so a relay outage cannot delay it.
         await PushRegistrar.shared.forget(client: client)
@@ -176,8 +226,8 @@ final class AppModel {
         agentChat.forget()
         supervisorChat.forget()
         Credentials.clear()
-        try? SnapshotStore().delete()
-        try? OutboundQueue().clear()
+        try? store.delete()
+        try? queue.clear()
     }
 
     // Leaves this daemon without revoking: switching between the agent on
@@ -187,16 +237,23 @@ final class AppModel {
     // Leaving a Mac for the iPhone agent parks the Mac's queued work (task
     // completions made while it was unreachable) instead of dropping it;
     // switching back restores it.
-    func detach() {
+    func detach(parkedQueue: OutboundQueue = .parkedForServer()) {
+        invalidateRefresh()
         stopEventStream()
         agentChat.forget()
         supervisorChat.forget()
-        try? SnapshotStore().delete()
+        try? store.delete()
         if credentials.isEmbedded {
-            try? OutboundQueue().clear()
+            try? queue.clear()
         } else {
-            try? OutboundQueue().move(to: .parkedForServer())
+            try? queue.move(to: parkedQueue)
         }
+    }
+
+    private func invalidateRefresh() {
+        isActive = false
+        todayRefresh?.cancel()
+        stopEventStream()
     }
 }
 

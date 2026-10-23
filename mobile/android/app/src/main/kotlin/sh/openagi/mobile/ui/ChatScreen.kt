@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -101,6 +100,7 @@ import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
 import sh.openagi.mobile.ui.components.ConnectionState
+import sh.openagi.mobile.ui.components.FoldAwareChatColumn
 import sh.openagi.mobile.ui.components.ChatTopBar
 import sh.openagi.mobile.ui.components.DownArrowGlyph
 import sh.openagi.mobile.ui.components.SendArrowGlyph
@@ -388,8 +388,11 @@ fun ChatScreen(
     starters: List<String> = emptyList(),
     conversationState: ChatConversationState,
     onBack: (() -> Unit)? = null,
+    onComposerFocusChanged: (Boolean) -> Unit = {},
 ) {
-    val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
+    val client = remember(credentials) { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
+    var showingFallback by remember { mutableStateOf(false) }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
     val scope = rememberCoroutineScope()
     // Starts at the newest line (an index past the end is clamped to the
     // last item), so a reopened chat never flashes its oldest messages
@@ -566,103 +569,112 @@ fun ChatScreen(
     // still scrolls.
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val gutter = chatGutter(maxWidth)
-        Column(modifier = Modifier.fillMaxSize()) {
-            ChatTopBar(
-                title = title,
-                connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
-                onBack = onBack,
-            )
-
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                LazyColumn(
-                    state = listState,
-                    // Room under the last line for the jump button while it shows,
-                    // so it never sits on the end of a reply.
-                    contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = if (showJump) 12.dp + JUMP_BUTTON_SPACE else 12.dp),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .nestedScroll(userScroll)
-                        // Touching the conversation, to scroll or to tap, puts the
-                        // keyboard away so there is room to read. Observed on the
-                        // initial pass and never consumed, so scrolling, links,
-                        // long-press copy and "Try again" all still work.
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                                focusManager.clearFocus()
-                                keyboard?.hide()
-                            }
-                        },
-                ) {
-                    if (showLoadOlder) {
-                        item(key = "load-older") {
-                            Text(
-                                if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
-                                style = OpenAGIType.caption,
-                                color = MaterialTheme.colorScheme.primary,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable(enabled = !loadingOlder) {
-                                        // Reading back: stay with the older lines.
-                                        userScrolledAway = true
-                                        conversationState.loadOlder(client)
-                                    }
-                                    .padding(vertical = 12.dp),
-                            )
-                        }
+        FoldAwareChatColumn(messages = {
+            Column(modifier = Modifier.fillMaxSize()) {
+                ChatTopBar(
+                    title = title,
+                    connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
+                    onBack = onBack,
+                )
+                if (title == "Chat" || !streamAttached) {
+                    androidx.compose.material3.TextButton(onClick = { showingFallback = true }, enabled = !isStreaming) {
+                        Text(if (streamAttached) "Chat without server" else "Server reconnecting · Use local or hosted chat")
                     }
-                    itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
-                        val previous = messages.getOrNull(index - 1)
-                        val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
-                        val topSpacing = MessageGrouping.spacingBeforeDp(
-                            previousIsUser = previous?.let { it is ChatEntry.User },
-                            previousEpochSeconds = previous?.timestamp?.epochSecond,
-                            currentIsUser = entry is ChatEntry.User,
-                            currentEpochSeconds = entry.timestamp.epochSecond,
-                        )
-                        Column(modifier = Modifier.fillMaxWidth().padding(top = topSpacing.dp)) {
-                            if (showDivider) {
+                }
+
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    LazyColumn(
+                        state = listState,
+                        // Room under the last line for the jump button while it shows,
+                        // so it never sits on the end of a reply.
+                        contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = if (showJump) 12.dp + JUMP_BUTTON_SPACE else 12.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .nestedScroll(userScroll)
+                            // Touching the conversation, to scroll or to tap, puts the
+                            // keyboard away so there is room to read. Observed on the
+                            // initial pass and never consumed, so scrolling, links,
+                            // long-press copy and "Try again" all still work.
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                    focusManager.clearFocus()
+                                    keyboard?.hide()
+                                }
+                            },
+                    ) {
+                        if (showLoadOlder) {
+                            item(key = "load-older") {
                                 Text(
-                                    formatDividerTime(entry.timestamp),
+                                    if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
                                     style = OpenAGIType.caption,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = MaterialTheme.colorScheme.primary,
                                     textAlign = TextAlign.Center,
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable(enabled = !loadingOlder) {
+                                            // Reading back: stay with the older lines.
+                                            userScrolledAway = true
+                                            conversationState.loadOlder(client)
+                                        }
+                                        .padding(vertical = 12.dp),
                                 )
                             }
-                            ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
                         }
+                        itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
+                            val previous = messages.getOrNull(index - 1)
+                            val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
+                            val topSpacing = MessageGrouping.spacingBeforeDp(
+                                previousIsUser = previous?.let { it is ChatEntry.User },
+                                previousEpochSeconds = previous?.timestamp?.epochSecond,
+                                currentIsUser = entry is ChatEntry.User,
+                                currentEpochSeconds = entry.timestamp.epochSecond,
+                            )
+                            Column(modifier = Modifier.fillMaxWidth().padding(top = topSpacing.dp)) {
+                                if (showDivider) {
+                                    Text(
+                                        formatDividerTime(entry.timestamp),
+                                        style = OpenAGIType.caption,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    )
+                                }
+                                ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
+                            }
+                        }
+                    }
+
+                    if (messages.isEmpty() && starters.isNotEmpty()) {
+                        StarterChips(
+                            starters = starters,
+                            onPick = { start(it) },
+                            modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
+                        )
+                    }
+
+                    if (showJump) {
+                        JumpToLatestButton(
+                            onClick = {
+                                userScrolledAway = false
+                                followToEnd()
+                            },
+                            modifier = Modifier.align(Alignment.BottomEnd).padding(end = gutter, bottom = 12.dp),
+                        )
                     }
                 }
 
-                if (messages.isEmpty() && starters.isNotEmpty()) {
-                    StarterChips(
-                        starters = starters,
-                        onPick = { start(it) },
-                        modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
-                    )
-                }
-
-                if (showJump) {
-                    JumpToLatestButton(
-                        onClick = {
-                            userScrolledAway = false
-                            followToEnd()
-                        },
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(end = gutter, bottom = 12.dp),
-                    )
-                }
             }
-
+        }, composer = {
             Composer(
                 value = inputText,
                 onValueChange = { inputText = it },
                 enabled = inputText.isNotBlank() && !isStreaming,
                 onSend = { send() },
                 gutter = gutter,
+                onFocus = onComposerFocusChanged,
             )
-        }
+        })
     }
 }
 
@@ -868,53 +880,20 @@ internal fun chatGutter(available: Dp): Dp = maxOf(CHAT_MIN_GUTTER, (available -
 // text inside it lines up with the messages: 12 from the edge on a phone.
 internal fun composerInset(gutter: Dp): Dp = maxOf(0.dp, gutter - 4.dp)
 
-// A rounded pill with the field and the send button inside it: one line at
-// rest, growing to six lines and then scrolling. It sits above the keyboard,
-// never behind it, and keeps the gesture-bar inset. Its hairline turns
-// `live` while the field has focus.
+// Material text entry and button semantics, including selection, TalkBack,
+// focus and keyboard behavior. The fold-aware parent owns the safe insets.
 @Composable
-private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit, gutter: Dp) {
-    val colors = LocalOpenAGIColors.current
-    val ink = MaterialTheme.colorScheme.onBackground
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    var focused by remember { mutableStateOf(false) }
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .imePadding()
-            .navigationBarsPadding()
-            .padding(horizontal = composerInset(gutter), vertical = 8.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Surface(
-            color = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(24.dp),
-            border = BorderStroke(1.dp, if (focused) colors.live else colors.edge),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Row(
-                modifier = Modifier.heightIn(min = 48.dp).padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-                verticalAlignment = Alignment.Bottom,
-            ) {
-                BasicTextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    textStyle = OpenAGIType.chatBody.copy(color = ink),
-                    cursorBrush = SolidColor(colors.live),
-                    minLines = 1,
-                    maxLines = 6,
-                    modifier = Modifier.weight(1f).padding(vertical = 7.dp).onFocusChanged { focused = it.isFocused },
-                    decorationBox = { inner ->
-                        Box {
-                            if (value.isEmpty()) Text("Message OpenAGI", style = OpenAGIType.chatBody, color = muted)
-                            inner()
-                        }
-                    },
-                )
-                SendButton(enabled = enabled, onClick = onSend)
-            }
-        }
-    }
+private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit, gutter: Dp, onFocus: (Boolean) -> Unit = {}) {
+    androidx.compose.material3.OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        placeholder = { Text("Message OpenAGI") },
+        maxLines = 6,
+        trailingIcon = { SendButton(enabled = enabled, onClick = onSend) },
+        modifier = Modifier.fillMaxWidth().navigationBarsPadding()
+            .padding(horizontal = maxOf(12.dp, composerInset(gutter)), vertical = 8.dp)
+            .onFocusChanged { onFocus(it.isFocused) },
+    )
 }
 
 // DESIGN.md: "Send is disabled and `muted` until there is non-whitespace
@@ -922,18 +901,11 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Bo
 // arrow in `onLive` so it reads in both modes.
 @Composable
 private fun SendButton(enabled: Boolean, onClick: () -> Unit) {
-    val colors = LocalOpenAGIColors.current
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Box(
-        modifier = Modifier
-            .padding(start = 8.dp)
-            .size(36.dp)
-            .clip(CircleShape)
-            .background(if (enabled) colors.live else muted.copy(alpha = 0.16f))
-            .clickable(enabled = enabled, onClickLabel = "Send", role = Role.Button, onClick = onClick)
-            .semantics { contentDescription = "Send" },
-        contentAlignment = Alignment.Center,
+    androidx.compose.material3.FilledIconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.semantics { contentDescription = "Send" },
     ) {
-        SendArrowGlyph(tint = if (enabled) colors.onLive else muted)
+        SendArrowGlyph(tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

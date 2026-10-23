@@ -50,11 +50,13 @@ final class AppSession {
     func chooseServer() { phase = .pairing }
 
     // Back from pairing or phone setup to wherever the person came from.
-    func goBack() {
+    func goBack(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
         if mode == .server, let backup = serverBackup {
             try? backup.save()
+            try? parkedQueue.move(to: queue)
             phase = .ready(backup)
         } else if mode == .server, let credentials = Credentials.load() {
+            try? parkedQueue.move(to: queue)
             phase = .ready(credentials)
         } else if mode == .onPhone, let credentials = Credentials.load(), credentials.isEmbedded {
             phase = .ready(credentials)
@@ -177,6 +179,7 @@ enum PhoneAgent {
     // the socket while the app is suspended.
     static func connectModel() async {
         guard let port = EmbeddedDaemon.shared.port, let secrets = EmbeddedSecrets.load() else { return }
-        await DeviceModelBridge.shared.connect(port: port, ownerToken: secrets.ownerToken, backend: OnDeviceModelStatus.backend())
+        await DeviceModelBridge.shared.connect(port: port, ownerToken: secrets.ownerToken,
+            backend: OnDeviceModelStatus.backend(), availability: OnDeviceModelStatus.current().availabilityName)
     }
 }

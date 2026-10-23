@@ -22,12 +22,19 @@ final class ChatConversation {
         // cache still shows; the header says how to get the shared history.
         case needsUpdate
         case offline
+        case needsPairing
     }
 
     let thread: ConversationThread
     private(set) var messages: [ChatMessage]
     private(set) var isSending = false
+    // Shared by compact and expanded presentations of this conversation.
+    var draft = ""
     private(set) var historyStatus: HistoryStatus = .unknown
+    private(set) var isRefreshingHistory = false
+    private(set) var isLoadingOlder = false
+    private(set) var olderHistoryError: String?
+    private(set) var nextBefore: String?
 
     private let client: DaemonClient
     private let store: ChatHistoryStore
@@ -37,6 +44,8 @@ final class ChatConversation {
     // refresh must not replace it.
     private var refreshIssued = 0
     private var refreshApplied = 0
+    private var activeRefreshes = 0
+    private var didLoadOlder = false
     private var forgotten = false
 
     init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String) {
@@ -143,6 +152,12 @@ final class ChatConversation {
 
     func refresh() async {
         guard !forgotten else { return }
+        activeRefreshes += 1
+        isRefreshingHistory = true
+        defer {
+            activeRefreshes -= 1
+            isRefreshingHistory = activeRefreshes > 0
+        }
         refreshIssued += 1
         let sequence = refreshIssued
         do {
@@ -150,19 +165,51 @@ final class ChatConversation {
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .synced
+            let pageIDs = Set(page.messages.map(\.id))
+            let overlaps = messages.contains { message in
+                message.serverID.map(pageIDs.contains) ?? false
+            }
             let merged = ChatHistoryMerge.merge(local: messages, server: page.messages)
             if merged != messages {
                 messages = merged
                 persist()
             }
+            if !didLoadOlder || !overlaps {
+                // Start at the returned page, not the oldest cached line:
+                // time spent offline can leave an unloaded gap in between.
+                nextBefore = page.nextBefore
+                didLoadOlder = false
+            }
         } catch DaemonError.notFound {
-            guard sequence > refreshApplied else { return }
+            guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .needsUpdate
+        } catch DaemonError.unauthorized {
+            guard sequence > refreshApplied, !forgotten else { return }
+            refreshApplied = sequence
+            historyStatus = .needsPairing
         } catch {
-            guard sequence > refreshApplied else { return }
+            guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .offline
+        }
+    }
+
+    func loadOlder() async {
+        guard !forgotten, !isLoadingOlder, let cursor = nextBefore else { return }
+        isLoadingOlder = true
+        olderHistoryError = nil
+        defer { isLoadingOlder = false }
+        do {
+            let page = try await client.conversationMessages(thread: thread, before: cursor)
+            guard !forgotten, nextBefore == cursor else { return }
+            messages = ChatHistoryMerge.prependOlder(local: messages, server: page.messages, before: cursor)
+            nextBefore = page.nextBefore
+            didLoadOlder = true
+            persist()
+        } catch {
+            guard !forgotten else { return }
+            olderHistoryError = "Couldn't load earlier messages. Try again."
         }
     }
 
@@ -178,8 +225,11 @@ final class ChatConversation {
     // On revoke: the cache belongs to the pairing being forgotten, and a
     // reply still streaming must not write it back afterwards.
     func forget() {
+        draft = ""
         forgotten = true
         messages = []
+        nextBefore = nil
+        olderHistoryError = nil
         store.delete()
     }
 }

@@ -89,6 +89,34 @@ enum ChatHistoryMerge {
     // line match the daemon's copy of it.
     static let clockSlack: TimeInterval = 5 * 60
 
+    // An earlier page must not run through the latest-page reconciliation:
+    // that would discard the newer server-backed messages already on screen.
+    static func prependOlder(local: [ChatMessage], server: [ConversationMessage], before cursor: String) -> [ChatMessage] {
+        var seen = Set(local.compactMap(\.serverID))
+        var result = local
+        for item in server {
+            guard seen.insert(item.id).inserted else { continue }
+            if let index = result.firstIndex(where: {
+                $0.serverID == nil && !$0.isStreaming && !$0.isFailed
+                    && $0.role == role(item.role) && normalized($0.text) == normalized(item.text)
+                    && abs(item.at.timeIntervalSince($0.timestamp)) <= clockSlack
+            }) {
+                result[index] = ChatMessage(id: result[index].id, role: role(item.role), text: item.text,
+                                            timestamp: item.at, serverID: item.id,
+                                            sourceNodeId: item.sourceNodeId, sourceName: item.sourceName)
+                continue
+            }
+            // A saved cache can include messages older than this page, with
+            // a gap between it and the latest page. Insert into that gap,
+            // keeping every existing message (including pending replies).
+            let boundary = result.firstIndex(where: { $0.serverID == cursor }) ?? result.endIndex
+            let index = result[..<boundary].firstIndex(where: { $0.timestamp > item.at }) ?? boundary
+            result.insert(ChatMessage(role: role(item.role), text: item.text, timestamp: item.at,
+                                      serverID: item.id, sourceNodeId: item.sourceNodeId, sourceName: item.sourceName), at: index)
+        }
+        return result
+    }
+
     static func merge(local: [ChatMessage], server: [ConversationMessage]) -> [ChatMessage] {
         guard let oldest = server.first?.at, let newest = server.last?.at else { return local }
         let serverIDs = Set(server.map(\.id))

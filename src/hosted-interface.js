@@ -1,3 +1,4 @@
+import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
 import http from "node:http";
 import fsSync from "node:fs";
@@ -53,6 +54,8 @@ import {
 } from "./node-registry.js";
 import { ServiceProbe, adoptRemoteServices, mergeServices } from "./service-nodes.js";
 import { readNodeConfig, writeNodeConfig } from "./cli-client.js";
+import { routeMainData } from "./main-data-router.js";
+import { taskIntegrationSettings, updateTaskIntegration, syncTaskIntegration } from "./task-integration-settings.js";
 import { composeBrief, dismissFocus } from "./daily-brief.js";
 import { queryReviewQueue, ReviewQueueQueryError } from "./review-queue.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
@@ -869,12 +872,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     // permanently locked out of its stable node id.
     if (pairing.nodeToken && pairing.nodeEnrollmentConfirmed === true) return pairing.nodeToken;
     const nodeToken = pairing.nodeToken ?? randomBytes(32).toString("base64url");
+    const ownerProxyToken = pairing.ownerProxyToken ?? randomBytes(32).toString("base64url");
     pairing.nodeToken = nodeToken;
+    pairing.ownerProxyToken = ownerProxyToken;
     pairing.nodeEnrollmentConfirmed = false;
     writeNodeConfig({
       remote: pairing.remote,
       token: pairing.token,
       nodeToken,
+      ownerProxyToken,
       nodeEnrollmentConfirmed: false
     }, dataDir);
     const enrollmentController = new AbortController();
@@ -889,7 +895,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           "content-type": "application/json",
           ...(pairing.token ? { authorization: `Bearer ${pairing.token}` } : {})
         },
-        body: JSON.stringify({ nodeId: identity.nodeId, nodeToken }),
+        body: JSON.stringify({ nodeId: identity.nodeId, nodeToken, ownerProxyToken }),
         redirect: "manual",
         signal: enrollmentController.signal
       });
@@ -904,6 +910,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       remote: pairing.remote,
       token: null,
       nodeToken,
+      ownerProxyToken,
       nodeEnrollmentConfirmed: true
     }, dataDir);
     return nodeToken;
@@ -958,12 +965,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         || isMobileRouteAllowed(method, pathname);
       const mobileNodeRoute = requestEnrollment?.platform === MOBILE_PLATFORM
         && isMobileRouteAllowed(method, pathname);
+      const ownerProxyRoute = isMobileRouteAllowed(method, pathname)
+        && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
-      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute || mobileNodeRoute)
+      const nodeScopedAuth = ownerProxyRoute || ((nodeScopedRoute || nodeClientRoute || mobileNodeRoute)
         ? g2NodeRouteAllowed && mobileRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
-        : false;
+        : false);
       // Even Hub runs the G2 client in a phone webview whose Origin is not the
       // daemon's origin. Bypass only the browser-origin check, and only after
       // the request has proven its G2 scoped bearer credential (and, when
@@ -1000,6 +1009,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
       }
 
+      // Shared workspace requests belong to main, including requests from a
+      // phone using this worker as its reachable gateway. Main validates the
+      // original scoped credential. Never grant this worker broader scopes.
+      const gatewayOwnerAuthenticated = checkAuth(req, url, getAuthToken()).ok;
+      if (routeMainData(req, res, url, {
+        pairing: readNodeConfig(dataDir), identity: localIdentity,
+        ownerAuthenticated: gatewayOwnerAuthenticated,
+        ownerBearerAuthenticated: Boolean(getAuthToken() && scopedBearer && checkAuth(
+          { headers: { authorization: req.headers.authorization } }, new URL("/", url), getAuthToken()
+        ).ok),
+        allowInsecureRemote: allowInsecureNodeRelay
+      })) return;
+
       // Auth gate. Webhooks self-validate, /health stays open, setup routes
       // bypass auth ONLY during first-run (no token exists yet).
       const extraCookies = [];
@@ -1007,7 +1029,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
-          : (nodeClientRoute || mobileNodeRoute) && requestNodeId
+          : (nodeClientRoute || mobileNodeRoute || ownerProxyRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
@@ -1017,7 +1039,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const wantsHtml = method === "GET" && accept.includes("text/html");
           if (wantsHtml && getAuthToken()) {
             const next = pathname + url.search;
-            return sendHtml(res, 401, renderLoginPage(auth.reason ?? "auth required", next));
+            return sendHtml(res, 401, renderLoginPage(auth.reason ?? "auth required", next, { isWorker: Boolean(readNodeConfig(dataDir)?.remote) }));
           }
           res.writeHead(401, {
             "content-type": "application/json; charset=utf-8",
@@ -1038,7 +1060,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const token = form.token ?? "";
         const next = (form.next && form.next.startsWith("/") && !form.next.startsWith("//")) ? form.next : "/";
         if (!expected || token !== expected) {
-          return sendHtml(res, 401, renderLoginPage("invalid token", next));
+          return sendHtml(res, 401, renderLoginPage("That token does not match this server. Tokens from other computers cannot sign you in here.", next, { isWorker: Boolean(readNodeConfig(dataDir)?.remote) }));
         }
         res.writeHead(302, {
           Location: next,
@@ -1268,7 +1290,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: "nodeId and nodeToken are required" });
         }
         try {
-          const enrollment = nodeRegistry.enroll(body.nodeId, body.nodeToken);
+          const enrollment = nodeRegistry.enroll(body.nodeId, body.nodeToken, { ownerProxyToken: body.ownerProxyToken ?? null });
           return sendJson(res, 200, { nodeId: body.nodeId, enrolled: true, created: enrollment.created });
         } catch (error) {
           if (error.code === "NODE_ALREADY_ENROLLED") {
@@ -2312,6 +2334,27 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         } catch (error) {
           return sendJson(res, error.status ?? 500, { error: "skill_error", message: error.message });
         }
+      }
+      if (pathname === "/workspace/integrations" && method === "GET") {
+        return sendJson(res, 200, { integrations: taskIntegrationSettings(runtime) });
+      }
+      const taskIntegrationMatch = /^\/workspace\/integrations\/(linear|buildbetter)(\/sync)?$/.exec(pathname);
+      if (taskIntegrationMatch) {
+        const [, id, sync] = taskIntegrationMatch;
+        if (sync && method === "POST") return sendJson(res, 200, await syncTaskIntegration(runtime, id));
+        if (!sync && ["PUT", "DELETE"].includes(method)) {
+          const body = method === "DELETE" ? {} : await readJsonLimited(req, 2048).catch(() => null);
+          if (!body || Object.keys(body).some(key => key !== "apiKey")) return sendJson(res, 400, { error: "invalid_body" });
+          try {
+            if (!updateTaskIntegration(runtime, dataDir, id, method === "DELETE" ? null : body.apiKey)) {
+              return sendJson(res, 409, { error: "integration_unavailable" });
+            }
+          } catch (error) {
+            return sendJson(res, error.status ?? 400, { error: "invalid_key" });
+          }
+          return sendJson(res, 200, { integrations: taskIntegrationSettings(runtime) });
+        }
+        return sendJson(res, 405, { error: "method_not_allowed" });
       }
       if (pathname === "/workspace/jobs" && method === "GET") {
         const jobs = runtime.cron.listJobs().map((job) => ({
@@ -4204,37 +4247,6 @@ function sendHtml(res, status, value, cookies = []) {
   if (cookies.length) headers["Set-Cookie"] = cookies;
   res.writeHead(status, headers);
   res.end(html);
-}
-
-function renderLoginPage(reason, next = "/") {
-  // Sanitise the redirect target so an attacker can't bounce the user
-  // off-site after sign-in.
-  const safeNext = typeof next === "string" && next.startsWith("/") && !next.startsWith("//") ? next : "/";
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>OpenAGI · auth</title>
-<style>body{font:14px/1.5 ui-sans-serif,system-ui;background:#0e1411;color:#e8efea;display:grid;place-items:center;min-height:100vh;margin:0}
-form{background:#161d19;border:1px solid #2a352f;border-radius:10px;padding:24px;width:min(420px,90vw)}
-h1{margin:0 0 4px;font-size:18px}p{color:#8da59a;margin:6px 0 16px;font-size:13px}
-input{width:100%;padding:9px 12px;background:#0e1411;color:#e8efea;border:1px solid #2a352f;border-radius:6px;font:inherit;margin-bottom:10px}
-button{background:#6fe1b1;color:#002219;border:0;padding:9px 14px;border-radius:6px;font-weight:700;cursor:pointer;width:100%}
-.err{color:#f08080;margin-bottom:10px;font-size:12px}
-.hint{color:#8da59a;font-size:12px;margin-top:14px}
-.hint code{background:#0e1411;padding:2px 5px;border-radius:3px;border:1px solid #2a352f}</style></head>
-<body><form method="POST" action="/sign-in" id="loginForm" enctype="application/x-www-form-urlencoded">
-<h1>OpenAGI</h1><p>This daemon requires authentication.</p>
-${reason ? `<div class="err">${escapeHtmlForLogin(reason)}</div>` : ""}
-<input name="token" placeholder="Bearer token" autofocus required spellcheck="false" autocapitalize="off">
-<input type="hidden" name="next" value="${escapeHtmlForLogin(safeNext)}">
-<button type="submit">Sign in</button>
-<div class="hint">Find your token in your data dir's <code>.env</code> as <code>OPENAGI_AUTH_TOKEN</code>.<br>If you're running the macOS app, click the menubar icon → <strong>Copy auth token</strong>.</div>
-</form>
-</body></html>`;
-}
-
-// SEC-4: single quotes too — this value lands in an attribute, and an
-// attribute is just as happy to be delimited by ' as by ".
-function escapeHtmlForLogin(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 }
 
 function sendJson(res, status, value) {
@@ -7552,6 +7564,13 @@ async function renderNodesOnce({ showLoading = true } = {}) {
         <div class="desc" id="g2DirectTokenOut" style="margin-top:8px;"></div>
       </div>\`;
 
+  const phoneEnrollmentCard = isNode
+    ? \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
+       <div class="desc">Pair phones with your main server, not this worker. Open your main's dashboard, choose Nodes, then Connect a phone. No auth-token copying is needed.</div></div>\`
+    : \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
+       <div class="desc">Generate one code per phone. Codes last 30 minutes and work once. On iOS or Android, choose Connect to a server and enter this address and code.</div>
+       <button class="ui-btn ui-btn-sm" id="phoneEnrollBtn">Generate phone pairing code</button>
+       <div class="desc" id="phoneEnrollOut" style="margin-top:8px;"></div></div>\`;
   main.innerHTML = \`
     <div class="pane">
       <h2>Nodes</h2>
@@ -7567,6 +7586,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
         <div class="row" style="margin-top:8px;"><button id="nodesRefresh">Re-check now</button></div>
       </div>
       \${g2EnrollmentCard}
+      \${phoneEnrollmentCard}
       \${banner}
       <div class="desc" style="margin-top:12px;">
         Everything this installation talks to. <b>main</b> is the machine that holds the
@@ -7599,6 +7619,21 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     c.style.verticalAlign = "top";
   });
   document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
+  document.getElementById("phoneEnrollBtn")?.addEventListener("click", async () => {
+    const button = document.getElementById("phoneEnrollBtn");
+    const out = document.getElementById("phoneEnrollOut");
+    button.disabled = true;
+    try {
+      const response = await fetch("/nodes/enrollment-code", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform: "mobile" })
+      });
+      const enrollment = await response.json();
+      if (!response.ok) throw new Error(enrollment.error || "Could not create a phone pairing code.");
+      out.textContent = "Server: " + (enrollment.publicUrl || location.origin) + " · Code: " + enrollment.code
+        + " · Single use, expires " + new Date(enrollment.expiresAt).toLocaleTimeString();
+    } catch (error) { out.textContent = error.message || "Could not create a phone pairing code."; }
+    finally { button.disabled = false; }
+  });
   document.getElementById("g2NodeEnrollBtn")?.addEventListener("click", async () => {
     const out = document.getElementById("g2NodeEnrollOut");
     try {

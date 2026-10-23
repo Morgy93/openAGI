@@ -1,5 +1,16 @@
 import Foundation
 import UserNotifications
+import Darwin
+
+// Keep notification-service IPC outside the registration/locking tests.
+// The app and extension use the system center by default.
+protocol SupervisorNotificationCenter {
+    func getNotificationCategories(completionHandler: @escaping @Sendable (Set<UNNotificationCategory>) -> Void)
+    func getDeliveredNotifications(completionHandler: @escaping @Sendable ([UNNotification]) -> Void)
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>)
+}
+
+extension UNUserNotificationCenter: SupervisorNotificationCenter {}
 
 // Notification categories for supervisor alerts, shared by the app and the
 // notification service extension (project.yml compiles this file into
@@ -44,22 +55,63 @@ enum SupervisorCategories {
     // UserNotifications object ever crosses an isolation boundary (Swift 6.1
     // strict concurrency rejects that). `completion` runs once the write has
     // landed.
-    static func register(_ category: UNNotificationCategory, center: UNUserNotificationCenter = .current(),
+    static func register(_ category: UNNotificationCategory, center: any SupervisorNotificationCenter = UNUserNotificationCenter.current(),
+                         coordinationDirectory: URL = SharedContainer.url.appending(path: "push-categories"),
                          completion: @escaping @Sendable () -> Void = {}) {
         let box = UncheckedSendableBox(value: (category: category, center: center))
-        center.getNotificationCategories { existing in
-            let existingBox = UncheckedSendableBox(value: existing)
-            box.value.center.getDeliveredNotifications { delivered in
-                let inUse = Set(delivered.map(\.request.content.categoryIdentifier))
-                box.value.center.setNotificationCategories(
-                    merged(existing: existingBox.value, adding: box.value.category, inUse: inUse))
-                // Reading the set back waits for the write to land. Without
-                // it, an extension that hands its content over straight away
-                // can have the alert shown before its category exists, with
-                // no buttons.
-                box.value.center.getNotificationCategories { _ in completion() }
+        // The app and extension can write from different processes. Acquire
+        // the shared file lock on a worker, never on the caller's UI thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let lease = CategoryRegistrationLease(directory: coordinationDirectory,
+                                                   adding: box.value.category.identifier)
+            box.value.center.getNotificationCategories { existing in
+                let existingBox = UncheckedSendableBox(value: existing)
+                box.value.center.getDeliveredNotifications { delivered in
+                    // A preceding extension can have finished registration
+                    // just before its alert appears in the delivered list.
+                    // Disk coordination is best-effort. Still register the
+                    // actions if the shared container cannot be written.
+                    let inUse = Set(delivered.map(\.request.content.categoryIdentifier)).union(lease?.recent ?? [])
+                    box.value.center.setNotificationCategories(
+                        merged(existing: existingBox.value, adding: box.value.category, inUse: inUse))
+                    // Keep the lock until the write has landed and the
+                    // extension hands its rewritten alert back to the system.
+                    box.value.center.getNotificationCategories { _ in
+                        withExtendedLifetime(lease) { completion() }
+                    }
+                }
             }
         }
+    }
+}
+
+// A tiny shared registration journal covers the gap before delivery. Old
+// entries expire after a minute; delivered notifications retain their own
+// categories through the normal merge. The OS releases the lock on exit.
+private final class CategoryRegistrationLease: @unchecked Sendable {
+    let recent: Set<String>
+    private let descriptor: Int32
+
+    init?(directory: URL, adding: String) {
+        do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        catch { return nil }
+        let fd = Darwin.open(directory.appending(path: "registration.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX) == 0 else { Darwin.close(fd); return nil }
+        let journal = directory.appending(path: "recent.json")
+        let now = Date().timeIntervalSince1970
+        var entries = (try? Data(contentsOf: journal)).flatMap { try? JSONDecoder().decode([String: Double].self, from: $0) } ?? [:]
+        entries = entries.filter { $0.value > now - 60 }
+        if adding.hasPrefix(SupervisorPushContent.categoryPrefix) { entries[adding] = now }
+        do { try JSONEncoder().encode(entries).write(to: journal, options: .atomic) }
+        catch { flock(fd, LOCK_UN); Darwin.close(fd); return nil }
+        descriptor = fd
+        recent = Set(entries.keys)
+    }
+
+    deinit {
+        flock(descriptor, LOCK_UN)
+        Darwin.close(descriptor)
     }
 }
 
